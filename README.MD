@@ -7,6 +7,20 @@ A WebGPU-accelerated 3D visualization of asteroid (162173) Ryugu with real-time 
 ![Bevy](https://img.shields.io/badge/Bevy-0.19.0-purple.svg)
 ![Rust](https://img.shields.io/badge/Rust-Edition_2024-orange.svg)
 
+<!-- 1. 顶部 Hero 动图演示 -->
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/a7378406-661f-45ed-8c5d-1d612c4031b2" width="100%" alt="Ryugu WebGPU Real-time Simulation"/>
+  <br>
+  <i>Real-time 60 FPS gravitational dynamics & orbital trajectory simulation running directly in browser via WebGPU & WASM.</i>
+</p>
+
+## 📸 Visual Highlights
+
+<!-- 2. 前 3 张静态截图并排展示 -->
+| Orbital Trajectory Overview | Cross-Section Density View (`D` key) | Surface Normal Vectors (`F` key) |
+| :---: | :---: | :---: |
+| <img src="https://github.com/user-attachments/assets/c362ea92-27ad-4bfb-82a5-858618dffb4c" width="100%"/> | <img src="https://github.com/user-attachments/assets/f264a0ab-f8fe-474a-9aa2-fbe3de496790" width="100%"/> | <img src="https://github.com/user-attachments/assets/bbb17da7-7dcb-4a5e-b39e-eb0af07a7961" width="100%"/> |
+
 ## Features
 
 ### Physics Simulation
