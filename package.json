@@ -1,0 +1,10 @@
+{
+  "name": "ryugu-wasm",
+  "version": "0.1.0",
+  "scripts": {
+    "build:wasm": "wasm-pack build --dev --target web --out-dir pkg",
+    "build": "wasm-pack build --release --target web --out-dir pkg",
+    "dev": "bun run build:wasm && bun run server.ts",
+    "serve": "bun run server.ts"
+  }
+}
