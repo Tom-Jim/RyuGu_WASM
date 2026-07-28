@@ -52,7 +52,7 @@
                 document.getElementById('bevy').style.display = 'none';
                 document.getElementById('no-webgpu').style.display = 'flex';
             } else {
-                import('./pkg/Ryugu_wasm.js').then(({ default: init }) => init());
+                import('./pkg/ryugu_wasm.js').then(({ default: init }) => init());
             }
         }
     </script>

@@ -2,6 +2,7 @@
 
 A WebGPU-accelerated 3D visualization of asteroid (162173) Ryugu with real-time gravitational dynamics, built with Rust and Bevy Engine, compiled to WebAssembly.
 
+[![Live Demo](https://img.shields.io/badge/🚀_Live_Demo-WebGPU_Simulation-success?style=for-the-badge)](https://tom-jim.github.io/RyuGu_WASM/)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)
 ![Bevy](https://img.shields.io/badge/Bevy-0.19.0-purple.svg)
 ![Rust](https://img.shields.io/badge/Rust-Edition_2024-orange.svg)
