@@ -133,8 +133,6 @@ WebGPU is required. Supported environments:
  |
 | Firefox | Not yet supported (WebGPU behind flag)
 
- |
-
 The dev server (`server.ts`) sets `Cross-Origin-Embedder-Policy: require-corp` and
 `Cross-Origin-Opener-Policy: same-origin` headers — required for `SharedArrayBuffer` / WASM threads.
 
@@ -156,7 +154,6 @@ The dev server (`server.ts`) sets `Cross-Origin-Embedder-Policy: require-corp` a
  |
 | Scroll wheel | Zoom
 
- |
 
 ## 📚 References
 
