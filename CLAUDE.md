@@ -5,43 +5,117 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-# JS dependencies
+# JS dependencies (none at runtime; just primes Bun's module cache)
 bun install
 
-# Dev: builds WASM (debug) then starts server at http://localhost:3000
+# Dev: builds WASM (debug, opt-level 1) then starts server at http://localhost:3000
 bun run dev
 
-# Production WASM build (release profile, output → pkg/)
+# Production WASM build (release profile: opt-level "z", LTO → pkg/)
 bun run build
 
-# Start server only (requires pkg/ to already exist)
+# Start dev server only (requires pkg/ to already exist)
 bun run serve
 
-# Lint / format (native host, for IDE feedback only)
+# Lint / format (native host, for IDE feedback only — not the WASM target)
 cargo clippy
 cargo fmt
 ```
 
-> `cargo run` and `cargo build` without a target are only useful for syntax checking; the actual runnable artifact is the WASM package built by `wasm-pack`.
+> `cargo run` / `cargo build` without `--target wasm32-unknown-unknown` are only useful for syntax checking. The runnable artifact is the WASM package produced by `wasm-pack --target web`.
 
 ## Architecture
 
-Single-file Bevy app (`src/lib.rs`) compiled to WASM via `wasm-pack`. The entry point is `main()` annotated with `#[wasm_bindgen(start)]`, mounted on the `#bevy` canvas in `index.html`.
+Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `wasm-pack`. Entry point is `pub fn main()` in `src/lib.rs`, annotated `#[wasm_bindgen(start)]`, mounted on the `#bevy` canvas in `index.html`.
 
-**Scene**: Asteroid Ryugu (900 m diameter) + Cassini probe (6.7 m) loaded as GLTF scenes. Both use `WorldAssetRoot` + `TargetSize` for deferred auto-scaling once Bevy computes their `Aabb`.
+**Source layout**
 
-**Systems**:
-- `normalize_model_scale_system` — runs every frame until `ScaleNormalized` is inserted; walks the entity tree to find the max AABB extent and applies a uniform scale factor so the model matches its real-world `TargetSize` in meters.
-- `probe_tracker_system` — renders a pulsing gizmo crosshair on the Cassini probe when the camera is more than 250 m away.
+| Path | Role |
+|---|---|
+| `src/lib.rs` | App setup: plugin stack, resource init, system scheduling |
+| `src/components.rs` | All ECS components, resources, and physics constants |
+| `src/topology.rs` | Builds a CSR adjacency list from the welded mesh for GPU upload |
+| `src/welding.rs` | Vertex deduplication (quantized HashMap) → `WeldedMesh` |
+| `src/systems/scale.rs` | `normalize_model_scale_system` + `build_topology_system` |
+| `src/systems/compute_pipeline.rs` | `NormalsComputePlugin` — WGSL compute pass for surface normals |
+| `src/systems/gravity_pipeline.rs` | `GravityComputePlugin` — voxel gravity summation on GPU |
+| `src/systems/compute_normals.rs` | Main-world side: drains normals readback channel → `AsteroidNormalsGpuData` |
+| `src/systems/physics.rs` | Newtonian orbital integration + Ryugu rotation |
+| `src/systems/render.rs` | Scene setup, camera follow/switch, gizmos, section plane |
+| `src/systems/ui.rs` | FPS display, keyboard toggles (normals / section view) |
+| `assets/shaders/normals.wgsl` | WGSL compute shader for surface normal averaging |
+| `assets/shaders/gravity.wgsl` | WGSL compute shader for voxel gravity summation |
+| `assets/shaders/gravity_stehfest.wgsl` | Alternative gravity shader with Gaver-Stehfest Laplace inversion + Struve function LUT |
+| `scripts/gen_lut.py` | Python script to precompute Struve function lookup table for analytical gravity kernel |
 
-**Dev server** (`server.ts`): plain Bun HTTP server with COEP/COOP headers required for `SharedArrayBuffer` / WASM threads.
+**Plugin stack (lib.rs)**
+
+- `DefaultPlugins` — `AssetPlugin { meta_check: Never }`, `WindowPlugin` (canvas `#bevy`, fits parent), `RenderPlugin` forces `BROWSER_WEBGPU` backend and raises `max_storage_buffers_per_shader_stage = 8` / `max_compute_workgroups_per_dimension = 65535`
+- `ObjPlugin` (`bevy_obj`) — loads Wavefront `.obj` asteroid mesh
+- `PanOrbitCameraPlugin` (`bevy_panorbit_camera`) — mouse-orbit camera
+- `FrameTimeDiagnosticsPlugin` — FPS counter
+- `NormalsComputePlugin` — custom render-world compute pass (WGSL)
+- `GravityComputePlugin` — custom render-world compute pass (WGSL)
+
+**One-shot initialization via marker components**
+
+`normalize_model_scale_system` and `build_topology_system` run every frame but are guarded by `Without<ScaleNormalized>` / `Without<TopologyBuilt>` queries. They insert these markers on completion so the work only runs once. The same pattern applies to `build_gravity_voxels_system`. Do not remove these marker inserts.
+
+**System ordering**
+
+All Update systems in `lib.rs` are registered with `.chain()`, enforcing strict sequential ordering every frame:
+`normalize_model_scale` → `build_topology` → `build_gravity_voxels` → `compute_normals` → `physics` → `ryugu_rotation` → camera/UI/render systems.
+
+**GPU compute / readback pattern**
+
+Both compute plugins live in the Bevy render world and communicate results back to the main world via `Arc<Mutex<Option<Vec<[f32;4]>>>>` channels (`NormalsReadbackChannel`, `GravityReadbackChannel`). Staging buffers are mapped async; each main-world system drains its channel each frame if data is ready.
+
+**Physics constants (components.rs)**
+
+Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 * 3600`, `RYUGU_SPIN_AXIS = Vec3(-0.043, -0.914, 0.405)`, `TIME_SCALE = 6000` (simulation speedup).
+
+`DensityC` is computed at startup as `RYUGU_MASS / ∫(1/(r³+ε³))dV` over the voxel mesh — it normalizes the custom gravity kernel so the total mass is conserved.
+
+**Keyboard controls (runtime)**
+
+| Key | Action |
+|---|---|
+| `S` | Switch camera mode (Overview ↔ Follow Cassini) |
+| `F` | Toggle surface normals display |
+| `D` | Toggle section plane view |
+
+**Deployment**
+
+`.github/workflows/deploy.yml` builds with `wasm-pack --release`, assembles `site/` from `index.html + assets/ + pkg/`, and deploys to GitHub Pages. It copies `ryugu_wasm.{js,wasm}` to `Ryugu_wasm.{js,wasm}` to handle Linux case-sensitivity vs macOS case-insensitive FS.
+
+## Dev server
+
+`server.ts` — plain Bun HTTP server on port 3000. Serves from project root. Sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on every response (required for `SharedArrayBuffer` / Bevy WASM threads).
 
 ## Bevy 0.19.0 API Notes
 
-- `Aabb` import path: `bevy::camera::primitives::Aabb`.
-- `gizmos.sphere(position, radius, color)` — 3 args, no `Isometry`.
-- `gizmos.circle(position, radius, color)` — 3 args.
-- Use `WorldAssetRoot(asset_server.load(...))` to spawn GLTF scenes.
-- WASM canvas: `canvas: Some("#bevy".into())` in `WindowPlugin`.
-- Avoid `std::fs` and bare `std::time::Instant`; use `bevy::time::Time` instead.
-- `AssetMetaCheck::Never` is required to suppress missing `.meta` file errors in WASM.
+- `Aabb` import: `bevy::camera::primitives::Aabb`
+- `gizmos.sphere(position, radius, color)` — 3 args, no `Isometry`
+- `gizmos.circle(position, radius, color)` — 3 args
+- Use `WorldAssetRoot(asset_server.load(...))` to spawn GLTF/OBJ scenes
+- WASM canvas: `canvas: Some("#bevy".into())` in `WindowPlugin`
+- Avoid `std::fs` and bare `std::time::Instant`; use `bevy::time::Time`
+- `AssetMetaCheck::Never` is required to suppress missing `.meta` file 404s in WASM
+- WebGPU backend identifier: `bevy::render::settings::WgpuBackends::BROWSER_WEBGPU`
+
+## WASM dependency gotcha
+
+Any crate that uses random number generation must enable the `wasm_js` feature for `getrandom`:
+```toml
+getrandom = { version = "0.3", features = ["wasm_js"] }
+```
+Without this, the WASM build panics at runtime when entropy is requested.
+
+## Gravity kernel variants
+
+Two compute shaders implement different gravity field methods:
+
+- **`gravity.wgsl`** (default): Direct `1/(r³+ε³)` voxel summation with mass normalization
+- **`gravity_stehfest.wgsl`** (experimental): Analytical Laplace-domain kernel with Gaver-Stehfest numerical inversion. Requires a precomputed Struve function LUT generated by `scripts/gen_lut.py`. Currently used in the active build.
+
+The choice affects `GravityComputePlugin` initialization in `gravity_pipeline.rs` (shader asset path + optional LUT resource).
