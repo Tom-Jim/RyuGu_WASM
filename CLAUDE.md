@@ -24,6 +24,12 @@ cargo fmt
 
 > `cargo run` / `cargo build` without `--target wasm32-unknown-unknown` are only useful for syntax checking. The runnable artifact is the WASM package produced by `wasm-pack --target web`.
 
+**Before running:** `lut_struve.bin` must exist in the project root. If missing, the simulation panics immediately at `build_gravity_voxels_system`. Regenerate with:
+
+```sh
+python scripts/gen_lut.py
+```
+
 ## Architecture
 
 Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `wasm-pack`. Entry point is `pub fn main()` in `src/lib.rs`, annotated `#[wasm_bindgen(start)]`, mounted on the `#bevy` canvas in `index.html`.
@@ -34,24 +40,23 @@ Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `was
 |---|---|
 | `src/lib.rs` | App setup: plugin stack, resource init, system scheduling |
 | `src/components.rs` | All ECS components, resources, and physics constants |
-| `src/topology.rs` | Builds a CSR adjacency list from the welded mesh for GPU upload |
+| `src/topology.rs` | Builds a CSR adjacency list from the welded mesh |
 | `src/welding.rs` | Vertex deduplication (quantized HashMap) → `WeldedMesh` |
-| `src/systems/scale.rs` | `normalize_model_scale_system` + `build_topology_system` |
-| `src/systems/compute_pipeline.rs` | `NormalsComputePlugin` — WGSL compute pass for surface normals |
-| `src/systems/gravity_pipeline.rs` | `GravityComputePlugin` — voxel gravity summation on GPU |
-| `src/systems/compute_normals.rs` | Main-world side: drains normals readback channel → `AsteroidNormalsGpuData` |
-| `src/systems/physics.rs` | Newtonian orbital integration + Ryugu rotation |
+| `src/systems/scale.rs` | `normalize_model_scale_system` + `build_topology_system` (solves `DensityC`) |
+| `src/systems/compute_pipeline.rs` | `NormalsComputePlugin` — one-shot render-world compute pass for surface normals |
+| `src/systems/gravity_pipeline.rs` | `GravityComputePlugin` — per-frame GPU gravity dispatch + readback |
+| `src/systems/compute_normals.rs` | CPU fallback normal computation; runs synchronously in `Update` |
+| `src/systems/physics.rs` | Semi-implicit Euler orbit integration + `ryugu_rotation_system` |
 | `src/systems/render.rs` | Scene setup, camera follow/switch, gizmos, section plane |
 | `src/systems/ui.rs` | FPS display, keyboard toggles (normals / section view) |
-| `assets/shaders/normals.wgsl` | WGSL compute shader for surface normal averaging |
-| `assets/shaders/gravity.wgsl` | WGSL compute shader for voxel gravity summation |
-| `assets/shaders/gravity_stehfest.wgsl` | Alternative gravity shader with Gaver-Stehfest Laplace inversion + Struve function LUT |
-| `scripts/gen_lut.py` | Python script to precompute Struve function lookup table for analytical gravity kernel |
+| `assets/shaders/normals.wgsl` | WGSL compute shader for surface normal averaging (CSR neighbor ring) |
+| `assets/shaders/gravity.wgsl` | WGSL compute shader: Gaver-Stehfest NILT loop + Struve-Neumann LUT |
+| `scripts/gen_lut.py` | Precomputes `S₀(z)`, `S₁(z)` via SciPy → `lut_struve.bin` (32 KB, 4096×2 f32) |
 
 **Plugin stack (lib.rs)**
 
 - `DefaultPlugins` — `AssetPlugin { meta_check: Never }`, `WindowPlugin` (canvas `#bevy`, fits parent), `RenderPlugin` forces `BROWSER_WEBGPU` backend and raises `max_storage_buffers_per_shader_stage = 8` / `max_compute_workgroups_per_dimension = 65535`
-- `ObjPlugin` (`bevy_obj`) — loads Wavefront `.obj` asteroid mesh
+- `ObjPlugin` (`bevy_obj`) — registered for Wavefront `.obj` mesh support
 - `PanOrbitCameraPlugin` (`bevy_panorbit_camera`) — mouse-orbit camera
 - `FrameTimeDiagnosticsPlugin` — FPS counter
 - `NormalsComputePlugin` — custom render-world compute pass (WGSL)
@@ -70,11 +75,19 @@ All Update systems in `lib.rs` are registered with `.chain()`, enforcing strict 
 
 Both compute plugins live in the Bevy render world and communicate results back to the main world via `Arc<Mutex<Option<Vec<[f32;4]>>>>` channels (`NormalsReadbackChannel`, `GravityReadbackChannel`). Staging buffers are mapped async; each main-world system drains its channel each frame if data is ready.
 
+**Normals dual-path behaviour**
+
+`compute_normals.rs` inserts `AsteroidNormalsGpuData` synchronously in `Update` on the same frame topology is built (CPU path). `compute_pipeline.rs` dispatches a GPU compute pass whose async readback fires one frame later, but `poll_normals_readback` returns early if `AsteroidNormalsGpuData` already exists. In practice the CPU path always wins and the GPU normals result is discarded.
+
 **Physics constants (components.rs)**
 
-Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 * 3600`, `RYUGU_SPIN_AXIS = Vec3(-0.043, -0.914, 0.405)`, `TIME_SCALE = 6000` (simulation speedup).
+Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 * 3600`, `RYUGU_SPIN_AXIS = Vec3(-0.043, -0.914, 0.405)`, `TIME_SCALE = 20000` (simulation speedup).
 
-`DensityC` is computed at startup as `RYUGU_MASS / ∫(1/(r³+ε³))dV` over the voxel mesh — it normalizes the custom gravity kernel so the total mass is conserved.
+`DensityC` is solved once in `build_topology_system` as `RYUGU_MASS / ∫(1/(‖r‖ + ε))dV` over the mesh using 4-point Gaussian quadrature on signed tetrahedra. The kernel is `1/(‖r‖ + ε)` with `ε = DENSITY_EPSILON = 10.0`. The same kernel is used in `build_gravity_voxels_system` to assign per-voxel masses, keeping them consistent.
+
+**Gravity shader kernel**
+
+`gravity.wgsl` implements Gaver-Stehfest NILT (M=6, 12 terms) with Stehfest coefficients hardcoded in `gravity_pipeline.rs`. The LUT argument simplifies to `as_val = h * s_k = k * ln2` (h cancels), so the LUT is sampled at 12 fixed points regardless of geometry. The per-voxel contribution is `-(G * mass * (S0+S1) / h²) * unit_dir`, summed across Stehfest terms, then scaled by `ln2/h`. The 80-byte uniform buffer layout is: `[probe_xyz, G, voxel_count, M=6, pad, pad, V[0..12] as 3×vec4<f32>]`.
 
 **Keyboard controls (runtime)**
 
@@ -99,9 +112,9 @@ Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 
 - `gizmos.circle(position, radius, color)` — 3 args
 - Use `WorldAssetRoot(asset_server.load(...))` to spawn GLTF/OBJ scenes
 - WASM canvas: `canvas: Some("#bevy".into())` in `WindowPlugin`
-- Avoid `std::fs` and bare `std::time::Instant`; use `bevy::time::Time`
+- Avoid `std::fs` (panics in WASM) and bare `std::time::Instant`; use `bevy::time::Time`
 - `AssetMetaCheck::Never` is required to suppress missing `.meta` file 404s in WASM
-- WebGPU backend identifier: `bevy::render::settings::WgpuBackends::BROWSER_WEBGPU`
+- WebGPU backend: `Backends::BROWSER_WEBGPU` (from `bevy::render::settings`)
 
 ## WASM dependency gotcha
 
@@ -110,12 +123,3 @@ Any crate that uses random number generation must enable the `wasm_js` feature f
 getrandom = { version = "0.3", features = ["wasm_js"] }
 ```
 Without this, the WASM build panics at runtime when entropy is requested.
-
-## Gravity kernel variants
-
-Two compute shaders implement different gravity field methods:
-
-- **`gravity.wgsl`** (default): Direct `1/(r³+ε³)` voxel summation with mass normalization
-- **`gravity_stehfest.wgsl`** (experimental): Analytical Laplace-domain kernel with Gaver-Stehfest numerical inversion. Requires a precomputed Struve function LUT generated by `scripts/gen_lut.py`. Currently used in the active build.
-
-The choice affects `GravityComputePlugin` initialization in `gravity_pipeline.rs` (shader asset path + optional LUT resource).
