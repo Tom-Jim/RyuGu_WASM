@@ -17,10 +17,10 @@ A WebGPU-accelerated 3D visualization of asteroid (162173) Ryugu with real-time 
 ## 📸 Visual Highlights
 
 <!-- 2. 4 张静态截图 (2×2 网格，屏占比与清晰度最佳) -->
-| Orbital Trajectory Overview | Cross-Section Density View (`D` key) |
+| Orbital Trajectory Overview | Precession Demonstration |
 | :---: | :---: |
 | <img src="https://github.com/user-attachments/assets/cdca307b-7b0b-4eca-a28b-96cc822f8069" width="100%"/> | <img src="https://github.com/user-attachments/assets/3c152cf3-071a-4807-8fdd-6c981ec3f4d4" width="100%"/> |
-| **Surface Normal Vectors (`F` key)** | **Follow Camera Mode (`S` key)** |
+| **Detector display** | **Normal vector display** |
 | <img src="https://github.com/user-attachments/assets/977a59b3-a0b1-44b4-8426-2237dbcac1fe" width="100%"/> | <img src="https://github.com/user-attachments/assets/d914c5f5-9a68-44ee-8ed6-0b75625bd312" width="100%"/> |
 ## Features
 
