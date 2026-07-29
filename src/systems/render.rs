@@ -37,9 +37,9 @@ pub fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         RyuguMarker,
     ));
 
-    let r0 = Vec3::new(-1200.0, 300.0, 500.0);
+    let r0 = Vec3::new(-650.0, 380.0, 700.0);
     let r_hat = r0.normalize();
-    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.18 * (G * RYUGU_MASS / r0.length()).sqrt());
+    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.11 * (G * RYUGU_MASS / r0.length()).sqrt());
 
     let v_sq = v_init.length_squared();
     let semi_major = 1.0 / (2.0 / r0.length() - v_sq / (G * RYUGU_MASS));

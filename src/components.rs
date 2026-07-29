@@ -6,8 +6,8 @@ pub const G: f32 = 6.6743e-11;
 pub const RYUGU_MASS: f32 = 4.5e11;
 pub const CASSINI_MASS: f32 = 2500.0;
 pub const GRAVITY_EPSILON: f32 = 1.0;
-pub const TIME_SCALE: f32 = 6000.0;
-pub const ORBIT_HISTORY_LEN: usize = 3500;
+pub const TIME_SCALE: f32 = 20000.0;
+pub const ORBIT_HISTORY_LEN: usize = 27500;
 pub const VISIBILITY_THRESHOLD: f32 = 250.0;
 pub const NORMAL_ARROW_LENGTH: f32 = 35.0;
 
