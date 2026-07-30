@@ -37,9 +37,9 @@ pub fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         RyuguMarker,
     ));
 
-    let r0 = Vec3::new(-800.0, 200.0, 100.0);
+    let r0 = Vec3::new(-1000.0, 200.0, 100.0);
     let r_hat = r0.normalize();
-    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.15 * (G * RYUGU_MASS / r0.length()).sqrt());
+    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.253 * (G * RYUGU_MASS / r0.length()).sqrt());
 
     commands.spawn((
         WorldAssetRoot(
