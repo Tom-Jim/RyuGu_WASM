@@ -58,6 +58,26 @@ uv run scripts/gen_lut.py
 
 ---
 
+## 🦀 Why Rust? (Tech Stack Justification)
+
+A common question is whether this real-time asteroid gravity simulation could be implemented in **Python** or **C++**. Below is the architectural justification for selecting **Rust + WebGPU + WASM**:
+
+### Performance & Architecture Comparison
+
+| Feature / Metric | 🦀 **Rust (Selected)** | 🐍 **Python** | ⚡ **C++** |
+| :--- | :--- | :--- | :--- |
+| **In-Browser Execution (WASM)** | **Native (60+ FPS)** | Python Extremely Slow (Pyodide / PyScript overhead) | **Native (60+ FPS)** |
+| **WebGPU Ecosystem** | 🟢 **First-Class** (`wgpu` powers Firefox/Deno native WebGPU) | 🟡 Desktop-only (`wgpu-py`), poor web support | 🟡 Complex setup (Dawn / Emscripten C bindings) |
+| **Async GPU Safety** | 🛡️ **Guaranteed at compile-time** (`Arc<Mutex<T>>`, Ownership) | High runtime overhead & GIL bottlenecks | ⚠️ Prone to race conditions & dangling pointers |
+| **Build & Toolchain** | 🟢 Single `cargo build --target wasm32-unknown-unknown` | 🔴 Multi-megabyte interpreter bundle | 🔴 Complex Emscripten / CMake toolchain difficulty |
+
+### Key Technical Advantages of Rust
+
+* **Zero-Cost WebAssembly Integration:** Rust compiles directly to lean WASM without requiring a Garbage Collector (GC) or a heavy runtime engine. This guarantees deterministic 60 FPS physics integration and minimal frame variance.
+* **Memory Safety in Async Readbacks:** WebGPU mapped staging buffers require asynchronous memory synchronization between GPU and CPU worlds. Rust’s strict ownership model eliminates data races and use-after-free bugs when lock-free channels poll GPU staging buffers.
+* **Ecosystem Synergy with `wgpu` & `Bevy`:** The core Rust `wgpu` crate is the industry reference implementation for WebGPU. Combined with Bevy's ECS (Entity Component System), the simulation decouples physics integrators, GPU dispatch loops, and UI gizmos cleanly.
+---
+
 ## Directory Structure and File Responsibilities
 
 ```
