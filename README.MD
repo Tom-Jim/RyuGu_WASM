@@ -570,7 +570,7 @@ The first three systems are guarded by marker components (`Without<ScaleNormaliz
 - Stehfest H. (1970). Algorithm 368: Numerical inversion of Laplace transforms. *CACM* 13(1), 47-49.
 - Bevy Engine: https://bevyengine.org/
 - W3C WebGPU Specification: https://www.w3.org/TR/webgpu/
-- Mathematical derivation of the Laplace-domain gravity sensitivity kernel: `mathstrict.md` (in-repo)
+- Mathematical derivation of the Laplace-domain gravity sensitivity kernel: `mathpub.md` (in-repo)
 
 ---
 
