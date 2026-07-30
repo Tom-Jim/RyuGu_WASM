@@ -39,24 +39,7 @@ pub fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
 
     let r0 = Vec3::new(-650.0, 380.0, 700.0);
     let r_hat = r0.normalize();
-    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.11 * (G * RYUGU_MASS / r0.length()).sqrt());
-
-    let v_sq = v_init.length_squared();
-    let semi_major = 1.0 / (2.0 / r0.length() - v_sq / (G * RYUGU_MASS));
-    let period = 2.0 * std::f32::consts::PI * (semi_major.powi(3) / (G * RYUGU_MASS)).sqrt();
-    let dt_sim = period / 1000.0;
-    let mut sim_pos = r0;
-    let mut sim_vel = v_init;
-    let mut _path = Vec::with_capacity(1001);
-    for _ in 0..1000 {
-        _path.push(sim_pos);
-        let diff = -sim_pos;
-        let dist_sq = diff.length_squared() + GRAVITY_EPSILON * GRAVITY_EPSILON;
-        let acc = diff / dist_sq.sqrt() * (G * RYUGU_MASS / dist_sq);
-        sim_vel += acc * dt_sim;
-        sim_pos += sim_vel * dt_sim;
-    }
-    _path.push(r0);
+    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.06 * (G * RYUGU_MASS / r0.length()).sqrt());
 
     commands.spawn((
         WorldAssetRoot(
@@ -192,7 +175,7 @@ pub fn render_section_system(
     let min_density = c / (SECTION_CLIP_RADIUS + eps);
     let density_range = (max_density - min_density).max(1e-6);
 
-    // Bug 2 fix: stride-sampled local vertices for mesh-boundary clipping
+    // Stride-sampled local vertices for mesh-boundary clipping (limits to ~2000 samples)
     let n_verts = topo.positions.len();
     let stride = (n_verts / 2000).max(1);
     let local_verts: Vec<Vec3> = topo.positions.iter().step_by(stride).copied().collect();

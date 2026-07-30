@@ -19,7 +19,11 @@ import struct
 import json
 
 # LUT configuration
-Z_MAX = 50.0          # Maximum argument for the LUT
+Z_MAX = 200.0         # Maximum argument for the LUT.
+                      # With a = length(p_i) and k*ln2/h as the frequency, as_val reaches
+                      # ~75 for typical close approaches (h≈50m, r_i≈450m, k=12).
+                      # Z_MAX=200 covers all realistic orbital scenarios; extreme grazing
+                      # (h<27m at k=12) falls into the S0→1, S1→1 asymptotic regime.
 N_SAMPLES = 4096      # Number of samples (power of 2 for GPU efficiency)
 OUTPUT_BIN = "lut_struve.bin"
 OUTPUT_NPY = "lut_struve.npy"

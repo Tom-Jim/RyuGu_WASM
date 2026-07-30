@@ -7,16 +7,13 @@
 
 Real-time orbital simulator of asteroid (162173) Ryugu, compiled to WASM via `wasm-pack`. A Cassini-class probe orbits Ryugu under gravity computed each frame by a WebGPU compute shader running a Gaver-Stehfest Numerical Inverse Laplace Transform (NILT) against a precomputed Struve-Neumann function lookup table. The Bevy 0.19 engine handles rendering, ECS scheduling, and the render-world/main-world GPU readback pattern.
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/f6fe44af-676f-4436-87c1-21b7f67a8e3a" width="100%" alt="Ryugu WebGPU Simulation"/>
-</p>
+https://github.com/user-attachments/assets/a78d663a-cb98-47b3-91c3-7303a12346cd
 
 | Orbital Trajectory | Precession |
 | :---: | :---: |
-| <img src="https://github.com/user-attachments/assets/cdca307b-7b0b-4eca-a28b-96cc822f8069" width="100%"/> | <img src="https://github.com/user-attachments/assets/3c152cf3-071a-4807-8fdd-6c981ec3f4d4" width="100%"/> |
-| **Probe view** | **Surface normals** |
-| <img src="https://github.com/user-attachments/assets/977a59b3-a0b1-44b4-8426-2237dbcac1fe" width="100%"/> | <img src="https://github.com/user-attachments/assets/d914c5f5-9a68-44ee-8ed6-0b75625bd312" width="100%"/> |
-
+| <img src="https://github.com/user-attachments/assets/ddc359c3-5b81-47ee-95fd-a9a1ccf20107" width="100%"/> | <img src="https://github.com/user-attachments/assets/d9482e7a-2c14-46b4-91a8-71a884567236" width="100%"/> |
+| **Mass distribution** | **Probe view** |
+| <img src="https://github.com/user-attachments/assets/9959363f-ab28-45e5-b43d-98e076b1791b" width="100%"/> | <img src="https://github.com/user-attachments/assets/548a0e90-2b29-484b-a974-a4f28d4bfe17" width="100%"/> |
 ---
 
 ## Quick Start
@@ -96,15 +93,15 @@ Ryugu_wasm/
 │       │                    extract_grav_input_system: transforms Cassini position
 │       │                    from world frame into Ryugu body-fixed frame via inv_rot.
 │       │                    Packs 80-byte uniform buffer: [probe_xyz, G, voxel_count,
-│       │                    M=6, pad, pad, V[0..12] as 3x vec4<f32>].
+│       │                    M=3, pad, pad, V[0..5] padded to 3x vec4<f32>].
 │       │                    dispatch_grav_system: dispatches n_workgroups=ceil(N/64)
 │       │                    workgroups. Initiates async staging buffer map_async.
 │       │                    poll_gravity_readback: folds all workgroup partial vec4
 │       │                    results into GravityAcceleration resource.
-│       ├── physics.rs       physics_system: semi-implicit (symplectic) Euler.
+│       ├── physics.rs       physics_system: Euler-Cromer (semi-implicit/symplectic Euler).
 │       │                    Rotates GPU result from Ryugu body frame to world frame.
-│       │                    Falls back to softened Newtonian point-mass until GPU
-│       │                    pipeline warms up (grav_voxels is None or result is zero).
+│       │                    Blends Newtonian and GPU gravity over GRAVITY_BLEND_FRAMES=60
+│       │                    frames. Clamps GPU acceleration to MAX_ACC=1.5e-3 m/s².
 │       │                    ryugu_rotation_system: incremental quaternion rotation
 │       │                    applied each frame using delta_angle = omega * dt.
 │       ├── render.rs        Scene setup, lighting, camera, Cassini initial conditions.
@@ -113,15 +110,9 @@ Ryugu_wasm/
 │       ├── compute_pipeline.rs  NormalsComputePlugin: one-shot GPU dispatch (DispatchState
 │       │                    goes Done after first fire). Writes result to staging buffer,
 │       │                    maps async, pushes to NormalsReadbackChannel.
-│       ├── compute_normals.rs   CPU normal computation. Accumulates area-weighted face
-│       │                    normals per vertex synchronously. Inserts AsteroidNormalsGpuData
-│       │                    on the same frame topology becomes available. Because this
-│       │                    runs before the GPU readback arrives, it short-circuits the
-│       │                    GPU normals path in practice (poll_normals_readback returns
-│       │                    early if AsteroidNormalsGpuData already exists).
 │       └── ui.rs            FPS display, keyboard toggle handlers for normals/section.
 ├── assets/shaders/
-│   ├── gravity.wgsl         Gaver-Stehfest NILT loop over 12 terms (k=1..12).
+│   ├── gravity.wgsl         Gaver-Stehfest NILT loop over 6 terms (k=1..6, M=3).
 │   │                        Per-thread voxel contribution written to workgroup shared
 │   │                        memory (shared_acc[64]). Parallel stride reduction:
 │   │                        stride starts at 32, halved each iteration via stride>>=1u.
@@ -131,7 +122,7 @@ Ryugu_wasm/
 │                            Normalizes; defaults to (0,1,0) for degenerate vertices.
 └── scripts/
     └── gen_lut.py           Computes S_v(z) = (pi/2)[H_v(z) - Y_v(z)] for v=0,1
-                             over z in [0,50] at N=4096 uniform samples using
+                             over z in [0,200] at N=4096 uniform samples using
                              scipy.special.struve and scipy.special.yv. Exports
                              interleaved f32 binary [S0[0],S1[0],S0[1],S1[1],...].
                              Output: lut_struve.bin (32768 bytes), lut_struve.npy,
@@ -149,8 +140,8 @@ All values sourced directly from `src/components.rs`:
 | `G` | 6.6743e-11 m^3 kg^-1 s^-2 | Gravitational constant |
 | `RYUGU_MASS` | 4.5e11 kg | Hayabusa2 estimate |
 | `CASSINI_MASS` | 2500.0 kg | Probe model mass |
-| `GRAVITY_EPSILON` | 1.0 m | Softening for Newtonian fallback only |
-| `DENSITY_EPSILON` | 10.0 m | Softening in 1/(r+e) kernel |
+| `GRAVITY_EPSILON` | 1.0 | Softening for Newtonian fallback only |
+| `DENSITY_EPSILON` | 10.0 | Softening in 1/(r+e) kernel |
 | `TIME_SCALE` | 20000.0 | Simulation speed multiplier |
 | `RYUGU_ROTATION_PERIOD_SECS` | 7.63 * 3600 = 27468 s | Physical spin period |
 | `RYUGU_SPIN_AXIS` | Vec3(-0.043, -0.914, 0.405) | Unnormalized; normalized in code |
@@ -235,24 +226,20 @@ An 80-byte uniform buffer is written with strict WGSL alignment:
 
 ```
 bytes 0-15:  probe_x, probe_y, probe_z, G          (4x f32)
-bytes 16-31: voxel_count, stehfest_M=6, pad, pad   (2x u32, 2x f32)
+bytes 16-31: voxel_count, stehfest_M=3, pad, pad   (2x u32, 2x f32)
 bytes 32-47: V[0..3]   (vec4<f32>)
-bytes 48-63: V[4..7]   (vec4<f32>)
-bytes 64-79: V[8..11]  (vec4<f32>)
+bytes 48-63: V[4..5], 0, 0   (vec4<f32>, last 2 slots zero-padded)
+bytes 64-79: 0, 0, 0, 0      (vec4<f32>, unused)
 ```
 
-The 12 Gaver-Stehfest coefficients for M=6 hardcoded in `gravity_pipeline.rs`:
+The 6 Gaver-Stehfest coefficients for M=3 hardcoded in `gravity_pipeline.rs`:
 
 ```
-k:   1       2        3           4           5            6
-V: -17.0  1450.0  -27244.0  196885.333  -696515.5  1354060.167
-
-k:   7          8           9          10        11       12
-V: -1533036.0  1018861.833  -387807.667  79427.5  -7846.5  301.833
+k:  1      2      3       4       5       6
+V:  1.0  -49.0  366.0  -858.0  810.0  -270.0
 ```
 
-Maximum absolute value: |V_6| = 1,354,060.17 (approximately 1.35e6). These coefficients
-alternate in sign and grow to magnitudes that nearly exhaust the 23-bit mantissa of fp32.
+Maximum absolute value: |V_4| = 858. These coefficients alternate in sign and sum to zero.
 
 **Step 3 — GPU dispatch**
 
@@ -293,7 +280,7 @@ S_v(z) = (pi/2) * [H_v(z) - Y_v(z)]
 where `H_v` is the Struve function and `Y_v` is the Bessel function of the second kind
 (Neumann function). These satisfy the derivative identity `S0'(z) = 1 - S1(z)`.
 
-`scripts/gen_lut.py` computes S0 and S1 over z in [0, 50] at N=4096 uniform samples
+`scripts/gen_lut.py` computes S0 and S1 over z in [0, 200] at N=4096 uniform samples
 using `scipy.special.struve` and `scipy.special.yv` in float64. The z=0 singularity is
 handled by evaluating at z=1e-12 then overwriting [0] = 0.0 for both functions.
 
@@ -303,7 +290,7 @@ Output format: interleaved f32 binary `[S0[0], S1[0], S0[1], S1[1], ...]` — 40
 **GPU-side lookup** (`get_S_modes` in `gravity.wgsl`):
 
 ```wgsl
-let idx_f = clamp((z / 50.0) * 4095.0, 0.0, 4095.0);
+let idx_f = clamp((z / 200.0) * 4095.0, 0.0, 4095.0);
 let idx0  = u32(idx_f);
 let idx1  = min(idx0 + 1u, 4095u);
 let fract = idx_f - f32(idx0);
@@ -317,49 +304,35 @@ return mix(lut[idx0], lut[idx1], fract);   // hardware linear interp, O(1)
 ### The Stehfest NILT formula
 
 The Gaver-Stehfest algorithm recovers a time-domain function f(t) from its Laplace
-transform F(s) evaluated at M=6 pairs of real probe frequencies:
+transform F(s) evaluated at M=3 pairs of real probe frequencies:
 
 ```
-f(h) ~= (ln2 / h) * sum_{k=1}^{12} V_k * F(s_k),   s_k = k * ln2 / h
+f(h) ~= (ln2 / h) * sum_{k=1}^{6} V_k * F(s_k),   s_k = k * ln2 / h
 ```
 
-where h is the probe distance (treated as the "time" variable) and V_k are the
+where h is the probe-voxel distance (treated as the "time" variable) and V_k are the
 precomputed alternating-sign Stehfest coefficients listed above.
 
-### The as_val cancellation: a critical shader observation
+### The as_val argument: actual shader behavior
 
 Inside `compute_voxel_acc` (gravity.wgsl), the LUT argument is computed as:
 
 ```wgsl
-let a     = h;         // approximation: set 'a' equal to probe distance h
-let as_val = a * s_k;  // = h * (k * ln2 / h) = k * ln2
+let r_probe   = length(probe);                   // probe distance from Ryugu center
+let safe_max_a = 200.0 * h / (6.0 * ln2);       // clamp so as_val <= 200 for all k
+let a          = min(r_probe, safe_max_a);
+let as_val     = a * s_k;                        // = r_probe * k * ln2 / h
 ```
 
-The h cancels exactly. `as_val` is always `k * ln2`, a fixed constant for each k,
-completely independent of the actual probe-voxel distance or asteroid geometry.
-The LUT is sampled at 12 fixed points: {0.693, 1.386, 2.079, ..., 8.318}.
-
-This is a deliberate engineering simplification. In the full analytical kernel derived as
-$$I_R = \int_0^\infty \frac{e^{-sw}}{\sqrt{w^2 + a^2}} dw = \mathcal{S}_0(as) = \frac{\pi}{2} \Big[ \mathbf{H}_0(as) - Y_0(as) \Big]$$,
-the argument `a*s` would depend on the geometric parameter
-`a = sqrt(u(r)^2 + c^2)` — a function of the actual source-observer configuration.
-By setting `a = h`, the per-voxel kernel reduces to a purely distance-dependent form:
-
-```
-a_i = -(G * mass_i * ln2 / h^3) * C_stehfest * unit_dir
-```
-
-where `C_stehfest = sum_k V_k * (S0(k*ln2) + S1(k*ln2))` is a fixed scalar constant
-evaluated at shader compile-time arguments. This makes the gravity model equivalent to
-a weighted point-mass law with a distance decay encoded in the Stehfest-LUT weighting.
+`a` is set to `r_probe` (probe's distance from the asteroid center), **not** the
+probe-voxel distance `h`. The LUT sampling point therefore varies with geometry:
+`as_val = r_probe * k * ln2 / h`. The clamp ensures `as_val <= 200` (the LUT range)
+for all k up to 6, which activates only for extremely close voxels (h < r_probe/48).
 
 ### fp32 catastrophic cancellation mitigation
 
-The Stehfest coefficients alternate in sign with magnitudes up to ~1.35e6. If the sum
-`sum_k V_k * G_total(s_k)` were computed by first accumulating G_total then scaling,
-the intermediate values would overflow fp32 dynamic range against the small per-voxel
-mass terms (~1e-11 range). The shader avoids this by multiplying V_k directly inside
-the innermost voxel loop at thread level, before reduction:
+The Stehfest coefficients alternate in sign with magnitudes up to ~858. The shader
+multiplies V_k directly inside the innermost voxel loop at thread level, before reduction:
 
 ```wgsl
 let s_domain_acc = -mass_term * ((S0 + S1) / (h * h)) * unit_dir;
@@ -406,56 +379,59 @@ each doing a 6-stage tree reduction — far fewer total additions than a naive s
 
 ---
 
-## Surface Normals Pipeline: Dual Path
+## Surface Normals Pipeline
 
-There are two independent code paths for computing surface normals. They race:
+Surface normals are computed once via a one-shot GPU compute pass (`NormalsComputePlugin`
+in `compute_pipeline.rs` + `normals.wgsl`).
 
-**Path A — CPU** (`compute_normals.rs`, runs in `Update`):
-
-Accumulates area-weighted face normal contributions per vertex synchronously,
-then immediately inserts `AsteroidNormalsGpuData`. This runs on the same frame
-that `build_topology_system` completes.
-
-**Path B — GPU** (`compute_pipeline.rs` + `normals.wgsl`, fires once in `Render`):
-
-Dispatches a one-shot compute pass over the CSR neighbor ring. The result travels
-through a staging buffer async readback. `poll_normals_readback` in `Update` tries to
-insert `AsteroidNormalsGpuData` from the channel — but only if it does not already exist:
+`build_topology_system` builds the CSR adjacency data. On the next frame, the GPU compute
+pass dispatches over all vertices. The result travels through an async staging buffer
+readback. `poll_normals_readback` in `Update` inserts `AsteroidNormalsGpuData` from the
+channel when data is ready:
 
 ```rust
 fn poll_normals_readback(...) {
-    if existing.is_some() { return; }   // short-circuits if CPU path already ran
+    if existing.is_some() { return; }   // already populated, skip
     ...
+    commands.insert_resource(AsteroidNormalsGpuData(normals));
 }
 ```
 
-**In practice, Path A always wins.** Path A runs synchronously in `Update` the same frame
-topology is built. Path B requires at least one full frame roundtrip for the GPU readback.
-Since `existing.is_some()` is true by the time the readback fires, Path B's result is
-silently discarded. The GPU normals shader exists and dispatches correctly, but its output
-is never used at runtime.
+The WGSL shader (`normals.wgsl`) computes each vertex normal by iterating the sorted CSR
+neighbor ring: for each consecutive pair of neighbors (a, b), it accumulates
+`cross(a-p, b-p)`, then normalizes. Vertices with fewer than 2 neighbors default to (0,1,0).
 
 ---
 
 ## Orbit Integrator
 
-`physics_system` (`src/systems/physics.rs`) implements semi-implicit (symplectic) Euler:
+`physics_system` (`src/systems/physics.rs`) implements Euler-Cromer (semi-implicit/symplectic Euler):
 
 ```rust
 let dt = time.delta_secs() * TIME_SCALE;   // TIME_SCALE = 20000.0
 
-// Use GPU gravity if available; else Newtonian point-mass fallback
-let acceleration = if grav_voxels.is_some() && grav_acc.0 != Vec3::ZERO {
-    r_transform.rotation * grav_acc.0   // rotate body-frame result to world
+// Newtonian point-mass fallback (always computed as blend anchor)
+let diff          = ryugu_pos - cassini_pos;
+let dist_sq       = diff.length_squared() + GRAVITY_EPSILON * GRAVITY_EPSILON;
+let newtonian_acc = (diff / dist_sq.sqrt()) * (G * RYUGU_MASS / dist_sq);
+
+// GPU gravity with blend warm-up (0→1 over GRAVITY_BLEND_FRAMES=60 frames)
+let acceleration = if grav_voxels.is_some() {
+    let gpu_acc = r_transform.rotation * grav_acc.0;  // body→world frame
+    if !gpu_acc.is_finite() || gpu_acc == Vec3::ZERO {
+        newtonian_acc
+    } else {
+        let mag = gpu_acc.length();
+        let safe_gpu = if mag > 1.5e-3 { gpu_acc * (1.5e-3 / mag) } else { gpu_acc };
+        blend.0 = (blend.0 + 1.0 / 60.0).min(1.0);
+        newtonian_acc.lerp(safe_gpu, blend.0)
+    }
 } else {
-    // Softened Newtonian: a = G*M*r / (|r|^2 + eps^2)^(3/2)
-    let diff    = ryugu_pos - cassini_pos;
-    let dist_sq = diff.length_squared() + GRAVITY_EPSILON * GRAVITY_EPSILON;
-    (diff / dist_sq.sqrt()) * (G * RYUGU_MASS / dist_sq)
+    newtonian_acc
 };
 
-c_velocity.0    += acceleration * dt;      // velocity update first
-c_transform.translation += c_velocity.0 * dt;  // position uses updated velocity
+c_velocity.0 += acceleration * dt;         // velocity update first (symplectic)
+c_transform.translation += c_velocity.0 * dt;
 ```
 
 Velocity is updated before position. This is symplectic Euler (Euler-Cromer), which is
@@ -464,7 +440,7 @@ first-order but has better long-term energy behavior than explicit Euler.
 **Initial orbit** (set in `render.rs`):
 
 ```rust
-let r0     = Vec3::new(-650.0, 380.0, 700.0);  // |r0| ≈ 967 m from Ryugu center
+let r0     = Vec3::new(-650.0, 380.0, 700.0);  // |r0| ≈ 1028 m from Ryugu center
 let v_circ = (G * RYUGU_MASS / r0.length()).sqrt();
 let v_init = r_hat.cross(Vec3::Y).normalize() * (1.11 * v_circ);
 ```
@@ -517,7 +493,7 @@ integrator introduces baseline secular energy drift proportional to the step siz
 
 **3. fp32 precision and Stehfest truncation**
 
-The Gaver-Stehfest series is truncated at M=6 (12 terms). The residual from truncation
+The Gaver-Stehfest series is truncated at M=3 (6 terms). The residual from truncation
 introduces a systematic bias in the computed gravity vector. Combined with fp32 arithmetic
 (~7 decimal digits of precision) and the alternating-sign cancellation of coefficients
 up to 1.35e6 in magnitude, the computed acceleration field has numerical noise of order
@@ -536,7 +512,6 @@ execution every frame:
 normalize_model_scale_system
   → build_topology_system
   → build_gravity_voxels_system
-  → compute_asteroid_normals_system
   → physics_system
   → ryugu_rotation_system
   → camera_switch_system

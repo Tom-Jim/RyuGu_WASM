@@ -80,14 +80,17 @@ impl Plugin for GravityComputePlugin {
 
 impl FromWorld for GravComputePipeline {
     fn from_world(world: &mut World) -> Self {
+        // 4 bindings: uniform(0), voxels(1), output(2), LUT(3)
         let entries = [
             uniform_entry(0),
             storage_ro_entry(1),
             storage_rw_entry(2),
-            storage_ro_entry(3), // LUT binding
+            storage_ro_entry(3),
         ];
+
         let bgl = BindGroupLayoutDescriptor::new("grav_bgl", &entries);
         let shader = world.resource::<AssetServer>().load("shaders/gravity.wgsl");
+
         let pipeline_id =
             world
                 .resource::<PipelineCache>()
@@ -150,10 +153,10 @@ pub fn build_gravity_voxels_system(
     ryugu_q: Query<&Transform, With<RyuguMarker>>,
     existing_voxels: Option<Res<GravVoxelSource>>,
     existing_lut: Option<Res<StruveLutSource>>,
+    density_c: Option<Res<DensityC>>,
 ) {
-    // Load LUT once (Fallback to zeroed buffer if file missing to prevent crash)
     if existing_lut.is_none() {
-        let lut_bytes = std::fs::read("lut_struve.bin").unwrap();
+        let lut_bytes = include_bytes!("../../lut_struve.bin").to_vec();
         commands.insert_resource(StruveLutSource { bytes: lut_bytes });
     }
 
@@ -172,25 +175,30 @@ pub fn build_gravity_voxels_system(
     let n = topo.positions.len() as u32;
     let eps = DENSITY_EPSILON;
 
-    let raw_weights: Vec<f32> = topo
+    // Map continuous DensityC kernel to per-voxel masses, then renormalize to RYUGU_MASS.
+    let c_val = density_c.map(|r| r.0).unwrap_or(1.0);
+    let v_ryugu = 3.77e8; // Approximate volume of Ryugu in m^3
+    let delta_v = v_ryugu / (n as f32); // Approximate tributary volume per mesh node
+
+    let raw_masses: Vec<f32> = topo
         .positions
         .iter()
         .map(|p| {
             let r_v = (*p * scale).length().max(1e-3);
-            1.0 / (r_v + eps)
+            c_val * delta_v / (r_v + eps)
         })
         .collect();
 
-    let sum_weights: f32 = raw_weights.iter().sum();
-    let mass_norm = RYUGU_MASS / sum_weights;
+    let sum_raw_mass: f32 = raw_masses.iter().sum();
+    let mass_scale = RYUGU_MASS / sum_raw_mass; // Force strict global mass conservation
 
     let bytes: Vec<u8> = topo
         .positions
         .iter()
-        .zip(raw_weights.iter())
-        .flat_map(|(p, w)| {
+        .zip(raw_masses.iter())
+        .flat_map(|(p, raw_m)| {
             let pw = *p * scale;
-            let mass = w * mass_norm;
+            let mass = raw_m * mass_scale;
             [pw.x, pw.y, pw.z, mass]
                 .iter()
                 .flat_map(|f| f.to_le_bytes())
@@ -204,6 +212,7 @@ pub fn build_gravity_voxels_system(
 pub fn poll_gravity_readback(
     channel: Res<GravityReadbackChannel>,
     mut grav_acc: ResMut<GravityAcceleration>,
+    time: Res<Time>,
 ) {
     let Ok(mut guard) = channel.0.try_lock() else {
         return;
@@ -211,9 +220,31 @@ pub fn poll_gravity_readback(
     let Some(partial_sums) = guard.take() else {
         return;
     };
+
     let total = partial_sums
         .iter()
         .fold(Vec3::ZERO, |acc, v| acc + Vec3::new(v[0], v[1], v[2]));
+
+    if !total.is_finite() {
+        warn!(
+            "[gravity] GPU readback NaN/Inf detected — discarding. partial_sums[0]={:?}",
+            partial_sums.first()
+        );
+        return;
+    }
+
+    let frame = (time.elapsed_secs() * 60.0) as u32;
+    if frame % 120 == 0 {
+        info!(
+            "[gravity] GPU acc=({:.3e},{:.3e},{:.3e}) |mag|={:.3e} n_wg={}",
+            total.x,
+            total.y,
+            total.z,
+            total.length(),
+            partial_sums.len()
+        );
+    }
+
     grav_acc.0 = total;
 }
 
@@ -232,7 +263,9 @@ fn extract_grav_input_system(
     let Some(vox_src) = voxels.as_ref() else {
         return;
     };
-    let Some(lut_src) = lut.as_ref() else { return };
+    let Some(lut_src) = lut.as_ref() else {
+        return;
+    };
     let Ok(cassini_tf) = cassini_q.single() else {
         return;
     };
@@ -288,9 +321,10 @@ fn dispatch_grav_system(
         let n_wg = extracted.voxel_count.div_ceil(64);
         let out_sz = (n_wg as u64) * 16;
 
+        // GravParams uniform: strictly 80 bytes for WGSL memory alignment
         let uniform_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("grav_uniform"),
-            size: 80, // STRICTLY 80 bytes alignment for WGSL
+            size: 80,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -328,24 +362,13 @@ fn dispatch_grav_system(
     if *state != GravDispatchState::Ready {
         return;
     }
+
     let bufs = buffers.0.as_ref().unwrap();
     let n_wg = bufs.n_workgroups;
     let out_sz = (n_wg as u64) * 16;
 
-    // Hardcoded Gaver-Stehfest Coefficients (M=6)
     let v_stehfest: [f32; 12] = [
-        -17.0,
-        1450.0,
-        -27244.0,
-        196885.3333,
-        -696515.5,
-        1354060.1667,
-        -1533036.0,
-        1018861.8333,
-        -387807.6667,
-        79427.5,
-        -7846.5,
-        301.8333,
+        1.0, -49.0, 366.0, -858.0, 810.0, -270.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     ];
 
     // Build 80-byte uniform buffer strictly packed
@@ -354,9 +377,12 @@ fn dispatch_grav_system(
         ub.extend_from_slice(&f.to_le_bytes());
     }
     ub.extend_from_slice(&bufs.voxel_count.to_le_bytes());
-    ub.extend_from_slice(&6u32.to_le_bytes()); // stehfest_M = 6
-    ub.extend_from_slice(&0f32.to_le_bytes()); // pad0
-    ub.extend_from_slice(&0f32.to_le_bytes()); // pad1
+
+    // Stehfest M=3 (6 terms): reduced order for performance/stability tradeoff
+    ub.extend_from_slice(&3u32.to_le_bytes());
+
+    ub.extend_from_slice(&0f32.to_le_bytes()); // _pad0
+    ub.extend_from_slice(&0f32.to_le_bytes()); // _pad1
     for v in v_stehfest.iter() {
         ub.extend_from_slice(&v.to_le_bytes());
     }
@@ -376,7 +402,7 @@ fn dispatch_grav_system(
             uniform_entry(0),
             storage_ro_entry(1),
             storage_rw_entry(2),
-            storage_ro_entry(3),
+            storage_ro_entry(3), // LUT attached!
         ],
     );
 

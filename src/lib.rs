@@ -1,30 +1,32 @@
 mod components;
+mod systems;
 mod topology;
 mod welding;
-mod systems;
 
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
+use bevy::render::render_resource::WgpuLimits;
 use bevy::render::{
     RenderPlugin,
     settings::{Backends, RenderCreation, WgpuSettings},
 };
-use bevy::render::render_resource::WgpuLimits;
 use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
-use components::{CameraMode, DensityC, GravityAcceleration, ShowNormals, ShowSection};
+use components::{CameraMode, DensityC, GravityAcceleration, GravityBlendFactor, ShowNormals, ShowSection};
 use systems::{
-    compute_normals::compute_asteroid_normals_system,
     compute_pipeline::NormalsComputePlugin,
-    gravity_pipeline::{GravityComputePlugin, build_gravity_voxels_system},
+    gravity_pipeline::GravityComputePlugin,
     physics::{physics_system, ryugu_rotation_system},
     render::{
-        camera_follow_system, camera_switch_system, render_gizmos_system,
-        render_section_system, section_alpha_system, setup_scene, setup_ui,
+        camera_follow_system, camera_switch_system, render_gizmos_system, render_section_system,
+        section_alpha_system, setup_scene, setup_ui,
     },
     scale::{build_topology_system, normalize_model_scale_system},
-    ui::{fps_update_system, normal_toggle_system, section_toggle_system, setup_fps_ui, update_hint_on_mode_change},
+    ui::{
+        fps_update_system, normal_toggle_system, section_toggle_system, setup_fps_ui,
+        update_hint_on_mode_change,
+    },
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -39,6 +41,7 @@ pub fn main() {
         .init_resource::<ShowSection>()
         .init_resource::<DensityC>()
         .init_resource::<GravityAcceleration>()
+        .init_resource::<GravityBlendFactor>()
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
@@ -78,8 +81,8 @@ pub fn main() {
             (
                 normalize_model_scale_system,
                 build_topology_system,
-                build_gravity_voxels_system,
-                compute_asteroid_normals_system,
+                // build_gravity_voxels_system is registered by GravityComputePlugin
+                // (chained with poll_gravity_readback). Do NOT add it here again.
                 physics_system,
                 ryugu_rotation_system,
                 camera_switch_system,

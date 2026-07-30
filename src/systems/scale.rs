@@ -94,8 +94,8 @@ pub fn build_topology_system(
     let mut topo = build_topology(&welded);
     topo.mesh_entity = Some(mesh_entity);
 
-    // 4-point Gaussian quadrature: ∫_V (1 / (||r||^3 + ε^3)) dV
-    // Decomposes mesh into signed tetrahedra anchored at origin
+    // Compute density constant C via 4-point Gaussian quadrature over signed tetrahedra.
+    // Kernel: 1/(||r|| + ε), integrated over volume decomposed into origin-anchored tets.
     let a = (5.0 + 3.0 * 5.0_f32.sqrt()) / 20.0; // ≈ 0.5854102
     let b = (5.0 - 5.0_f32.sqrt()) / 20.0;        // ≈ 0.1381966
     let eps = DENSITY_EPSILON as f64;

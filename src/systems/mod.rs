@@ -1,4 +1,3 @@
-pub mod compute_normals;
 pub mod compute_pipeline;
 pub mod gravity_pipeline;
 pub mod physics;

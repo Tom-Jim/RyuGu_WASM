@@ -51,7 +51,8 @@ pub struct ShowNormals(pub bool);
 #[derive(Resource, Default)]
 pub struct ShowSection(pub bool);
 
-/// Solved density constant: C = RYUGU_MASS / ∫(1/(r^3+ε^3))dV
+/// Solved density constant: C = RYUGU_MASS / ∫(1/(||r||+ε))dV
+/// Kernel is 1/(||r||+ε), NOT 1/(r³+ε³). Used for section-view colormap.
 #[derive(Resource)]
 pub struct DensityC(pub f32);
 
@@ -91,6 +92,15 @@ pub struct GravVoxelSource {
 /// Latest GPU-computed gravity acceleration for Cassini (world space).
 #[derive(Resource, Default)]
 pub struct GravityAcceleration(pub Vec3);
+
+/// Blend weight for smooth GPU gravity warm-up transition.
+/// 0.0 = 100% Newtonian fallback, 1.0 = 100% GPU-computed.
+/// Increments by 1/GRAVITY_BLEND_FRAMES per frame once the first valid GPU result
+/// arrives, reaching 1.0 after GRAVITY_BLEND_FRAMES frames.
+#[derive(Resource, Default)]
+pub struct GravityBlendFactor(pub f32);
+
+pub const GRAVITY_BLEND_FRAMES: f32 = 60.0;
 
 /// Shared channel: render world writes partial sums, main world reads + reduces.
 #[derive(Resource, Clone)]

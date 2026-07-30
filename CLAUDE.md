@@ -45,7 +45,6 @@ Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `was
 | `src/systems/scale.rs` | `normalize_model_scale_system` + `build_topology_system` (solves `DensityC`) |
 | `src/systems/compute_pipeline.rs` | `NormalsComputePlugin` — one-shot render-world compute pass for surface normals |
 | `src/systems/gravity_pipeline.rs` | `GravityComputePlugin` — per-frame GPU gravity dispatch + readback |
-| `src/systems/compute_normals.rs` | CPU fallback normal computation; runs synchronously in `Update` |
 | `src/systems/physics.rs` | Semi-implicit Euler orbit integration + `ryugu_rotation_system` |
 | `src/systems/render.rs` | Scene setup, camera follow/switch, gizmos, section plane |
 | `src/systems/ui.rs` | FPS display, keyboard toggles (normals / section view) |
@@ -69,21 +68,21 @@ Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `was
 **System ordering**
 
 All Update systems in `lib.rs` are registered with `.chain()`, enforcing strict sequential ordering every frame:
-`normalize_model_scale` → `build_topology` → `build_gravity_voxels` → `compute_normals` → `physics` → `ryugu_rotation` → camera/UI/render systems.
+`normalize_model_scale` → `build_topology` → `build_gravity_voxels` → `physics` → `ryugu_rotation` → camera/UI/render systems.
 
 **GPU compute / readback pattern**
 
 Both compute plugins live in the Bevy render world and communicate results back to the main world via `Arc<Mutex<Option<Vec<[f32;4]>>>>` channels (`NormalsReadbackChannel`, `GravityReadbackChannel`). Staging buffers are mapped async; each main-world system drains its channel each frame if data is ready.
-
-**Normals dual-path behaviour**
-
-`compute_normals.rs` inserts `AsteroidNormalsGpuData` synchronously in `Update` on the same frame topology is built (CPU path). `compute_pipeline.rs` dispatches a GPU compute pass whose async readback fires one frame later, but `poll_normals_readback` returns early if `AsteroidNormalsGpuData` already exists. In practice the CPU path always wins and the GPU normals result is discarded.
 
 **Physics constants (components.rs)**
 
 Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 * 3600`, `RYUGU_SPIN_AXIS = Vec3(-0.043, -0.914, 0.405)`, `TIME_SCALE = 20000` (simulation speedup).
 
 `DensityC` is solved once in `build_topology_system` as `RYUGU_MASS / ∫(1/(‖r‖ + ε))dV` over the mesh using 4-point Gaussian quadrature on signed tetrahedra. The kernel is `1/(‖r‖ + ε)` with `ε = DENSITY_EPSILON = 10.0`. The same kernel is used in `build_gravity_voxels_system` to assign per-voxel masses, keeping them consistent.
+
+**Orbit integration**
+
+`physics_system` uses a Leapfrog (Velocity Verlet) integrator — second-order accurate, energy-conserving. Because GPU readback is delayed by one frame, the same interpolated acceleration is used for both half-steps, which reduces to the standard leapfrog scheme. GPU gravity is blended in smoothly via `GravityBlendFactor` (ramps 0 → 1 over `GRAVITY_BLEND_FRAMES = 60` frames from the first valid GPU result). While blending, `newtonian_acc` anchors the transition; a `MAX_ACC = 1.5e-3` cap prevents transient spikes from corrupting the orbit.
 
 **Gravity shader kernel**
 
