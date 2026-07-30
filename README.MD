@@ -539,12 +539,12 @@ first-order but has better long-term energy behavior than explicit Euler.
 **Initial orbit** (set in `render.rs`):
 
 ```rust
-let r0     = Vec3::new(-650.0, 380.0, 700.0);  // |r0| ≈ 1028 m from Ryugu center
+let r0     = Vec3::new(-1000.0, 200.0, 100.0);  // |r0| ≈ 1025 m from Ryugu center
 let v_circ = (G * RYUGU_MASS / r0.length()).sqrt();
-let v_init = r_hat.cross(Vec3::Y).normalize() * (1.11 * v_circ);
+let v_init = r_hat.cross(Vec3::Y).normalize() * (1.253 * v_circ);
 ```
 
-The 1.11 factor places Cassini at 11% above circular velocity, producing an eccentric
+The 1.253 factor places Cassini at 25.3% above circular velocity, producing an eccentric
 rather than circular initial orbit.
 
 ---
