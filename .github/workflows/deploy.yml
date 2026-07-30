@@ -30,7 +30,7 @@ jobs:
               run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
             - name: Build WASM Release
-              run: wasm-pack build --release --target web --out-dir pkg
+              run: wasm-pack build --dev --target web --out-dir pkg
 
             - name: Assemble Site Directory & Auto-Fix Case Sensitivity
               run: |

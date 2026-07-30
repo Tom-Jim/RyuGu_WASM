@@ -39,12 +39,91 @@ cargo fmt
 > `cargo run` / `cargo build` without `--target wasm32-unknown-unknown` are only useful
 > for syntax checking. The runnable artifact is the WASM package produced by `wasm-pack`.
 
-**Browser:** WebGPU required. Chrome/Chromium 113+, Edge 113+, Safari 18+.
-Firefox has WebGPU behind a flag but is not supported in production.
+## 🌐 Browser Support & WebGPU Setup
 
-The dev server (`server.ts`) sets `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp` on every response, required for
-`SharedArrayBuffer` / Bevy WASM thread support.
+> ⚠️ **Crucial Warning**  
+> This project relies on **WebGPU** and **WASM multi-threading**. **Your browser must have WebGPU properly enabled to run the simulation, otherwise the page will render a black screen.** Please verify your browser environment and configuration before launching.
+
+---
+
+### 1. Browser Compatibility
+
+| Browser | Support Status | Notes |
+| :--- | :--- | :--- |
+| **Google Chrome** | 🟢 `113+` | Recommended / Native Support |
+| **Microsoft Edge** | 🟢 `113+` | Recommended / Native Support |
+| **Apple Safari** | 🟢 `18+` | macOS / iOS Native Support |
+| **Mozilla Firefox** | 🟡 Experimental | Requires flag enabled; **Not supported in production** |
+
+---
+
+### 2. Cross-Origin Isolation (COOP / COEP Headers)
+
+To enable **Bevy WASM multi-threading** and `SharedArrayBuffer` support, the dev server (`server.ts`) sets the following headers on every response:
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+
+```
+
+> 💡 **Deployment Note:** If you deploy the built static assets to production environments (e.g., Nginx, Vercel, Cloudflare Pages), make sure to configure these HTTP headers on your web server; otherwise, WASM thread support will fail to initialize.
+
+---
+
+### 3. How to Check WebGPU Status
+
+1. Open Chrome or Edge and navigate to `chrome://gpu`.
+2. Look for **WebGPU** under the **Graphics Feature Status** list:
+* 🟢 **Hardware accelerated**: WebGPU is active and working.
+* 🔴 **Disabled** or **Unavailable**: WebGPU is inactive. Running the project will result in a **black screen**. Refer to the setup guide below.
+
+
+
+---
+
+### 4. Step-by-Step WebGPU Setup Guide
+
+#### 🔹 Chrome / Edge
+
+WebGPU is enabled by default in Chrome/Edge 113+. If you encounter a black screen, follow these troubleshooting steps:
+
+1. **Verify Hardware Acceleration (Required):**
+* Go to **Settings** -> **System**.
+* Turn on **"Use graphics acceleration when available"**.
+* **Relaunch the browser**.
+
+
+2. **Force Enable WebGPU (If black screen persists):**
+* Navigate to `chrome://flags/#enable-unsafe-webgpu`.
+* Set **Unsafe WebGPU** to `Enabled`.
+* Click **Relaunch** at the bottom right.
+
+
+
+#### 🔹 Firefox (Testing / Experimental Only)
+
+Firefox WebGPU support is experimental and not supported in production. To test:
+
+1. Navigate to `about:config` and accept the warning prompt.
+2. Search for `dom.webgpu.enabled` and set it to `true`.
+3. (On some platforms) Search for `gfx.webgpu.force-enabled` and set it to `true`.
+4. **Restart Firefox**.
+
+#### 🔹 Safari (macOS / iOS)
+
+* Safari 18+ natively supports WebGPU with no additional setup required.
+* If using an older version, update your OS or switch to Chrome/Edge 113+.
+
+---
+
+### 5. Troubleshooting
+
+* **Still getting a black screen after enabling WebGPU?**
+1. **Update GPU Drivers:** Ensure your graphics drivers (NVIDIA / AMD / Intel) are fully updated.
+2. **Switch to Discrete GPU:** If using a dual-GPU laptop, configure system settings to force your browser to use the high-performance / dedicated GPU.
+3. **Inspect DevTools Logs:** Press `F12` to open Developer Tools and check the Console tab for errors like `WebGPU is not supported` or `Adapter not found`.
+
 
 **Before running,** `lut_struve.bin` must exist in the project root.
 If the file is missing, `build_gravity_voxels_system` calls
