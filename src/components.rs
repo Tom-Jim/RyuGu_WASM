@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 pub const G: f32 = 6.6743e-11;
 pub const RYUGU_MASS: f32 = 4.5e11;
 pub const CASSINI_MASS: f32 = 2500.0;
@@ -16,7 +17,12 @@ pub const RYUGU_SPIN_AXIS: Vec3 = Vec3::new(-0.043, -0.914, 0.405);
 
 pub const DENSITY_EPSILON: f32 = 10.0;
 pub const SECTION_CLIP_RADIUS: f32 = 450.0;
-
+pub const PROBE_R0: Vec3 = Vec3::new(-1000.0, 200.0, 100.0);
+pub static PROBE_V_INIT: LazyLock<Vec3> = LazyLock::new(|| {
+    let r0 = PROBE_R0;
+    let speed = 1.253 * (G * RYUGU_MASS / r0.length()).sqrt();
+    r0.normalize().cross(Vec3::Y).normalize() * speed
+});
 #[derive(Component)]
 pub struct TargetSize(pub f32);
 #[derive(Component)]
@@ -26,7 +32,9 @@ pub struct TopologyBuilt;
 #[derive(Component)]
 pub struct RyuguMarker;
 #[derive(Component)]
-pub struct CassiniMarker;
+pub struct CassiniMarker; //GPU acceleration
+#[derive(Component)]
+pub struct CassiniWernerMarker; //Werner 1996 GPU acceleration
 #[derive(Component)]
 pub struct UiTextMarker;
 #[derive(Component)]
@@ -57,7 +65,9 @@ pub struct ShowSection(pub bool);
 pub struct DensityC(pub f32);
 
 impl Default for DensityC {
-    fn default() -> Self { Self(1.0) }
+    fn default() -> Self {
+        Self(1.0)
+    }
 }
 
 #[derive(Resource)]
@@ -112,3 +122,18 @@ impl Default for GravityReadbackChannel {
     }
 }
 
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+pub enum ActiveGravityMethod {
+    #[default]
+    VoxelStehfest, // Cyan trajectory: GPU voxel NILT (default)
+    DecomposedWerner, // Red trajectory: decomposed-Werner polyhedron kernel
+}
+
+impl ActiveGravityMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VoxelStehfest => "GPU Voxel (Stehfest)",
+            Self::DecomposedWerner => "Decomposed Werner (1/R)",
+        }
+    }
+}

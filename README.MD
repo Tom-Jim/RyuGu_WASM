@@ -209,16 +209,24 @@ Ryugu_wasm/
 │       ├── compute_pipeline.rs  NormalsComputePlugin: one-shot GPU dispatch (DispatchState
 │       │                    goes Done after first fire). Writes result to staging buffer,
 │       │                    maps async, pushes to NormalsReadbackChannel.
-│       └── ui.rs            FPS display, keyboard toggle handlers for normals/section.
+│       ├── werner_pipeline.rs   WernerComputePlugin (alternative GPU kernel): per-frame
+│       │                    dispatch over 4× split mesh triangles (1 surface face + 3
+│       │                    inner faces anchored at the origin vertex). CPU poll
+│       │                    reduces per-face partial sums into WernerAcceleration.
+│       └── ui.rs            FPS display, keyboard toggle handlers for normals/section
+│                            and the active gravity method.
 ├── assets/shaders/
 │   ├── gravity.wgsl         Gaver-Stehfest NILT loop over 6 terms (k=1..6, M=3).
 │   │                        Per-thread voxel contribution written to workgroup shared
 │   │                        memory (shared_acc[64]). Parallel stride reduction:
 │   │                        stride starts at 32, halved each iteration via stride>>=1u.
 │   │                        Each workgroup writes one vec4 partial sum to output_acc.
-│   └── normals.wgsl         Per-vertex normal from CSR neighbor ring. Iterates
-│                            consecutive neighbor pairs, accumulates cross(a-p, b-p).
-│                            Normalizes; defaults to (0,1,0) for degenerate vertices.
+│   ├── normals.wgsl         Per-vertex normal from CSR neighbor ring. Iterates
+│   │                        consecutive neighbor pairs, accumulates cross(a-p, b-p).
+│   │                        Normalizes; defaults to (0,1,0) for degenerate vertices.
+│   └── werner_gravity.wgsl  Per-face Weyl-kernel accumulator for the decomposed-Werner
+│                            method: reads per-face G·ρ and emits one vec4 partial sum
+│                            per workgroup into werner_output_acc.
 └── scripts/
     └── gen_lut.py           Computes S_v(z) = (pi/2)[H_v(z) - Y_v(z)] for v=0,1
                              over z in [0,200] at N=4096 uniform samples using
@@ -637,6 +645,7 @@ The first three systems are guarded by marker components (`Without<ScaleNormaliz
 | `S` | Toggle camera mode: Overview / Follow Cassini |
 | `F` | Toggle surface normal arrow gizmos |
 | `D` | Toggle cross-section plane view |
+| `G` | Toggle gravity method: GPU Voxel (Stehfest) / Decomposed Werner (1/R) |
 | Mouse drag | Pan-orbit camera rotation |
 | Scroll wheel | Zoom |
 

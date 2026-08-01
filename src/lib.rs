@@ -2,7 +2,6 @@ mod components;
 mod systems;
 mod topology;
 mod welding;
-
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -11,10 +10,12 @@ use bevy::render::{
     RenderPlugin,
     settings::{Backends, RenderCreation, WgpuSettings},
 };
+use bevy::window::PresentMode;
 use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use components::{
-    CameraMode, DensityC, GravityAcceleration, GravityBlendFactor, ShowNormals, ShowSection,
+    ActiveGravityMethod, CameraMode, DensityC, GravityAcceleration, GravityBlendFactor,
+    ShowNormals, ShowSection,
 };
 use systems::{
     compute_pipeline::NormalsComputePlugin,
@@ -26,9 +27,10 @@ use systems::{
     },
     scale::{build_topology_system, normalize_model_scale_system},
     ui::{
-        fps_update_system, normal_toggle_system, section_toggle_system, setup_fps_ui,
-        update_hint_on_mode_change,
+        fps_update_system, method_toggle_system, normal_toggle_system, section_toggle_system,
+        setup_fps_ui, update_hint_on_mode_change,
     },
+    werner_pipeline::WernerComputePlugin,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -110,6 +112,7 @@ pub fn main() {
         .init_resource::<ShowNormals>()
         .init_resource::<ShowSection>()
         .init_resource::<DensityC>()
+        .init_resource::<ActiveGravityMethod>()
         .init_resource::<GravityAcceleration>()
         .init_resource::<GravityBlendFactor>()
         .add_plugins(
@@ -123,6 +126,7 @@ pub fn main() {
                         canvas: Some("#bevy".into()),
                         fit_canvas_to_parent: true,
                         prevent_default_event_handling: false,
+                        present_mode: PresentMode::AutoNoVsync,
                         ..default()
                     }),
                     ..default()
@@ -143,6 +147,7 @@ pub fn main() {
     if has_webgpu {
         app.add_plugins(NormalsComputePlugin);
         app.add_plugins(GravityComputePlugin);
+        app.add_plugins(WernerComputePlugin);
     }
 
     app.add_systems(Startup, (setup_scene, setup_ui, setup_fps_ui))
@@ -156,6 +161,7 @@ pub fn main() {
                 camera_switch_system,
                 normal_toggle_system,
                 section_toggle_system,
+                method_toggle_system,
                 update_hint_on_mode_change,
                 camera_follow_system,
                 fps_update_system,

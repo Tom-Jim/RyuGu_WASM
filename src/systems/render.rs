@@ -37,18 +37,14 @@ pub fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         RyuguMarker,
     ));
 
-    let r0 = Vec3::new(-1000.0, 200.0, 100.0);
-    let r_hat = r0.normalize();
-    let v_init = r_hat.cross(Vec3::Y).normalize() * (1.253 * (G * RYUGU_MASS / r0.length()).sqrt());
-
     commands.spawn((
         WorldAssetRoot(
             asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/cassini.gltf")),
         ),
         TargetSize(6.7),
-        Transform::from_translation(r0),
+        Transform::from_translation(PROBE_R0),
         Mass(CASSINI_MASS),
-        Velocity(v_init),
+        Velocity(*PROBE_V_INIT),
         OrbitHistory(std::collections::VecDeque::with_capacity(ORBIT_HISTORY_LEN)),
         CassiniMarker,
     ));
@@ -104,37 +100,63 @@ pub fn camera_follow_system(
 pub fn render_gizmos_system(
     mut gizmos: Gizmos,
     camera_query: Query<&Transform, With<Camera3d>>,
-    cassini_query: Query<(&Transform, &OrbitHistory), With<CassiniMarker>>,
+    cassini_query: Query<(
+        &Transform,
+        &OrbitHistory,
+        Option<&CassiniMarker>,
+        Option<&CassiniWernerMarker>,
+    )>,
     global_transforms: Query<&GlobalTransform>,
     show_normals: Res<ShowNormals>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
     normals_data: Option<Res<AsteroidNormalsGpuData>>,
     time: Res<Time>,
 ) {
-    let Some(cam) = camera_query.iter().next() else { return };
-    let Some((ct, history)) = cassini_query.iter().next() else { return };
+    let Some(cam) = camera_query.iter().next() else {
+        return;
+    };
+    for (ct, history, marker, werner_marker) in cassini_query.iter() {
+        let pts: Vec<Vec3> = history.0.iter().copied().collect();
+        if marker.is_some() {
+            // Cyan trajectory: GPU voxel NILT (active gravity method)
+            gizmos.linestrip(pts.into_iter(), Color::srgba(0.0, 1.0, 1.0, 0.8));
+        } else if werner_marker.is_some() {
+            // Red trajectory: decomposed-Werner polyhedron kernel
+            gizmos.linestrip(pts.into_iter(), Color::srgba(1.0, 0.2, 0.2, 0.8));
+        }
 
-    let pts: Vec<Vec3> = history.0.iter().copied().collect();
-    gizmos.linestrip(pts.into_iter(), Color::srgba(0.4, 0.8, 1.0, 0.7));
-
-    if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
-        let pos = ct.translation;
-        gizmos.sphere(pos, 12.0, Color::srgb(1.0, 0.9, 0.1));
-        let pulse = 20.0 + (time.elapsed_secs() * 5.0).sin() * 6.0;
-        gizmos.circle(pos, pulse, Color::srgb(1.0, 0.6, 0.0));
-        let d = 35.0_f32;
-        gizmos.line(pos - Vec3::X * d, pos + Vec3::X * d, Color::srgb(1.0, 0.9, 0.1));
-        gizmos.line(pos - Vec3::Y * d, pos + Vec3::Y * d, Color::srgb(1.0, 0.9, 0.1));
-        gizmos.line(pos - Vec3::Z * d, pos + Vec3::Z * d, Color::srgb(1.0, 0.9, 0.1));
+        if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
+            let pos = ct.translation;
+            gizmos.sphere(pos, 12.0, Color::srgb(1.0, 0.9, 0.1));
+            let pulse = 20.0 + (time.elapsed_secs() * 5.0).sin() * 6.0;
+            gizmos.circle(pos, pulse, Color::srgb(1.0, 0.6, 0.0));
+            let d = 35.0_f32;
+            gizmos.line(
+                pos - Vec3::X * d,
+                pos + Vec3::X * d,
+                Color::srgb(1.0, 0.9, 0.1),
+            );
+            gizmos.line(
+                pos - Vec3::Y * d,
+                pos + Vec3::Y * d,
+                Color::srgb(1.0, 0.9, 0.1),
+            );
+            gizmos.line(
+                pos - Vec3::Z * d,
+                pos + Vec3::Z * d,
+                Color::srgb(1.0, 0.9, 0.1),
+            );
+        }
     }
-
     if show_normals.0 {
         if let (Some(topo), Some(normals)) = (topo, normals_data) {
             if let Some(mesh_entity) = topo.mesh_entity {
                 if let Ok(mesh_gtf) = global_transforms.get(mesh_entity) {
                     let rot = mesh_gtf.compute_transform().rotation;
                     for (i, &local_pos) in topo.positions.iter().enumerate() {
-                        if i >= normals.0.len() { break; }
+                        if i >= normals.0.len() {
+                            break;
+                        }
                         let world_pos = mesh_gtf.transform_point(local_pos);
                         let world_normal = (rot * normals.0[i]).normalize_or_zero();
                         let tip = world_pos + world_normal * NORMAL_ARROW_LENGTH;
@@ -154,18 +176,32 @@ pub fn render_section_system(
     density_c: Option<Res<DensityC>>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
 ) {
-    if !show_section.0 { return; }
-    let Some(ryugu_tf) = ryugu_query.iter().next() else { return };
-    let Some(cam_tf) = camera_query.iter().next() else { return };
+    if !show_section.0 {
+        return;
+    }
+    let Some(ryugu_tf) = ryugu_query.iter().next() else {
+        return;
+    };
+    let Some(cam_tf) = camera_query.iter().next() else {
+        return;
+    };
     let Some(topo) = topo else { return };
     let c = density_c.map(|r| r.0).unwrap_or(1.0);
-    if c <= 0.0 { return; }
+    if c <= 0.0 {
+        return;
+    }
 
     let com = ryugu_tf.translation;
     let plane_normal = (cam_tf.translation - com).normalize_or_zero();
-    if plane_normal == Vec3::ZERO { return; }
+    if plane_normal == Vec3::ZERO {
+        return;
+    }
 
-    let up = if plane_normal.abs().dot(Vec3::Y) < 0.9 { Vec3::Y } else { Vec3::X };
+    let up = if plane_normal.abs().dot(Vec3::Y) < 0.9 {
+        Vec3::Y
+    } else {
+        Vec3::X
+    };
     let tangent_u = plane_normal.cross(up).normalize();
     let tangent_v = plane_normal.cross(tangent_u).normalize();
 
@@ -198,12 +234,19 @@ pub fn render_section_system(
             // Transform sample point into asteroid local mesh space
             let local_pt = (inv_rot * (point - com)) * inv_scale;
             let dir = local_pt.normalize_or_zero();
-            if dir == Vec3::ZERO { continue; }
+            if dir == Vec3::ZERO {
+                continue;
+            }
 
             // Surface radius in dir: max vertex projection along dir
             // Rotates with the asteroid — boundary shape changes as Ryugu spins
-            let r_surface = local_verts.iter().map(|p| p.dot(dir)).fold(0.0_f32, f32::max);
-            if local_pt.length() > r_surface { continue; }
+            let r_surface = local_verts
+                .iter()
+                .map(|p| p.dot(dir))
+                .fold(0.0_f32, f32::max);
+            if local_pt.length() > r_surface {
+                continue;
+            }
 
             // Density in world space (r from CoM)
             let r = (point - com).length().max(0.01);
@@ -231,9 +274,13 @@ pub fn section_alpha_system(
     material_handles: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if !show_section.is_changed() { return; }
+    if !show_section.is_changed() {
+        return;
+    }
 
-    let Some(root) = ryugu_query.iter().next() else { return };
+    let Some(root) = ryugu_query.iter().next() else {
+        return;
+    };
 
     let mut stack = vec![root];
     while let Some(curr) = stack.pop() {

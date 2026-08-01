@@ -172,41 +172,63 @@ pub fn build_gravity_voxels_system(
     }
 
     let scale = ryugu_tf.scale.x;
-    let n = topo.positions.len() as u32;
     let eps = DENSITY_EPSILON;
-
-    // Map continuous DensityC kernel to per-voxel masses, then renormalize to RYUGU_MASS.
+    // Density coefficient C solved once in scale.rs by 4-point Gaussian quadrature
+    // over origin-anchored tets; reusing it here keeps per-voxel masses consistent
+    // with the integral that produced it.
     let c_val = density_c.map(|r| r.0).unwrap_or(1.0);
-    let v_ryugu = 3.77e8; // Approximate volume of Ryugu in m^3
-    let delta_v = v_ryugu / (n as f32); // Approximate tributary volume per mesh node
 
-    let raw_masses: Vec<f32> = topo
-        .positions
-        .iter()
-        .map(|p| {
-            let r_v = (*p * scale).length().max(1e-3);
-            c_val * delta_v / (r_v + eps)
-        })
-        .collect();
+    // 4-point Gaussian quadrature weights on a reference tetrahedron (a for the
+    // barycentric-self vertex, b for each of the three mixed vertices).
+    let a = (5.0 + 3.0 * 5.0_f32.sqrt()) / 20.0;
+    let b = (5.0 - 5.0_f32.sqrt()) / 20.0;
 
-    let sum_raw_mass: f32 = raw_masses.iter().sum();
-    let mass_scale = RYUGU_MASS / sum_raw_mass; // Force strict global mass conservation
+    let expected_voxels = (topo.triangles.len() / 3) * 4;
+    let mut voxel_bytes = Vec::with_capacity(expected_voxels * 16);
+    let mut voxel_count = 0;
 
-    let bytes: Vec<u8> = topo
-        .positions
-        .iter()
-        .zip(raw_masses.iter())
-        .flat_map(|(p, raw_m)| {
-            let pw = *p * scale;
-            let mass = raw_m * mass_scale;
-            [pw.x, pw.y, pw.z, mass]
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect::<Vec<u8>>()
-        })
-        .collect();
+    // Iterate every origin-anchored tet (one per surface triangle). Each tet
+    // contributes its signed volume times the 1/r density at the 4 Gauss points,
+    // so the summed voxel masses reproduce RYUGU_MASS without any manual scaling.
+    for chunk in topo.triangles.chunks(3) {
+        let va = topo.positions[chunk[0] as usize] * scale;
+        let vb = topo.positions[chunk[1] as usize] * scale;
+        let vc = topo.positions[chunk[2] as usize] * scale;
 
-    commands.insert_resource(GravVoxelSource { bytes, count: n });
+        let vol = va.dot(vb.cross(vc)) / 6.0;
+
+        let p1 = va * a + vb * b + vc * b;
+        let p2 = va * b + vb * a + vc * b;
+        let p3 = va * b + vb * b + vc * a;
+        let p4 = va * b + vb * b + vc * b;
+
+        let points = [p1, p2, p3, p4];
+
+        for p in points {
+            let r = p.length().max(1e-3);
+            let density = c_val / (r + eps);
+
+            // Per-voxel mass = (1/4) * tet signed-volume * local density. Negative
+            // volumes from concavities yield negative masses, cancelling the false
+            // pull that concave regions would otherwise exert.
+            let mass = vol * 0.25 * density;
+
+            voxel_bytes.extend_from_slice(&p.x.to_le_bytes());
+            voxel_bytes.extend_from_slice(&p.y.to_le_bytes());
+            voxel_bytes.extend_from_slice(&p.z.to_le_bytes());
+            voxel_bytes.extend_from_slice(&mass.to_le_bytes());
+
+            voxel_count += 1;
+        }
+    }
+
+    // The summed voxel masses exactly equal RYUGU_MASS — the 1/r density kernel
+    // and the same 4-point quadrature that produced C make this self-consistent,
+    // so no manual mass_scale is needed here.
+    commands.insert_resource(GravVoxelSource {
+        bytes: voxel_bytes,
+        count: voxel_count,
+    });
 }
 
 pub fn poll_gravity_readback(

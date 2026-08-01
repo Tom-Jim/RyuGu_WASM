@@ -53,9 +53,11 @@ Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `was
 | `src/systems/gravity_pipeline.rs` | `GravityComputePlugin` — per-frame GPU gravity dispatch + readback |
 | `src/systems/physics.rs` | Semi-implicit Euler orbit integration + `ryugu_rotation_system` |
 | `src/systems/render.rs` | Scene setup, camera follow/switch, gizmos, section plane |
-| `src/systems/ui.rs` | FPS display, keyboard toggles (normals / section view) |
+| `src/systems/ui.rs` | FPS display, keyboard toggles (normals / section view / gravity method) |
+| `src/systems/werner_pipeline.rs` | `WernerComputePlugin` — per-frame GPU Werner-decomposition gravity dispatch + readback |
 | `assets/shaders/normals.wgsl` | WGSL compute shader for surface normal averaging (CSR neighbor ring) |
 | `assets/shaders/gravity.wgsl` | WGSL compute shader: Gaver-Stehfest NILT loop + Struve-Neumann LUT |
+| `assets/shaders/werner_gravity.wgsl` | WGSL compute shader: Werner-series decomposition kernel |
 | `scripts/gen_lut.py` | Precomputes `S₀(z)`, `S₁(z)` via SciPy → `lut_struve.bin` (32 KB, 4096×2 f32) |
 
 **Plugin stack (lib.rs)**
@@ -66,6 +68,9 @@ Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `was
 - `FrameTimeDiagnosticsPlugin` — FPS counter
 - `NormalsComputePlugin` — custom render-world compute pass (WGSL)
 - `GravityComputePlugin` — custom render-world compute pass (WGSL)
+- `WernerComputePlugin` — custom render-world compute pass (WGSL, Werner-decomposition gravity)
+
+All three compute plugins are only registered when `navigator.gpu` is available; on a non-WebGPU browser the app falls back to a Newtonian CPU gravity path and shows an inline warning overlay.
 
 **One-shot initialization via marker components**
 
@@ -78,7 +83,15 @@ All Update systems in `lib.rs` are registered with `.chain()`, enforcing strict 
 
 **GPU compute / readback pattern**
 
-Both compute plugins live in the Bevy render world and communicate results back to the main world via `Arc<Mutex<Option<Vec<[f32;4]>>>>` channels (`NormalsReadbackChannel`, `GravityReadbackChannel`). Staging buffers are mapped async; each main-world system drains its channel each frame if data is ready.
+Compute plugins live in the Bevy render world and communicate results back to the main world via two channels:
+- `Arc<Mutex<Option<Vec<[f32;4]>>>>` for `GravityComputePlugin` (`GravityReadbackChannel`) and `WernerComputePlugin` (`WernerReadbackChannel`) — fixed-size GPU-output readbacks.
+- `WernerAcceleration(pub Vec3)` resource and `GravityAcceleration(Vec3)` resource carry the latest per-probe acceleration onto the main world.
+
+Staging buffers are mapped async; each main-world system drains its channel each frame if data is ready.
+
+**Gravity-method selection**
+
+`ActiveGravityMethod` (`components.rs`) toggles between `VoxelStehfest` (default, `gravity.wgsl`) and `DecomposedWerner` (`werner_gravity.wgsl`). Pressing **G** in `method_toggle_system` switches the active shader used by `physics_system`; if a method's GPU readback hasn't landed yet, the integrator falls back to a Newtonian point-mass acceleration.
 
 **Physics constants (components.rs)**
 
@@ -88,11 +101,11 @@ Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 
 
 **Orbit integration**
 
-`physics_system` uses a Leapfrog (Velocity Verlet) integrator — second-order accurate, energy-conserving. Because GPU readback is delayed by one frame, the same interpolated acceleration is used for both half-steps, which reduces to the standard leapfrog scheme. GPU gravity is blended in smoothly via `GravityBlendFactor` (ramps 0 → 1 over `GRAVITY_BLEND_FRAMES = 60` frames from the first valid GPU result). While blending, `newtonian_acc` anchors the transition; a `MAX_ACC = 1.5e-3` cap prevents transient spikes from corrupting the orbit.
+`physics_system` is symplectic Euler / Euler-Cromer: `v += a·dt` then `x += v·dt`. Phase-space volume is preserved, but unlike Verlet the step is only first-order accurate — so the cap and blend below matter for stability. GPU readback is delayed by one frame, so the same chosen acceleration is used for both updates within a single frame. The chosen GPU acceleration is clamped to `MAX_ACC = 1.5e-3`, then blended toward the GPU value via `GravityBlendFactor` (ramps 0 → 1 over `GRAVITY_BLEND_FRAMES = 60` frames from the first valid GPU result). A Newtonian point-mass anchor is used while the GPU result is non-finite, zero, or not yet ready.
 
 **Gravity shader kernel**
 
-`gravity.wgsl` implements Gaver-Stehfest NILT (M=6, 12 terms) with Stehfest coefficients hardcoded in `gravity_pipeline.rs`. The LUT argument simplifies to `as_val = h * s_k = k * ln2` (h cancels), so the LUT is sampled at 12 fixed points regardless of geometry. The per-voxel contribution is `-(G * mass * (S0+S1) / h²) * unit_dir`, summed across Stehfest terms, then scaled by `ln2/h`. The 80-byte uniform buffer layout is: `[probe_xyz, G, voxel_count, M=6, pad, pad, V[0..12] as 3×vec4<f32>]`.
+`gravity.wgsl` implements Gaver-Stehfest NILT with M=3 (6 terms); the 12-entry coefficient table in `gravity_pipeline.rs` pads the trailing 6 slots with zeros. The LUT argument simplifies to `as_val = h * s_k = k * ln2` (h cancels), so the LUT is sampled at the 6 nonzero Stehfest points regardless of geometry. The per-voxel contribution is `-(G * mass * (S0+S1) / h²) * unit_dir`, summed across Stehfest terms, then scaled by `ln2/h`. The 80-byte uniform buffer layout is: `[probe_xyz, G, voxel_count, M=3, pad, pad, V[0..12] as 3×vec4<f32>]`.
 
 **Keyboard controls (runtime)**
 
@@ -101,6 +114,7 @@ Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 
 | `S` | Switch camera mode (Overview ↔ Follow Cassini) |
 | `F` | Toggle surface normals display |
 | `D` | Toggle section plane view |
+| `G` | Toggle gravity method (VoxelStehfest ↔ DecomposedWerner) |
 
 **Deployment**
 
