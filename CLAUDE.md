@@ -11,11 +11,17 @@ bun install
 # Dev: builds WASM (debug, opt-level 1) then starts server at http://localhost:3000
 bun run dev
 
-# Production WASM build (release profile: opt-level "z", LTO → pkg/)
+# Production build only (release: opt-level "z", LTO) -> pkg/
 bun run build
+
+# Production-mode preview (build + serve)
+bun run preview
 
 # Start dev server only (requires pkg/ to already exist)
 bun run serve
+
+# Syntax check only (host build, no WASM)
+cargo build
 
 # Lint / format (native host, for IDE feedback only — not the WASM target)
 cargo clippy
@@ -111,6 +117,7 @@ Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 
 - `gizmos.circle(position, radius, color)` — 3 args
 - Use `WorldAssetRoot(asset_server.load(...))` to spawn GLTF/OBJ scenes
 - WASM canvas: `canvas: Some("#bevy".into())` in `WindowPlugin`
+- `index.html` does a `navigator.gpu` + `requestAdapter()` check before importing the WASM bundle; shows a fallback `#no-webgpu` panel if WebGPU is unavailable. Update that panel (not the canvas) when changing browser-support messaging.
 - Avoid `std::fs` (panics in WASM) and bare `std::time::Instant`; use `bevy::time::Time`
 - `AssetMetaCheck::Never` is required to suppress missing `.meta` file 404s in WASM
 - WebGPU backend: `Backends::BROWSER_WEBGPU` (from `bevy::render::settings`)
