@@ -41,7 +41,7 @@ cargo fmt
 
 ## 🌐 Browser Support & WebGPU Setup
 
-> ⚠️ **Crucial Warning**  
+> ⚠️ **Crucial Warning**
 > This project relies on **WebGPU** and **WASM multi-threading**. **Your browser must have WebGPU properly enabled to run the simulation, otherwise the page will render a black screen.** Please verify your browser environment and configuration before launching.
 
 ---
@@ -664,9 +664,18 @@ The first three systems are guarded by marker components (`Without<ScaleNormaliz
 
 ## License
 
-Copyright (C) 2026 Ryugu WASM Contributors
+Copyright (c) 2026 Tom-Jim
 
-This program is free software: you can redistribute it and/or modify it under the terms of the
-**GNU General Public License v3.0** as published by the Free Software Foundation, either version 3
-of the License, or (at your option) any later version.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
