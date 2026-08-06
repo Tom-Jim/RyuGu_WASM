@@ -32,8 +32,26 @@ struct WernerFace {
 @group(0) @binding(3) var<storage, read_write> output_acc: array<vec4<f32>>;
 
 var<workgroup> shared_acc: array<vec4<f32>, 64>;
+var<workgroup> shared_potential: array<vec2<f32>, 64>;
 
-fn edge_contribution(index: u32) -> vec3<f32> {
+// Double-single compensated addition for the strongly cancelling Werner
+// edge/face potential. The final value remains f32, but cancellation during
+// the tree reduction retains the low component instead of discarding it at
+// every lane.
+fn two_sum(a: f32, b: f32) -> vec2<f32> {
+    let sum = a + b;
+    let b_virtual = sum - a;
+    let error = (a - (sum - b_virtual)) + (b - b_virtual);
+    return vec2<f32>(sum, error);
+}
+
+fn compensated_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let high = two_sum(a.x, b.x);
+    let low = a.y + b.y + high.y;
+    return two_sum(high.x, low);
+}
+
+fn edge_contribution(index: u32) -> vec4<f32> {
     let edge = edges[index];
     let r0 = edge.p0.xyz - params.probe_pos;
     let r1 = edge.p1.xyz - params.probe_pos;
@@ -48,10 +66,10 @@ fn edge_contribution(index: u32) -> vec3<f32> {
         dot(edge.tensor_row1.xyz, r0),
         dot(edge.tensor_row2.xyz, r0)
     );
-    return tensor_r * logarithm;
+    return vec4<f32>(tensor_r * logarithm, dot(r0, tensor_r) * logarithm);
 }
 
-fn face_contribution(index: u32) -> vec3<f32> {
+fn face_contribution(index: u32) -> vec4<f32> {
     let face = faces[index];
     let r0 = face.p0.xyz - params.probe_pos;
     let r1 = face.p1.xyz - params.probe_pos;
@@ -66,7 +84,11 @@ fn face_contribution(index: u32) -> vec3<f32> {
         + length2 * dot(r0, r1);
     let solid_angle = 2.0 * atan2(numerator, denominator);
     let normal = face.normal.xyz;
-    return normal * dot(normal, r0) * solid_angle;
+    let normal_distance = dot(normal, r0);
+    return vec4<f32>(
+        normal * normal_distance * solid_angle,
+        normal_distance * normal_distance * solid_angle
+    );
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -77,8 +99,8 @@ fn main(
 ) {
     let index = global_id.x;
     let lane = local_id.x;
-    var edge_sum = vec3<f32>(0.0);
-    var face_sum = vec3<f32>(0.0);
+    var edge_sum = vec4<f32>(0.0);
+    var face_sum = vec4<f32>(0.0);
     if index < params.edge_count {
         edge_sum = edge_contribution(index);
     }
@@ -87,7 +109,11 @@ fn main(
     }
     // ∇U for the conventional positive gravitational potential:
     // -Gρ Σ(E r L) + Gρ Σ(F r ω).
-    shared_acc[lane] = vec4<f32>(params.g_density * (-edge_sum + face_sum), 0.0);
+    shared_acc[lane] = vec4<f32>(-edge_sum.xyz + face_sum.xyz, 0.0);
+    shared_potential[lane] = compensated_add(
+        vec2<f32>(0.5 * edge_sum.w, 0.0),
+        vec2<f32>(-0.5 * face_sum.w, 0.0)
+    );
     workgroupBarrier();
 
     var stride = 32u;
@@ -97,11 +123,18 @@ fn main(
         }
         if lane < stride {
             shared_acc[lane] += shared_acc[lane + stride];
+            shared_potential[lane] = compensated_add(
+                shared_potential[lane],
+                shared_potential[lane + stride]
+            );
         }
         workgroupBarrier();
         stride = stride >> 1u;
     }
     if lane == 0u {
-        output_acc[workgroup_id.x] = shared_acc[0];
+        output_acc[workgroup_id.x] = params.g_density * vec4<f32>(
+            shared_acc[0].xyz,
+            shared_potential[0].x + shared_potential[0].y
+        );
     }
 }

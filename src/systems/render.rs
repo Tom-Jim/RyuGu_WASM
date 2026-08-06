@@ -2,7 +2,11 @@ use crate::components::*;
 use bevy::prelude::*;
 use bevy_panorbit_camera::PanOrbitCamera;
 
-pub fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
+pub fn setup_scene(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    probe_initial: Res<ProbeInitialConditions>,
+) {
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.8, 0.8, 1.0),
         brightness: 250.0,
@@ -42,9 +46,9 @@ pub fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/cassini.gltf")),
         ),
         TargetSize(6.7),
-        Transform::from_translation(PROBE_R0),
+        Transform::from_translation(probe_initial.position),
         Mass(CASSINI_MASS),
-        Velocity(*PROBE_V_INIT),
+        Velocity(probe_initial.velocity()),
         OrbitHistory(std::collections::VecDeque::with_capacity(ORBIT_HISTORY_LEN)),
         CassiniMarker,
     ));
@@ -247,7 +251,7 @@ pub fn render_section_system(
 
             let color = match *active_method {
                 ActiveGravityMethod::RadialAnalytic => {
-                    // Continuous rho(r)=C/(r+epsilon) represented by equation (18).
+                    // Continuous rho(r)=C/(r+epsilon) used by the radial model.
                     let r = (point - com).length().max(0.01);
                     let density = c / (r + eps);
                     let t = ((density - min_density) / density_range).clamp(0.0, 1.0);

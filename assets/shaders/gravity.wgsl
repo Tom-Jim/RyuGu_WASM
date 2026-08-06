@@ -1,4 +1,4 @@
-// Spatial-domain radial analytic forward model (equation 18).
+// Spatial-domain radial analytic forward model.
 // One invocation evaluates one angular-cell/radial-layer pair; workgroups
 // reduce their 64 contributions before asynchronous CPU readback.
 
@@ -22,37 +22,12 @@ struct RadialLayer {
 
 var<workgroup> shared_acc: array<vec4<f32>, 64>;
 
-fn asinh_safe(x: f32) -> f32 {
-    let ax = abs(x);
-    let value = log(ax + sqrt(ax * ax + 1.0));
-    if x < 0.0 {
-        return -value;
-    }
-    return value;
-}
-
-// K(lambda) = J3(lambda) n' - R J2(lambda) n.
-fn radial_primitive(lambda: f32, radius: f32, cosine: f32, source_dir: vec3<f32>, probe_dir: vec3<f32>) -> vec3<f32> {
-    let a = radius * cosine;
-    let u = lambda - a;
-    let b2 = max(radius * radius * (1.0 - cosine * cosine), 1.0e-12);
-    let b = sqrt(b2);
-    let distance = sqrt(u * u + b2);
-    let hyperbolic = asinh_safe(u / b);
-
-    let j2 = hyperbolic - u / distance - 2.0 * a / distance
-        + a * a * u / (b2 * distance);
-    let j3 = distance + b2 / distance
-        + 3.0 * a * (hyperbolic - u / distance)
-        - 3.0 * a * a / distance
-        + a * a * a * u / (b2 * distance);
-    return j3 * source_dir - radius * j2 * probe_dir;
-}
-
-// Collinear and near-collinear directions make the closed form ill-conditioned
-// even though the integral is finite away from the surface. The derivation
-// explicitly permits a numerical fallback, so use 8-point Gauss-Legendre here.
-fn collinear_quadrature(inner: f32, outer: f32, source_dir: vec3<f32>, probe: vec3<f32>) -> vec3<f32> {
+// Eight-point Gauss-Legendre integration evaluates U and its analytic gradient
+// at the same nodes. This avoids the f32 cancellation in the closed primitive
+// and the even worse cancellation from finite-differencing two nearly equal
+// potential values. The xyz result is therefore the gradient of the same
+// discrete positive potential stored in w.
+fn numerical_field_quadrature(inner: f32, outer: f32, source_dir: vec3<f32>, probe: vec3<f32>) -> vec4<f32> {
     let nodes = array<f32, 8>(
         -0.9602898565, -0.7966664774, -0.5255324099, -0.1834346425,
          0.1834346425,  0.5255324099,  0.7966664774,  0.9602898565
@@ -63,18 +38,22 @@ fn collinear_quadrature(inner: f32, outer: f32, source_dir: vec3<f32>, probe: ve
     );
     let midpoint = 0.5 * (inner + outer);
     let half_width = 0.5 * (outer - inner);
-    var sum = vec3<f32>(0.0);
+    var sum = vec4<f32>(0.0);
     for (var index = 0u; index < 8u; index = index + 1u) {
         let lambda = midpoint + half_width * nodes[index];
         let displacement = lambda * source_dir - probe;
         let distance2 = max(dot(displacement, displacement), 1.0e-8);
-        sum += weights[index] * lambda * lambda * displacement
-            / (distance2 * sqrt(distance2));
+        let distance = sqrt(distance2);
+        let mass_measure = weights[index] * lambda * lambda;
+        sum += mass_measure * vec4<f32>(
+            displacement / (distance2 * distance),
+            1.0 / distance
+        );
     }
     return half_width * sum;
 }
 
-fn layer_acceleration(index: u32) -> vec3<f32> {
+fn layer_field(index: u32) -> vec4<f32> {
     let layer = layers[index];
     let source_dir = normalize(layer.direction_solid_angle.xyz);
     let solid_angle = layer.direction_solid_angle.w;
@@ -82,24 +61,11 @@ fn layer_acceleration(index: u32) -> vec3<f32> {
     let outer = layer.radii_density.y;
     let density = layer.radii_density.z;
 
-    let probe = params.probe_pos;
-    let radius = length(probe);
-    if radius < 1.0e-6 || outer <= inner || density <= 0.0 {
-        return vec3<f32>(0.0);
+    if outer <= inner || density <= 0.0 {
+        return vec4<f32>(0.0);
     }
-    let probe_dir = probe / radius;
-    let cosine = clamp(dot(probe_dir, source_dir), -1.0, 1.0);
-    let sine2 = max(0.0, 1.0 - cosine * cosine);
-
-    var radial_integral: vec3<f32>;
-    if sine2 < 1.0e-4 {
-        radial_integral = collinear_quadrature(inner, outer, source_dir, probe);
-    } else {
-        radial_integral =
-            radial_primitive(outer, radius, cosine, source_dir, probe_dir)
-            - radial_primitive(inner, radius, cosine, source_dir, probe_dir);
-    }
-    return params.g_const * solid_angle * density * radial_integral;
+    return params.g_const * solid_angle * density
+        * numerical_field_quadrature(inner, outer, source_dir, params.probe_pos);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -112,7 +78,7 @@ fn main(
     let lane = local_id.x;
     var value = vec4<f32>(0.0);
     if index < params.layer_count {
-        value = vec4<f32>(layer_acceleration(index), 0.0);
+        value = layer_field(index);
     }
     shared_acc[lane] = value;
     workgroupBarrier();

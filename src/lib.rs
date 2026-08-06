@@ -20,11 +20,13 @@ use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use components::{
     ActiveGravityMethod, CameraMode, DensityC, GravityAcceleration, GravityBlendFactor,
-    ShowNormals, ShowSection,
+    GravityPotential, JacobiHistory, ProbeInitialConditions, ShowNormals, ShowSection,
+    SimulationAcceleration, SimulationClock,
 };
 use std::time::Duration;
 use systems::{
     compute_pipeline::NormalsComputePlugin,
+    energy::{record_probe_jacobi_system, setup_jacobi_chart, update_jacobi_chart_system},
     gravity_pipeline::GravityComputePlugin,
     physics::{physics_system, ryugu_rotation_system},
     render::{
@@ -33,8 +35,10 @@ use systems::{
     },
     scale::{build_topology_system, normalize_model_scale_system},
     ui::{
-        fps_update_system, method_toggle_system, normal_toggle_system, section_toggle_system,
-        setup_fps_ui, update_hint_on_mode_change,
+        fps_update_system, method_toggle_system, normal_toggle_system, probe_slider_system,
+        probe_slider_visual_system, section_toggle_system, setup_fps_ui, setup_probe_controls,
+        setup_simulation_acceleration_control, simulation_acceleration_slider_system,
+        simulation_acceleration_slider_visual_system, update_hint_on_mode_change,
     },
     werner_pipeline::WernerComputePlugin,
 };
@@ -119,7 +123,12 @@ pub fn main() {
         .init_resource::<DensityC>()
         .init_resource::<ActiveGravityMethod>()
         .init_resource::<GravityAcceleration>()
+        .init_resource::<GravityPotential>()
         .init_resource::<GravityBlendFactor>()
+        .init_resource::<JacobiHistory>()
+        .init_resource::<SimulationClock>()
+        .init_resource::<SimulationAcceleration>()
+        .init_resource::<ProbeInitialConditions>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::Reactive {
@@ -175,27 +184,50 @@ pub fn main() {
         app.add_plugins(WernerComputePlugin);
     }
 
-    app.add_systems(Startup, (setup_scene, setup_ui, setup_fps_ui))
-        .add_systems(
-            Update,
-            (
-                normalize_model_scale_system,
-                build_topology_system,
-                camera_switch_system,
-                normal_toggle_system,
-                section_toggle_system,
-                method_toggle_system,
-                update_hint_on_mode_change,
-                camera_follow_system,
-                fps_update_system,
-                section_alpha_system,
-                render_gizmos_system,
-                render_section_system,
-            )
-                .chain(),
+    app.add_systems(
+        Startup,
+        (
+            setup_scene,
+            setup_ui,
+            setup_fps_ui,
+            setup_probe_controls,
+            setup_simulation_acceleration_control,
+            setup_jacobi_chart,
+        ),
+    )
+    .add_systems(
+        Update,
+        (
+            normalize_model_scale_system,
+            build_topology_system,
+            camera_switch_system,
+            normal_toggle_system,
+            section_toggle_system,
+            method_toggle_system,
+            probe_slider_system,
+            probe_slider_visual_system,
+            simulation_acceleration_slider_system,
+            simulation_acceleration_slider_visual_system,
+            update_hint_on_mode_change,
+            camera_follow_system,
+            fps_update_system,
+            update_jacobi_chart_system,
+            section_alpha_system,
+            render_gizmos_system,
+            render_section_system,
         )
-        .add_systems(FixedUpdate, (physics_system, ryugu_rotation_system).chain())
-        .run();
+            .chain(),
+    )
+    .add_systems(
+        FixedUpdate,
+        (
+            physics_system,
+            ryugu_rotation_system,
+            record_probe_jacobi_system,
+        )
+            .chain(),
+    )
+    .run();
 }
 
 #[cfg(test)]

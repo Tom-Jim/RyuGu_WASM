@@ -19,9 +19,12 @@ const WORKGROUP_SIZE: u32 = 64;
 #[derive(Resource, Default)]
 pub struct WernerAcceleration(pub Vec3);
 
+#[derive(Resource, Default)]
+pub struct WernerPotential(pub Option<f32>);
+
 #[derive(Resource, Clone)]
 pub struct WernerReadbackChannel {
-    data: Arc<Mutex<Option<Vec<[f32; 4]>>>>,
+    data: Arc<Mutex<Option<GravityReadbackPacket>>>,
     in_flight: Arc<AtomicBool>,
 }
 
@@ -49,6 +52,7 @@ struct WernerSource {
 #[derive(Resource, Default)]
 struct ExtractedWernerInput {
     probe: Vec3,
+    snapshot: Option<GravityRequestSnapshot>,
     edge_bytes: Option<Vec<u8>>,
     face_bytes: Option<Vec<u8>>,
     edge_count: u32,
@@ -69,6 +73,7 @@ struct WernerGpuBuffersInner {
     item_count: u32,
     workgroup_count: u32,
     output_size: u64,
+    last_submitted: Option<(u64, u64)>,
 }
 
 #[derive(Resource)]
@@ -82,10 +87,10 @@ impl Plugin for WernerComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WernerReadbackChannel>();
         app.init_resource::<WernerAcceleration>();
-        app.add_systems(
-            Update,
-            (build_werner_source_system, poll_werner_readback).chain(),
-        );
+        app.init_resource::<WernerPotential>();
+        app.init_resource::<WernerGravityHistory>();
+        app.add_systems(Update, build_werner_source_system);
+        app.add_systems(PreUpdate, poll_werner_readback);
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedWernerInput>();
@@ -265,15 +270,25 @@ fn push_vec4(bytes: &mut Vec<u8>, value: Vec4) {
 fn extract_werner_input_system(
     mut extracted: ResMut<ExtractedWernerInput>,
     source: Extract<Option<Res<WernerSource>>>,
-    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
+    clock: Extract<Res<SimulationClock>>,
+    cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    let (Some(source), Ok(cassini), Ok(ryugu)) =
+    let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
         return;
     };
     extracted.probe = ryugu.rotation.inverse() * (cassini.translation - ryugu.translation);
+    extracted.snapshot = Some(GravityRequestSnapshot {
+        request_id: clock.request_id,
+        epoch: clock.epoch,
+        simulation_time_seconds: clock.elapsed_seconds,
+        body_position: extracted.probe,
+        ryugu_transform: *ryugu,
+        probe_position: cassini.translation,
+        probe_velocity: velocity.0,
+    });
     extracted.edge_count = source.edge_count;
     extracted.face_count = source.face_count;
     extracted.g_density = source.g_density;
@@ -380,10 +395,18 @@ fn dispatch_werner_system(
             item_count,
             workgroup_count,
             output_size,
+            last_submitted: None,
         });
     }
 
-    let inner = buffers.0.as_ref().expect("Werner buffers initialized");
+    let inner = buffers.0.as_mut().expect("Werner buffers initialized");
+    let Some(snapshot) = extracted.snapshot.as_ref() else {
+        return;
+    };
+    let submission_key = (snapshot.epoch, snapshot.request_id);
+    if inner.last_submitted == Some(submission_key) {
+        return;
+    }
     if channel
         .in_flight
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -391,6 +414,7 @@ fn dispatch_werner_system(
     {
         return;
     }
+    inner.last_submitted = Some(submission_key);
     let uniform_bytes = werner_uniform_bytes(
         extracted.probe,
         extracted.g_density,
@@ -419,14 +443,18 @@ fn dispatch_werner_system(
     let in_flight = Arc::clone(&channel.in_flight);
     let staging = inner.staging.clone();
     let map_staging = staging.clone();
+    let snapshot = snapshot.clone();
     map_staging
         .slice(..)
         .map_async(MapMode::Read, move |result| {
             if result.is_ok() {
                 let view = staging.slice(..).get_mapped_range();
-                let partial = bytes_to_f32x4(&view);
+                let partial_sums = bytes_to_f32x4(&view);
                 if let Ok(mut guard) = shared.lock() {
-                    *guard = Some(partial);
+                    *guard = Some(GravityReadbackPacket {
+                        partial_sums,
+                        snapshot,
+                    });
                 }
                 drop(view);
                 staging.unmap();
@@ -438,20 +466,44 @@ fn dispatch_werner_system(
 fn poll_werner_readback(
     channel: Res<WernerReadbackChannel>,
     mut acceleration: ResMut<WernerAcceleration>,
+    mut potential: ResMut<WernerPotential>,
+    mut history: ResMut<WernerGravityHistory>,
 ) {
     let Ok(mut guard) = channel.data.try_lock() else {
         return;
     };
-    let Some(partial_sums) = guard.take() else {
+    let Some(packet) = guard.take() else {
         return;
     };
-    let total = partial_sums.iter().fold(Vec3::ZERO, |sum, value| {
-        sum + Vec3::new(value[0], value[1], value[2])
-    });
-    if total.is_finite() {
-        acceleration.0 = total;
+    let total_f64 = packet
+        .partial_sums
+        .iter()
+        .fold([0.0_f64; 4], |mut sum, value| {
+            for index in 0..4 {
+                sum[index] += value[index] as f64;
+            }
+            sum
+        });
+    let total = Vec4::from_array(total_f64.map(|value| value as f32));
+    let acceleration_is_valid = total.xyz().is_finite();
+    let potential_is_valid = total.w.is_finite() && total.w > 0.0;
+    if acceleration_is_valid {
+        acceleration.0 = total.xyz();
     } else {
         warn!("[werner] discarded non-finite GPU result");
+    }
+    if potential_is_valid {
+        potential.0 = Some(total.w);
+    } else {
+        potential.0 = None;
+        warn!("[werner] discarded invalid GPU potential");
+    }
+    if acceleration_is_valid && potential_is_valid {
+        history.0.push(GravityFieldSample {
+            snapshot: packet.snapshot,
+            body_acceleration: total.xyz(),
+            positive_potential: total.w,
+        });
     }
 }
 
@@ -512,6 +564,48 @@ fn bytes_to_f32x4(bytes: &[u8]) -> Vec<[f32; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn polyhedron_field(
+        vertices: &[Vec3],
+        faces: &[([Vec3; 3], Vec3)],
+        sides: &HashMap<(usize, usize), Vec<EdgeSide>>,
+        probe: Vec3,
+    ) -> (Vec3, f32) {
+        let mut edge_sum = Vec3::ZERO;
+        let mut edge_potential_sum = 0.0;
+        for ((first, second), adjacent) in sides {
+            let r0 = vertices[*first] - probe;
+            let r1 = vertices[*second] - probe;
+            let edge_length = (vertices[*second] - vertices[*first]).length();
+            let logarithm = ((r0.length() + r1.length() + edge_length)
+                / (r0.length() + r1.length() - edge_length))
+                .ln();
+            let tensor = outer_product(adjacent[0].face_normal, adjacent[0].edge_outward)
+                + outer_product(adjacent[1].face_normal, adjacent[1].edge_outward);
+            let tensor_r = tensor * r0;
+            edge_sum += tensor_r * logarithm;
+            edge_potential_sum += r0.dot(tensor_r) * logarithm;
+        }
+        let mut face_sum = Vec3::ZERO;
+        let mut face_potential_sum = 0.0;
+        for (points, normal) in faces {
+            let r0 = points[0] - probe;
+            let r1 = points[1] - probe;
+            let r2 = points[2] - probe;
+            let denominator = r0.length() * r1.length() * r2.length()
+                + r0.length() * r1.dot(r2)
+                + r1.length() * r2.dot(r0)
+                + r2.length() * r0.dot(r1);
+            let solid_angle = 2.0 * r0.dot(r1.cross(r2)).atan2(denominator);
+            let normal_distance = normal.dot(r0);
+            face_sum += *normal * normal_distance * solid_angle;
+            face_potential_sum += normal_distance * normal_distance * solid_angle;
+        }
+        (
+            -edge_sum + face_sum,
+            0.5 * (edge_potential_sum - face_potential_sum),
+        )
+    }
 
     #[test]
     fn outer_product_applies_to_vector() {
@@ -576,35 +670,29 @@ mod tests {
         }
 
         let probe = Vec3::new(20.0, 3.0, -2.0);
-        let mut edge_sum = Vec3::ZERO;
-        for ((first, second), adjacent) in sides {
-            assert_eq!(adjacent.len(), 2);
-            let r0 = vertices[first] - probe;
-            let r1 = vertices[second] - probe;
-            let edge_length = (vertices[second] - vertices[first]).length();
-            let logarithm = ((r0.length() + r1.length() + edge_length)
-                / (r0.length() + r1.length() - edge_length))
-                .ln();
-            let tensor = outer_product(adjacent[0].face_normal, adjacent[0].edge_outward)
-                + outer_product(adjacent[1].face_normal, adjacent[1].edge_outward);
-            edge_sum += tensor * r0 * logarithm;
-        }
-        let mut face_sum = Vec3::ZERO;
-        for (points, normal) in faces {
-            let r0 = points[0] - probe;
-            let r1 = points[1] - probe;
-            let r2 = points[2] - probe;
-            let denominator = r0.length() * r1.length() * r2.length()
-                + r0.length() * r1.dot(r2)
-                + r1.length() * r2.dot(r0)
-                + r2.length() * r0.dot(r1);
-            let solid_angle = 2.0 * r0.dot(r1.cross(r2)).atan2(denominator);
-            face_sum += normal * normal.dot(r0) * solid_angle;
-        }
-
-        let actual = -edge_sum + face_sum;
+        let (actual, actual_potential) = polyhedron_field(&vertices, &faces, &sides, probe);
         let expected = -probe.normalize() * volume / probe.length_squared();
         assert!(actual.normalize().dot(expected.normalize()) > 0.999);
         assert!((actual.length() / expected.length() - 1.0).abs() < 0.02);
+
+        let expected_potential = volume / probe.length();
+        assert!(actual_potential > 0.0);
+        assert!((actual_potential / expected_potential - 1.0).abs() < 0.01);
+
+        let step = 0.2;
+        let potential_at = |point| polyhedron_field(&vertices, &faces, &sides, point).1;
+        let finite_difference = Vec3::new(
+            (potential_at(probe + step * Vec3::X) - potential_at(probe - step * Vec3::X))
+                / (2.0 * step),
+            (potential_at(probe + step * Vec3::Y) - potential_at(probe - step * Vec3::Y))
+                / (2.0 * step),
+            (potential_at(probe + step * Vec3::Z) - potential_at(probe - step * Vec3::Z))
+                / (2.0 * step),
+        );
+        let gradient_error = (actual - finite_difference).length() / actual.length();
+        assert!(
+            gradient_error < 0.02,
+            "Werner acceleration/potential gradient mismatch: {gradient_error:.3e}; a={actual:?}, fd={finite_difference:?}"
+        );
     }
 }

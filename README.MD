@@ -34,6 +34,9 @@ These modes intentionally use different density assumptions. They are two forwar
 - 60 Hz fixed-step physics and Ryugu rotation.
 - 60 FPS frame pacing, VSync, and a 30 Hz unfocused mode.
 - Method-aware density cross-section visualization.
+- Four on-screen sliders for the probe's initial position and velocity multiplier.
+- A `1x`--`8x` simulation-acceleration slider that skips presentation of fully integrated intermediate frames without enlarging the stable physics step.
+- A scrolling rotating-frame Jacobi-constant chart with automatic vertical scaling.
 - Newtonian point-mass fallback while a GPU result is unavailable or invalid.
 
 ## Requirements
@@ -87,6 +90,49 @@ The current gravity implementation does not use `lut_struve.bin`; no LUT generat
 
 The page checks `navigator.gpu` and requests an adapter before loading the WASM bundle. Chrome and Edge with WebGPU enabled are the recommended development browsers.
 
+WebGPU is available only in a [secure context](https://developer.mozilla.org/en-US/docs/Web/API/GPU): use HTTPS in deployment. `http://localhost` is accepted for local development.
+
+### Enabling WebGPU by browser
+
+#### Chrome and Chromium
+
+1. Update to a current browser release. WebGPU has been enabled by default on supported desktop platforms since Chrome 113.
+2. Open `chrome://settings/system` and enable **Use graphics acceleration when available**, then restart the browser.
+3. Open `chrome://gpu` and confirm that WebGPU is hardware accelerated.
+4. If a supported test machine is still blocked, open `chrome://flags/#enable-unsafe-webgpu`, enable **Unsafe WebGPU**, and restart. On Linux, `chrome://flags/#enable-vulkan` may also be needed for a Vulkan-backed configuration.
+
+See the official [Chrome WebGPU troubleshooting guide](https://developer.chrome.com/docs/web-platform/webgpu/troubleshooting-tips) for current platform restrictions. Flags are a development fallback and should not be required on an ordinarily supported configuration.
+
+#### Microsoft Edge
+
+1. Open `edge://settings/system` and enable **Use graphics acceleration when available**, then restart Edge.
+2. Check the adapter and feature status at `edge://gpu`.
+3. If WebGPU is unavailable on an otherwise supported development machine, enable `edge://flags/#enable-unsafe-webgpu` and restart.
+
+Edge uses Chromium's WebGPU implementation, so Chrome's platform notes and driver requirements generally apply.
+
+#### Firefox
+
+WebGPU availability depends on Firefox version, operating system, and GPU driver. Try a current stable release first. If `navigator.gpu` remains unavailable:
+
+1. Open `about:config` and accept the warning.
+2. Search for `dom.webgpu.enabled` and set it to `true`.
+3. Restart Firefox and test again. Firefox Nightly is the preferred fallback on a platform where stable Firefox has not enabled WebGPU by default.
+
+Mozilla tracks the current platform rollout and preference in [Firefox experimental features](https://developer.mozilla.org/en-US/docs/Mozilla/Firefox/Experimental_features#webgpu_api).
+
+#### Safari
+
+Safari 26 ships WebGPU on supported Apple devices and normally requires no flag. Enable **Settings → Advanced → Show features for web developers**, then use **Develop → Feature Flags** only when testing an older Safari Technology Preview build where WebGPU is still exposed as an experimental switch. Apple's implementation maps WebGPU to Metal; see the [Safari 26 WebGPU release notes](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/) and the older [Technology Preview setup instructions](https://webkit.org/blog/14879/webgpu-now-available-for-testing-in-safari-technology-preview/).
+
+After changing any browser setting, open the developer console on the served page and verify:
+
+```js
+Boolean(navigator.gpu && await navigator.gpu.requestAdapter())
+```
+
+A `true` result confirms that the page can obtain an adapter. It does not guarantee that every requested limit is supported; the application still reports adapter or device creation failures in the console.
+
 The Bun server returns these headers on every response:
 
 ```http
@@ -100,6 +146,27 @@ The WebGPU render backend is configured with:
 - `max_compute_workgroups_per_dimension = 65535`;
 - canvas selector `#bevy`;
 - `AssetMetaCheck::Never` for browser assets.
+
+## Why Rust, Bevy, WebAssembly, and WebGPU
+
+This stack is selected for the simulator's specific workload rather than for rendering alone:
+
+| Technology | Reason for this project |
+|---|---|
+| Rust | Strong ownership and type checks make asynchronous GPU buffers, readback channels, and ECS state easier to keep valid without a garbage collector in the simulation loop. |
+| Bevy | Its ECS and separate main/render worlds provide an explicit place for fixed-step physics, one-shot mesh preprocessing, render extraction, compute dispatch, and asynchronous readback. |
+| WebAssembly | The same Rust gravity and physics code is distributed as a browser artifact with near-native numeric execution and no local application installation. |
+| WebGPU | Compute shaders, storage buffers, workgroups, and WGSL validation allow thousands of independent gravity contributions to be evaluated and reduced in parallel. WebGL does not provide the general compute pipeline used here. |
+
+Together, Rust and Bevy keep the CPU-side data flow structured, WebAssembly makes that code portable to the browser, and WebGPU moves the dominant forward-gravity summation to the user's GPU through modern Metal, Direct3D 12, or Vulkan-class backends.
+
+### Why Rust instead of C++ or Python
+
+- **Rust:** provides native-level numerical performance while checking ownership, lifetimes, thread safety, and many buffer-layout mistakes at compile time. Its WebAssembly toolchain integrates directly with `wasm-bindgen`, and Bevy supplies one consistent ECS architecture for native and browser builds. This is the best fit for the project's asynchronous WebGPU readback and long-running simulation state.
+- **C++:** can deliver comparable native and WebAssembly performance and has mature scientific libraries. It was not selected here because manual memory ownership, pointer lifetime management, and JavaScript/WASM binding maintenance would increase the risk and maintenance cost around asynchronous mapped GPU buffers. C++ remains a reasonable option where an existing C++ physics engine or library ecosystem is the primary requirement.
+- **Python:** is excellent for deriving formulas, preprocessing data, validating results, and rapidly prototyping numerical experiments; the project still uses Python for research scripts where appropriate. It was not selected for the interactive runtime because ordinary Python execution cannot directly provide the same browser-native WebGPU/Bevy pipeline, and per-frame Python or Python-to-browser bridging would add overhead around the 60 Hz simulation loop.
+
+The choice is therefore workload-specific: Rust is used for the real-time browser runtime, while Python remains useful for offline analysis and validation. The decision does not imply that Rust is universally faster or more suitable than C++ for every numerical project.
 
 ## Gravity models
 
@@ -161,18 +228,27 @@ An atomic `in_flight` flag prevents overlapping maps of the same staging buffer.
 
 The GPU result is computed in Ryugu's body-fixed frame and rotated back into world space before integration.
 
+Each dispatch carries a monotonically increasing request ID, simulation epoch, simulation time, and a snapshot of the probe and Ryugu transforms. The asynchronous readback returns that snapshot together with its acceleration and potential, so an old body-frame result is never rotated with a newer asteroid attitude. Completed samples are kept in a bounded eight-entry history instead of being reduced to an unlabelled "latest value".
+
+Main-world polling runs in `PreUpdate`, before the following `FixedUpdate`. Partial workgroup results are accumulated in CPU `f64`, while the GPU remains responsible for the parallel field evaluation.
+
 ## Physics and frame pacing
 
-`physics_system` and `ryugu_rotation_system` run in `FixedUpdate` at 60 Hz. Simulation time is accelerated by `TIME_SCALE = 20000`.
+`physics_system` and `ryugu_rotation_system` run in `FixedUpdate` at 60 Hz. Simulation time is accelerated by `TIME_SCALE = 500`; one fixed update therefore advances approximately `8.33 s` of simulation time.
 
-The probe uses Euler--Cromer integration:
+Each fixed update is divided into 12 kick--drift--kick leapfrog substeps:
 
 ```text
-velocity += acceleration * dt
-position += velocity * dt
+velocity += 0.5 * acceleration(position, t) * substep_dt
+position += velocity * substep_dt
+velocity += 0.5 * acceleration(position, t + substep_dt) * substep_dt
 ```
 
-Before the first valid GPU sample, the integrator uses a softened Newtonian point-mass acceleration. A valid GPU result is clamped to `1.5e-3 m/s²` and blended in over 60 fixed updates.
+Before the first valid GPU sample, the integrator uses a softened Newtonian point-mass acceleration. Once samples arrive, the integrator predicts only the non-spherical residual relative to a point mass: it evaluates the point-mass anchor at the current substep position and adds a history-derived residual. This avoids extrapolating the dominant radial field from a stale probe position.
+
+Within the known sample interval, residual acceleration uses cubic Hermite interpolation. Beyond the newest sample, radial mode permits at most two sample intervals of slope-limited extrapolation; Werner mode holds the newest residual because browser measurements showed that extrapolating its more cancellation-sensitive samples increased drift. Ryugu's known rotation is evaluated analytically at every substep boundary. A valid combined acceleration is clamped to `1.5e-3 m/s²` and blended in over 60 fixed updates.
+
+The upper-right simulation-acceleration control selects `1x` through `8x`. At `Nx`, one displayed fixed update completes `N` full stable physics frames, each retaining the same `8.33 s` frame interval and 12 leapfrog substeps. Intermediate states are added to the orbit trail but are not presented individually. The multiplier therefore increases simulated time per displayed frame without multiplying `dt`; it does not make a single integration step coarser. GPU readback remains once per displayed frame, so the range is deliberately bounded.
 
 Frame pacing uses:
 
@@ -180,6 +256,38 @@ Frame pacing uses:
 - a 60 Hz focused Winit update interval;
 - `bevy_framepace` at 60 FPS for native builds;
 - a 30 Hz low-power unfocused interval.
+
+## Rotating-frame Jacobi-constant chart
+
+The lower-right display plots the specific Jacobi constant in Ryugu's body-fixed rotating frame. Let \(R\) be Ryugu's world rotation, \(\boldsymbol\omega\) its angular velocity, and \(U>0\) the positive gravitational potential returned by the active GPU model. The body-frame position and velocity are
+
+$$
+\mathbf r_b=R^{-1}(\mathbf r_p-\mathbf r_R),
+\qquad
+\mathbf v_b=R^{-1}\mathbf v_p-\boldsymbol\omega_b\times\mathbf r_b,
+\qquad
+\boldsymbol\omega_b=R^{-1}\boldsymbol\omega.
+$$
+
+The displayed diagnostic is
+
+$$
+C_J=2U(\mathbf r_b)
++\lVert\boldsymbol\omega_b\times\mathbf r_b\rVert^2
+-\lVert\mathbf v_b\rVert^2,
+$$
+
+with units of \(\mathrm{m^2/s^2}\). This is a specific invariant, so probe mass does not appear.
+
+Both compute shaders reduce acceleration in `xyz` and the matching positive potential in `w`. The radial shader evaluates both quantities at the same eight Gauss--Legendre nodes, avoiding an f32 central difference of nearly equal potentials. The Werner shader uses the standard edge-minus-face polyhedron field and a compensated double-single sum for its strongly cancelling scalar potential. The chart selects the potential belonging to the active gravity method and waits until the 60-step GPU warm-up blend is complete before recording samples.
+
+Every chart sample is evaluated from the position, velocity, Ryugu attitude, and potential carried by the same completed GPU request. It never combines the current probe state with a delayed potential. For exact continuous dynamics in a steadily rotating, time-independent body-fixed potential, \(C_J\) should remain constant. Visible drift therefore helps expose remaining integration, interpolation, clamping, or f32 field error; it is a diagnostic rather than a proof of exact conservation.
+
+The chart retains 256 timestamped GPU samples. Before the time window fills, the newest point moves from left to right. After it fills, old samples leave from the left, the newest yellow point remains on the right edge, and the previous values continue as a scrolling line. The visible minimum and maximum receive an 8% margin, so the vertical scale automatically expands or contracts while keeping the full visible trajectory inside the plot. The label `dC/|C0|` reports the relative change across the currently visible history, making small variations distinguishable from a large physical drift.
+
+In the final browser validation at the default initial conditions, the visible-window relative change was approximately `-2.4e-4%` in radial mode and `+2.3e-2%` in Werner mode while rendering at 59--60 FPS. These are observed regression values, not universal error bounds for every orbit or slider setting.
+
+Changing a probe slider or switching gravity methods resets the trajectory, GPU-potential warm-up, and Jacobi history so unrelated runs are not joined into one curve.
 
 ## Surface topology and normals
 
@@ -201,10 +309,13 @@ One-shot initialization is guarded by `ScaleNormalized` and `TopologyBuilt` mark
 | `F` | Toggle GPU-computed surface-normal gizmos. |
 | `D` | Toggle the density section for the active gravity model. |
 | `G` | Switch between Equation and homogeneous Werner gravity. |
+| `X`, `Y`, `Z` sliders | Set the three components of the initial probe position from `-2000` to `2000` in 100 intervals (`40` per step). |
+| `Speed` slider | Set the circular-speed multiplier from `0` to `2` in 100 intervals (`0.02` per step). |
+| Upper-right acceleration slider | Advance `1`--`8` complete stable physics frames per displayed frame. |
 | Mouse drag | Orbit the camera. |
 | Scroll wheel | Zoom. |
 
-Switching with `G` clears the old trajectory, restores the initial probe state, resets Ryugu's rotation, and warms the selected GPU result from the Newtonian fallback.
+Moving a probe slider immediately clears the old trajectory, applies the new position and tangent velocity, resets Ryugu's rotation, and warms the active GPU result from the Newtonian fallback. Switching with `G` performs the same reset using the current slider values.
 
 The orbit line is cyan in Equation mode and red in Werner mode.
 
@@ -218,8 +329,14 @@ The orbit line is cyan in Equation mode and red in Werner mode.
 | `DENSITY_EPSILON` | `10 m` | Radial-density regularization. |
 | `GRAVITY_EPSILON` | `1 m` | Point-mass fallback softening. |
 | `RYUGU_ROTATION_PERIOD_SECS` | `7.63 h` | Physical rotation period. |
-| `TIME_SCALE` | `20000` | Simulation speed multiplier. |
+| `TIME_SCALE` | `500` | Simulation speed multiplier chosen to keep asynchronous interpolation and integration error controlled. |
+| `PHYSICS_SUBSTEPS` | `12` | Leapfrog substeps per 60 Hz fixed update. |
+| `MIN_SIMULATION_ACCELERATION` | `1` | Minimum stable physics frames advanced per displayed frame. |
+| `MAX_SIMULATION_ACCELERATION` | `8` | Maximum stable physics frames advanced per displayed frame. |
+| `GRAVITY_SAMPLE_HISTORY_CAPACITY` | `8` | Timestamped GPU field samples retained for interpolation and matching diagnostics. |
 | `ORBIT_HISTORY_LEN` | `27500` | Maximum stored trail points. |
+| `PROBE_SPEED_FACTOR` | `1.053` | Default multiplier applied to the local circular-orbit speed. |
+| `JACOBI_HISTORY_CAPACITY` | `256` | Number of Jacobi-constant samples retained by the scrolling chart. |
 
 The current initial probe state is:
 
@@ -228,12 +345,15 @@ position = (-1000, 1200, 100)
 speed    = 1.053 * sqrt(G * RYUGU_MASS / |position|)
 ```
 
+The on-screen sliders replace these defaults at runtime. A zero position produces a zero initial velocity instead of an undefined normalized direction.
+
 ## Scheduling
 
 ### Startup
 
 ```text
-setup_scene, setup_ui, setup_fps_ui
+setup_scene, setup_ui, setup_fps_ui, setup_probe_controls,
+setup_simulation_acceleration_control, setup_jacobi_chart
 ```
 
 ### Main-world update chain
@@ -247,12 +367,12 @@ normalize model scale
   -> gizmo and density-section rendering
 ```
 
-The gravity plugins independently build their immutable source resources and poll completed readbacks in `Update`.
+The gravity plugins independently build their immutable source resources in `Update` and poll completed readbacks in `PreUpdate`, so newly mapped samples are available before fixed-step physics.
 
 ### Fixed update
 
 ```text
-physics_system -> ryugu_rotation_system
+physics_system -> ryugu_rotation_system -> record_probe_jacobi_system
 ```
 
 ### Render world
@@ -277,6 +397,7 @@ Ryugu_wasm/
 │   ├── welding.rs
 │   └── systems/
 │       ├── mod.rs
+│       ├── energy.rs
 │       ├── scale.rs
 │       ├── compute_pipeline.rs
 │       ├── gravity_pipeline.rs
@@ -304,18 +425,19 @@ Ryugu_wasm/
 | File | Responsibility |
 |---|---|
 | `src/lib.rs` | Bevy app construction, WebGPU limits, plugins, schedules, fixed timestep, and frame pacing. |
-| `src/components.rs` | Physical constants, ECS components, gravity mode, shared sources, and readback resources. |
+| `src/components.rs` | Physical constants, runtime probe initial conditions, ECS components, gravity mode, shared sources, and readback resources. |
 | `src/topology.rs` | CSR adjacency construction from the welded mesh. |
 | `src/welding.rs` | Quantized vertex deduplication. |
 | `src/systems/scale.rs` | One-shot model normalization and topology creation. |
+| `src/systems/energy.rs` | Snapshot-aligned body-frame Jacobi evaluation, relative-drift reporting, rolling history, automatic chart scaling, and right-edge point rendering. |
 | `src/systems/compute_pipeline.rs` | One-shot GPU surface-normal computation and readback. |
-| `src/systems/gravity_pipeline.rs` | Equation angular/radial preprocessing, GPU dispatch, and readback. |
-| `src/systems/werner_pipeline.rs` | Homogeneous closed-polyhedron preprocessing, Werner GPU dispatch, and readback. |
-| `src/systems/physics.rs` | Fixed-step fallback selection, acceleration blending, orbit integration, and asteroid rotation. |
+| `src/systems/gravity_pipeline.rs` | Radial angular/layer preprocessing, snapshot-tagged GPU dispatch, f64 partial reduction, and history insertion. |
+| `src/systems/werner_pipeline.rs` | Homogeneous closed-polyhedron preprocessing, snapshot-tagged Werner dispatch, f64 partial reduction, and history insertion. |
+| `src/systems/physics.rs` | Point-mass residual interpolation, bounded async prediction, 12-substep leapfrog integration, and asteroid rotation. |
 | `src/systems/render.rs` | Scene, camera, orbit gizmos, normals, and method-aware density section. |
-| `src/systems/ui.rs` | FPS display and keyboard controls. |
-| `assets/shaders/gravity.wgsl` | Equation layer evaluation and workgroup reduction. |
-| `assets/shaders/werner_gravity.wgsl` | Shared-edge and signed-face Werner evaluation. |
+| `src/systems/ui.rs` | FPS display, keyboard controls, four probe sliders, and the upper-right simulation-acceleration slider. |
+| `assets/shaders/gravity.wgsl` | Joint eight-node radial acceleration/potential quadrature and workgroup reduction. |
+| `assets/shaders/werner_gravity.wgsl` | Shared-edge and signed-face Werner field evaluation with compensated potential summation. |
 | `assets/shaders/normals.wgsl` | CSR-neighbor surface normals. |
 | `server.ts` | Static Bun server with COOP/COEP headers. |
 | `index.html` | WebGPU preflight and WASM bootstrap. |
@@ -326,6 +448,12 @@ Ryugu_wasm/
 The Rust tests cover:
 
 - the Equation radial primitive against direct numerical integration;
+- the radial potential primitive against direct numerical integration;
+- 1000 deterministic f32 radial rays against high-resolution direct integration, including acceleration/potential gradient consistency;
+- Werner acceleration and potential far-field limits;
+- Werner potential finite-difference gradient consistency for a closed tetrahedron;
+- interpolation and bounded-extrapolation behavior for asynchronous field samples;
+- the rotating-frame Jacobi definition and invalid-input handling;
 - mass-density radial integration;
 - solid-angle construction;
 - Rust/WGSL uniform-buffer layouts;
@@ -337,8 +465,10 @@ The Rust tests cover:
 - Equation currently assumes a star-shaped body and one radial interval per direction.
 - Four radial layers approximate the continuous density pointwise, although each layer mass is preserved.
 - Werner mode is homogeneous and is not a non-uniform-density Werner extension.
-- GPU readback is asynchronous, so physics consumes the latest completed sample.
-- Euler--Cromer is first-order accurate and the large time scale favors visualization over precision orbit determination.
+- GPU readback remains asynchronous. Snapshot tags prevent state mismatch, but force prediction between completed samples is still a numerical approximation.
+- At acceleration above `1x`, the integration step remains unchanged but GPU field samples are farther apart in simulation time; the `8x` cap limits this interpolation tradeoff.
+- Leapfrog substeps greatly reduce secular integration drift, but this remains an interactive f32 visualization rather than a precision orbit-determination tool.
+- The current `TIME_SCALE = 500` is a deliberate fidelity/performance compromise; increasing it without increasing the GPU sampling rate or changing the predictor can reintroduce drift.
 - The browser page requires WebGPU; it does not load the full simulation after the preflight fails.
 
 ## Deployment

@@ -19,6 +19,7 @@ const RADIAL_LAYER_COUNT: u32 = 4;
 #[derive(Resource, Default)]
 struct ExtractedGravityInput {
     probe: Vec3,
+    snapshot: Option<GravityRequestSnapshot>,
     layer_bytes: Option<Vec<u8>>,
     layer_count: u32,
 }
@@ -34,6 +35,7 @@ struct GravityGpuBuffersInner {
     layer_count: u32,
     workgroup_count: u32,
     output_size: u64,
+    last_submitted: Option<(u64, u64)>,
 }
 
 #[derive(Resource)]
@@ -46,10 +48,10 @@ pub struct GravityComputePlugin;
 impl Plugin for GravityComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GravityReadbackChannel>();
-        app.add_systems(
-            Update,
-            (build_radial_gravity_source_system, poll_gravity_readback).chain(),
-        );
+        app.init_resource::<GravityPotential>();
+        app.init_resource::<RadialGravityHistory>();
+        app.add_systems(Update, build_radial_gravity_source_system);
+        app.add_systems(PreUpdate, poll_gravity_readback);
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedGravityInput>();
@@ -90,7 +92,7 @@ impl FromWorld for GravityComputePipeline {
     }
 }
 
-/// Builds the angular-cell/radial-layer discretization used by equation (18).
+/// Builds the angular-cell/radial-layer discretization used by the radial model.
 /// The mesh is assumed star-shaped with respect to its model origin, which is
 /// true for the Ryugu asset. A non-star-shaped mesh would require multiple
 /// radial intervals per angular cell.
@@ -130,7 +132,7 @@ pub fn build_radial_gravity_source_system(
     }
 
     if cells.is_empty() || density_integral <= f64::EPSILON {
-        error!("[gravity] failed to build equation (18) angular cells");
+        error!("[gravity] failed to build radial-model angular cells");
         return;
     }
 
@@ -160,7 +162,7 @@ pub fn build_radial_gravity_source_system(
 
     let count = (bytes.len() / 32) as u32;
     info!(
-        "[gravity] equation (18): {} angular cells, {} radial layers, solid-angle sum={:.6}, C={:.6e}",
+        "[gravity] radial model: {} angular cells, {} radial layers, solid-angle sum={:.6}, C={:.6e}",
         count / RADIAL_LAYER_COUNT,
         count,
         solid_angle_sum,
@@ -219,36 +221,70 @@ fn push_f32s(bytes: &mut Vec<u8>, values: [f32; 4]) {
 fn poll_gravity_readback(
     channel: Res<GravityReadbackChannel>,
     mut acceleration: ResMut<GravityAcceleration>,
+    mut potential: ResMut<GravityPotential>,
+    mut history: ResMut<RadialGravityHistory>,
 ) {
     let Ok(mut guard) = channel.data.try_lock() else {
         return;
     };
-    let Some(partial_sums) = guard.take() else {
+    let Some(packet) = guard.take() else {
         return;
     };
-    let total = partial_sums.iter().fold(Vec3::ZERO, |sum, value| {
-        sum + Vec3::new(value[0], value[1], value[2])
-    });
-    if total.is_finite() {
-        acceleration.0 = total;
+    let total_f64 = packet
+        .partial_sums
+        .iter()
+        .fold([0.0_f64; 4], |mut sum, value| {
+            for index in 0..4 {
+                sum[index] += value[index] as f64;
+            }
+            sum
+        });
+    let total = Vec4::from_array(total_f64.map(|value| value as f32));
+    let acceleration_is_valid = total.xyz().is_finite();
+    let potential_is_valid = total.w.is_finite() && total.w > 0.0;
+    if acceleration_is_valid {
+        acceleration.0 = total.xyz();
     } else {
-        warn!("[gravity] discarded non-finite equation (18) GPU result");
+        warn!("[gravity] discarded non-finite radial-model GPU result");
+    }
+    if potential_is_valid {
+        potential.0 = Some(total.w);
+    } else {
+        potential.0 = None;
+        warn!("[gravity] discarded invalid radial-model potential");
+    }
+    if acceleration_is_valid && potential_is_valid {
+        history.0.push(GravityFieldSample {
+            snapshot: packet.snapshot,
+            body_acceleration: total.xyz(),
+            positive_potential: total.w,
+        });
     }
 }
 
 fn extract_gravity_input_system(
     mut extracted: ResMut<ExtractedGravityInput>,
     source: Extract<Option<Res<RadialGravitySource>>>,
-    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
+    clock: Extract<Res<SimulationClock>>,
+    cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    let (Some(source), Ok(cassini), Ok(ryugu)) =
+    let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
         return;
     };
 
     extracted.probe = ryugu.rotation.inverse() * (cassini.translation - ryugu.translation);
+    extracted.snapshot = Some(GravityRequestSnapshot {
+        request_id: clock.request_id,
+        epoch: clock.epoch,
+        simulation_time_seconds: clock.elapsed_seconds,
+        body_position: extracted.probe,
+        ryugu_transform: *ryugu,
+        probe_position: cassini.translation,
+        probe_velocity: velocity.0,
+    });
     extracted.layer_count = source.count;
     if extracted.layer_bytes.is_none() {
         extracted.layer_bytes = Some(source.bytes.clone());
@@ -333,10 +369,18 @@ fn dispatch_gravity_system(
             layer_count: extracted.layer_count,
             workgroup_count,
             output_size,
+            last_submitted: None,
         });
     }
 
-    let inner = buffers.0.as_ref().expect("gravity buffers initialized");
+    let inner = buffers.0.as_mut().expect("gravity buffers initialized");
+    let Some(snapshot) = extracted.snapshot.as_ref() else {
+        return;
+    };
+    let submission_key = (snapshot.epoch, snapshot.request_id);
+    if inner.last_submitted == Some(submission_key) {
+        return;
+    }
     if channel
         .in_flight
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -344,6 +388,7 @@ fn dispatch_gravity_system(
     {
         return;
     }
+    inner.last_submitted = Some(submission_key);
 
     let uniform_bytes = gravity_uniform_bytes(extracted.probe, inner.layer_count);
     render_queue.write_buffer(&inner.uniform, 0, &uniform_bytes);
@@ -367,14 +412,18 @@ fn dispatch_gravity_system(
     let in_flight = Arc::clone(&channel.in_flight);
     let staging = inner.staging.clone();
     let map_staging = staging.clone();
+    let snapshot = snapshot.clone();
     map_staging
         .slice(..)
         .map_async(MapMode::Read, move |result| {
             if result.is_ok() {
                 let view = staging.slice(..).get_mapped_range();
-                let partial = bytes_to_f32x4(&view);
+                let partial_sums = bytes_to_f32x4(&view);
                 if let Ok(mut guard) = shared.lock() {
-                    *guard = Some(partial);
+                    *guard = Some(GravityReadbackPacket {
+                        partial_sums,
+                        snapshot,
+                    });
                 }
                 drop(view);
                 staging.unmap();
@@ -450,6 +499,59 @@ mod tests {
         j3 * source_direction - radius * j2 * probe_direction
     }
 
+    fn potential_primitive_cpu(lambda: f64, probe: DVec3, source_direction: DVec3) -> f64 {
+        let radius = probe.length();
+        let cosine = (probe / radius).dot(source_direction);
+        let a = radius * cosine;
+        let u = lambda - a;
+        let b2 = radius * radius * (1.0 - cosine * cosine);
+        let distance = (u * u + b2).sqrt();
+        0.5 * u * distance + 2.0 * a * distance + (a * a - 0.5 * b2) * (u / b2.sqrt()).asinh()
+    }
+
+    fn numerical_field_f32(inner: f32, outer: f32, direction: Vec3, probe: Vec3) -> Vec4 {
+        const NODES: [f32; 8] = [
+            -0.960_289_84,
+            -0.796_666_5,
+            -0.525_532_4,
+            -0.183_434_64,
+            0.183_434_64,
+            0.525_532_4,
+            0.796_666_5,
+            0.960_289_84,
+        ];
+        const WEIGHTS: [f32; 8] = [
+            0.101_228_535,
+            0.222_381_03,
+            0.313_706_64,
+            0.362_683_77,
+            0.362_683_77,
+            0.313_706_64,
+            0.222_381_03,
+            0.101_228_535,
+        ];
+        let midpoint = 0.5 * (inner + outer);
+        let half_width = 0.5 * (outer - inner);
+        let sum = NODES
+            .iter()
+            .zip(WEIGHTS)
+            .fold(Vec4::ZERO, |sum, (node, weight)| {
+                let lambda = midpoint + half_width * node;
+                let displacement = lambda * direction - probe;
+                let distance_squared = displacement.length_squared().max(1.0e-8);
+                let distance = distance_squared.sqrt();
+                let mass_measure = weight * lambda * lambda;
+                sum + mass_measure
+                    * Vec4::new(
+                        displacement.x / (distance_squared * distance),
+                        displacement.y / (distance_squared * distance),
+                        displacement.z / (distance_squared * distance),
+                        1.0 / distance,
+                    )
+            });
+        half_width * sum
+    }
+
     #[test]
     fn density_integral_matches_numerical_quadrature() {
         let analytic = radial_density_integral(3.0, 27.0, 10.0);
@@ -478,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn equation_18_primitive_matches_direct_radial_integral() {
+    fn radial_primitive_matches_direct_radial_integral() {
         let probe = DVec3::new(900.0, 130.0, 80.0);
         let source_direction = DVec3::new(0.2, 0.7, 0.6).normalize();
         let (inner, outer) = (30.0, 420.0);
@@ -493,5 +595,82 @@ mod tests {
             sum + lambda * lambda * displacement / displacement.length().powi(3) * width
         });
         assert!((analytic - numerical).length() / numerical.length() < 1.0e-9);
+    }
+
+    #[test]
+    fn radial_potential_primitive_matches_direct_integral() {
+        let probe = DVec3::new(900.0, 130.0, 80.0);
+        let source_direction = DVec3::new(0.2, 0.7, 0.6).normalize();
+        let (inner, outer) = (30.0, 420.0);
+        let analytic = potential_primitive_cpu(outer, probe, source_direction)
+            - potential_primitive_cpu(inner, probe, source_direction);
+
+        let steps = 200_000;
+        let width = (outer - inner) / steps as f64;
+        let numerical = (0..steps)
+            .map(|index| {
+                let lambda = inner + (index as f64 + 0.5) * width;
+                lambda * lambda / (lambda * source_direction - probe).length() * width
+            })
+            .sum::<f64>();
+        assert!((analytic - numerical).abs() / numerical < 1.0e-9);
+    }
+
+    #[test]
+    fn f32_potential_gradient_matches_direct_acceleration() {
+        let mut state = 0x1234_5678_u32;
+        let mut random = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state as f32 / u32::MAX as f32
+        };
+        let mut worst_relative_error = 0.0_f64;
+        for _ in 0..1_000 {
+            let direction = Vec3::new(
+                2.0 * random() - 1.0,
+                2.0 * random() - 1.0,
+                2.0 * random() - 1.0,
+            )
+            .normalize_or_zero();
+            let probe_direction = Vec3::new(
+                2.0 * random() - 1.0,
+                2.0 * random() - 1.0,
+                2.0 * random() - 1.0,
+            )
+            .normalize_or_zero();
+            if direction == Vec3::ZERO || probe_direction == Vec3::ZERO {
+                continue;
+            }
+            let probe = probe_direction * (550.0 + 1_950.0 * random());
+            let inner = 350.0 * random();
+            let outer = inner + (450.0 - inner) * (0.15 + 0.85 * random());
+            let actual = numerical_field_f32(inner, outer, direction, probe);
+
+            let steps = 2_048;
+            let width = (outer - inner) as f64 / steps as f64;
+            let probe_f64 = probe.as_dvec3();
+            let direction_f64 = direction.as_dvec3();
+            let (expected_acceleration, expected_potential) = (0..steps).fold(
+                (DVec3::ZERO, 0.0_f64),
+                |(acceleration, potential), index| {
+                    let lambda = inner as f64 + (index as f64 + 0.5) * width;
+                    let displacement = lambda * direction_f64 - probe_f64;
+                    (
+                        acceleration
+                            + lambda * lambda * displacement / displacement.length().powi(3)
+                                * width,
+                        potential + lambda * lambda / displacement.length() * width,
+                    )
+                },
+            );
+            let acceleration_error = (actual.xyz().as_dvec3() - expected_acceleration).length()
+                / expected_acceleration.length();
+            let potential_error = (actual.w as f64 - expected_potential).abs() / expected_potential;
+            worst_relative_error =
+                worst_relative_error.max(acceleration_error.max(potential_error));
+        }
+        assert!(
+            worst_relative_error < 0.02,
+            "worst f32 gradient mismatch was {worst_relative_error:.3e}"
+        );
     }
 }
