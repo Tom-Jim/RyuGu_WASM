@@ -5,6 +5,15 @@
 ![Rust](https://img.shields.io/badge/Rust-Edition_2024-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
+https://github.com/user-attachments/assets/a78d663a-cb98-47b3-91c3-7303a12346cd
+
+| Orbital Trajectory | Precession |
+| :---: | :---: |
+| <img src="https://github.com/user-attachments/assets/ddc359c3-5b81-47ee-95fd-a9a1ccf20107" width="100%"/> | <img src="https://github.com/user-attachments/assets/d9482e7a-2c14-46b4-91a8-71a884567236" width="100%"/> |
+| **Mass distribution** | **Probe view** |
+| <img src="https://github.com/user-attachments/assets/9959363f-ab28-45e5-b43d-98e076b1791b" width="100%"/> | <img src="https://github.com/user-attachments/assets/548a0e90-2b29-484b-a974-a4f28d4bfe17" width="100%"/> |
+---
+
 Ryugu WASM is a real-time gravitational-dynamics simulator for asteroid (162173) Ryugu. It is written in Rust with Bevy 0.19, compiled to WebAssembly, and uses WebGPU compute shaders for forward gravity evaluation.
 
 The simulator provides two GPU gravity modes:
