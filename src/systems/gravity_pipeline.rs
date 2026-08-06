@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_resource::{
-        BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+        BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
         BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
@@ -11,490 +11,487 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
 };
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-#[derive(Resource)]
-pub struct StruveLutSource {
-    pub bytes: Vec<u8>,
+const WORKGROUP_SIZE: u32 = 64;
+const RADIAL_LAYER_COUNT: u32 = 4;
+
+#[derive(Resource, Default)]
+struct ExtractedGravityInput {
+    probe: Vec3,
+    layer_bytes: Option<Vec<u8>>,
+    layer_count: u32,
 }
 
 #[derive(Resource, Default)]
-struct ExtractedGravInput {
-    probe_x: f32,
-    probe_y: f32,
-    probe_z: f32,
-    voxel_bytes: Option<Vec<u8>>,
-    lut_bytes: Option<Vec<u8>>,
-    voxel_count: u32,
-}
+struct GravityGpuBuffers(Option<GravityGpuBuffersInner>);
 
-#[derive(Resource, Default)]
-struct GravGpuBuffers(Option<GravGpuBuffersInner>);
-
-struct GravGpuBuffersInner {
-    uniform_buf: bevy::render::render_resource::Buffer,
-    voxel_buf: bevy::render::render_resource::Buffer,
-    output_buf: bevy::render::render_resource::Buffer,
-    lut_buf: bevy::render::render_resource::Buffer,
-    voxel_count: u32,
-    n_workgroups: u32,
+struct GravityGpuBuffersInner {
+    uniform: bevy::render::render_resource::Buffer,
+    output: bevy::render::render_resource::Buffer,
+    staging: bevy::render::render_resource::Buffer,
+    bind_group: BindGroup,
+    layer_count: u32,
+    workgroup_count: u32,
+    output_size: u64,
 }
 
 #[derive(Resource)]
-struct GravComputePipeline {
+struct GravityComputePipeline {
     pipeline_id: CachedComputePipelineId,
 }
 
-#[derive(Resource, Default, PartialEq, Eq)]
-enum GravDispatchState {
-    #[default]
-    NeedsBuild,
-    Ready,
-    Dispatched,
-}
-
 pub struct GravityComputePlugin;
+
 impl Plugin for GravityComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GravityReadbackChannel>();
         app.add_systems(
             Update,
-            (build_gravity_voxels_system, poll_gravity_readback).chain(),
+            (build_radial_gravity_source_system, poll_gravity_readback).chain(),
         );
 
         let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<ExtractedGravInput>();
-        render_app.init_resource::<GravGpuBuffers>();
-        render_app.init_resource::<GravDispatchState>();
-
-        render_app.add_systems(ExtractSchedule, extract_grav_input_system);
-        render_app.add_systems(Render, dispatch_grav_system.in_set(RenderSystems::Render));
+        render_app.init_resource::<ExtractedGravityInput>();
+        render_app.init_resource::<GravityGpuBuffers>();
+        render_app.add_systems(ExtractSchedule, extract_gravity_input_system);
+        render_app.add_systems(
+            Render,
+            dispatch_gravity_system.in_set(RenderSystems::Render),
+        );
     }
 
     fn finish(&self, app: &mut App) {
         let channel = app.world().resource::<GravityReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<GravComputePipeline>();
+        render_app.init_resource::<GravityComputePipeline>();
     }
 }
 
-impl FromWorld for GravComputePipeline {
+impl FromWorld for GravityComputePipeline {
     fn from_world(world: &mut World) -> Self {
-        // 4 bindings: uniform(0), voxels(1), output(2), LUT(3)
-        let entries = [
-            uniform_entry(0),
-            storage_ro_entry(1),
-            storage_rw_entry(2),
-            storage_ro_entry(3),
-        ];
-
-        let bgl = BindGroupLayoutDescriptor::new("grav_bgl", &entries);
+        let entries = [uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)];
+        let layout = BindGroupLayoutDescriptor::new("radial_gravity_bgl", &entries);
         let shader = world.resource::<AssetServer>().load("shaders/gravity.wgsl");
-
         let pipeline_id =
             world
                 .resource::<PipelineCache>()
                 .queue_compute_pipeline(ComputePipelineDescriptor {
-                    label: Some("grav_compute".into()),
-                    layout: vec![bgl],
+                    label: Some("radial_gravity_compute".into()),
+                    layout: vec![layout],
                     immediate_size: 0,
                     shader,
                     shader_defs: vec![],
                     entry_point: None,
                     zero_initialize_workgroup_memory: false,
                 });
-
-        GravComputePipeline { pipeline_id }
+        Self { pipeline_id }
     }
 }
 
-fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
-    BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-            ty: BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn storage_ro_entry(binding: u32) -> BindGroupLayoutEntry {
-    BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-            ty: BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn storage_rw_entry(binding: u32) -> BindGroupLayoutEntry {
-    BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-            ty: BufferBindingType::Storage { read_only: false },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-pub fn build_gravity_voxels_system(
+/// Builds the angular-cell/radial-layer discretization used by equation (18).
+/// The mesh is assumed star-shaped with respect to its model origin, which is
+/// true for the Ryugu asset. A non-star-shaped mesh would require multiple
+/// radial intervals per angular cell.
+pub fn build_radial_gravity_source_system(
     mut commands: Commands,
-    topo: Option<Res<AsteroidTopologyGpuData>>,
-    ryugu_q: Query<&Transform, With<RyuguMarker>>,
-    existing_voxels: Option<Res<GravVoxelSource>>,
-    existing_lut: Option<Res<StruveLutSource>>,
-    density_c: Option<Res<DensityC>>,
+    topology: Option<Res<AsteroidTopologyGpuData>>,
+    ryugu: Query<&Transform, With<RyuguMarker>>,
+    existing: Option<Res<RadialGravitySource>>,
 ) {
-    if existing_lut.is_none() {
-        let lut_bytes = include_bytes!("../../lut_struve.bin").to_vec();
-        commands.insert_resource(StruveLutSource { bytes: lut_bytes });
-    }
-
-    if existing_voxels.is_some() {
+    if existing.is_some() {
         return;
     }
-    let Some(topo) = topo else { return };
-    let Ok(ryugu_tf) = ryugu_q.single() else {
+    let Some(topology) = topology else { return };
+    let Ok(transform) = ryugu.single() else {
         return;
     };
-    if topo.positions.is_empty() {
+    if topology.triangles.is_empty() {
         return;
     }
 
-    let scale = ryugu_tf.scale.x;
-    let eps = DENSITY_EPSILON;
-    // Density coefficient C solved once in scale.rs by 4-point Gaussian quadrature
-    // over origin-anchored tets; reusing it here keeps per-voxel masses consistent
-    // with the integral that produced it.
-    let c_val = density_c.map(|r| r.0).unwrap_or(1.0);
+    let scale = transform.scale.x;
+    let mut cells = Vec::with_capacity(topology.triangles.len() / 3);
+    let mut density_integral = 0.0_f64;
+    let mut solid_angle_sum = 0.0_f64;
 
-    // 4-point Gaussian quadrature weights on a reference tetrahedron (a for the
-    // barycentric-self vertex, b for each of the three mixed vertices).
-    let a = (5.0 + 3.0 * 5.0_f32.sqrt()) / 20.0;
-    let b = (5.0 - 5.0_f32.sqrt()) / 20.0;
+    for tri in topology.triangles.chunks_exact(3) {
+        let p0 = topology.positions[tri[0] as usize] * scale;
+        let p1 = topology.positions[tri[1] as usize] * scale;
+        let p2 = topology.positions[tri[2] as usize] * scale;
+        let Some((direction, radius, solid_angle)) = angular_cell(p0, p1, p2) else {
+            continue;
+        };
+        cells.push((direction, radius, solid_angle));
+        solid_angle_sum += solid_angle as f64;
+        density_integral += solid_angle as f64
+            * radial_density_integral(0.0, radius as f64, DENSITY_EPSILON as f64);
+    }
 
-    let expected_voxels = (topo.triangles.len() / 3) * 4;
-    let mut voxel_bytes = Vec::with_capacity(expected_voxels * 16);
-    let mut voxel_count = 0;
+    if cells.is_empty() || density_integral <= f64::EPSILON {
+        error!("[gravity] failed to build equation (18) angular cells");
+        return;
+    }
 
-    // Iterate every origin-anchored tet (one per surface triangle). Each tet
-    // contributes its signed volume times the 1/r density at the 4 Gauss points,
-    // so the summed voxel masses reproduce RYUGU_MASS without any manual scaling.
-    for chunk in topo.triangles.chunks(3) {
-        let va = topo.positions[chunk[0] as usize] * scale;
-        let vb = topo.positions[chunk[1] as usize] * scale;
-        let vc = topo.positions[chunk[2] as usize] * scale;
+    let density_c = (RYUGU_MASS as f64 / density_integral) as f32;
+    let mut bytes = Vec::with_capacity(cells.len() * RADIAL_LAYER_COUNT as usize * 32);
 
-        let vol = va.dot(vb.cross(vc)) / 6.0;
+    for (direction, radius, solid_angle) in cells {
+        for layer in 0..RADIAL_LAYER_COUNT {
+            // Equal-volume shells avoid over-resolving the small central region.
+            let inner_fraction = (layer as f32 / RADIAL_LAYER_COUNT as f32).cbrt();
+            let outer_fraction = ((layer + 1) as f32 / RADIAL_LAYER_COUNT as f32).cbrt();
+            let r_inner = radius * inner_fraction;
+            let r_outer = radius * outer_fraction;
+            let shell_measure = (r_outer.powi(3) - r_inner.powi(3)) / 3.0;
+            let shell_integral =
+                radial_density_integral(r_inner as f64, r_outer as f64, DENSITY_EPSILON as f64)
+                    as f32;
+            let density = density_c * shell_integral / shell_measure.max(f32::MIN_POSITIVE);
 
-        let p1 = va * a + vb * b + vc * b;
-        let p2 = va * b + vb * a + vc * b;
-        let p3 = va * b + vb * b + vc * a;
-        let p4 = va * b + vb * b + vc * b;
-
-        let points = [p1, p2, p3, p4];
-
-        for p in points {
-            let r = p.length().max(1e-3);
-            let density = c_val / (r + eps);
-
-            // Per-voxel mass = (1/4) * tet signed-volume * local density. Negative
-            // volumes from concavities yield negative masses, cancelling the false
-            // pull that concave regions would otherwise exert.
-            let mass = vol * 0.25 * density;
-
-            voxel_bytes.extend_from_slice(&p.x.to_le_bytes());
-            voxel_bytes.extend_from_slice(&p.y.to_le_bytes());
-            voxel_bytes.extend_from_slice(&p.z.to_le_bytes());
-            voxel_bytes.extend_from_slice(&mass.to_le_bytes());
-
-            voxel_count += 1;
+            push_f32s(
+                &mut bytes,
+                [direction.x, direction.y, direction.z, solid_angle],
+            );
+            push_f32s(&mut bytes, [r_inner, r_outer, density, 0.0]);
         }
     }
 
-    // The summed voxel masses exactly equal RYUGU_MASS — the 1/r density kernel
-    // and the same 4-point quadrature that produced C make this self-consistent,
-    // so no manual mass_scale is needed here.
-    commands.insert_resource(GravVoxelSource {
-        bytes: voxel_bytes,
-        count: voxel_count,
-    });
+    let count = (bytes.len() / 32) as u32;
+    info!(
+        "[gravity] equation (18): {} angular cells, {} radial layers, solid-angle sum={:.6}, C={:.6e}",
+        count / RADIAL_LAYER_COUNT,
+        count,
+        solid_angle_sum,
+        density_c
+    );
+    if (solid_angle_sum - std::f64::consts::TAU * 2.0).abs() > 0.05 {
+        warn!(
+            "[gravity] mesh subtends {:.6} sr instead of 4π; check that it is closed and star-shaped",
+            solid_angle_sum
+        );
+    }
+
+    commands.insert_resource(DensityC(density_c));
+    commands.insert_resource(RadialGravitySource { bytes, count });
 }
 
-pub fn poll_gravity_readback(
+fn angular_cell(p0: Vec3, p1: Vec3, p2: Vec3) -> Option<(Vec3, f32, f32)> {
+    let n0 = p0.try_normalize()?;
+    let n1 = p1.try_normalize()?;
+    let n2 = p2.try_normalize()?;
+    let direction = (n0 + n1 + n2).try_normalize()?;
+
+    let numerator = n0.dot(n1.cross(n2)).abs();
+    let denominator = 1.0 + n0.dot(n1) + n1.dot(n2) + n2.dot(n0);
+    let solid_angle = 2.0 * numerator.atan2(denominator);
+    if !solid_angle.is_finite() || solid_angle <= 0.0 {
+        return None;
+    }
+
+    let face_normal = (p1 - p0).cross(p2 - p0);
+    let divisor = face_normal.dot(direction);
+    let plane_radius = face_normal.dot(p0) / divisor;
+    let centroid_radius = ((p0 + p1 + p2) / 3.0).length();
+    let radius = if plane_radius.is_finite() && plane_radius > 0.0 {
+        plane_radius
+    } else {
+        centroid_radius
+    };
+    (radius > 0.0).then_some((direction, radius, solid_angle))
+}
+
+/// Integral of r²/(r+epsilon), evaluated in f64 to avoid cancellation near 0.
+fn radial_density_integral(inner: f64, outer: f64, epsilon: f64) -> f64 {
+    fn primitive(r: f64, epsilon: f64) -> f64 {
+        0.5 * r * r - epsilon * r + epsilon * epsilon * (1.0 + r / epsilon).ln()
+    }
+    primitive(outer, epsilon) - primitive(inner, epsilon)
+}
+
+fn push_f32s(bytes: &mut Vec<u8>, values: [f32; 4]) {
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn poll_gravity_readback(
     channel: Res<GravityReadbackChannel>,
-    mut grav_acc: ResMut<GravityAcceleration>,
-    time: Res<Time>,
+    mut acceleration: ResMut<GravityAcceleration>,
 ) {
-    let Ok(mut guard) = channel.0.try_lock() else {
+    let Ok(mut guard) = channel.data.try_lock() else {
         return;
     };
     let Some(partial_sums) = guard.take() else {
         return;
     };
-
-    let total = partial_sums
-        .iter()
-        .fold(Vec3::ZERO, |acc, v| acc + Vec3::new(v[0], v[1], v[2]));
-
-    if !total.is_finite() {
-        warn!(
-            "[gravity] GPU readback NaN/Inf detected — discarding. partial_sums[0]={:?}",
-            partial_sums.first()
-        );
-        return;
+    let total = partial_sums.iter().fold(Vec3::ZERO, |sum, value| {
+        sum + Vec3::new(value[0], value[1], value[2])
+    });
+    if total.is_finite() {
+        acceleration.0 = total;
+    } else {
+        warn!("[gravity] discarded non-finite equation (18) GPU result");
     }
-
-    let frame = (time.elapsed_secs() * 60.0) as u32;
-    if frame % 120 == 0 {
-        info!(
-            "[gravity] GPU acc=({:.3e},{:.3e},{:.3e}) |mag|={:.3e} n_wg={}",
-            total.x,
-            total.y,
-            total.z,
-            total.length(),
-            partial_sums.len()
-        );
-    }
-
-    grav_acc.0 = total;
 }
 
-fn extract_grav_input_system(
-    mut extracted: ResMut<ExtractedGravInput>,
-    mut dispatch: ResMut<GravDispatchState>,
-    voxels: Extract<Option<Res<GravVoxelSource>>>,
-    lut: Extract<Option<Res<StruveLutSource>>>,
-    cassini_q: Extract<Query<&Transform, With<CassiniMarker>>>,
-    ryugu_q: Extract<Query<&Transform, With<RyuguMarker>>>,
+fn extract_gravity_input_system(
+    mut extracted: ResMut<ExtractedGravityInput>,
+    source: Extract<Option<Res<RadialGravitySource>>>,
+    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
+    ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    if *dispatch == GravDispatchState::Dispatched {
-        *dispatch = GravDispatchState::Ready;
-    }
-
-    let Some(vox_src) = voxels.as_ref() else {
-        return;
-    };
-    let Some(lut_src) = lut.as_ref() else {
-        return;
-    };
-    let Ok(cassini_tf) = cassini_q.single() else {
-        return;
-    };
-    let Ok(ryugu_tf) = ryugu_q.single() else {
+    let (Some(source), Ok(cassini), Ok(ryugu)) =
+        (source.as_ref(), cassini.single(), ryugu.single())
+    else {
         return;
     };
 
-    let inv_rot = ryugu_tf.rotation.inverse();
-    let local_pos = inv_rot * (cassini_tf.translation - ryugu_tf.translation);
-
-    extracted.probe_x = local_pos.x;
-    extracted.probe_y = local_pos.y;
-    extracted.probe_z = local_pos.z;
-    extracted.voxel_count = vox_src.count;
-
-    if extracted.voxel_bytes.is_none() {
-        extracted.voxel_bytes = Some(vox_src.bytes.clone());
-    }
-    if extracted.lut_bytes.is_none() {
-        extracted.lut_bytes = Some(lut_src.bytes.clone());
+    extracted.probe = ryugu.rotation.inverse() * (cassini.translation - ryugu.translation);
+    extracted.layer_count = source.count;
+    if extracted.layer_bytes.is_none() {
+        extracted.layer_bytes = Some(source.bytes.clone());
     }
 }
 
-fn dispatch_grav_system(
-    mut state: ResMut<GravDispatchState>,
-    mut buffers: ResMut<GravGpuBuffers>,
-    pipeline_res: Option<Res<GravComputePipeline>>,
+fn dispatch_gravity_system(
+    mut buffers: ResMut<GravityGpuBuffers>,
+    pipeline_resource: Option<Res<GravityComputePipeline>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    extracted: Res<ExtractedGravInput>,
+    extracted: Res<ExtractedGravityInput>,
     channel: Res<GravityReadbackChannel>,
 ) {
-    if *state == GravDispatchState::Dispatched {
-        return;
-    }
-    let Some(pl) = pipeline_res else { return };
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pl.pipeline_id) else {
+    let Some(pipeline_resource) = pipeline_resource else {
         return;
     };
-    if extracted.voxel_count == 0 {
+    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
+        return;
+    };
+    if extracted.layer_count == 0 {
         return;
     }
 
     if buffers.0.is_none() {
-        let Some(voxel_bytes) = extracted.voxel_bytes.as_ref() else {
+        let Some(layer_bytes) = extracted.layer_bytes.as_ref() else {
             return;
         };
-        let Some(lut_bytes) = extracted.lut_bytes.as_ref() else {
-            return;
-        };
-
-        let n_wg = extracted.voxel_count.div_ceil(64);
-        let out_sz = (n_wg as u64) * 16;
-
-        // GravParams uniform: strictly 80 bytes for WGSL memory alignment
-        let uniform_buf = render_device.create_buffer(&BufferDescriptor {
-            label: Some("grav_uniform"),
-            size: 80,
+        let workgroup_count = extracted.layer_count.div_ceil(WORKGROUP_SIZE);
+        let output_size = workgroup_count as u64 * 16;
+        let uniform = render_device.create_buffer(&BufferDescriptor {
+            label: Some("radial_gravity_uniform"),
+            size: 32,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let voxel_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("grav_voxels"),
-            contents: voxel_bytes,
+        let layers = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("radial_gravity_layers"),
+            contents: layer_bytes,
             usage: BufferUsages::STORAGE,
         });
-
-        let lut_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("grav_lut"),
-            contents: lut_bytes,
-            usage: BufferUsages::STORAGE,
-        });
-
-        let output_buf = render_device.create_buffer(&BufferDescriptor {
-            label: Some("grav_output"),
-            size: out_sz,
+        let output = render_device.create_buffer(&BufferDescriptor {
+            label: Some("radial_gravity_output"),
+            size: output_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-
-        buffers.0 = Some(GravGpuBuffersInner {
-            uniform_buf,
-            voxel_buf,
-            output_buf,
-            lut_buf,
-            voxel_count: extracted.voxel_count,
-            n_workgroups: n_wg,
+        let staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("radial_gravity_staging"),
+            size: output_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
         });
-        *state = GravDispatchState::Ready;
+        let layout = render_device.create_bind_group_layout(
+            "radial_gravity_bgl_runtime",
+            &[uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)],
+        );
+        let bind_group = render_device.create_bind_group(
+            "radial_gravity_bg",
+            &layout,
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: layers.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        );
+        buffers.0 = Some(GravityGpuBuffersInner {
+            uniform,
+            output,
+            staging,
+            bind_group,
+            layer_count: extracted.layer_count,
+            workgroup_count,
+            output_size,
+        });
     }
 
-    if *state != GravDispatchState::Ready {
+    let inner = buffers.0.as_ref().expect("gravity buffers initialized");
+    if channel
+        .in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return;
     }
 
-    let bufs = buffers.0.as_ref().unwrap();
-    let n_wg = bufs.n_workgroups;
-    let out_sz = (n_wg as u64) * 16;
-
-    let v_stehfest: [f32; 12] = [
-        1.0, -49.0, 366.0, -858.0, 810.0, -270.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    ];
-
-    // Build 80-byte uniform buffer strictly packed
-    let mut ub = Vec::<u8>::with_capacity(80);
-    for f in [extracted.probe_x, extracted.probe_y, extracted.probe_z, G] {
-        ub.extend_from_slice(&f.to_le_bytes());
-    }
-    ub.extend_from_slice(&bufs.voxel_count.to_le_bytes());
-
-    // Stehfest M=3 (6 terms): reduced order for performance/stability tradeoff
-    ub.extend_from_slice(&3u32.to_le_bytes());
-
-    ub.extend_from_slice(&0f32.to_le_bytes()); // _pad0
-    ub.extend_from_slice(&0f32.to_le_bytes()); // _pad1
-    for v in v_stehfest.iter() {
-        ub.extend_from_slice(&v.to_le_bytes());
-    }
-
-    render_queue.write_buffer(&bufs.uniform_buf, 0, &ub);
-
-    let staging = render_device.create_buffer(&BufferDescriptor {
-        label: Some("grav_staging"),
-        size: out_sz,
-        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let bgl = render_device.create_bind_group_layout(
-        "grav_bgl_rt",
-        &[
-            uniform_entry(0),
-            storage_ro_entry(1),
-            storage_rw_entry(2),
-            storage_ro_entry(3), // LUT attached!
-        ],
-    );
-
-    let bind_group = render_device.create_bind_group(
-        "grav_bg",
-        &bgl,
-        &[
-            BindGroupEntry {
-                binding: 0,
-                resource: bufs.uniform_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: bufs.voxel_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 2,
-                resource: bufs.output_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 3,
-                resource: bufs.lut_buf.as_entire_binding(),
-            },
-        ],
-    );
+    let uniform_bytes = gravity_uniform_bytes(extracted.probe, inner.layer_count);
+    render_queue.write_buffer(&inner.uniform, 0, &uniform_bytes);
 
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("grav_encoder"),
+        label: Some("radial_gravity_encoder"),
     });
-
     {
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("grav_pass"),
+            label: Some("radial_gravity_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(n_wg, 1, 1);
+        pass.set_bind_group(0, &inner.bind_group, &[]);
+        pass.dispatch_workgroups(inner.workgroup_count, 1, 1);
     }
-
-    encoder.copy_buffer_to_buffer(&bufs.output_buf, 0, &staging, 0, out_sz);
+    encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);
     render_queue.submit([encoder.finish()]);
 
-    let shared = Arc::clone(&channel.0);
-    let staging_ref = staging.clone();
-
-    staging.slice(..).map_async(MapMode::Read, move |result| {
-        if result.is_ok() {
-            let view = staging_ref.slice(..).get_mapped_range();
-            let partial = bytes_to_f32x4(&view);
-            if let Ok(mut lock) = shared.lock() {
-                *lock = Some(partial);
+    let shared = Arc::clone(&channel.data);
+    let in_flight = Arc::clone(&channel.in_flight);
+    let staging = inner.staging.clone();
+    let map_staging = staging.clone();
+    map_staging
+        .slice(..)
+        .map_async(MapMode::Read, move |result| {
+            if result.is_ok() {
+                let view = staging.slice(..).get_mapped_range();
+                let partial = bytes_to_f32x4(&view);
+                if let Ok(mut guard) = shared.lock() {
+                    *guard = Some(partial);
+                }
+                drop(view);
+                staging.unmap();
             }
-            drop(view);
-            staging_ref.unmap();
-        }
-    });
+            in_flight.store(false, Ordering::Release);
+        });
+}
 
-    *state = GravDispatchState::Dispatched;
+fn gravity_uniform_bytes(probe: Vec3, layer_count: u32) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    for (offset, value) in [(0, probe.x), (4, probe.y), (8, probe.z), (12, G)] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[16..20].copy_from_slice(&layer_count.to_le_bytes());
+    bytes
+}
+
+fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Uniform)
+}
+
+fn storage_ro_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Storage { read_only: true })
+}
+
+fn storage_rw_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Storage { read_only: false })
+}
+
+fn buffer_entry(binding: u32, buffer_type: BufferBindingType) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+            ty: buffer_type,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 fn bytes_to_f32x4(bytes: &[u8]) -> Vec<[f32; 4]> {
     bytes
         .chunks_exact(16)
-        .map(|c| {
-            let mut v = [0f32; 4];
-            for (i, b4) in c.chunks_exact(4).enumerate() {
-                v[i] = f32::from_le_bytes(b4.try_into().unwrap());
-            }
-            v
+        .map(|chunk| {
+            std::array::from_fn(|index| {
+                let start = index * 4;
+                f32::from_le_bytes(chunk[start..start + 4].try_into().unwrap())
+            })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::DVec3;
+
+    fn primitive_cpu(lambda: f64, probe: DVec3, source_direction: DVec3) -> DVec3 {
+        let radius = probe.length();
+        let probe_direction = probe / radius;
+        let cosine = probe_direction.dot(source_direction);
+        let a = radius * cosine;
+        let u = lambda - a;
+        let b2 = radius * radius * (1.0 - cosine * cosine);
+        let distance = (u * u + b2).sqrt();
+        let hyperbolic = (u / b2.sqrt()).asinh();
+        let j2 = hyperbolic - u / distance - 2.0 * a / distance + a * a * u / (b2 * distance);
+        let j3 = distance + b2 / distance + 3.0 * a * (hyperbolic - u / distance)
+            - 3.0 * a * a / distance
+            + a * a * a * u / (b2 * distance);
+        j3 * source_direction - radius * j2 * probe_direction
+    }
+
+    #[test]
+    fn density_integral_matches_numerical_quadrature() {
+        let analytic = radial_density_integral(3.0, 27.0, 10.0);
+        let steps = 100_000;
+        let h = 24.0 / steps as f64;
+        let numerical = (0..steps)
+            .map(|i| {
+                let r = 3.0 + (i as f64 + 0.5) * h;
+                r * r / (r + 10.0) * h
+            })
+            .sum::<f64>();
+        assert!((analytic - numerical).abs() / analytic < 1.0e-9);
+    }
+
+    #[test]
+    fn triangle_solid_angle_is_positive() {
+        let cell = angular_cell(Vec3::X, Vec3::Y, Vec3::Z).unwrap();
+        assert!((cell.2 - std::f32::consts::FRAC_PI_2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn gravity_uniform_matches_wgsl_layout() {
+        let bytes = gravity_uniform_bytes(Vec3::new(1.0, 2.0, 3.0), 42);
+        assert_eq!(f32::from_le_bytes(bytes[12..16].try_into().unwrap()), G);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn equation_18_primitive_matches_direct_radial_integral() {
+        let probe = DVec3::new(900.0, 130.0, 80.0);
+        let source_direction = DVec3::new(0.2, 0.7, 0.6).normalize();
+        let (inner, outer) = (30.0, 420.0);
+        let analytic = primitive_cpu(outer, probe, source_direction)
+            - primitive_cpu(inner, probe, source_direction);
+
+        let steps = 200_000;
+        let width = (outer - inner) / steps as f64;
+        let numerical = (0..steps).fold(DVec3::ZERO, |sum, index| {
+            let lambda = inner + (index as f64 + 0.5) * width;
+            let displacement = lambda * source_direction - probe;
+            sum + lambda * lambda * displacement / displacement.length().powi(3) * width
+        });
+        assert!((analytic - numerical).length() / numerical.length() < 1.0e-9);
+    }
 }

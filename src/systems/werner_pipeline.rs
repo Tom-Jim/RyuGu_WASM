@@ -3,49 +3,72 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_resource::{
-        BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+        BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
         BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-// =====================================================================
-// Shared resources: the "mailbox" between pipeline and physics
-// =====================================================================
+const WORKGROUP_SIZE: u32 = 64;
 
-/// Final Werner acceleration produced by the WGSL kernel, consumed by the
-/// main-world physics system.
 #[derive(Resource, Default)]
 pub struct WernerAcceleration(pub Vec3);
 
-/// Async CPU/GPU readback channel: GPU partial-sums land here for the poll
-/// system to reduce into `WernerAcceleration`.
 #[derive(Resource, Clone)]
-pub struct WernerReadbackChannel(pub Arc<std::sync::Mutex<Option<Vec<[f32; 4]>>>>);
+pub struct WernerReadbackChannel {
+    data: Arc<Mutex<Option<Vec<[f32; 4]>>>>,
+    in_flight: Arc<AtomicBool>,
+}
 
 impl Default for WernerReadbackChannel {
     fn default() -> Self {
-        Self(Arc::new(std::sync::Mutex::new(None)))
+        Self {
+            data: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
-// =====================================================================
-// Render-world state and extraction
-// =====================================================================
+/// Correct closed-polyhedron Werner data. Each edge record is five vec4 values
+/// (`p0`, `p1`, and three rows of E); each face is four vec4 values
+/// (`p0`, `p1`, `p2`, outward normal).
+#[derive(Resource)]
+struct WernerSource {
+    edge_bytes: Vec<u8>,
+    face_bytes: Vec<u8>,
+    edge_count: u32,
+    face_count: u32,
+    g_density: f32,
+}
+
+#[derive(Resource, Default)]
+struct ExtractedWernerInput {
+    probe: Vec3,
+    edge_bytes: Option<Vec<u8>>,
+    face_bytes: Option<Vec<u8>>,
+    edge_count: u32,
+    face_count: u32,
+    g_density: f32,
+}
 
 #[derive(Resource, Default)]
 struct WernerGpuBuffers(Option<WernerGpuBuffersInner>);
 
 struct WernerGpuBuffersInner {
-    uniform_buf: bevy::render::render_resource::Buffer,
-    vertex_buf: bevy::render::render_resource::Buffer,
-    index_buf: bevy::render::render_resource::Buffer,
-    output_buf: bevy::render::render_resource::Buffer,
-    density_buf: bevy::render::render_resource::Buffer,
-    n_workgroups: u32,
+    uniform: bevy::render::render_resource::Buffer,
+    output: bevy::render::render_resource::Buffer,
+    staging: bevy::render::render_resource::Buffer,
+    bind_group: BindGroup,
+    edge_count: u32,
+    face_count: u32,
+    item_count: u32,
+    workgroup_count: u32,
+    output_size: u64,
 }
 
 #[derive(Resource)]
@@ -53,32 +76,20 @@ struct WernerComputePipeline {
     pipeline_id: CachedComputePipelineId,
 }
 
-#[derive(Resource, Default, PartialEq, Eq)]
-enum WernerDispatchState {
-    #[default]
-    NeedsBuild,
-    Ready,
-    Dispatched,
-}
-
-// =====================================================================
-// Plugin assembly
-// =====================================================================
-
 pub struct WernerComputePlugin;
 
 impl Plugin for WernerComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WernerReadbackChannel>();
         app.init_resource::<WernerAcceleration>();
-
-        app.add_systems(Update, poll_werner_readback);
+        app.add_systems(
+            Update,
+            (build_werner_source_system, poll_werner_readback).chain(),
+        );
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedWernerInput>();
         render_app.init_resource::<WernerGpuBuffers>();
-        render_app.init_resource::<WernerDispatchState>();
-
         render_app.add_systems(ExtractSchedule, extract_werner_input_system);
         render_app.add_systems(Render, dispatch_werner_system.in_set(RenderSystems::Render));
     }
@@ -91,18 +102,15 @@ impl Plugin for WernerComputePlugin {
     }
 }
 
-// WGSL bind-group layout.
 impl FromWorld for WernerComputePipeline {
     fn from_world(world: &mut World) -> Self {
         let entries = [
-            uniform_entry(0),    // binding(0): params (GravParams)
-            storage_ro_entry(1), // binding(1): vertices
-            storage_ro_entry(2), // binding(2): indices
-            storage_rw_entry(3), // binding(3): partial_sums
-            storage_ro_entry(4), // binding(4): face_densities
+            uniform_entry(0),
+            storage_ro_entry(1),
+            storage_ro_entry(2),
+            storage_rw_entry(3),
         ];
-
-        let bgl = BindGroupLayoutDescriptor::new("werner_bgl", &entries);
+        let layout = BindGroupLayoutDescriptor::new("werner_bgl", &entries);
         let shader = world
             .resource::<AssetServer>()
             .load("shaders/werner_gravity.wgsl");
@@ -111,388 +119,492 @@ impl FromWorld for WernerComputePipeline {
                 .resource::<PipelineCache>()
                 .queue_compute_pipeline(ComputePipelineDescriptor {
                     label: Some("werner_compute".into()),
-                    layout: vec![bgl],
+                    layout: vec![layout],
                     immediate_size: 0,
                     shader,
                     shader_defs: vec![],
                     entry_point: None,
                     zero_initialize_workgroup_memory: false,
                 });
-        WernerComputePipeline { pipeline_id }
+        Self { pipeline_id }
     }
 }
 
-// =====================================================================
-// Extract: push the probe position into GPU memory
-// =====================================================================
-
-// Per-face local density `G * rho` is recomputed here (rather than reused from
-// the voxel source) so the GPU path remains a fair apples-to-apples comparison
-// with the CPU reference.
-#[derive(Resource, Default)]
-struct ExtractedWernerInput {
-    probe_x: f32,
-    probe_y: f32,
-    probe_z: f32,
-    num_faces: u32,
-    vertices_bytes: Option<Vec<u8>>,
-    indices_bytes: Option<Vec<u8>>,
-    densities_bytes: Option<Vec<u8>>,
+#[derive(Clone, Copy)]
+struct EdgeSide {
+    face_normal: Vec3,
+    edge_outward: Vec3,
 }
 
-// =====================================================================
-// Core split: each surface triangle becomes 4 outward Weyl faces
-// (1 surface triangle + 3 inner triangles against the origin vertex).
-// =====================================================================
-fn extract_werner_input_system(
-    mut extracted: ResMut<ExtractedWernerInput>,
-    mut dispatch: ResMut<WernerDispatchState>,
-    topo: Extract<Option<Res<AsteroidTopologyGpuData>>>,
-    density_c: Extract<Option<Res<DensityC>>>,
-    cassini_q: Extract<Query<&Transform, With<CassiniWernerMarker>>>,
-    ryugu_q: Extract<Query<&Transform, With<RyuguMarker>>>,
+fn build_werner_source_system(
+    mut commands: Commands,
+    topology: Option<Res<AsteroidTopologyGpuData>>,
+    ryugu: Query<&Transform, With<RyuguMarker>>,
+    existing: Option<Res<WernerSource>>,
 ) {
-    if *dispatch == WernerDispatchState::Dispatched {
-        *dispatch = WernerDispatchState::Ready;
+    if existing.is_some() {
+        return;
     }
-    let Some(topo_data) = topo.as_ref() else {
-        return;
-    };
-    let Ok(cassini_tf) = cassini_q.single() else {
-        return;
-    };
-    let Ok(ryugu_tf) = ryugu_q.single() else {
+    let Some(topology) = topology else { return };
+    let Ok(transform) = ryugu.single() else {
         return;
     };
 
-    let scale = ryugu_tf.scale.x;
-    let inv_rot = ryugu_tf.rotation.inverse();
-    let local_pos = inv_rot * (cassini_tf.translation - ryugu_tf.translation);
+    let scale = transform.scale.x;
+    let mut edge_sides: HashMap<(u32, u32), Vec<EdgeSide>> = HashMap::new();
+    let mut face_bytes = Vec::with_capacity(topology.triangles.len() / 3 * 64);
+    let mut volume = 0.0_f64;
+    let mut face_count = 0_u32;
 
-    extracted.probe_x = local_pos.x;
-    extracted.probe_y = local_pos.y;
-    extracted.probe_z = local_pos.z;
-    // Each surface triangle is split into 4 faces (1 surface + 3 inner), so the
-    // GPU sees 4× the triangle count of the raw mesh.
-    extracted.num_faces = (topo_data.triangles.len() / 3) as u32 * 4;
-
-    if extracted.vertices_bytes.is_none() {
-        let c_val = density_c.as_ref().map(|r| r.0).unwrap_or(1.0);
-        let eps = DENSITY_EPSILON;
-
-        let mut pos_bytes = Vec::with_capacity((topo_data.positions.len() + 1) * 16);
-        for p in topo_data.positions.iter() {
-            let sp = *p * scale;
-            pos_bytes.extend_from_slice(&sp.x.to_le_bytes());
-            pos_bytes.extend_from_slice(&sp.y.to_le_bytes());
-            pos_bytes.extend_from_slice(&sp.z.to_le_bytes());
-            pos_bytes.extend_from_slice(&0f32.to_le_bytes());
+    for triangle in topology.triangles.chunks_exact(3) {
+        let mut indices = [triangle[0], triangle[1], triangle[2]];
+        let mut points = [
+            topology.positions[indices[0] as usize] * scale,
+            topology.positions[indices[1] as usize] * scale,
+            topology.positions[indices[2] as usize] * scale,
+        ];
+        let centroid = (points[0] + points[1] + points[2]) / 3.0;
+        let raw_normal = (points[1] - points[0]).cross(points[2] - points[0]);
+        if raw_normal.dot(centroid) < 0.0 {
+            indices.swap(1, 2);
+            points.swap(1, 2);
         }
-        let origin_idx = topo_data.positions.len() as u32;
-        // Append the origin as an extra vertex so inner faces can reference it.
-        pos_bytes.extend_from_slice(&0f32.to_le_bytes());
-        pos_bytes.extend_from_slice(&0f32.to_le_bytes());
-        pos_bytes.extend_from_slice(&0f32.to_le_bytes());
-        pos_bytes.extend_from_slice(&0f32.to_le_bytes());
+        let Some(normal) = (points[1] - points[0])
+            .cross(points[2] - points[0])
+            .try_normalize()
+        else {
+            continue;
+        };
 
-        let mut idx_bytes = Vec::with_capacity(extracted.num_faces as usize * 12);
-        let mut density_bytes = Vec::with_capacity(extracted.num_faces as usize * 4);
-        let mut total_mass = 0.0;
-
-        // Pass 1: precompute per-tet mass and density (used only to derive
-        // RYUGU_MASS-aligned scaling — not stored on the GPU path).
-        struct Tet {
-            v0: u32,
-            v1: u32,
-            v2: u32,
-            density: f32,
+        volume += points[0]
+            .as_dvec3()
+            .dot(points[1].as_dvec3().cross(points[2].as_dvec3()))
+            / 6.0;
+        for point in points {
+            push_vec4(&mut face_bytes, point.extend(0.0));
         }
-        let mut tets = Vec::new();
+        push_vec4(&mut face_bytes, normal.extend(0.0));
+        face_count += 1;
 
-        for chunk in topo_data.triangles.chunks(3) {
-            let (i0, i1, i2) = (chunk[0], chunk[1], chunk[2]);
-            let v0 = topo_data.positions[i0 as usize] * scale;
-            let v1 = topo_data.positions[i1 as usize] * scale;
-            let v2 = topo_data.positions[i2 as usize] * scale;
-
-            let centroid = (v0 + v1 + v2) * 0.25; // Tet centroid = (v0+v1+v2+origin)/4
-            let r = centroid.length().max(1e-3);
-            let local_density = c_val / (r + eps);
-
-            let vol = (v0.dot(v1.cross(v2)) / 6.0).abs();
-            total_mass += vol * local_density;
-
-            tets.push(Tet {
-                v0: i0,
-                v1: i1,
-                v2: i2,
-                density: local_density,
+        for edge_index in 0..3 {
+            let next = (edge_index + 1) % 3;
+            let from_index = indices[edge_index];
+            let to_index = indices[next];
+            let edge_direction = (points[next] - points[edge_index]).normalize();
+            let edge_outward = edge_direction.cross(normal);
+            let key = if from_index < to_index {
+                (from_index, to_index)
+            } else {
+                (to_index, from_index)
+            };
+            edge_sides.entry(key).or_default().push(EdgeSide {
+                face_normal: normal,
+                edge_outward,
             });
         }
+    }
 
-        // Pass 2: scale densities so total mass matches RYUGU_MASS exactly,
-        // then emit the 4 outward-facing Weyl faces per tet.
-        let mass_scale = RYUGU_MASS / total_mass;
+    if volume <= f64::EPSILON || face_count == 0 {
+        error!("[werner] cannot build a positive-volume closed polyhedron");
+        return;
+    }
 
-        for t in tets {
-            let g_rho = G * t.density * mass_scale;
-            let g_rho_bytes = g_rho.to_le_bytes();
-
-            // 1. Outward surface triangle.
-            idx_bytes.extend_from_slice(&t.v0.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v1.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v2.to_le_bytes());
-            density_bytes.extend_from_slice(&g_rho_bytes);
-
-            // 2-4. Three inner triangles anchored at the origin. Winding order
-            // chosen so the outward normal points away from the surface.
-            idx_bytes.extend_from_slice(&origin_idx.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v1.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v0.to_le_bytes());
-            density_bytes.extend_from_slice(&g_rho_bytes);
-
-            idx_bytes.extend_from_slice(&origin_idx.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v2.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v1.to_le_bytes());
-            density_bytes.extend_from_slice(&g_rho_bytes);
-
-            idx_bytes.extend_from_slice(&origin_idx.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v0.to_le_bytes());
-            idx_bytes.extend_from_slice(&t.v2.to_le_bytes());
-            density_bytes.extend_from_slice(&g_rho_bytes);
+    let mut edge_bytes = Vec::with_capacity(edge_sides.len() * 80);
+    let mut edge_count = 0_u32;
+    let mut invalid_edges = 0_usize;
+    for ((first, second), sides) in edge_sides {
+        if sides.len() != 2 {
+            invalid_edges += 1;
+            continue;
         }
+        let p0 = topology.positions[first as usize] * scale;
+        let p1 = topology.positions[second as usize] * scale;
+        let tensor = outer_product(sides[0].face_normal, sides[0].edge_outward)
+            + outer_product(sides[1].face_normal, sides[1].edge_outward);
+        let rows = tensor.transpose();
+        push_vec4(&mut edge_bytes, p0.extend(0.0));
+        push_vec4(&mut edge_bytes, p1.extend(0.0));
+        push_vec4(&mut edge_bytes, rows.x_axis.extend(0.0));
+        push_vec4(&mut edge_bytes, rows.y_axis.extend(0.0));
+        push_vec4(&mut edge_bytes, rows.z_axis.extend(0.0));
+        edge_count += 1;
+    }
 
-        extracted.vertices_bytes = Some(pos_bytes);
-        extracted.indices_bytes = Some(idx_bytes);
-        extracted.densities_bytes = Some(density_bytes);
+    if invalid_edges != 0 {
+        warn!(
+            "[werner] skipped {} boundary/non-manifold edges; source mesh should be watertight",
+            invalid_edges
+        );
+    }
+    let density = RYUGU_MASS / volume as f32;
+    info!(
+        "[werner] closed polyhedron: {} faces, {} shared edges, volume={:.6e} m³, rho={:.6e} kg/m³",
+        face_count, edge_count, volume, density
+    );
+    commands.insert_resource(WernerSource {
+        edge_bytes,
+        face_bytes,
+        edge_count,
+        face_count,
+        g_density: G * density,
+    });
+    commands.insert_resource(WernerDensity(density));
+}
+
+/// Returns the dyad `left * right^T`.
+fn outer_product(left: Vec3, right: Vec3) -> Mat3 {
+    Mat3::from_cols(left * right.x, left * right.y, left * right.z)
+}
+
+fn push_vec4(bytes: &mut Vec<u8>, value: Vec4) {
+    for component in value.to_array() {
+        bytes.extend_from_slice(&component.to_le_bytes());
     }
 }
+
+fn extract_werner_input_system(
+    mut extracted: ResMut<ExtractedWernerInput>,
+    source: Extract<Option<Res<WernerSource>>>,
+    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
+    ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
+) {
+    let (Some(source), Ok(cassini), Ok(ryugu)) =
+        (source.as_ref(), cassini.single(), ryugu.single())
+    else {
+        return;
+    };
+    extracted.probe = ryugu.rotation.inverse() * (cassini.translation - ryugu.translation);
+    extracted.edge_count = source.edge_count;
+    extracted.face_count = source.face_count;
+    extracted.g_density = source.g_density;
+    if extracted.edge_bytes.is_none() {
+        extracted.edge_bytes = Some(source.edge_bytes.clone());
+        extracted.face_bytes = Some(source.face_bytes.clone());
+    }
+}
+
 fn dispatch_werner_system(
-    mut state: ResMut<WernerDispatchState>,
     mut buffers: ResMut<WernerGpuBuffers>,
-    pipeline_res: Option<Res<WernerComputePipeline>>,
+    pipeline_resource: Option<Res<WernerComputePipeline>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     extracted: Res<ExtractedWernerInput>,
     channel: Res<WernerReadbackChannel>,
 ) {
-    if *state == WernerDispatchState::Dispatched {
-        return;
-    }
-    let Some(pl) = pipeline_res else { return };
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pl.pipeline_id) else {
+    let Some(pipeline_resource) = pipeline_resource else {
         return;
     };
-
-    if extracted.num_faces == 0 {
+    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
+        return;
+    };
+    let item_count = extracted.edge_count.max(extracted.face_count);
+    if item_count == 0 {
         return;
     }
 
     if buffers.0.is_none() {
-        let n_wg = extracted.num_faces.div_ceil(64);
-        let out_sz = (extracted.num_faces as u64) * 16;
-
-        let uniform_buf = render_device.create_buffer(&BufferDescriptor {
+        let (Some(edge_bytes), Some(face_bytes)) =
+            (extracted.edge_bytes.as_ref(), extracted.face_bytes.as_ref())
+        else {
+            return;
+        };
+        let workgroup_count = item_count.div_ceil(WORKGROUP_SIZE);
+        let output_size = workgroup_count as u64 * 16;
+        let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("werner_uniform"),
             size: 32,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let vertex_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("werner_vertices"),
-            contents: extracted.vertices_bytes.as_ref().unwrap(),
+        let edges = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("werner_edges"),
+            contents: edge_bytes,
             usage: BufferUsages::STORAGE,
         });
-
-        let index_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("werner_indices"),
-            contents: extracted.indices_bytes.as_ref().unwrap(),
+        let faces = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("werner_faces"),
+            contents: face_bytes,
             usage: BufferUsages::STORAGE,
         });
-        let density_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("werner_densities"),
-            contents: extracted.densities_bytes.as_ref().unwrap(),
-            usage: BufferUsages::STORAGE,
-        });
-        let output_buf = render_device.create_buffer(&BufferDescriptor {
+        let output = render_device.create_buffer(&BufferDescriptor {
             label: Some("werner_output"),
-            size: out_sz,
+            size: output_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-
-        buffers.0 = Some(WernerGpuBuffersInner {
-            uniform_buf,
-            vertex_buf,
-            index_buf,
-            output_buf,
-            density_buf,
-            n_workgroups: n_wg,
+        let staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("werner_staging"),
+            size: output_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
         });
-        *state = WernerDispatchState::Ready;
+        let layout = render_device.create_bind_group_layout(
+            "werner_bgl_runtime",
+            &[
+                uniform_entry(0),
+                storage_ro_entry(1),
+                storage_ro_entry(2),
+                storage_rw_entry(3),
+            ],
+        );
+        let bind_group = render_device.create_bind_group(
+            "werner_bg",
+            &layout,
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: edges.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: faces.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        );
+        buffers.0 = Some(WernerGpuBuffersInner {
+            uniform,
+            output,
+            staging,
+            bind_group,
+            edge_count: extracted.edge_count,
+            face_count: extracted.face_count,
+            item_count,
+            workgroup_count,
+            output_size,
+        });
     }
 
-    if *state != WernerDispatchState::Ready {
+    let inner = buffers.0.as_ref().expect("Werner buffers initialized");
+    if channel
+        .in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return;
     }
+    let uniform_bytes = werner_uniform_bytes(
+        extracted.probe,
+        extracted.g_density,
+        inner.edge_count,
+        inner.face_count,
+        inner.item_count,
+    );
+    render_queue.write_buffer(&inner.uniform, 0, &uniform_bytes);
 
-    let bufs = buffers.0.as_ref().unwrap();
-    let out_sz = (extracted.num_faces as u64) * 16;
-
-    let mut ub = Vec::<u8>::with_capacity(32);
-    ub.extend_from_slice(&extracted.probe_x.to_le_bytes());
-    ub.extend_from_slice(&extracted.probe_y.to_le_bytes());
-    ub.extend_from_slice(&extracted.probe_z.to_le_bytes());
-    ub.extend_from_slice(&0f32.to_le_bytes());
-    ub.extend_from_slice(&0f32.to_le_bytes());
-    ub.extend_from_slice(&extracted.num_faces.to_le_bytes());
-    ub.extend_from_slice(&0f32.to_le_bytes());
-    ub.extend_from_slice(&0f32.to_le_bytes());
-    render_queue.write_buffer(&bufs.uniform_buf, 0, &ub);
-
-    let staging = render_device.create_buffer(&BufferDescriptor {
-        label: Some("werner_staging"),
-        size: out_sz,
-        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-        mapped_at_creation: false,
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("werner_encoder"),
     });
-
-    let bgl = render_device.create_bind_group_layout(
-        "werner_bgl_rt",
-        &[
-            uniform_entry(0),
-            storage_ro_entry(1),
-            storage_ro_entry(2),
-            storage_rw_entry(3),
-            storage_ro_entry(4),
-        ],
-    );
-    let bind_group = render_device.create_bind_group(
-        "werner_bg",
-        &bgl,
-        &[
-            BindGroupEntry {
-                binding: 0,
-                resource: bufs.uniform_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: bufs.vertex_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 2,
-                resource: bufs.index_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 3,
-                resource: bufs.output_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 4,
-                resource: bufs.density_buf.as_entire_binding(),
-            },
-        ],
-    );
-
-    let mut encoder =
-        render_device.create_command_encoder(&CommandEncoderDescriptor { label: None });
     {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("werner_pass"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(bufs.n_workgroups, 1, 1);
+        pass.set_bind_group(0, &inner.bind_group, &[]);
+        pass.dispatch_workgroups(inner.workgroup_count, 1, 1);
     }
-
-    encoder.copy_buffer_to_buffer(&bufs.output_buf, 0, &staging, 0, out_sz);
+    encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);
     render_queue.submit([encoder.finish()]);
 
-    let shared = Arc::clone(&channel.0);
-    let staging_ref = staging.clone();
-    staging.slice(..).map_async(MapMode::Read, move |result| {
-        if result.is_ok() {
-            let view = staging_ref.slice(..).get_mapped_range();
-            let partial = bytes_to_f32x4(&view);
-            if let Ok(mut lock) = shared.lock() {
-                *lock = Some(partial);
+    let shared = Arc::clone(&channel.data);
+    let in_flight = Arc::clone(&channel.in_flight);
+    let staging = inner.staging.clone();
+    let map_staging = staging.clone();
+    map_staging
+        .slice(..)
+        .map_async(MapMode::Read, move |result| {
+            if result.is_ok() {
+                let view = staging.slice(..).get_mapped_range();
+                let partial = bytes_to_f32x4(&view);
+                if let Ok(mut guard) = shared.lock() {
+                    *guard = Some(partial);
+                }
+                drop(view);
+                staging.unmap();
             }
-            drop(view);
-            staging_ref.unmap();
-        }
-    });
-    *state = WernerDispatchState::Dispatched;
+            in_flight.store(false, Ordering::Release);
+        });
 }
-// =====================================================================
-// Readback: CPU reduces GPU face contributions into one acceleration
-// =====================================================================
+
 fn poll_werner_readback(
     channel: Res<WernerReadbackChannel>,
-    mut werner_acc: ResMut<WernerAcceleration>,
+    mut acceleration: ResMut<WernerAcceleration>,
 ) {
-    let Ok(mut guard) = channel.0.try_lock() else {
+    let Ok(mut guard) = channel.data.try_lock() else {
         return;
     };
     let Some(partial_sums) = guard.take() else {
         return;
     };
-
-    // Sum the per-face GPU contributions (xyz channels; w is unused) into the
-    // single acceleration that physics_system consumes.
-    let total = partial_sums
-        .iter()
-        .fold(Vec3::ZERO, |acc, v| acc + Vec3::new(v[0], v[1], v[2]));
-
+    let total = partial_sums.iter().fold(Vec3::ZERO, |sum, value| {
+        sum + Vec3::new(value[0], value[1], value[2])
+    });
     if total.is_finite() {
-        werner_acc.0 = total;
+        acceleration.0 = total;
+    } else {
+        warn!("[werner] discarded non-finite GPU result");
     }
+}
+
+fn werner_uniform_bytes(
+    probe: Vec3,
+    g_density: f32,
+    edge_count: u32,
+    face_count: u32,
+    item_count: u32,
+) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    for (offset, value) in [(0, probe.x), (4, probe.y), (8, probe.z), (12, g_density)] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[16..20].copy_from_slice(&edge_count.to_le_bytes());
+    bytes[20..24].copy_from_slice(&face_count.to_le_bytes());
+    bytes[24..28].copy_from_slice(&item_count.to_le_bytes());
+    bytes
 }
 
 fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
-    BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-            ty: BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
+    buffer_entry(binding, BufferBindingType::Uniform)
 }
+
 fn storage_ro_entry(binding: u32) -> BindGroupLayoutEntry {
-    BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-            ty: BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
+    buffer_entry(binding, BufferBindingType::Storage { read_only: true })
 }
+
 fn storage_rw_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Storage { read_only: false })
+}
+
+fn buffer_entry(binding: u32, buffer_type: BufferBindingType) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {
         binding,
         visibility: ShaderStages::COMPUTE,
         ty: BindingType::Buffer {
-            ty: BufferBindingType::Storage { read_only: false },
+            ty: buffer_type,
             has_dynamic_offset: false,
             min_binding_size: None,
         },
         count: None,
     }
 }
+
 fn bytes_to_f32x4(bytes: &[u8]) -> Vec<[f32; 4]> {
     bytes
         .chunks_exact(16)
-        .map(|c| {
-            let mut v = [0f32; 4];
-            for (i, b4) in c.chunks_exact(4).enumerate() {
-                v[i] = f32::from_le_bytes(b4.try_into().unwrap());
-            }
-            v
+        .map(|chunk| {
+            std::array::from_fn(|index| {
+                let start = index * 4;
+                f32::from_le_bytes(chunk[start..start + 4].try_into().unwrap())
+            })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outer_product_applies_to_vector() {
+        let left = Vec3::new(1.0, 2.0, 3.0);
+        let right = Vec3::new(4.0, 5.0, 6.0);
+        let vector = Vec3::new(0.5, -1.0, 2.0);
+        let matrix = outer_product(left, right);
+        assert!((matrix * vector - left * right.dot(vector)).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn uniform_matches_wgsl_layout() {
+        let bytes = werner_uniform_bytes(Vec3::new(1.0, 2.0, 3.0), 4.0, 5, 6, 7);
+        assert_eq!(f32::from_le_bytes(bytes[12..16].try_into().unwrap()), 4.0);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 6);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 7);
+    }
+
+    #[test]
+    fn closed_tetrahedron_has_correct_far_field() {
+        let vertices = [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+        ];
+        let triangles = [[0_usize, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]];
+        let mut faces = Vec::new();
+        let mut sides: HashMap<(usize, usize), Vec<EdgeSide>> = HashMap::new();
+        let mut volume = 0.0;
+
+        for mut indices in triangles {
+            let mut points = [
+                vertices[indices[0]],
+                vertices[indices[1]],
+                vertices[indices[2]],
+            ];
+            let raw = (points[1] - points[0]).cross(points[2] - points[0]);
+            if raw.dot((points[0] + points[1] + points[2]) / 3.0) < 0.0 {
+                indices.swap(1, 2);
+                points.swap(1, 2);
+            }
+            let normal = (points[1] - points[0])
+                .cross(points[2] - points[0])
+                .normalize();
+            volume += points[0].dot(points[1].cross(points[2])) / 6.0;
+            faces.push((points, normal));
+            for edge_index in 0..3 {
+                let next = (edge_index + 1) % 3;
+                let key = if indices[edge_index] < indices[next] {
+                    (indices[edge_index], indices[next])
+                } else {
+                    (indices[next], indices[edge_index])
+                };
+                let edge_direction = (points[next] - points[edge_index]).normalize();
+                sides.entry(key).or_default().push(EdgeSide {
+                    face_normal: normal,
+                    edge_outward: edge_direction.cross(normal),
+                });
+            }
+        }
+
+        let probe = Vec3::new(20.0, 3.0, -2.0);
+        let mut edge_sum = Vec3::ZERO;
+        for ((first, second), adjacent) in sides {
+            assert_eq!(adjacent.len(), 2);
+            let r0 = vertices[first] - probe;
+            let r1 = vertices[second] - probe;
+            let edge_length = (vertices[second] - vertices[first]).length();
+            let logarithm = ((r0.length() + r1.length() + edge_length)
+                / (r0.length() + r1.length() - edge_length))
+                .ln();
+            let tensor = outer_product(adjacent[0].face_normal, adjacent[0].edge_outward)
+                + outer_product(adjacent[1].face_normal, adjacent[1].edge_outward);
+            edge_sum += tensor * r0 * logarithm;
+        }
+        let mut face_sum = Vec3::ZERO;
+        for (points, normal) in faces {
+            let r0 = points[0] - probe;
+            let r1 = points[1] - probe;
+            let r2 = points[2] - probe;
+            let denominator = r0.length() * r1.length() * r2.length()
+                + r0.length() * r1.dot(r2)
+                + r1.length() * r2.dot(r0)
+                + r2.length() * r0.dot(r1);
+            let solid_angle = 2.0 * r0.dot(r1.cross(r2)).atan2(denominator);
+            face_sum += normal * normal.dot(r0) * solid_angle;
+        }
+
+        let actual = -edge_sum + face_sum;
+        let expected = -probe.normalize() * volume / probe.length_squared();
+        assert!(actual.normalize().dot(expected.normalize()) > 0.999);
+        assert!((actual.length() / expected.length() - 1.0).abs() < 0.02);
+    }
 }

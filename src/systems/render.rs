@@ -100,30 +100,24 @@ pub fn camera_follow_system(
 pub fn render_gizmos_system(
     mut gizmos: Gizmos,
     camera_query: Query<&Transform, With<Camera3d>>,
-    cassini_query: Query<(
-        &Transform,
-        &OrbitHistory,
-        Option<&CassiniMarker>,
-        Option<&CassiniWernerMarker>,
-    )>,
+    cassini_query: Query<(&Transform, &OrbitHistory), With<CassiniMarker>>,
     global_transforms: Query<&GlobalTransform>,
     show_normals: Res<ShowNormals>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
     normals_data: Option<Res<AsteroidNormalsGpuData>>,
+    active_method: Res<ActiveGravityMethod>,
     time: Res<Time>,
 ) {
     let Some(cam) = camera_query.iter().next() else {
         return;
     };
-    for (ct, history, marker, werner_marker) in cassini_query.iter() {
+    for (ct, history) in cassini_query.iter() {
         let pts: Vec<Vec3> = history.0.iter().copied().collect();
-        if marker.is_some() {
-            // Cyan trajectory: GPU voxel NILT (active gravity method)
-            gizmos.linestrip(pts.into_iter(), Color::srgba(0.0, 1.0, 1.0, 0.8));
-        } else if werner_marker.is_some() {
-            // Red trajectory: decomposed-Werner polyhedron kernel
-            gizmos.linestrip(pts.into_iter(), Color::srgba(1.0, 0.2, 0.2, 0.8));
-        }
+        let orbit_color = match *active_method {
+            ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
+            ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
+        };
+        gizmos.linestrip(pts, orbit_color);
 
         if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
             let pos = ct.translation;
@@ -148,22 +142,20 @@ pub fn render_gizmos_system(
             );
         }
     }
-    if show_normals.0 {
-        if let (Some(topo), Some(normals)) = (topo, normals_data) {
-            if let Some(mesh_entity) = topo.mesh_entity {
-                if let Ok(mesh_gtf) = global_transforms.get(mesh_entity) {
-                    let rot = mesh_gtf.compute_transform().rotation;
-                    for (i, &local_pos) in topo.positions.iter().enumerate() {
-                        if i >= normals.0.len() {
-                            break;
-                        }
-                        let world_pos = mesh_gtf.transform_point(local_pos);
-                        let world_normal = (rot * normals.0[i]).normalize_or_zero();
-                        let tip = world_pos + world_normal * NORMAL_ARROW_LENGTH;
-                        gizmos.line(world_pos, tip, Color::srgb(0.2, 1.0, 0.8));
-                    }
-                }
+    if show_normals.0
+        && let (Some(topo), Some(normals)) = (topo, normals_data)
+        && let Some(mesh_entity) = topo.mesh_entity
+        && let Ok(mesh_gtf) = global_transforms.get(mesh_entity)
+    {
+        let rot = mesh_gtf.compute_transform().rotation;
+        for (i, &local_pos) in topo.positions.iter().enumerate() {
+            if i >= normals.0.len() {
+                break;
             }
+            let world_pos = mesh_gtf.transform_point(local_pos);
+            let world_normal = (rot * normals.0[i]).normalize_or_zero();
+            let tip = world_pos + world_normal * NORMAL_ARROW_LENGTH;
+            gizmos.line(world_pos, tip, Color::srgb(0.2, 1.0, 0.8));
         }
     }
 }
@@ -173,7 +165,9 @@ pub fn render_section_system(
     ryugu_query: Query<&Transform, With<RyuguMarker>>,
     camera_query: Query<&Transform, (With<Camera3d>, Without<RyuguMarker>)>,
     show_section: Res<ShowSection>,
+    active_method: Res<ActiveGravityMethod>,
     density_c: Option<Res<DensityC>>,
+    werner_density: Option<Res<WernerDensity>>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
 ) {
     if !show_section.0 {
@@ -187,7 +181,10 @@ pub fn render_section_system(
     };
     let Some(topo) = topo else { return };
     let c = density_c.map(|r| r.0).unwrap_or(1.0);
-    if c <= 0.0 {
+    let uniform_density = werner_density.map(|r| r.0).unwrap_or(0.0);
+    if (*active_method == ActiveGravityMethod::RadialAnalytic && c <= 0.0)
+        || (*active_method == ActiveGravityMethod::HomogeneousWerner && uniform_density <= 0.0)
+    {
         return;
     }
 
@@ -248,18 +245,25 @@ pub fn render_section_system(
                 continue;
             }
 
-            // Density in world space (r from CoM)
-            let r = (point - com).length().max(0.01);
-            let density = c / (r + eps);
-            let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
+            let color = match *active_method {
+                ActiveGravityMethod::RadialAnalytic => {
+                    // Continuous rho(r)=C/(r+epsilon) represented by equation (18).
+                    let r = (point - com).length().max(0.01);
+                    let density = c / (r + eps);
+                    let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
 
-            // Rainbow-thermal colormap: Red (center) → Yellow → Cyan → Blue/Purple (edge)
-            let color = if t > 0.75 {
-                Color::srgb(1.0, (1.0 - t) * 4.0, 0.0)
-            } else if t > 0.35 {
-                Color::srgb((t - 0.35) * 2.5, 1.0, (0.75 - t) * 2.5)
-            } else {
-                Color::srgb(0.0, t * 2.85, 0.5 + 0.5 * (1.0 - t * 2.85))
+                    // Red center → yellow → cyan → blue/purple edge.
+                    if t > 0.75 {
+                        Color::srgb(1.0, (1.0 - t) * 4.0, 0.0)
+                    } else if t > 0.35 {
+                        Color::srgb((t - 0.35) * 2.5, 1.0, (0.75 - t) * 2.5)
+                    } else {
+                        Color::srgb(0.0, t * 2.85, 0.5 + 0.5 * (1.0 - t * 2.85))
+                    }
+                }
+                // Every interior point has rho=M/V in the Werner model, so a
+                // single color is the only faithful normalized visualization.
+                ActiveGravityMethod::HomogeneousWerner => Color::srgb(0.15, 0.8, 1.0),
             };
             gizmos.sphere(point, dot_radius, color);
         }
@@ -284,16 +288,16 @@ pub fn section_alpha_system(
 
     let mut stack = vec![root];
     while let Some(curr) = stack.pop() {
-        if let Ok(handle) = material_handles.get(curr) {
-            if let Some(mut mat) = materials.get_mut(&handle.0) {
-                let srgba = mat.base_color.to_srgba();
-                if show_section.0 {
-                    mat.base_color = Color::srgba(srgba.red, srgba.green, srgba.blue, 0.25);
-                    mat.alpha_mode = AlphaMode::Blend;
-                } else {
-                    mat.base_color = Color::srgba(srgba.red, srgba.green, srgba.blue, 1.0);
-                    mat.alpha_mode = AlphaMode::Opaque;
-                }
+        if let Ok(handle) = material_handles.get(curr)
+            && let Some(mut mat) = materials.get_mut(&handle.0)
+        {
+            let srgba = mat.base_color.to_srgba();
+            if show_section.0 {
+                mat.base_color = Color::srgba(srgba.red, srgba.green, srgba.blue, 0.25);
+                mat.alpha_mode = AlphaMode::Blend;
+            } else {
+                mat.base_color = Color::srgba(srgba.red, srgba.green, srgba.blue, 1.0);
+                mat.alpha_mode = AlphaMode::Opaque;
             }
         }
         if let Ok(children) = children_query.get(curr) {

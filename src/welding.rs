@@ -29,5 +29,9 @@ pub fn weld_mesh_vertices(positions: &[Vec3], indices: &[u32], epsilon: f32) -> 
 
     let welded_indices = indices.iter().map(|&i| vert_remap[i as usize]).collect();
 
-    WeldedMesh { unique_positions, _vert_remap: vert_remap, welded_indices }
+    WeldedMesh {
+        unique_positions,
+        _vert_remap: vert_remap,
+        welded_indices,
+    }
 }

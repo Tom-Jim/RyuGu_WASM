@@ -10,9 +10,9 @@ pub fn physics_system(
     >,
     grav_acc: Res<GravityAcceleration>,
     werner_acc: Option<Res<WernerAcceleration>>,
-    grav_voxels: Option<Res<GravVoxelSource>>,
+    radial_source: Option<Res<RadialGravitySource>>,
     mut blend: ResMut<GravityBlendFactor>,
-    time: Res<Time>,
+    time: Res<Time<Fixed>>,
     active_method: Res<ActiveGravityMethod>,
 ) {
     let dt = time.delta_secs() * TIME_SCALE;
@@ -33,21 +33,19 @@ pub fn physics_system(
 
     const MAX_ACC: f32 = 1.5e-3;
 
-    let acceleration = if grav_voxels.is_some() {
-        let voxel_gpu_acc = r_transform.rotation * grav_acc.0;
+    let acceleration = if radial_source.is_some() {
+        let radial_gpu_acc = r_transform.rotation * grav_acc.0;
         let werner_gpu_acc = if let Some(acc) = &werner_acc {
             r_transform.rotation * acc.0
         } else {
             Vec3::ZERO
         };
-        let mut chosen_acc = match *active_method {
-            ActiveGravityMethod::VoxelStehfest => voxel_gpu_acc,
-            ActiveGravityMethod::DecomposedWerner => werner_gpu_acc,
+        let chosen_acc = match *active_method {
+            ActiveGravityMethod::RadialAnalytic => radial_gpu_acc,
+            ActiveGravityMethod::HomogeneousWerner => werner_gpu_acc,
         };
 
-        if !chosen_acc.is_finite() {
-            newtonian_acc
-        } else if chosen_acc == Vec3::ZERO {
+        if !chosen_acc.is_finite() || chosen_acc == Vec3::ZERO {
             newtonian_acc
         } else {
             let mag = chosen_acc.length();
@@ -75,7 +73,7 @@ pub fn physics_system(
 }
 pub fn ryugu_rotation_system(
     mut ryugu_query: Query<&mut Transform, With<RyuguMarker>>,
-    time: Res<Time>,
+    time: Res<Time<Fixed>>,
 ) {
     let dt = time.delta_secs() * TIME_SCALE;
     let angular_speed = std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS;

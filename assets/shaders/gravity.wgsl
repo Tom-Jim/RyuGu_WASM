@@ -1,122 +1,134 @@
-// GravParams: 80 bytes (Strict 16-byte alignment enforced by WGSL array<vec4>)
-struct GravParams {
-    probe_x:     f32,  // 0-3
-    probe_y:     f32,  // 4-7
-    probe_z:     f32,  // 8-11
-    G_const:     f32,  // 12-15
-    voxel_count: u32,  // 16-19
-    stehfest_M:  u32,  // 20-23
-    _pad0:       f32,  // 24-27
-    _pad1:       f32,  // 28-31
-    V:           array<vec4<f32>, 3>, // 32-79 (12 floats packed into 3 vec4s)
-}
+// Spatial-domain radial analytic forward model (equation 18).
+// One invocation evaluates one angular-cell/radial-layer pair; workgroups
+// reduce their 64 contributions before asynchronous CPU readback.
 
-struct VoxelData {
-    x:    f32,
-    y:    f32,
-    z:    f32,
-    mass: f32,
-}
+struct GravityParams {
+    probe_pos: vec3<f32>,
+    g_const: f32,
+    layer_count: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
+};
 
-@group(0) @binding(0) var<uniform>             params:     GravParams;
-@group(0) @binding(1) var<storage, read>       voxels:     array<VoxelData>;
+struct RadialLayer {
+    direction_solid_angle: vec4<f32>,
+    radii_density: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> params: GravityParams;
+@group(0) @binding(1) var<storage, read> layers: array<RadialLayer>;
 @group(0) @binding(2) var<storage, read_write> output_acc: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read>       lut:        array<vec2<f32>>; // S0 and S1
 
 var<workgroup> shared_acc: array<vec4<f32>, 64>;
 
-fn get_S_modes(z: f32) -> vec2<f32> {
-    let max_z = 200.0;
-    let n_samples = 4096.0;
-
-    // Clamp to prevent out-of-bounds LUT sampling
-    let idx_f = clamp((z / max_z) * (n_samples - 1.0), 0.0, n_samples - 1.0);
-
-    let idx0 = u32(idx_f);
-    let idx1 = min(idx0 + 1u, u32(n_samples - 1.0));
-    let fract = idx_f - f32(idx0);
-
-    let s0 = lut[idx0];
-    let s1 = lut[idx1];
-
-    return mix(s0, s1, fract);
+fn asinh_safe(x: f32) -> f32 {
+    let ax = abs(x);
+    let value = log(ax + sqrt(ax * ax + 1.0));
+    if x < 0.0 {
+        return -value;
+    }
+    return value;
 }
 
-fn compute_voxel_acc(idx: u32) -> vec3<f32> {
-    let probe = vec3<f32>(params.probe_x, params.probe_y, params.probe_z);
-    let v     = voxels[idx];
-    let p_i   = vec3<f32>(v.x, v.y, v.z);
+// K(lambda) = J3(lambda) n' - R J2(lambda) n.
+fn radial_primitive(lambda: f32, radius: f32, cosine: f32, source_dir: vec3<f32>, probe_dir: vec3<f32>) -> vec3<f32> {
+    let a = radius * cosine;
+    let u = lambda - a;
+    let b2 = max(radius * radius * (1.0 - cosine * cosine), 1.0e-12);
+    let b = sqrt(b2);
+    let distance = sqrt(u * u + b2);
+    let hyperbolic = asinh_safe(u / b);
 
-    let h_vec = probe - p_i;
-    let h = length(h_vec);
+    let j2 = hyperbolic - u / distance - 2.0 * a / distance
+        + a * a * u / (b2 * distance);
+    let j3 = distance + b2 / distance
+        + 3.0 * a * (hyperbolic - u / distance)
+        - 3.0 * a * a / distance
+        + a * a * a * u / (b2 * distance);
+    return j3 * source_dir - radius * j2 * probe_dir;
+}
 
-    if h < 1e-6 {
+// Collinear and near-collinear directions make the closed form ill-conditioned
+// even though the integral is finite away from the surface. The derivation
+// explicitly permits a numerical fallback, so use 8-point Gauss-Legendre here.
+fn collinear_quadrature(inner: f32, outer: f32, source_dir: vec3<f32>, probe: vec3<f32>) -> vec3<f32> {
+    let nodes = array<f32, 8>(
+        -0.9602898565, -0.7966664774, -0.5255324099, -0.1834346425,
+         0.1834346425,  0.5255324099,  0.7966664774,  0.9602898565
+    );
+    let weights = array<f32, 8>(
+        0.1012285363, 0.2223810345, 0.3137066459, 0.3626837834,
+        0.3626837834, 0.3137066459, 0.2223810345, 0.1012285363
+    );
+    let midpoint = 0.5 * (inner + outer);
+    let half_width = 0.5 * (outer - inner);
+    var sum = vec3<f32>(0.0);
+    for (var index = 0u; index < 8u; index = index + 1u) {
+        let lambda = midpoint + half_width * nodes[index];
+        let displacement = lambda * source_dir - probe;
+        let distance2 = max(dot(displacement, displacement), 1.0e-8);
+        sum += weights[index] * lambda * lambda * displacement
+            / (distance2 * sqrt(distance2));
+    }
+    return half_width * sum;
+}
+
+fn layer_acceleration(index: u32) -> vec3<f32> {
+    let layer = layers[index];
+    let source_dir = normalize(layer.direction_solid_angle.xyz);
+    let solid_angle = layer.direction_solid_angle.w;
+    let inner = layer.radii_density.x;
+    let outer = layer.radii_density.y;
+    let density = layer.radii_density.z;
+
+    let probe = params.probe_pos;
+    let radius = length(probe);
+    if radius < 1.0e-6 || outer <= inner || density <= 0.0 {
         return vec3<f32>(0.0);
     }
+    let probe_dir = probe / radius;
+    let cosine = clamp(dot(probe_dir, source_dir), -1.0, 1.0);
+    let sine2 = max(0.0, 1.0 - cosine * cosine);
 
-    let ln2 = 0.69314718056;
-    let r_probe = length(probe);
-
-    // Clamp LUT argument to prevent out-of-bounds sampling (max_z=200.0)
-    // With M=3 (6 terms), max k=6, so bound as_val <= 200 via a <= 200*h/(6*ln2)
-    let safe_max_a = 200.0 * h / (6.0 * ln2);
-    let a = min(r_probe, safe_max_a);
-
-    var g_total = vec3<f32>(0.0);
-
-    // Gaver-Stehfest NILT: M=3 (6 terms), k=1..6
-    for (var k = 1u; k <= 6u; k = k + 1u) {
-        let s_k = f32(k) * ln2 / h;
-
-        let array_idx = (k - 1u) / 4u;
-        let vec_idx   = (k - 1u) % 4u;
-        let v_k = params.V[array_idx][vec_idx];
-
-        let as_val = a * s_k;
-        
-        let modes = get_S_modes(as_val);
-        let S0 = modes.x;
-        let S1 = modes.y;
-
-        let unit_dir = h_vec / h;
-        let mass_term = params.G_const * v.mass;
-
-        let s_domain_acc = -mass_term * ((S0 + S1) / h) * unit_dir;
-        g_total += v_k * s_domain_acc;
+    var radial_integral: vec3<f32>;
+    if sine2 < 1.0e-4 {
+        radial_integral = collinear_quadrature(inner, outer, source_dir, probe);
+    } else {
+        radial_integral =
+            radial_primitive(outer, radius, cosine, source_dir, probe_dir)
+            - radial_primitive(inner, radius, cosine, source_dir, probe_dir);
     }
-
-    return (ln2 / h) * g_total;
+    return params.g_const * solid_angle * density * radial_integral;
 }
 
 @compute @workgroup_size(64, 1, 1)
 fn main(
-    @builtin(global_invocation_id) global_id:   vec3<u32>,
-    @builtin(local_invocation_id)  local_id:    vec3<u32>,
-    @builtin(workgroup_id)         workgroup_id: vec3<u32>,
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
 ) {
-    let idx = global_id.x;
-    let lid = local_id.x;
-
-    var contrib = vec4<f32>(0.0);
-    if idx < params.voxel_count {
-        let a = compute_voxel_acc(idx);
-        contrib = vec4<f32>(a, 0.0);
+    let index = global_id.x;
+    let lane = local_id.x;
+    var value = vec4<f32>(0.0);
+    if index < params.layer_count {
+        value = vec4<f32>(layer_acceleration(index), 0.0);
     }
-
-    shared_acc[lid] = contrib;
+    shared_acc[lane] = value;
     workgroupBarrier();
 
     var stride = 32u;
     loop {
-        if stride == 0u { break; }
-        if lid < stride {
-            shared_acc[lid] += shared_acc[lid + stride];
+        if stride == 0u {
+            break;
+        }
+        if lane < stride {
+            shared_acc[lane] += shared_acc[lane + stride];
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride = stride >> 1u;
     }
-
-    if lid == 0u {
+    if lane == 0u {
         output_acc[workgroup_id.x] = shared_acc[0];
     }
 }

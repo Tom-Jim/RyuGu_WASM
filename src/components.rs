@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 pub const G: f32 = 6.6743e-11;
 pub const RYUGU_MASS: f32 = 4.5e11;
 pub const CASSINI_MASS: f32 = 2500.0;
@@ -17,10 +18,10 @@ pub const RYUGU_SPIN_AXIS: Vec3 = Vec3::new(-0.043, -0.914, 0.405);
 
 pub const DENSITY_EPSILON: f32 = 10.0;
 pub const SECTION_CLIP_RADIUS: f32 = 450.0;
-pub const PROBE_R0: Vec3 = Vec3::new(-1000.0, 200.0, 100.0);
+pub const PROBE_R0: Vec3 = Vec3::new(-1000.0, 1200.0, 100.0);
 pub static PROBE_V_INIT: LazyLock<Vec3> = LazyLock::new(|| {
     let r0 = PROBE_R0;
-    let speed = 1.253 * (G * RYUGU_MASS / r0.length()).sqrt();
+    let speed = 1.053 * (G * RYUGU_MASS / r0.length()).sqrt();
     r0.normalize().cross(Vec3::Y).normalize() * speed
 });
 #[derive(Component)]
@@ -32,9 +33,7 @@ pub struct TopologyBuilt;
 #[derive(Component)]
 pub struct RyuguMarker;
 #[derive(Component)]
-pub struct CassiniMarker; //GPU acceleration
-#[derive(Component)]
-pub struct CassiniWernerMarker; //Werner 1996 GPU acceleration
+pub struct CassiniMarker;
 #[derive(Component)]
 pub struct UiTextMarker;
 #[derive(Component)]
@@ -70,6 +69,10 @@ impl Default for DensityC {
     }
 }
 
+/// Constant density used by the homogeneous Werner polyhedron model.
+#[derive(Resource, Default)]
+pub struct WernerDensity(pub f32);
+
 #[derive(Resource)]
 pub struct AsteroidTopologyGpuData {
     pub mesh_entity: Option<Entity>,
@@ -92,9 +95,11 @@ impl Default for NormalsReadbackChannel {
     }
 }
 
-/// Packed voxel data built once from the asteroid mesh, shared to render world.
+/// Equation (18) discretization. Each 32-byte record stores one angular cell
+/// and one radial layer as `[direction.xyz, solid_angle]` followed by
+/// `[r_inner, r_outer, density, padding]`.
 #[derive(Resource)]
-pub struct GravVoxelSource {
+pub struct RadialGravitySource {
     pub bytes: Vec<u8>,
     pub count: u32,
 }
@@ -112,28 +117,35 @@ pub struct GravityBlendFactor(pub f32);
 
 pub const GRAVITY_BLEND_FRAMES: f32 = 60.0;
 
-/// Shared channel: render world writes partial sums, main world reads + reduces.
+/// Shared channel: render world writes workgroup sums, main world reduces them.
+/// `in_flight` prevents mapping the same staging buffer twice.
 #[derive(Resource, Clone)]
-pub struct GravityReadbackChannel(pub Arc<Mutex<Option<Vec<[f32; 4]>>>>);
+pub struct GravityReadbackChannel {
+    pub data: Arc<Mutex<Option<Vec<[f32; 4]>>>>,
+    pub in_flight: Arc<AtomicBool>,
+}
 
 impl Default for GravityReadbackChannel {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(None)))
+        Self {
+            data: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
 pub enum ActiveGravityMethod {
     #[default]
-    VoxelStehfest, // Cyan trajectory: GPU voxel NILT (default)
-    DecomposedWerner, // Red trajectory: decomposed-Werner polyhedron kernel
+    RadialAnalytic,
+    HomogeneousWerner,
 }
 
 impl ActiveGravityMethod {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::VoxelStehfest => "GPU Voxel (Stehfest)",
-            Self::DecomposedWerner => "Decomposed Werner (1/R)",
+            Self::RadialAnalytic => "GPU Radial Analytic (Eq. 18)",
+            Self::HomogeneousWerner => "GPU Werner Polyhedron",
         }
     }
 }

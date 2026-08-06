@@ -104,6 +104,7 @@ pub fn method_toggle_system(
     show_normals: Res<ShowNormals>,
     show_section: Res<ShowSection>,
     mut text_query: Query<&mut Text, With<UiTextMarker>>,
+    mut gravity_blend: ResMut<GravityBlendFactor>,
     mut cassini_query: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         With<CassiniMarker>,
@@ -114,19 +115,23 @@ pub fn method_toggle_system(
         return;
     }
     *active_method = match *active_method {
-        ActiveGravityMethod::VoxelStehfest => ActiveGravityMethod::DecomposedWerner,
-        ActiveGravityMethod::DecomposedWerner => ActiveGravityMethod::VoxelStehfest,
+        ActiveGravityMethod::RadialAnalytic => ActiveGravityMethod::HomogeneousWerner,
+        ActiveGravityMethod::HomogeneousWerner => ActiveGravityMethod::RadialAnalytic,
     };
-    if let Ok((mut c_transform, mut c_velocity, mut c_history)) = cassini_query.single_mut() {
-        if let Some(mut r_transform) = ryugu_query.iter_mut().next() {
-            c_transform.translation = PROBE_R0;
-            c_velocity.0 = *PROBE_V_INIT;
-            // Reset probe state so the new trajectory starts clean: drop the old
-            // history line, undo accumulated spin, and keep Ryugu centered at CoM.
-            c_history.0.clear();
-            r_transform.rotation = Quat::IDENTITY;
-            r_transform.translation = Vec3::ZERO;
-        }
+    // The newly selected GPU path may not have produced a sample for the reset
+    // probe position yet. Warm it up from the Newtonian anchor again instead of
+    // applying a full-strength stale readback from before the method switch.
+    gravity_blend.0 = 0.0;
+    if let Ok((mut c_transform, mut c_velocity, mut c_history)) = cassini_query.single_mut()
+        && let Some(mut r_transform) = ryugu_query.iter_mut().next()
+    {
+        c_transform.translation = PROBE_R0;
+        c_velocity.0 = *PROBE_V_INIT;
+        // Reset probe state so the new trajectory starts clean: drop the old
+        // history line, undo accumulated spin, and keep Ryugu centered at CoM.
+        c_history.0.clear();
+        r_transform.rotation = Quat::IDENTITY;
+        r_transform.translation = Vec3::ZERO;
     }
     if let Some(mut text) = text_query.iter_mut().next() {
         *text = Text::new(hint_text(

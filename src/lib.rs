@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod components;
 mod systems;
 mod topology;
@@ -11,12 +13,16 @@ use bevy::render::{
     settings::{Backends, RenderCreation, WgpuSettings},
 };
 use bevy::window::PresentMode;
+use bevy::winit::{UpdateMode, WinitSettings};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use components::{
     ActiveGravityMethod, CameraMode, DensityC, GravityAcceleration, GravityBlendFactor,
     ShowNormals, ShowSection,
 };
+use std::time::Duration;
 use systems::{
     compute_pipeline::NormalsComputePlugin,
     gravity_pipeline::GravityComputePlugin,
@@ -36,17 +42,13 @@ use systems::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-// 1. sniff navigator.gpu
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = navigator, js_name = gpu)]
-    static GPU: JsValue;
-}
-
-// 2. DOM windows insert
+// Browser capability check and fallback warning.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = r#"
+    export function has_webgpu() {
+        return typeof navigator !== "undefined" && navigator.gpu !== undefined;
+    }
+
     export function show_webgpu_warning() {
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.9);color:white;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:99999;font-family:sans-serif;text-align:center;padding:20px;box-sizing:border-box;";
@@ -70,6 +72,9 @@ extern "C" {
     }
 "#)]
 extern "C" {
+    #[wasm_bindgen(js_name = has_webgpu)]
+    fn browser_has_webgpu() -> bool;
+
     fn show_webgpu_warning();
 }
 
@@ -78,7 +83,7 @@ pub fn main() {
     let has_webgpu = {
         #[cfg(target_arch = "wasm32")]
         {
-            !GPU.is_undefined()
+            browser_has_webgpu()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -115,6 +120,16 @@ pub fn main() {
         .init_resource::<ActiveGravityMethod>()
         .init_resource::<GravityAcceleration>()
         .init_resource::<GravityBlendFactor>()
+        .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .insert_resource(WinitSettings {
+            focused_mode: UpdateMode::Reactive {
+                wait: Duration::from_secs_f64(1.0 / 60.0),
+                react_to_device_events: false,
+                react_to_user_events: false,
+                react_to_window_events: false,
+            },
+            unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 30.0)),
+        })
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
@@ -126,7 +141,7 @@ pub fn main() {
                         canvas: Some("#bevy".into()),
                         fit_canvas_to_parent: true,
                         prevent_default_event_handling: false,
-                        present_mode: PresentMode::AutoNoVsync,
+                        present_mode: PresentMode::AutoVsync,
                         ..default()
                     }),
                     ..default()
@@ -144,6 +159,16 @@ pub fn main() {
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default());
 
+    // Native builds use a precise sleep/spin limiter. Browsers already own the
+    // animation clock, so the Winit 60 Hz reactive mode above is the cap there.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        app.add_plugins(FramepacePlugin);
+        app.insert_resource(FramepaceSettings {
+            limiter: Limiter::from_framerate(60.0),
+        });
+    }
+
     if has_webgpu {
         app.add_plugins(NormalsComputePlugin);
         app.add_plugins(GravityComputePlugin);
@@ -156,8 +181,6 @@ pub fn main() {
             (
                 normalize_model_scale_system,
                 build_topology_system,
-                physics_system,
-                ryugu_rotation_system,
                 camera_switch_system,
                 normal_toggle_system,
                 section_toggle_system,
@@ -171,5 +194,28 @@ pub fn main() {
             )
                 .chain(),
         )
+        .add_systems(FixedUpdate, (physics_system, ryugu_rotation_system).chain())
         .run();
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+    fn validate_wgsl(source: &str) {
+        let module = naga::front::wgsl::parse_str(source).expect("WGSL parsing failed");
+        Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .expect("WGSL validation failed");
+    }
+
+    #[test]
+    fn radial_gravity_shader_is_valid() {
+        validate_wgsl(include_str!("../assets/shaders/gravity.wgsl"));
+    }
+
+    #[test]
+    fn werner_shader_is_valid() {
+        validate_wgsl(include_str!("../assets/shaders/werner_gravity.wgsl"));
+    }
 }
