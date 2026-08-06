@@ -277,11 +277,11 @@ C_J=2U(\mathbf r_b)
 -\lVert\mathbf v_b\rVert^2,
 $$
 
-with units of \(\mathrm{m^2/s^2}\). This is a specific invariant, so probe mass does not appear.
+with units of $\mathrm{m^2/s^2}$. This is a specific invariant, so probe mass does not appear.
 
 Both compute shaders reduce acceleration in `xyz` and the matching positive potential in `w`. The radial shader evaluates both quantities at the same eight Gauss--Legendre nodes, avoiding an f32 central difference of nearly equal potentials. The Werner shader uses the standard edge-minus-face polyhedron field and a compensated double-single sum for its strongly cancelling scalar potential. The chart selects the potential belonging to the active gravity method and waits until the 60-step GPU warm-up blend is complete before recording samples.
 
-Every chart sample is evaluated from the position, velocity, Ryugu attitude, and potential carried by the same completed GPU request. It never combines the current probe state with a delayed potential. For exact continuous dynamics in a steadily rotating, time-independent body-fixed potential, \(C_J\) should remain constant. Visible drift therefore helps expose remaining integration, interpolation, clamping, or f32 field error; it is a diagnostic rather than a proof of exact conservation.
+Every chart sample is evaluated from the position, velocity, Ryugu attitude, and potential carried by the same completed GPU request. It never combines the current probe state with a delayed potential. For exact continuous dynamics in a steadily rotating, time-independent body-fixed potential, $C_J$ should remain constant. Visible drift therefore helps expose remaining integration, interpolation, clamping, or f32 field error; it is a diagnostic rather than a proof of exact conservation.
 
 The chart retains 256 timestamped GPU samples. Before the time window fills, the newest point moves from left to right. After it fills, old samples leave from the left, the newest yellow point remains on the right edge, and the previous values continue as a scrolling line. The visible minimum and maximum receive an 8% margin, so the vertical scale automatically expands or contracts while keeping the full visible trajectory inside the plot. The label `dC/|C0|` reports the relative change across the currently visible history, making small variations distinguishable from a large physical drift.
 
