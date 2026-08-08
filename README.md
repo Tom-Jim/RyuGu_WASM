@@ -16,13 +16,13 @@
 
 Ryugu WASM is a real-time gravitational-dynamics simulator for asteroid (162173) Ryugu. It is written in Rust with Bevy 0.19, compiled to WebAssembly, and uses WebGPU compute shaders for forward gravity evaluation.
 
-The simulator provides two GPU forward gravity modes plus an adaptive curved-arc solver:
+The simulator exposes three complementary gravity algorithms through the `G` key:
 
-- **Radial Analytic (Equation):** a non-uniform radial density model evaluated as angular cells and mass-preserving radial layers.
-- **Werner Polyhedron:** a corrected closed-polyhedron Werner--Scheeres implementation for a homogeneous body with the same shape and total mass.
-- **Eq.106 Adaptive Curved-Arc:** the non-periodic 70-to-106 Taylor transport is used by default; after ten stable orbit closures it promotes to the periodic branch. Segments are split until the documented Taylor convergence bound is safe.
+- **Werner--Scheeres homogeneous polyhedron:** the classical reference algorithm. It reduces the exterior field of a closed, consistently oriented, constant-density polyhedron to edge and face sums.
+- **Original radial-analytic GPU method:** the second algorithm. It represents a star-shaped heterogeneous body by angular cells and mass-preserving radial layers, evaluates radial contributions analytically, and reduces the remaining contributions on the GPU.
+- **Original Equation (106) adaptive curved-trajectory method:** the third algorithm. It transports the Equation (70) straight-line complex-frequency operator to curved arcs by a convergent spatial Taylor expansion.
 
-These modes intentionally use different density assumptions. They are two forward models, not two numerical solvers for an identical density field.
+The three algorithms have different source, geometry, and trajectory assumptions and are not interchangeable discretizations of one identical model. Werner--Scheeres is the homogeneous benchmark; the radial-analytic method is the primary heterogeneous pointwise solver; and Equation (106) is a trajectory-level representation for long, structured arcs.
 
 ## Features
 
@@ -172,6 +172,8 @@ The choice is therefore workload-specific: Rust is used for the real-time browse
 
 ## Gravity models
 
+>The originality claims are deliberately limited: Werner--Scheeres is classical; the radial-analytic GPU organization is the second algorithm and an original contribution; and the Equation (106) adaptive curved-trajectory construction is the third algorithm and an original contribution.
+
 ### Radial Analytic: Equation
 
 The default model uses
@@ -200,6 +202,35 @@ $$
 Mesh faces are oriented outward. Every watertight shared edge is combined with its two adjacent face normals to build one edge dyad. The GPU sums the shared-edge logarithmic terms and signed face-solid-angle terms, then multiplies the result by $G\rho_{\mathrm W}$.
 
 This mode does not use `DensityC` or the radial layers. It is a homogeneous reference model.
+
+### Equation (106) adaptive curved trajectory
+
+Equation (106) begins with the Equation (70) complex-frequency field on a straight reference line and writes a curved trajectory as
+
+$$
+\mathbf q(t)=\overline{\mathbf q}(t)+\delta\mathbf q(t).
+$$
+
+In a fixed Cartesian basis, the field is transported by
+
+$$
+\mathbf g(\overline{\mathbf q}+\delta\mathbf q)
+=\exp(\delta\mathbf q\cdot\nabla_{\mathbf q})
+\mathbf g(\overline{\mathbf q}).
+$$
+
+Finite non-periodic arcs use local polynomial displacement models and mixed spatial/complex-frequency derivatives by default. The periodic sideband representation is enabled only after at least ten consecutive orbit closures satisfy the configured position, velocity, and period tolerances. A failed closure resets the counter.
+
+Each candidate arc is divided into as many straight reference segments as required by the convergence guard
+
+$$
+\varepsilon_{\max}
+=\sup_h\frac{\|\delta\mathbf q(h)\|}{d(h)}<1,
+$$
+
+where $d(h)$ is a conservative distance from the reference line to the density support. The solver selects the lowest permitted Taylor order whose remainder estimate is below tolerance and bisects a segment when that order is insufficient.
+
+While this algorithm is active, the lower-right chart displays the Equation (157) dual-representation potential residual. It compares curved-path acceleration work with an independently accumulated gravitational-potential difference and therefore monitors Taylor transport, path resolution, potential/acceleration consistency, and floating-point error.
 
 ### Density section view
 
@@ -392,6 +423,10 @@ Ryugu_wasm/
 ├── index.html
 ├── server.ts
 ├── mathpub.md
+├── docs/
+│   ├── mathtidy.md
+│   ├── mathtidy_EN.md
+│   └── mathstrict_EN.md
 ├── src/
 │   ├── lib.rs
 │   ├── components.rs
@@ -400,6 +435,7 @@ Ryugu_wasm/
 │   └── systems/
 │       ├── mod.rs
 │       ├── energy.rs
+│       ├── curved_arc.rs
 │       ├── scale.rs
 │       ├── compute_pipeline.rs
 │       ├── gravity_pipeline.rs
@@ -432,6 +468,7 @@ Ryugu_wasm/
 | `src/welding.rs` | Quantized vertex deduplication. |
 | `src/systems/scale.rs` | One-shot model normalization and topology creation. |
 | `src/systems/energy.rs` | Snapshot-aligned body-frame Jacobi evaluation, relative-drift reporting, rolling history, automatic chart scaling, and right-edge point rendering. |
+| `src/systems/curved_arc.rs` | Equation (106) trajectory classification, stable-closure tracking, adaptive segmentation, Taylor-order selection, and curved-path residual state. |
 | `src/systems/compute_pipeline.rs` | One-shot GPU surface-normal computation and readback. |
 | `src/systems/gravity_pipeline.rs` | Radial angular/layer preprocessing, snapshot-tagged GPU dispatch, f64 partial reduction, and history insertion. |
 | `src/systems/werner_pipeline.rs` | Homogeneous closed-polyhedron preprocessing, snapshot-tagged Werner dispatch, f64 partial reduction, and history insertion. |
@@ -444,6 +481,8 @@ Ryugu_wasm/
 | `server.ts` | Static Bun server with COOP/COEP headers. |
 | `index.html` | WebGPU preflight and WASM bootstrap. |
 | `scripts/gen_lut.py` | Legacy LUT generator; retained for research history and unused by the current runtime. |
+| `mathpub.md` | Academic English taxonomy and mathematical principles of the three gravity algorithms. |
+| `docs/mathtidy_EN.md` | Rigorous English derivation of Equations (70), (106), and (157), including convergence and residual analysis. |
 
 ## Testing
 
@@ -467,6 +506,8 @@ The Rust tests cover:
 - Equation currently assumes a star-shaped body and one radial interval per direction.
 - Four radial layers approximate the continuous density pointwise, although each layer mass is preserved.
 - Werner mode is homogeneous and is not a non-uniform-density Werner extension.
+- Equation (106) requires every accepted segment to remain inside the Taylor convergence radius relative to the density support; strongly curved or near-surface arcs may require many segments or a direct fallback.
+- The periodic Equation (106) branch is a promoted optimization after ten stable closures, not an assumption applied to a newly observed orbit.
 - GPU readback remains asynchronous. Snapshot tags prevent state mismatch, but force prediction between completed samples is still a numerical approximation.
 - At acceleration above `1x`, the integration step remains unchanged but GPU field samples are farther apart in simulation time; the `8x` cap limits this interpolation tradeoff.
 - Leapfrog substeps greatly reduce secular integration drift, but this remains an interactive f32 visualization rather than a precision orbit-determination tool.
