@@ -26,6 +26,10 @@ use components::{
 use std::time::Duration;
 use systems::{
     compute_pipeline::NormalsComputePlugin,
+    curved_arc::{
+        CurvedArcPlannerState, CurvedArcResidualHistory, PeriodicityDetector,
+        monitor_curved_arc_system,
+    },
     energy::{record_probe_jacobi_system, setup_jacobi_chart, update_jacobi_chart_system},
     gravity_pipeline::GravityComputePlugin,
     physics::{physics_system, ryugu_rotation_system},
@@ -129,6 +133,9 @@ pub fn main() {
         .init_resource::<SimulationClock>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
+        .init_resource::<CurvedArcPlannerState>()
+        .init_resource::<CurvedArcResidualHistory>()
+        .init_resource::<PeriodicityDetector>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::Reactive {
@@ -202,10 +209,18 @@ pub fn main() {
             build_topology_system,
             camera_switch_system,
             normal_toggle_system,
-            section_toggle_system,
-            method_toggle_system,
-            probe_slider_system,
-            probe_slider_visual_system,
+        )
+            .chain(),
+    )
+    .add_systems(Update, section_toggle_system)
+    .add_systems(Update, method_toggle_system)
+    .add_systems(
+        Update,
+        (probe_slider_system, probe_slider_visual_system).chain(),
+    )
+    .add_systems(
+        Update,
+        (
             simulation_acceleration_slider_system,
             simulation_acceleration_slider_visual_system,
             update_hint_on_mode_change,
@@ -213,10 +228,12 @@ pub fn main() {
             fps_update_system,
             update_jacobi_chart_system,
             section_alpha_system,
-            render_gizmos_system,
-            render_section_system,
         )
             .chain(),
+    )
+    .add_systems(
+        Update,
+        (render_gizmos_system, render_section_system).chain(),
     )
     .add_systems(
         FixedUpdate,
@@ -224,6 +241,7 @@ pub fn main() {
             physics_system,
             ryugu_rotation_system,
             record_probe_jacobi_system,
+            monitor_curved_arc_system,
         )
             .chain(),
     )

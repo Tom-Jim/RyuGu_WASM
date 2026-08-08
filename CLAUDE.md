@@ -55,6 +55,7 @@ Bevy 0.19.0 asteroid simulator of real asteroid Ryugu, compiled to WASM via `was
 | `src/systems/render.rs` | Scene setup, camera follow/switch, gizmos, section plane |
 | `src/systems/ui.rs` | FPS display, keyboard toggles (normals / section view / gravity method) |
 | `src/systems/werner_pipeline.rs` | `WernerComputePlugin` — per-frame GPU Werner-decomposition gravity dispatch + readback |
+| `src/systems/energy.rs` | Rotating-frame Jacobi-constant recorder + scrolling chart renderer |
 | `assets/shaders/normals.wgsl` | WGSL compute shader for surface normal averaging (CSR neighbor ring) |
 | `assets/shaders/gravity.wgsl` | WGSL compute shader: Gaver-Stehfest NILT loop + Struve-Neumann LUT |
 | `assets/shaders/werner_gravity.wgsl` | WGSL compute shader: Werner-series decomposition kernel |
@@ -91,7 +92,7 @@ Staging buffers are mapped async; each main-world system drains its channel each
 
 **Gravity-method selection**
 
-`ActiveGravityMethod` (`components.rs`) toggles between `VoxelStehfest` (default, `gravity.wgsl`) and `DecomposedWerner` (`werner_gravity.wgsl`). Pressing **G** in `method_toggle_system` switches the active shader used by `physics_system`; if a method's GPU readback hasn't landed yet, the integrator falls back to a Newtonian point-mass acceleration.
+`ActiveGravityMethod` (`components.rs`) cycles through radial Stehfest, homogeneous Werner, and `CurvedArcEq106`. The curved-arc branch uses the radial 70-style sample as its straight-line anchor, adaptively splits the observed path under the Taylor convergence bound, and promotes from non-periodic to periodic only after ten stable closures. If a readback or convergent segment is unavailable, the integrator falls back to a Newtonian point-mass acceleration.
 
 **Physics constants (components.rs)**
 
@@ -114,7 +115,7 @@ Real-world values: `RYUGU_MASS = 4.5e11 kg`, `RYUGU_ROTATION_PERIOD_SECS = 7.63 
 | `S` | Switch camera mode (Overview ↔ Follow Cassini) |
 | `F` | Toggle surface normals display |
 | `D` | Toggle section plane view |
-| `G` | Toggle gravity method (VoxelStehfest ↔ DecomposedWerner) |
+| `G` | Cycle radial, Werner, and Eq.106 adaptive curved-arc gravity |
 
 **Deployment**
 

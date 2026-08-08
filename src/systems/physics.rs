@@ -1,4 +1,5 @@
 use crate::components::*;
+use crate::systems::curved_arc::{CurvedArcPlannerState, approximate_eq106_acceleration};
 use bevy::prelude::*;
 
 const MAX_ACC: f32 = 1.5e-3;
@@ -158,6 +159,7 @@ pub fn physics_system(
     mut clock: ResMut<SimulationClock>,
     time: Res<Time<Fixed>>,
     active_method: Res<ActiveGravityMethod>,
+    curved_planner: Res<CurvedArcPlannerState>,
     simulation_acceleration: Res<SimulationAcceleration>,
 ) {
     let Some((ryugu_transform, ryugu_mass)) = ryugu_query.iter().next() else {
@@ -172,10 +174,14 @@ pub fn physics_system(
     let active_history = match *active_method {
         ActiveGravityMethod::RadialAnalytic => radial_history.as_ref().map(|history| &history.0),
         ActiveGravityMethod::HomogeneousWerner => werner_history.as_ref().map(|history| &history.0),
+        // Eq. (106) transports the radial 70-style sample along the planned
+        // convergent arc; the planner controls when this branch is usable.
+        ActiveGravityMethod::CurvedArcEq106 => radial_history.as_ref().map(|history| &history.0),
     };
     let maximum_extrapolation_intervals = match *active_method {
         ActiveGravityMethod::RadialAnalytic => MAX_EXTRAPOLATION_INTERVALS,
         ActiveGravityMethod::HomogeneousWerner => 0.0,
+        ActiveGravityMethod::CurvedArcEq106 => 0.0,
     };
     let gpu_ready = active_history
         .and_then(|history| history.latest_for_epoch(clock.epoch))
@@ -194,6 +200,22 @@ pub fn physics_system(
 
     let acceleration_at = |position: Vec3, sample_time: f64| {
         let fallback = newtonian_acceleration(ryugu_transform.translation, position, ryugu_mass.0);
+        if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+            let Some(history) = active_history else {
+                return fallback;
+            };
+            let Some(curved) = approximate_eq106_acceleration(
+                history,
+                clock.epoch,
+                position,
+                *ryugu_transform,
+                ryugu_mass.0,
+                &curved_planner,
+            ) else {
+                return fallback;
+            };
+            return clamp_acceleration(fallback + blend_weight * (curved - fallback));
+        }
         let Some(history) = active_history else {
             return fallback;
         };

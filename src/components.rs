@@ -325,6 +325,9 @@ pub enum ActiveGravityMethod {
     #[default]
     RadialAnalytic,
     HomogeneousWerner,
+    /// Eq. (106) adaptive curved-arc mode; it starts non-periodic and promotes
+    /// itself to periodic only after the planner sees stable orbit closures.
+    CurvedArcEq106,
 }
 
 impl ActiveGravityMethod {
@@ -332,6 +335,7 @@ impl ActiveGravityMethod {
         match self {
             Self::RadialAnalytic => "GPU Radial Analytic",
             Self::HomogeneousWerner => "GPU Werner Polyhedron",
+            Self::CurvedArcEq106 => "Eq.106 Adaptive Curved-Arc",
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::components::*;
+use crate::systems::curved_arc::{CurvedArcPlannerState, CurvedArcResidualHistory};
 use bevy::math::Rot2;
 use bevy::prelude::*;
 
@@ -14,6 +15,12 @@ pub(crate) struct JacobiChartSegment(usize);
 
 #[derive(Component)]
 pub(crate) struct JacobiLatestPoint;
+
+#[derive(Component)]
+pub(crate) struct JacobiChartTitle;
+
+#[derive(Component)]
+pub(crate) struct JacobiChartAxisLabel;
 
 #[derive(Component, Clone, Copy)]
 pub(crate) enum JacobiChartLabel {
@@ -67,6 +74,9 @@ pub fn record_probe_jacobi_system(
         ActiveGravityMethod::HomogeneousWerner => werner_samples
             .as_ref()
             .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
+        // The curved-arc chart reports Eq. (157) directly; it does not mix a
+        // delayed GPU potential with the current probe state.
+        ActiveGravityMethod::CurvedArcEq106 => None,
     };
     let Some(sample) = sample else {
         return;
@@ -139,16 +149,19 @@ pub fn setup_jacobi_chart(mut commands: Commands) {
             BorderColor::all(Color::srgba(0.3, 0.7, 0.75, 0.65)),
         ))
         .with_children(|panel| {
-            panel.spawn(chart_text(
-                "Rotating-frame Jacobi constant",
-                15.0,
-                Color::srgb(0.85, 0.95, 1.0),
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(12),
-                    top: px(9),
-                    ..default()
-                },
+            panel.spawn((
+                chart_text(
+                    "Rotating-frame Jacobi constant",
+                    15.0,
+                    Color::srgb(0.85, 0.95, 1.0),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(12),
+                        top: px(9),
+                        ..default()
+                    },
+                ),
+                JacobiChartTitle,
             ));
 
             panel.spawn((
@@ -208,16 +221,19 @@ pub fn setup_jacobi_chart(mut commands: Commands) {
                 ),
                 JacobiChartLabel::Minimum,
             ));
-            panel.spawn(chart_text(
-                "C_J (m^2/s^2)",
-                10.0,
-                Color::srgb(0.65, 0.75, 0.8),
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(7),
-                    top: px(128),
-                    ..default()
-                },
+            panel.spawn((
+                chart_text(
+                    "C_J (m^2/s^2)",
+                    10.0,
+                    Color::srgb(0.65, 0.75, 0.8),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(7),
+                        top: px(128),
+                        ..default()
+                    },
+                ),
+                JacobiChartAxisLabel,
             ));
 
             panel.spawn((
@@ -348,17 +364,60 @@ fn jacobi_time_bounds(
 }
 
 pub fn update_jacobi_chart_system(
+    active_method: Res<ActiveGravityMethod>,
     history: Res<JacobiHistory>,
+    curved_history: Res<CurvedArcResidualHistory>,
+    curved_planner: Res<CurvedArcPlannerState>,
     simulation_acceleration: Res<SimulationAcceleration>,
     mut segments: Query<
         (&JacobiChartSegment, &mut Node, &mut UiTransform),
         Without<JacobiLatestPoint>,
     >,
     mut latest_point: Query<&mut Node, (With<JacobiLatestPoint>, Without<JacobiChartSegment>)>,
-    mut labels: Query<(&JacobiChartLabel, &mut Text)>,
+    mut labels: Query<
+        (&JacobiChartLabel, &mut Text),
+        (Without<JacobiChartTitle>, Without<JacobiChartAxisLabel>),
+    >,
+    mut titles: Query<
+        &mut Text,
+        (
+            With<JacobiChartTitle>,
+            Without<JacobiChartAxisLabel>,
+            Without<JacobiChartLabel>,
+        ),
+    >,
+    mut axis_labels: Query<
+        &mut Text,
+        (
+            With<JacobiChartAxisLabel>,
+            Without<JacobiChartTitle>,
+            Without<JacobiChartLabel>,
+        ),
+    >,
 ) {
-    if !history.is_changed() && !simulation_acceleration.is_changed() {
+    if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+        update_curved_arc_chart(
+            &curved_history,
+            &curved_planner,
+            &mut segments,
+            &mut latest_point,
+            &mut labels,
+            &mut titles,
+            &mut axis_labels,
+        );
         return;
+    }
+
+    if !history.is_changed() && !simulation_acceleration.is_changed() && !active_method.is_changed()
+    {
+        return;
+    }
+
+    for mut title in titles.iter_mut() {
+        **title = "Rotating-frame Jacobi constant".to_owned();
+    }
+    for mut axis in axis_labels.iter_mut() {
+        **axis = "C_J (m^2/s^2)".to_owned();
     }
 
     let samples: Vec<JacobiSample> = history.samples.iter().copied().collect();
@@ -451,6 +510,163 @@ pub fn update_jacobi_chart_system(
             JacobiChartLabel::RelativeDrift => {
                 let denominator = first.abs().max(1.0e-12);
                 format!("dC/|C0| = {:+.3e}%", 100.0 * (latest - first) / denominator)
+            }
+            JacobiChartLabel::Minimum => format!("{minimum:.3e}"),
+            JacobiChartLabel::Maximum => format!("{maximum:.3e}"),
+            JacobiChartLabel::TimeStart => format_axis_time(time_start),
+            JacobiChartLabel::TimeEnd => format_axis_time(time_end),
+        };
+    }
+}
+
+fn update_curved_arc_chart(
+    history: &CurvedArcResidualHistory,
+    planner: &CurvedArcPlannerState,
+    segments: &mut Query<
+        (&JacobiChartSegment, &mut Node, &mut UiTransform),
+        Without<JacobiLatestPoint>,
+    >,
+    latest_point: &mut Query<&mut Node, (With<JacobiLatestPoint>, Without<JacobiChartSegment>)>,
+    labels: &mut Query<
+        (&JacobiChartLabel, &mut Text),
+        (Without<JacobiChartTitle>, Without<JacobiChartAxisLabel>),
+    >,
+    titles: &mut Query<
+        &mut Text,
+        (
+            With<JacobiChartTitle>,
+            Without<JacobiChartAxisLabel>,
+            Without<JacobiChartLabel>,
+        ),
+    >,
+    axis_labels: &mut Query<
+        &mut Text,
+        (
+            With<JacobiChartAxisLabel>,
+            Without<JacobiChartTitle>,
+            Without<JacobiChartLabel>,
+        ),
+    >,
+) {
+    for mut title in titles.iter_mut() {
+        **title = "Eq.106 curved-path residual".to_owned();
+    }
+    for mut axis in axis_labels.iter_mut() {
+        **axis = "|r_dual| (m^2/s^2)".to_owned();
+    }
+
+    let samples: Vec<_> = history.samples.iter().copied().collect();
+    if samples.is_empty() {
+        for (_, mut node, _) in segments.iter_mut() {
+            node.display = Display::None;
+        }
+        if let Some(mut node) = latest_point.iter_mut().next() {
+            node.display = Display::None;
+        }
+        for (label, mut text) in labels.iter_mut() {
+            **text = match label {
+                JacobiChartLabel::Current => "|r_dual| = --".to_owned(),
+                JacobiChartLabel::RelativeDrift => format!(
+                    "{} | segments: {} | closures: {}/10",
+                    planner.mode.as_str(),
+                    planner.segments.len(),
+                    planner.stable_closures,
+                ),
+                JacobiChartLabel::TimeStart => "0 s".to_owned(),
+                _ => "--".to_owned(),
+            };
+        }
+        return;
+    }
+
+    let residual_value = |sample: crate::systems::curved_arc::CurvedArcResidualSample| {
+        sample.dual_residual.unwrap_or(0.0).abs()
+    };
+    let raw_minimum = samples
+        .iter()
+        .copied()
+        .map(residual_value)
+        .fold(f64::INFINITY, f64::min);
+    let raw_maximum = samples
+        .iter()
+        .copied()
+        .map(residual_value)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let maximum = if raw_maximum > f64::EPSILON {
+        raw_maximum * 1.08
+    } else {
+        1.0e-9
+    };
+    let minimum = 0.0_f64.min(raw_minimum);
+    let span = (maximum - minimum).max(f64::EPSILON);
+    let time_start = samples
+        .first()
+        .map_or(0.0, |sample| sample.simulation_time_seconds);
+    let time_end = samples
+        .last()
+        .map_or(time_start + 1.0, |sample| sample.simulation_time_seconds)
+        .max(time_start + f64::EPSILON);
+    let time_span = time_end - time_start;
+    let point_for = |sample: crate::systems::curved_arc::CurvedArcResidualSample| {
+        let x = ((sample.simulation_time_seconds - time_start) / time_span).clamp(0.0, 1.0) as f32
+            * CHART_WIDTH;
+        let y = (1.0 - ((residual_value(sample) - minimum) / span).clamp(0.0, 1.0)) as f32
+            * CHART_HEIGHT;
+        Vec2::new(x, y)
+    };
+
+    for (segment, mut node, mut transform) in segments.iter_mut() {
+        let Some((from, to)) = samples
+            .get(segment.0)
+            .zip(samples.get(segment.0 + 1))
+            .map(|(from, to)| (point_for(*from), point_for(*to)))
+        else {
+            node.display = Display::None;
+            continue;
+        };
+        let delta = to - from;
+        let length = delta.length();
+        let midpoint = (from + to) * 0.5;
+        node.display = Display::Flex;
+        node.left = px(midpoint.x - length * 0.5);
+        node.top = px(midpoint.y - 1.0);
+        node.width = px(length.max(0.5));
+        transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
+    }
+
+    if let Some(last) = samples.last()
+        && let Some(mut node) = latest_point.iter_mut().next()
+    {
+        let point = point_for(*last);
+        node.display = Display::Flex;
+        node.left = px(point.x - 3.5);
+        node.top = px(point.y - 3.5);
+    }
+
+    for (label, mut text) in labels.iter_mut() {
+        let latest = residual_value(*samples.last().unwrap());
+        **text = match label {
+            JacobiChartLabel::Current => {
+                format!("|r_dual| = {latest:.3e} m^2/s^2")
+            }
+            JacobiChartLabel::RelativeDrift => {
+                let order = samples
+                    .last()
+                    .map_or(planner.taylor_order, |sample| sample.taylor_order);
+                let epsilon = samples.last().map_or(0.0, |sample| sample.epsilon_max);
+                let remainder = planner
+                    .active_segment
+                    .as_ref()
+                    .map_or(f64::INFINITY, |segment| segment.remainder_bound);
+                format!(
+                    "{} A{} e={:.2} R={:.1e} seg={} c={}/10",
+                    planner.mode.short_str(),
+                    order,
+                    epsilon,
+                    remainder,
+                    planner.segments.len(),
+                    planner.stable_closures,
+                )
             }
             JacobiChartLabel::Minimum => format!("{minimum:.3e}"),
             JacobiChartLabel::Maximum => format!("{maximum:.3e}"),

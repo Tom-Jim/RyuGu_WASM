@@ -1,5 +1,8 @@
 use crate::components::*;
-use crate::systems::werner_pipeline::{WernerAcceleration, WernerPotential};
+use crate::systems::{
+    curved_arc::{CurvedArcPlannerState, CurvedArcResidualHistory, PeriodicityDetector},
+    werner_pipeline::{WernerAcceleration, WernerPotential},
+};
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
@@ -465,6 +468,11 @@ pub fn probe_slider_system(
     mut werner_samples: Option<ResMut<WernerGravityHistory>>,
     mut simulation_clock: ResMut<SimulationClock>,
     mut jacobi_history: ResMut<JacobiHistory>,
+    mut curved_arc: ParamSet<(
+        ResMut<CurvedArcPlannerState>,
+        ResMut<PeriodicityDetector>,
+        ResMut<CurvedArcResidualHistory>,
+    )>,
     mut cassini_query: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         With<CassiniMarker>,
@@ -522,6 +530,9 @@ pub fn probe_slider_system(
     }
     simulation_clock.reset_state();
     jacobi_history.reset();
+    curved_arc.p0().reset();
+    curved_arc.p1().reset();
+    curved_arc.p2().reset();
 
     if let Ok((mut transform, mut velocity, mut history)) = cassini_query.single_mut() {
         transform.translation = next.position;
@@ -633,10 +644,6 @@ pub fn method_toggle_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut active_method: ResMut<ActiveGravityMethod>,
     probe_initial: Res<ProbeInitialConditions>,
-    mode: Res<CameraMode>,
-    show_normals: Res<ShowNormals>,
-    show_section: Res<ShowSection>,
-    mut text_query: Query<&mut Text, With<UiTextMarker>>,
     mut gravity_blend: ResMut<GravityBlendFactor>,
     mut radial_potential: ResMut<GravityPotential>,
     mut werner_potential: Option<ResMut<WernerPotential>>,
@@ -644,6 +651,11 @@ pub fn method_toggle_system(
     mut werner_samples: Option<ResMut<WernerGravityHistory>>,
     mut simulation_clock: ResMut<SimulationClock>,
     mut jacobi_history: ResMut<JacobiHistory>,
+    mut curved_arc: ParamSet<(
+        ResMut<CurvedArcPlannerState>,
+        ResMut<PeriodicityDetector>,
+        ResMut<CurvedArcResidualHistory>,
+    )>,
     mut cassini_query: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         With<CassiniMarker>,
@@ -655,7 +667,8 @@ pub fn method_toggle_system(
     }
     *active_method = match *active_method {
         ActiveGravityMethod::RadialAnalytic => ActiveGravityMethod::HomogeneousWerner,
-        ActiveGravityMethod::HomogeneousWerner => ActiveGravityMethod::RadialAnalytic,
+        ActiveGravityMethod::HomogeneousWerner => ActiveGravityMethod::CurvedArcEq106,
+        ActiveGravityMethod::CurvedArcEq106 => ActiveGravityMethod::RadialAnalytic,
     };
     // The newly selected GPU path may not have produced a sample for the reset
     // probe position yet. Warm it up from the Newtonian anchor again instead of
@@ -673,6 +686,9 @@ pub fn method_toggle_system(
     }
     simulation_clock.reset_state();
     jacobi_history.reset();
+    curved_arc.p0().reset();
+    curved_arc.p1().reset();
+    curved_arc.p2().reset();
     if let Ok((mut c_transform, mut c_velocity, mut c_history)) = cassini_query.single_mut()
         && let Some(mut r_transform) = ryugu_query.iter_mut().next()
     {
@@ -684,23 +700,19 @@ pub fn method_toggle_system(
         r_transform.rotation = Quat::IDENTITY;
         r_transform.translation = Vec3::ZERO;
     }
-    if let Some(mut text) = text_query.iter_mut().next() {
-        *text = Text::new(hint_text(
-            *mode,
-            show_normals.0,
-            show_section.0,
-            *active_method,
-        ));
-    }
 }
 pub fn update_hint_on_mode_change(
-    active_method: ResMut<ActiveGravityMethod>,
+    active_method: Res<ActiveGravityMethod>,
     mode: Res<CameraMode>,
     show_normals: Res<ShowNormals>,
     show_section: Res<ShowSection>,
     mut text_query: Query<&mut Text, With<UiTextMarker>>,
 ) {
-    if !mode.is_changed() && !show_normals.is_changed() && !show_section.is_changed() {
+    if !active_method.is_changed()
+        && !mode.is_changed()
+        && !show_normals.is_changed()
+        && !show_section.is_changed()
+    {
         return;
     }
     if let Some(mut text) = text_query.iter_mut().next() {

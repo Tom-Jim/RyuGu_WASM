@@ -1,4 +1,5 @@
 pub mod compute_pipeline;
+pub mod curved_arc;
 pub mod energy;
 pub mod gravity_pipeline;
 pub mod physics;

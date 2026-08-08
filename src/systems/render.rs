@@ -120,6 +120,7 @@ pub fn render_gizmos_system(
         let orbit_color = match *active_method {
             ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
             ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
+            ActiveGravityMethod::CurvedArcEq106 => Color::srgba(0.8, 0.35, 1.0, 0.9),
         };
         gizmos.linestrip(pts, orbit_color);
 
@@ -188,6 +189,7 @@ pub fn render_section_system(
     let uniform_density = werner_density.map(|r| r.0).unwrap_or(0.0);
     if (*active_method == ActiveGravityMethod::RadialAnalytic && c <= 0.0)
         || (*active_method == ActiveGravityMethod::HomogeneousWerner && uniform_density <= 0.0)
+        || (*active_method == ActiveGravityMethod::CurvedArcEq106 && c <= 0.0)
     {
         return;
     }
@@ -268,6 +270,13 @@ pub fn render_section_system(
                 // Every interior point has rho=M/V in the Werner model, so a
                 // single color is the only faithful normalized visualization.
                 ActiveGravityMethod::HomogeneousWerner => Color::srgb(0.15, 0.8, 1.0),
+                // Eq. (106) is defined over the existing radial-density source.
+                ActiveGravityMethod::CurvedArcEq106 => {
+                    let r = (point - com).length().max(0.01);
+                    let density = c / (r + eps);
+                    let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
+                    Color::srgb(0.35 + 0.45 * t, 0.15 + 0.35 * t, 0.8 + 0.2 * (1.0 - t))
+                }
             };
             gizmos.sphere(point, dot_radius, color);
         }
