@@ -14,15 +14,15 @@
 | <img src="https://github.com/user-attachments/assets/7921e222-c7c4-4758-8dfe-82575efdeeb5" width="100%"/> | <img src="https://github.com/user-attachments/assets/6ac1d9aa-2a2f-4744-b8f0-47dd4f11b352" width="100%"/> |
 ---
 
-Ryugu WASM is a real-time gravitational-dynamics simulator for asteroid (162173) Ryugu. It is written in Rust with Bevy 0.19, compiled to WebAssembly, and uses WebGPU compute shaders for forward gravity evaluation.
+Ryugu WASM is an interactive gravitational-dynamics simulator for asteroid (162173) Ryugu. The runtime is implemented in Rust with Bevy 0.19, compiled to WebAssembly, and uses WebGPU compute shaders for selected forward-field evaluations. The project is intended for numerical experimentation and software validation; it is not an orbit-determination or flight-certification tool.
 
 The simulator exposes three complementary gravity algorithms through the `G` key:
 
 - **Werner--Scheeres homogeneous polyhedron:** the classical reference algorithm. It reduces the exterior field of a closed, consistently oriented, constant-density polyhedron to edge and face sums.
-- **Original radial-analytic GPU method:** the second algorithm. It represents a star-shaped heterogeneous body by angular cells and mass-preserving radial layers, evaluates radial contributions analytically, and reduces the remaining contributions on the GPU.
-- **Original Equation (106) adaptive curved-trajectory method:** the third algorithm. It transports the Equation (70) straight-line complex-frequency operator to curved arcs by a convergent spatial Taylor expansion.
+- **Radial-analytic GPU method:** a project-specific discretization for a star-shaped body with radially structured density. It uses angular cells, mass-preserving radial layers, analytic radial primitives, and GPU reduction.
+- **Equation (106) adaptive curved-trajectory method:** a project-specific trajectory representation. It transports the Equation (70) straight-line operator to curved arcs with an adaptive spatial Taylor expansion.
 
-The three algorithms have different source, geometry, and trajectory assumptions and are not interchangeable discretizations of one identical model. Werner--Scheeres is the homogeneous benchmark; the radial-analytic method is the primary heterogeneous pointwise solver; and Equation (106) is a trajectory-level representation for long, structured arcs.
+The three algorithms use different source representations and have different validity conditions. Werner--Scheeres provides the homogeneous polyhedron reference. The radial-analytic method is useful when a star-shaped, radially structured density model is acceptable. Equation (106) is useful only when the trajectory can be segmented so that its Taylor convergence conditions remain satisfied. None of the three methods should be treated as universally optimal.
 
 ## Features
 
@@ -73,6 +73,31 @@ bun run preview
 bun run serve
 ```
 
+Python research and validation tools are managed with `uv`. The repository
+pins the stable interpreter used by this project in `.python-version` and
+`pyproject.toml` (`Python 3.14.6`):
+
+```sh
+uv sync
+uv run pytest -q
+uv run python scripts/wasmtime_benchmark.py --wasm pkg/Ryugu_wasm_bg.wasm
+```
+
+The Wasmtime report measures wasm compilation and instantiation separately.
+Because the generated Bevy artifact contains browser/WebGPU imports, a
+headless run may report those imports and omit the numeric export call while
+still providing a reproducible compile benchmark.
+
+The top-center **Performance comparison** button opens an opaque performance
+workspace that hides the 3D scene. The application cycles through the three
+algorithms in repeated 120-frame measurement windows and continues until the
+top-center **3D display** button is selected. The workspace shows a rolling
+FPS plot and a rolling plot of four Jacobi-constant series: radial-analytic,
+Werner, Equation (106) before residual correction, and Equation (106) after
+residual correction. These measurements describe the current browser, GPU,
+driver, window size, and selected probe state; they are not portable hardware
+benchmarks or accuracy guarantees.
+
 Useful validation commands:
 
 ```sh
@@ -119,7 +144,7 @@ WebGPU availability depends on Firefox version, operating system, and GPU driver
 
 1. Open `about:config` and accept the warning.
 2. Search for `dom.webgpu.enabled` and set it to `true`.
-3. Restart Firefox and test again. Firefox Nightly is the preferred fallback on a platform where stable Firefox has not enabled WebGPU by default.
+3. Restart Firefox and test again. Firefox Nightly can also be used for testing on a platform where stable Firefox has not enabled WebGPU by default.
 
 Mozilla tracks the current platform rollout and preference in [Firefox experimental features](https://developer.mozilla.org/en-US/docs/Mozilla/Firefox/Experimental_features#webgpu_api).
 
@@ -151,28 +176,28 @@ The WebGPU render backend is configured with:
 
 ## Why Rust, Bevy, WebAssembly, and WebGPU
 
-This stack is selected for the simulator's specific workload rather than for rendering alone:
+This stack was selected for the simulator's current workload rather than as a general recommendation:
 
 | Technology | Reason for this project |
 |---|---|
-| Rust | Strong ownership and type checks make asynchronous GPU buffers, readback channels, and ECS state easier to keep valid without a garbage collector in the simulation loop. |
+| Rust | Ownership and type checking help organize asynchronous GPU buffers, readback channels, and ECS state. This reduces some classes of implementation error but does not remove numerical or browser-specific failure modes. |
 | Bevy | Its ECS and separate main/render worlds provide an explicit place for fixed-step physics, one-shot mesh preprocessing, render extraction, compute dispatch, and asynchronous readback. |
-| WebAssembly | The same Rust gravity and physics code is distributed as a browser artifact with near-native numeric execution and no local application installation. |
+| WebAssembly | The Rust gravity and physics code can be distributed as a browser artifact without a native installation. Runtime performance remains dependent on the browser and WebGPU implementation. |
 | WebGPU | Compute shaders, storage buffers, workgroups, and WGSL validation allow thousands of independent gravity contributions to be evaluated and reduced in parallel. WebGL does not provide the general compute pipeline used here. |
 
 Together, Rust and Bevy keep the CPU-side data flow structured, WebAssembly makes that code portable to the browser, and WebGPU moves the dominant forward-gravity summation to the user's GPU through modern Metal, Direct3D 12, or Vulkan-class backends.
 
 ### Why Rust instead of C++ or Python
 
-- **Rust:** provides native-level numerical performance while checking ownership, lifetimes, thread safety, and many buffer-layout mistakes at compile time. Its WebAssembly toolchain integrates directly with `wasm-bindgen`, and Bevy supplies one consistent ECS architecture for native and browser builds. This is the best fit for the project's asynchronous WebGPU readback and long-running simulation state.
-- **C++:** can deliver comparable native and WebAssembly performance and has mature scientific libraries. It was not selected here because manual memory ownership, pointer lifetime management, and JavaScript/WASM binding maintenance would increase the risk and maintenance cost around asynchronous mapped GPU buffers. C++ remains a reasonable option where an existing C++ physics engine or library ecosystem is the primary requirement.
-- **Python:** is excellent for deriving formulas, preprocessing data, validating results, and rapidly prototyping numerical experiments; the project still uses Python for research scripts where appropriate. It was not selected for the interactive runtime because ordinary Python execution cannot directly provide the same browser-native WebGPU/Bevy pipeline, and per-frame Python or Python-to-browser bridging would add overhead around the 60 Hz simulation loop.
+- **Rust:** provides compile-time ownership and type checks and integrates with `wasm-bindgen`. These properties are useful for the asynchronous ECS and GPU readback code, but they do not by themselves establish numerical accuracy.
+- **C++:** would also be a reasonable implementation language and may be preferable when an established native physics or mesh-processing library is required. The present project uses Rust to keep one implementation shared between native tests and the browser target.
+- **Python:** is used for derivations, validation, tests, and Wasmtime benchmarking. It is not part of the interactive browser loop because the current runtime is organized around Bevy and WebGPU rather than a Python-to-browser bridge.
 
-The choice is therefore workload-specific: Rust is used for the real-time browser runtime, while Python remains useful for offline analysis and validation. The decision does not imply that Rust is universally faster or more suitable than C++ for every numerical project.
+The choice is therefore workload-specific. It should not be interpreted as evidence that Rust is generally faster or more suitable than C++, Python, or other scientific-computing environments.
 
 ## Gravity models
 
->The originality claims are deliberately limited: Werner--Scheeres is classical; the radial-analytic GPU organization is the second algorithm and an original contribution; and the Equation (106) adaptive curved-trajectory construction is the third algorithm and an original contribution.
+>The project-specific radial-analytic and Equation (106) constructions are experimental methods described in [mathpub.md](mathpub.md). Werner--Scheeres is used as the classical reference. The two project-specific methods are not presented as universal replacements for established gravity solvers.
 
 ### Radial Analytic: Equation
 
@@ -185,7 +210,7 @@ $$
 
 The surface mesh is converted into angular cells. Each cell stores a representative direction, a solid-angle weight, and a surface radius. It is then split into four equal-volume radial layers.
 
-Each layer stores the volume-weighted mean density of the continuous model. This preserves the layer mass, and \(C\) is normalized so the complete discretization has mass `RYUGU_MASS`.
+Each layer stores the volume-weighted mean density of the continuous model. This preserves the layer mass, and $C$ is normalized so the complete discretization has mass `RYUGU_MASS`.
 
 At runtime, one GPU invocation evaluates one angular-layer contribution. Workgroups contain 64 invocations and reduce their results to one partial acceleration. See [mathpub.md](mathpub.md) for the public GPU evaluation form of Equation.
 
@@ -236,10 +261,27 @@ While this algorithm is active, the lower-right chart displays the Equation (157
 
 Press `D` to show a camera-facing density section:
 
-- Equation mode shows the continuous radial color field \(C/(r+10)\).
+- Radial-analytic and Equation (106) modes show the continuous radial color field $C/(r+10)$.
 - Werner mode shows one uniform color throughout the interior because its density is constant.
 
-The section is a visualization of the selected model. Equation itself uses four piecewise-constant, mass-preserving layers per angular cell.
+The section is a visualization of the selected model. The radial-analytic and
+Equation (106) modes use the same four piecewise-constant, mass-preserving
+radial layers; Werner remains homogeneous.
+
+## Comparative scope
+
+The methods should be selected according to the source model and trajectory,
+not according to a single aggregate performance number.
+
+| Method | Useful when | Main limitations in this implementation |
+|---|---|---|
+| Werner--Scheeres | A closed, consistently oriented, homogeneous polyhedron is an adequate model or an independent reference is required. | It does not represent heterogeneous density without decomposing the body into multiple polyhedra. Near-degenerate mesh geometry and cancellation in the scalar potential still require care. |
+| Radial-analytic GPU | The body is approximately star-shaped and a radial density law such as $\rho(r)=C/(r+\varepsilon)$ is acceptable. Repeated pointwise evaluations can reuse the angular/layer source. | The star-shaped assumption excludes general multi-interval radial geometry. Angular and radial discretization introduce approximation error, and near-surface cells require conservative handling. |
+| Equation (106) curved trajectory | A trajectory can be divided into segments satisfying the Taylor convergence guard and the same field representation is reused along structured arcs. | It is not a general pointwise replacement for direct gravity. Strong curvature, near-surface motion, changing density models, or insufficient closure can force fallback or reduce the benefit of the compressed representation. |
+
+The current implementation is therefore a comparative research prototype. A
+method should be considered acceptable only after comparison with an
+independent reference for the geometry, density, and trajectory under study.
 
 ## GPU execution and readback
 
@@ -292,7 +334,7 @@ Frame pacing uses:
 
 ## Rotating-frame Jacobi-constant chart
 
-The lower-right display plots the specific Jacobi constant in Ryugu's body-fixed rotating frame. Let \(R\) be Ryugu's world rotation, \(\boldsymbol\omega\) its angular velocity, and \(U>0\) the positive gravitational potential returned by the active GPU model. The body-frame position and velocity are
+The lower-right display plots the specific Jacobi constant in Ryugu's body-fixed rotating frame. Let $R$ be Ryugu's world rotation, $\boldsymbol\omega$ its angular velocity, and $U>0$ the positive gravitational potential returned by the active GPU model. The body-frame position and velocity are
 
 $$
 \mathbf r_b=R^{-1}(\mathbf r_p-\mathbf r_R),
@@ -322,17 +364,56 @@ In the final browser validation at the default initial conditions, the visible-w
 
 Changing a probe slider or switching gravity methods resets the trajectory, GPU-potential warm-up, and Jacobi history so unrelated runs are not joined into one curve.
 
+## Performance comparison
+
+The browser performance workspace is opened with the top-center
+**Performance comparison** button. It places an opaque UI layer over the 3D
+scene so that the displayed frame rate is not visually confused with the
+ordinary 3D view. The corresponding **3D display** button returns to the
+simulation.
+
+The workspace cycles through radial-analytic, Werner--Scheeres, and Equation
+(106) modes. Each mode is sampled in a 120-frame window, after which the next
+mode is selected. The cycle repeats until the user returns to the 3D view. The
+reported value is the observed browser frame rate during the current window;
+it includes UI, rendering, WebGPU dispatch, readback scheduling, and the
+current browser's presentation behavior. It is not a solver-only throughput
+measurement and should not be compared across machines without recording the
+browser version, GPU, driver, window size, and probe settings.
+
+The workspace contains two rolling plots. The first stores one FPS series per
+gravity method. The second stores four Jacobi-related series: the
+radial-analytic value, the Werner value, the Equation (106) near-straight
+value before the dual residual correction, and the residual-adjusted value.
+The latter two are diagnostic representations of the same trajectory-level
+calculation; they are not independent physical models.
+
+For a headless compilation and instantiation measurement, use the Python
+Wasmtime script after building the browser artifact:
+
+```sh
+uv run python scripts/wasmtime_benchmark.py --wasm pkg/Ryugu_wasm_bg.wasm \
+  --calls 8 --iterations 100000 --json
+```
+
+Wasmtime can compile the generated module without a browser, but the Bevy
+artifact contains browser and WebGPU imports. Consequently, instantiation or
+the exported numeric call may be unavailable in a headless environment. Such
+a result is still useful for reporting module size, compilation time, and the
+specific missing import; it is not a substitute for a browser benchmark.
+
 ## Surface topology and normals
 
 After the GLTF scene loads:
 
-1. The Ryugu root is uniformly scaled to a 900-unit maximum dimension.
+1. The Ryugu root is uniformly scaled to a maximum dimension of 900 scene units.
 2. Mesh vertices are welded with a quantization tolerance of `1e-4`.
 3. A CSR adjacency list is constructed from the welded triangle mesh.
 4. `NormalsComputePlugin` dispatches a one-shot compute shader.
 5. The normal result is read back and displayed when `F` is enabled.
 
-One-shot initialization is guarded by `ScaleNormalized` and `TopologyBuilt` marker components.
+One-shot initialization is guarded by the `ScaleNormalized` and
+`TopologyBuilt` marker components.
 
 ## Runtime controls
 
@@ -341,7 +422,7 @@ One-shot initialization is guarded by `ScaleNormalized` and `TopologyBuilt` mark
 | `S` | Switch between overview and probe-follow camera modes. |
 | `F` | Toggle GPU-computed surface-normal gizmos. |
 | `D` | Toggle the density section for the active gravity model. |
-| `G` | Cycle through Equation, homogeneous Werner, and Eq.106 adaptive curved-arc gravity. |
+| `G` | Cycle through radial-analytic, homogeneous Werner, and Eq.106 adaptive curved-arc gravity. |
 | `X`, `Y`, `Z` sliders | Set the three components of the initial probe position from `-2000` to `2000` in 100 intervals (`40` per step). |
 | `Speed` slider | Set the circular-speed multiplier from `0` to `2` in 100 intervals (`0.02` per step). |
 | Upper-right acceleration slider | Advance `1`--`8` complete stable physics frames per displayed frame. |
@@ -350,7 +431,7 @@ One-shot initialization is guarded by `ScaleNormalized` and `TopologyBuilt` mark
 
 Moving a probe slider immediately clears the old trajectory, applies the new position and tangent velocity, resets Ryugu's rotation, and warms the active GPU result from the Newtonian fallback. Switching with `G` performs the same reset using the current slider values.
 
-The orbit line is cyan in Equation mode, red in Werner mode, and purple in Eq.106 curved-arc mode.
+The orbit line is cyan in radial-analytic mode, red in Werner mode, and purple in Eq.106 curved-arc mode.
 
 ## Physical constants
 
@@ -386,7 +467,8 @@ The on-screen sliders replace these defaults at runtime. A zero position produce
 
 ```text
 setup_scene, setup_ui, setup_fps_ui, setup_probe_controls,
-setup_simulation_acceleration_control, setup_jacobi_chart
+setup_simulation_acceleration_control, setup_performance_controls,
+setup_performance_chart_segments, setup_jacobi_chart
 ```
 
 ### Main-world update chain
@@ -453,7 +535,9 @@ Ryugu_wasm/
 │       ├── werner_gravity.wgsl
 │       └── normals.wgsl
 ├── scripts/
-│   └── gen_lut.py
+│   └── wasmtime_benchmark.py
+├── tests/
+│   └── test_gravity_models.py
 └── .github/workflows/
     └── deploy.yml
 ```
@@ -474,13 +558,14 @@ Ryugu_wasm/
 | `src/systems/werner_pipeline.rs` | Homogeneous closed-polyhedron preprocessing, snapshot-tagged Werner dispatch, f64 partial reduction, and history insertion. |
 | `src/systems/physics.rs` | Point-mass residual interpolation, bounded async prediction, 12-substep leapfrog integration, and asteroid rotation. |
 | `src/systems/render.rs` | Scene, camera, orbit gizmos, normals, and method-aware density section. |
-| `src/systems/ui.rs` | FPS display, keyboard controls, four probe sliders, and the upper-right simulation-acceleration slider. |
+| `src/systems/ui.rs` | FPS display, keyboard controls, probe sliders, simulation acceleration, and the continuous performance workspace. |
 | `assets/shaders/gravity.wgsl` | Joint eight-node radial acceleration/potential quadrature and workgroup reduction. |
 | `assets/shaders/werner_gravity.wgsl` | Shared-edge and signed-face Werner field evaluation with compensated potential summation. |
 | `assets/shaders/normals.wgsl` | CSR-neighbor surface normals. |
 | `server.ts` | Static Bun server with COOP/COEP headers. |
 | `index.html` | WebGPU preflight and WASM bootstrap. |
-| `scripts/gen_lut.py` | Legacy LUT generator; retained for research history and unused by the current runtime. |
+| `scripts/wasmtime_benchmark.py` | Headless Wasmtime compilation and instantiation benchmark for the generated browser module. |
+| `tests/test_gravity_models.py` | Python checks for the inverse-density law and Equation (106) convergence guards. |
 | `mathpub.md` | Academic English taxonomy and mathematical principles of the three gravity algorithms. |
 | `docs/mathtidy_EN.md` | Rigorous English derivation of Equations (70), (106), and (157), including convergence and residual analysis. |
 
@@ -503,7 +588,7 @@ The Rust tests cover:
 
 ## Known limitations
 
-- Equation currently assumes a star-shaped body and one radial interval per direction.
+- The radial-analytic method assumes a star-shaped body and one radial interval per direction.
 - Four radial layers approximate the continuous density pointwise, although each layer mass is preserved.
 - Werner mode is homogeneous and is not a non-uniform-density Werner extension.
 - Equation (106) requires every accepted segment to remain inside the Taylor convergence radius relative to the density support; strongly curved or near-surface arcs may require many segments or a direct fallback.

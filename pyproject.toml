@@ -1,16 +1,19 @@
 [project]
-name = "ryugu-lut-generator"
+name = "ryugu-validation-tools"
 version = "0.1.0"
-description = "Generate Struve-Neumann LUT for Ryugu gravity solver"
-requires-python = ">=3.14"
+description = "Validation and Wasmtime benchmarking tools for the Ryugu gravity simulator"
+requires-python = "==3.14.6"
 dependencies = [
     "numpy>=1.24.0",
     "scipy>=1.10.0",
+    "wasmtime>=36.0.0",
+    "pytest>=8.3.0",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.uv]
+python-preference = "managed"
+package = false
 
-[tool.hatch.build.targets.wheel]
-packages = ["scripts"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

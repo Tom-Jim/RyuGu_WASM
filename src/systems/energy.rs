@@ -74,9 +74,12 @@ pub fn record_probe_jacobi_system(
         ActiveGravityMethod::HomogeneousWerner => werner_samples
             .as_ref()
             .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
-        // The curved-arc chart reports Eq. (157) directly; it does not mix a
-        // delayed GPU potential with the current probe state.
-        ActiveGravityMethod::CurvedArcEq106 => None,
+        // Eq. (106) starts from the same radial potential sample as the
+        // near-straight operator; the second performance curve adds its dual
+        // residual after this base Jacobi value is recorded.
+        ActiveGravityMethod::CurvedArcEq106 => radial_samples
+            .as_ref()
+            .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
     };
     let Some(sample) = sample else {
         return;

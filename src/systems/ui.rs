@@ -40,6 +40,37 @@ pub(crate) struct SimulationAccelerationSliderThumb;
 #[derive(Component)]
 pub(crate) struct SimulationAccelerationValueLabel;
 
+#[derive(Component)]
+pub(crate) struct PerformanceViewButton;
+
+#[derive(Component)]
+pub(crate) struct ThreeDViewButton;
+
+#[derive(Component)]
+pub(crate) struct PerformanceComparisonPanel;
+
+#[derive(Component)]
+pub(crate) struct PerformanceComparisonStatus;
+
+#[derive(Component)]
+pub(crate) struct PerformanceComparisonResult(pub usize);
+
+#[derive(Component)]
+pub(crate) struct PerformanceOverlay;
+
+#[derive(Component)]
+pub(crate) struct PerformanceFpsPlot;
+
+#[derive(Component)]
+pub(crate) struct PerformanceJacobiPlot;
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct PerformanceChartSegment {
+    pub series: usize,
+    pub index: usize,
+    pub jacobi: bool,
+}
+
 fn probe_value_text(parameter: ProbeParameter, conditions: ProbeInitialConditions) -> String {
     match parameter {
         ProbeParameter::X => format!("{:.0}", conditions.position.x),
@@ -563,6 +594,561 @@ pub fn setup_fps_ui(mut commands: Commands) {
     ));
 }
 
+fn performance_button(label: &str) -> impl Bundle {
+    (
+        Button,
+        Node {
+            width: px(230),
+            height: px(34),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(6)),
+            ..default()
+        },
+        BackgroundColor(Color::srgb(0.05, 0.25, 0.3)),
+        children![(
+            Text::new(label),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(13.0),
+                ..default()
+            },
+            TextColor(Color::srgb(0.9, 1.0, 1.0)),
+        )],
+    )
+}
+
+pub fn setup_performance_controls(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(38),
+            left: percent(50),
+            margin: UiRect::left(px(-240)),
+            width: px(480),
+            height: px(38),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        GlobalZIndex(1_000_001),
+        children![
+            (
+                performance_button("Performance comparison"),
+                PerformanceViewButton,
+            ),
+            (performance_button("3D display"), ThreeDViewButton,),
+        ],
+    ));
+
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            top: px(0),
+            width: percent(100),
+            height: percent(100),
+            padding: UiRect {
+                top: px(72),
+                right: px(28),
+                bottom: px(28),
+                left: px(28),
+            },
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: px(14),
+            display: Display::None,
+            ..default()
+        },
+        BackgroundColor(Color::srgb(0.005, 0.012, 0.025)),
+        GlobalZIndex(1_000_000),
+        PerformanceComparisonPanel,
+        PerformanceOverlay,
+        children![
+            (
+                Text::new("Three-algorithm performance comparison"),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(17.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.9, 1.0, 1.0)),
+            ),
+            (
+                Text::new("Preparing benchmark..."),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(13.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.7, 0.9, 0.9)),
+                PerformanceComparisonStatus,
+            ),
+            (
+                Text::new("Radial Analytic: -- FPS"),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.3, 1.0, 1.0)),
+                PerformanceComparisonResult(0),
+            ),
+            (
+                Text::new("Werner Polyhedron: -- FPS"),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(1.0, 0.35, 0.35)),
+                PerformanceComparisonResult(1),
+            ),
+            (
+                Text::new("Equation (106) Curved Arc: -- FPS"),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.85, 0.45, 1.0)),
+                PerformanceComparisonResult(2),
+            ),
+            (
+                Text::new("Jacobi curves: cyan radial | red Werner | purple Eq.106 near-straight | gold Eq.106 residual-adjusted"),
+                TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                TextColor(Color::srgb(0.7, 0.82, 0.9)),
+            ),
+            (
+                Node {
+                    width: px(1120),
+                    height: px(250),
+                    border: UiRect::all(px(1)),
+                    padding: UiRect::all(px(10)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.01, 0.02, 0.04, 0.95)),
+                children![
+                    (
+                        Text::new("Frame rate by algorithm"),
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(14.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.75, 0.95, 1.0)),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(14),
+                            top: px(8),
+                            ..default()
+                        },
+                    ),
+                    (
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(48),
+                            top: px(34),
+                            width: px(1040),
+                            height: px(190),
+                            border: UiRect::all(px(1)),
+                            overflow: Overflow::clip(),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.002, 0.006, 0.012, 0.95)),
+                        PerformanceFpsPlot,
+                        children![
+                            (
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: percent(50),
+                                    width: percent(100),
+                                    height: px(1),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.3, 0.4, 0.45, 0.25))
+                            ),
+                            (
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: percent(25),
+                                    width: percent(100),
+                                    height: px(1),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.3, 0.4, 0.45, 0.18))
+                            ),
+                            (
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: percent(75),
+                                    width: percent(100),
+                                    height: px(1),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.3, 0.4, 0.45, 0.18))
+                            ),
+                        ]
+                    )
+                ]
+            ),
+            (
+                Node {
+                    width: px(1120),
+                    height: px(330),
+                    border: UiRect::all(px(1)),
+                    padding: UiRect::all(px(10)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.01, 0.02, 0.04, 0.95)),
+                children![
+                    (
+                        Text::new("Rotating-frame Jacobi constants"),
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(14.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.75, 0.95, 1.0)),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(14),
+                            top: px(8),
+                            ..default()
+                        },
+                    ),
+                    (
+                        Text::new("Radial analytic"),
+                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextColor(Color::srgb(0.2, 0.95, 1.0)),
+                        Node { position_type: PositionType::Absolute, left: px(220), top: px(30), ..default() },
+                    ),
+                    (
+                        Text::new("Werner"),
+                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextColor(Color::srgb(1.0, 0.3, 0.3)),
+                        Node { position_type: PositionType::Absolute, left: px(360), top: px(30), ..default() },
+                    ),
+                    (
+                        Text::new("Eq.106 near-straight"),
+                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextColor(Color::srgb(0.85, 0.45, 1.0)),
+                        Node { position_type: PositionType::Absolute, left: px(470), top: px(30), ..default() },
+                    ),
+                    (
+                        Text::new("Eq.106 residual-adjusted"),
+                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextColor(Color::srgb(1.0, 0.78, 0.2)),
+                        Node { position_type: PositionType::Absolute, left: px(690), top: px(30), ..default() },
+                    ),
+                    (
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(48),
+                            top: px(58),
+                            width: px(1040),
+                            height: px(250),
+                            border: UiRect::all(px(1)),
+                            overflow: Overflow::clip(),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.002, 0.006, 0.012, 0.95)),
+                        PerformanceJacobiPlot,
+                        children![
+                            (
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: percent(50),
+                                    width: percent(100),
+                                    height: px(1),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.3, 0.4, 0.45, 0.25))
+                            ),
+                            (
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: percent(25),
+                                    width: percent(100),
+                                    height: px(1),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.3, 0.4, 0.45, 0.18))
+                            ),
+                            (
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: percent(75),
+                                    width: percent(100),
+                                    height: px(1),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.3, 0.4, 0.45, 0.18))
+                            ),
+                        ]
+                    )
+                ]
+            ),
+        ],
+    ));
+}
+
+pub fn setup_performance_chart_segments(
+    mut commands: Commands,
+    roots: Query<
+        (
+            Entity,
+            Option<&PerformanceFpsPlot>,
+            Option<&PerformanceJacobiPlot>,
+        ),
+        Or<(With<PerformanceFpsPlot>, With<PerformanceJacobiPlot>)>,
+    >,
+) {
+    for (root, fps_plot, jacobi_plot) in roots.iter() {
+        let series_count = if fps_plot.is_some() && jacobi_plot.is_none() {
+            3
+        } else {
+            4
+        };
+        commands.entity(root).with_children(|plot| {
+            for series in 0..series_count {
+                for index in 0..(PERFORMANCE_HISTORY_CAPACITY - 1) {
+                    let color = match series {
+                        0 => Color::srgb(0.2, 0.95, 1.0),
+                        1 => Color::srgb(1.0, 0.3, 0.3),
+                        2 => Color::srgb(0.85, 0.45, 1.0),
+                        _ => Color::srgb(1.0, 0.78, 0.2),
+                    };
+                    plot.spawn((
+                        PerformanceChartSegment {
+                            series,
+                            index,
+                            jacobi: series_count == 4,
+                        },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            display: Display::None,
+                            height: px(2),
+                            ..default()
+                        },
+                        UiTransform::IDENTITY,
+                        BackgroundColor(color),
+                    ));
+                }
+            }
+        });
+    }
+}
+
+pub fn performance_button_system(
+    mut interactions: Query<
+        (
+            &Interaction,
+            Option<&PerformanceViewButton>,
+            Option<&ThreeDViewButton>,
+        ),
+        (Changed<Interaction>, With<Button>),
+    >,
+    active_method: Res<ActiveGravityMethod>,
+    mut state: ResMut<PerformanceComparisonState>,
+) {
+    for (interaction, performance_button, three_d_button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if performance_button.is_some() && !state.active {
+            state.start(*active_method);
+        } else if three_d_button.is_some() && state.active {
+            state.stop();
+        }
+    }
+}
+
+pub fn performance_comparison_system(
+    time: Res<Time>,
+    mut state: ResMut<PerformanceComparisonState>,
+    active_method: Res<ActiveGravityMethod>,
+    jacobi: Res<JacobiHistory>,
+    curved_history: Res<CurvedArcResidualHistory>,
+    mut nodes: ParamSet<(
+        Query<&mut Node, With<PerformanceComparisonPanel>>,
+        Query<&mut Node, (With<PerformanceViewButton>, Without<ThreeDViewButton>)>,
+        Query<&mut Node, (With<ThreeDViewButton>, Without<PerformanceViewButton>)>,
+        Query<(&PerformanceChartSegment, &mut Node, &mut UiTransform)>,
+    )>,
+    mut texts: ParamSet<(
+        Query<&mut Text, With<PerformanceComparisonStatus>>,
+        Query<(&mut Text, &PerformanceComparisonResult)>,
+    )>,
+) {
+    let panel_display = if state.active {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if let Some(mut panel) = nodes.p0().iter_mut().next() {
+        panel.display = panel_display;
+    }
+    if let Some(mut button) = nodes.p1().iter_mut().next() {
+        button.display = if state.active {
+            Display::None
+        } else {
+            Display::Flex
+        };
+    }
+    if let Some(mut button) = nodes.p2().iter_mut().next() {
+        button.display = if state.active {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    if state.active && state.measuring && *active_method == method_for_phase(state.phase) {
+        let dt = time.delta_secs_f64().max(f64::EPSILON);
+        let fps = (1.0 / dt) as f32;
+        let phase = state.phase;
+        push_performance_sample(&mut state.fps_history[phase], fps);
+        if let Some(sample) = jacobi.samples.back() {
+            let series = match *active_method {
+                ActiveGravityMethod::RadialAnalytic => 0,
+                ActiveGravityMethod::HomogeneousWerner => 1,
+                ActiveGravityMethod::CurvedArcEq106 => 2,
+            };
+            push_performance_sample(&mut state.jacobi_history[series], sample.jacobi_constant);
+            if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+                let residual = curved_history
+                    .samples
+                    .back()
+                    .and_then(|sample| sample.dual_residual)
+                    .unwrap_or(0.0);
+                push_performance_sample(
+                    &mut state.jacobi_history[3],
+                    sample.jacobi_constant + 2.0 * residual,
+                );
+            }
+        }
+        state.phase_frames = state.phase_frames.saturating_add(1);
+        state.phase_elapsed_seconds += time.delta_secs_f64();
+        if state.phase_frames >= PERFORMANCE_PHASE_FRAMES {
+            let elapsed = state.phase_elapsed_seconds.max(f64::EPSILON);
+            let phase = state.phase;
+            state.frames_per_second[phase] = PERFORMANCE_PHASE_FRAMES as f64 / elapsed;
+            state.phase = (state.phase + 1) % 3;
+            state.phase_frames = 0;
+            state.phase_elapsed_seconds = 0.0;
+            state.pending_method = Some(method_for_phase(state.phase));
+        }
+    }
+
+    if let Some(mut text) = texts.p0().iter_mut().next() {
+        *text = Text::new(if state.active {
+            format!(
+                "Measuring {} ({} / {} frames)",
+                method_for_phase(state.phase).as_str(),
+                state.phase_frames,
+                PERFORMANCE_PHASE_FRAMES
+            )
+        } else {
+            "Select 3D display to return.".to_owned()
+        });
+    }
+    for (mut text, result) in texts.p1().iter_mut() {
+        let fps = state.frames_per_second[result.0];
+        *text = Text::new(format!(
+            "{}: {} FPS",
+            method_for_phase(result.0).as_str(),
+            if fps > 0.0 {
+                format!("{fps:.1}")
+            } else {
+                "--".to_owned()
+            }
+        ));
+    }
+
+    update_performance_chart_segments(&state, &mut nodes.p3());
+}
+
+fn push_performance_sample<T>(history: &mut std::collections::VecDeque<T>, value: T) {
+    if history.len() == PERFORMANCE_HISTORY_CAPACITY {
+        history.pop_front();
+    }
+    history.push_back(value);
+}
+
+fn update_performance_chart_segments(
+    state: &PerformanceComparisonState,
+    segments: &mut Query<(&PerformanceChartSegment, &mut Node, &mut UiTransform)>,
+) {
+    let fps_max = state
+        .fps_history
+        .iter()
+        .flat_map(|series| series.iter().copied())
+        .fold(1.0_f32, f32::max);
+    let jacobi_values = state
+        .jacobi_history
+        .iter()
+        .flat_map(|series| series.iter().copied());
+    let (jacobi_min, jacobi_max) = jacobi_values
+        .clone()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+            (min.min(value), max.max(value))
+        });
+    let jacobi_span = (jacobi_max - jacobi_min).max(1.0e-9);
+
+    for (segment, mut node, mut transform) in segments.iter_mut() {
+        let (y0, y1) = if segment.jacobi {
+            let history = &state.jacobi_history[segment.series];
+            let (Some(from), Some(to)) =
+                (history.get(segment.index), history.get(segment.index + 1))
+            else {
+                node.display = Display::None;
+                continue;
+            };
+            let a = ((from - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
+            let b = ((to - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
+            (
+                (1.0 - a) * 220.0 + (segment.series as f32 - 1.5) * 2.0,
+                (1.0 - b) * 220.0 + (segment.series as f32 - 1.5) * 2.0,
+            )
+        } else {
+            let history = &state.fps_history[segment.series];
+            let (Some(from), Some(to)) =
+                (history.get(segment.index), history.get(segment.index + 1))
+            else {
+                node.display = Display::None;
+                continue;
+            };
+            let y0 = (1.0 - *from / fps_max) * 170.0;
+            let y1 = (1.0 - *to / fps_max) * 170.0;
+            (y0, y1)
+        };
+        let width = if segment.jacobi && state.jacobi_history[segment.series].len() > 1
+            || !segment.jacobi && state.fps_history[segment.series].len() > 1
+        {
+            1000.0 / (PERFORMANCE_HISTORY_CAPACITY - 1) as f32
+        } else {
+            1.0
+        };
+        let x0 = segment.index as f32 * width;
+        let x1 = (segment.index + 1) as f32 * width;
+        let delta = Vec2::new(x1 - x0, y1 - y0);
+        let length = delta.length();
+        node.display = Display::Flex;
+        node.left = px((x0 + x1) * 0.5 - length * 0.5);
+        node.top = px((y0 + y1) * 0.5 - 1.0);
+        node.width = px(length.max(0.5));
+        transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
+    }
+}
+
+fn method_for_phase(phase: usize) -> ActiveGravityMethod {
+    match phase {
+        0 => ActiveGravityMethod::RadialAnalytic,
+        1 => ActiveGravityMethod::HomogeneousWerner,
+        _ => ActiveGravityMethod::CurvedArcEq106,
+    }
+}
+
 pub fn fps_update_system(
     diagnostics: Res<DiagnosticsStore>,
     mut query: Query<&mut Text, With<FpsTextMarker>>,
@@ -643,6 +1229,7 @@ pub fn section_toggle_system(
 pub fn method_toggle_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut active_method: ResMut<ActiveGravityMethod>,
+    mut performance: ResMut<PerformanceComparisonState>,
     probe_initial: Res<ProbeInitialConditions>,
     mut gravity_blend: ResMut<GravityBlendFactor>,
     mut radial_potential: ResMut<GravityPotential>,
@@ -662,14 +1249,19 @@ pub fn method_toggle_system(
     >,
     mut ryugu_query: Query<&mut Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyG) {
+    let requested_method = performance.pending_method.take().or_else(|| {
+        (!performance.active && keyboard.just_pressed(KeyCode::KeyG)).then_some(
+            match *active_method {
+                ActiveGravityMethod::RadialAnalytic => ActiveGravityMethod::HomogeneousWerner,
+                ActiveGravityMethod::HomogeneousWerner => ActiveGravityMethod::CurvedArcEq106,
+                ActiveGravityMethod::CurvedArcEq106 => ActiveGravityMethod::RadialAnalytic,
+            },
+        )
+    });
+    let Some(next_method) = requested_method else {
         return;
-    }
-    *active_method = match *active_method {
-        ActiveGravityMethod::RadialAnalytic => ActiveGravityMethod::HomogeneousWerner,
-        ActiveGravityMethod::HomogeneousWerner => ActiveGravityMethod::CurvedArcEq106,
-        ActiveGravityMethod::CurvedArcEq106 => ActiveGravityMethod::RadialAnalytic,
     };
+    *active_method = next_method;
     // The newly selected GPU path may not have produced a sample for the reset
     // probe position yet. Warm it up from the Newtonian anchor again instead of
     // applying a full-strength stale readback from before the method switch.

@@ -209,9 +209,8 @@ pub fn render_section_system(
     let tangent_v = plane_normal.cross(tangent_u).normalize();
 
     // Linear normalization for 1/r density field
-    let eps = DENSITY_EPSILON;
-    let max_density = c / eps;
-    let min_density = c / (SECTION_CLIP_RADIUS + eps);
+    let max_density = inverse_radial_density(0.0, c);
+    let min_density = inverse_radial_density(SECTION_CLIP_RADIUS, c);
     let density_range = (max_density - min_density).max(1e-6);
 
     // Stride-sampled local vertices for mesh-boundary clipping (limits to ~2000 samples)
@@ -255,7 +254,7 @@ pub fn render_section_system(
                 ActiveGravityMethod::RadialAnalytic => {
                     // Continuous rho(r)=C/(r+epsilon) used by the radial model.
                     let r = (point - com).length().max(0.01);
-                    let density = c / (r + eps);
+                    let density = inverse_radial_density(r, c);
                     let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
 
                     // Red center → yellow → cyan → blue/purple edge.
@@ -273,9 +272,15 @@ pub fn render_section_system(
                 // Eq. (106) is defined over the existing radial-density source.
                 ActiveGravityMethod::CurvedArcEq106 => {
                     let r = (point - com).length().max(0.01);
-                    let density = c / (r + eps);
+                    let density = inverse_radial_density(r, c);
                     let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
-                    Color::srgb(0.35 + 0.45 * t, 0.15 + 0.35 * t, 0.8 + 0.2 * (1.0 - t))
+                    if t > 0.75 {
+                        Color::srgb(1.0, (1.0 - t) * 4.0, 0.0)
+                    } else if t > 0.35 {
+                        Color::srgb((t - 0.35) * 2.5, 1.0, (0.75 - t) * 2.5)
+                    } else {
+                        Color::srgb(0.0, t * 2.85, 0.5 + 0.5 * (1.0 - t * 2.85))
+                    }
                 }
             };
             gizmos.sphere(point, dot_radius, color);

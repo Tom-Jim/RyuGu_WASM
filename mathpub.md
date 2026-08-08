@@ -405,7 +405,7 @@ For a fixed observation point, every pair $(k,j)$ is independent. A workgroup th
 
 ### 3.7 Degenerate and near-singular configurations
 
-When $\mathbf n'\) is nearly collinear with $\mathbf q$, the closed-form primitive can become ill-conditioned because algebraically cancelling terms are individually large. The implementation detects this narrow configuration and evaluates only the affected layer with an eight-point Gauss-Legendre rule. Regular layers continue to use the endpoint primitive.
+When $\mathbf n'$ is nearly collinear with $\mathbf q$, the closed-form primitive can become ill-conditioned because algebraically cancelling terms are individually large. The implementation detects this narrow configuration and evaluates only the affected layer with an eight-point Gauss-Legendre rule. Regular layers continue to use the endpoint primitive.
 
 This fallback is not a global replacement of the analytic method. It is a local stabilization of a removable or nearly removable degeneracy.
 

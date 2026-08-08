@@ -26,6 +26,12 @@ pub const SECTION_CLIP_RADIUS: f32 = 450.0;
 pub const PROBE_R0: Vec3 = Vec3::new(-1000.0, 1200.0, 100.0);
 pub const PROBE_SPEED_FACTOR: f32 = 1.053;
 
+/// Shared inverse-radial density law used by the radial-analytic and
+/// Equation (106) modes: rho(r) = C / (r + epsilon).
+pub fn inverse_radial_density(radius: f32, density_c: f32) -> f32 {
+    density_c / (radius.max(0.0) + DENSITY_EPSILON)
+}
+
 pub fn probe_initial_velocity(position: Vec3, speed_factor: f32) -> Vec3 {
     let radius = position.length();
     if !radius.is_finite() || radius <= f32::EPSILON {
@@ -320,7 +326,7 @@ impl Default for GravityReadbackChannel {
     }
 }
 
-#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum ActiveGravityMethod {
     #[default]
     RadialAnalytic,
@@ -328,6 +334,69 @@ pub enum ActiveGravityMethod {
     /// Eq. (106) adaptive curved-arc mode; it starts non-periodic and promotes
     /// itself to periodic only after the planner sees stable orbit closures.
     CurvedArcEq106,
+}
+
+pub const PERFORMANCE_PHASE_FRAMES: u32 = 120;
+pub const PERFORMANCE_HISTORY_CAPACITY: usize = 180;
+
+#[derive(Resource, Debug)]
+pub struct PerformanceComparisonState {
+    pub active: bool,
+    pub measuring: bool,
+    pub phase: usize,
+    pub phase_frames: u32,
+    pub phase_elapsed_seconds: f64,
+    pub frames_per_second: [f64; 3],
+    pub pending_method: Option<ActiveGravityMethod>,
+    pub return_method: ActiveGravityMethod,
+    pub fps_history: [VecDeque<f32>; 3],
+    pub jacobi_history: [VecDeque<f64>; 4],
+}
+
+impl Default for PerformanceComparisonState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            measuring: false,
+            phase: 0,
+            phase_frames: 0,
+            phase_elapsed_seconds: 0.0,
+            frames_per_second: [0.0; 3],
+            pending_method: None,
+            return_method: ActiveGravityMethod::RadialAnalytic,
+            fps_history: std::array::from_fn(|_| {
+                VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
+            }),
+            jacobi_history: std::array::from_fn(|_| {
+                VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
+            }),
+        }
+    }
+}
+
+impl PerformanceComparisonState {
+    pub fn start(&mut self, return_method: ActiveGravityMethod) {
+        self.active = true;
+        self.measuring = true;
+        self.phase = 0;
+        self.phase_frames = 0;
+        self.phase_elapsed_seconds = 0.0;
+        self.frames_per_second = [0.0; 3];
+        self.pending_method = Some(ActiveGravityMethod::RadialAnalytic);
+        self.return_method = return_method;
+        for history in &mut self.fps_history {
+            history.clear();
+        }
+        for history in &mut self.jacobi_history {
+            history.clear();
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.active = false;
+        self.measuring = false;
+        self.pending_method = Some(self.return_method);
+    }
 }
 
 impl ActiveGravityMethod {

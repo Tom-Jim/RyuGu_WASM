@@ -20,8 +20,8 @@ use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use components::{
     ActiveGravityMethod, CameraMode, DensityC, GravityAcceleration, GravityBlendFactor,
-    GravityPotential, JacobiHistory, ProbeInitialConditions, ShowNormals, ShowSection,
-    SimulationAcceleration, SimulationClock,
+    GravityPotential, JacobiHistory, PerformanceComparisonState, ProbeInitialConditions,
+    ShowNormals, ShowSection, SimulationAcceleration, SimulationClock,
 };
 use std::time::Duration;
 use systems::{
@@ -39,10 +39,12 @@ use systems::{
     },
     scale::{build_topology_system, normalize_model_scale_system},
     ui::{
-        fps_update_system, method_toggle_system, normal_toggle_system, probe_slider_system,
-        probe_slider_visual_system, section_toggle_system, setup_fps_ui, setup_probe_controls,
-        setup_simulation_acceleration_control, simulation_acceleration_slider_system,
-        simulation_acceleration_slider_visual_system, update_hint_on_mode_change,
+        fps_update_system, method_toggle_system, normal_toggle_system, performance_button_system,
+        performance_comparison_system, probe_slider_system, probe_slider_visual_system,
+        section_toggle_system, setup_fps_ui, setup_performance_chart_segments,
+        setup_performance_controls, setup_probe_controls, setup_simulation_acceleration_control,
+        simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
+        update_hint_on_mode_change,
     },
     werner_pipeline::WernerComputePlugin,
 };
@@ -133,6 +135,7 @@ pub fn main() {
         .init_resource::<SimulationClock>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
+        .init_resource::<PerformanceComparisonState>()
         .init_resource::<CurvedArcPlannerState>()
         .init_resource::<CurvedArcResidualHistory>()
         .init_resource::<PeriodicityDetector>()
@@ -203,6 +206,10 @@ pub fn main() {
         ),
     )
     .add_systems(
+        Startup,
+        (setup_performance_controls, setup_performance_chart_segments).chain(),
+    )
+    .add_systems(
         Update,
         (
             normalize_model_scale_system,
@@ -213,7 +220,10 @@ pub fn main() {
             .chain(),
     )
     .add_systems(Update, section_toggle_system)
-    .add_systems(Update, method_toggle_system)
+    .add_systems(
+        Update,
+        (performance_button_system, method_toggle_system).chain(),
+    )
     .add_systems(
         Update,
         (probe_slider_system, probe_slider_visual_system).chain(),
@@ -224,6 +234,7 @@ pub fn main() {
             simulation_acceleration_slider_system,
             simulation_acceleration_slider_visual_system,
             update_hint_on_mode_change,
+            performance_comparison_system,
             camera_follow_system,
             fps_update_system,
             update_jacobi_chart_system,
@@ -246,6 +257,28 @@ pub fn main() {
             .chain(),
     )
     .run();
+}
+
+/// Deterministic WASM-side microbenchmark entry point used by the Python
+/// `wasmtime` benchmark harness. The browser performance panel measures the
+/// complete Bevy/WebGPU paths; this export measures the corresponding numeric
+/// kernels without requiring a browser DOM or WebGPU imports.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn benchmark_gravity_algorithms(iterations: u32) -> f64 {
+    let iterations = iterations.max(1);
+    let mut checksum = 0.0_f64;
+    for index in 0..iterations {
+        let radius = 120.0 + (index % 4096) as f64 * 0.125;
+        let inverse_density = 1.0 / (radius + components::DENSITY_EPSILON as f64);
+        let radial = inverse_density * radius * radius;
+        let edge_log = ((radius + 900.0 + 42.0) / (radius + 900.0 - 42.0)).ln();
+        let werner = edge_log * (radius + 1.0).recip();
+        let displacement = 0.05 * (index as f64 * 0.017).sin();
+        let ratio = displacement / radius;
+        let taylor = ratio + 0.5 * ratio * ratio + 0.375 * ratio * ratio * ratio;
+        checksum += radial + werner + taylor;
+    }
+    std::hint::black_box(checksum)
 }
 
 #[cfg(test)]
