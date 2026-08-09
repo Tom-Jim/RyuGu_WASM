@@ -19,8 +19,8 @@ use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use components::{
-    ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GravityAcceleration,
-    GravityBlendFactor, GravityPotential, GravityRuntimeError, JacobiHistory,
+    ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GpuMemoryEstimate,
+    GravityAcceleration, GravityBlendFactor, GravityPotential, GravityRuntimeError, JacobiHistory,
     PerformanceComparisonState, ProbeInitialConditions, ShowNormals, ShowSection,
     SimulationAcceleration, SimulationClock,
 };
@@ -52,7 +52,7 @@ use systems::{
         setup_fps_ui, setup_performance_chart_segments, setup_performance_controls,
         setup_probe_controls, setup_runtime_error_overlay, setup_simulation_acceleration_control,
         simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
-        update_hint_on_mode_change, update_ui_scale_system,
+        update_gpu_memory_estimate_system, update_hint_on_mode_change, update_ui_scale_system,
     },
     werner_pipeline::WernerComputePlugin,
 };
@@ -152,6 +152,7 @@ pub fn main() {
         .init_resource::<ActiveGravityMethod>()
         .init_resource::<GravityAcceleration>()
         .init_resource::<GravityPotential>()
+        .init_resource::<GpuMemoryEstimate>()
         .init_resource::<GravityBlendFactor>()
         .init_resource::<GravityRuntimeError>()
         .init_resource::<JacobiHistory>()
@@ -288,6 +289,7 @@ pub fn main() {
             update_hint_on_mode_change,
             performance_comparison_system,
             camera_follow_system,
+            update_gpu_memory_estimate_system,
             fps_update_system,
             update_jacobi_chart_system,
             section_alpha_system,

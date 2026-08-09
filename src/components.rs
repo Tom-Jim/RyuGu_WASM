@@ -89,6 +89,8 @@ pub struct UiTextMarker;
 #[derive(Component)]
 pub struct FpsTextMarker;
 #[derive(Component)]
+pub struct VramTextMarker;
+#[derive(Component)]
 pub struct Velocity(pub Vec3);
 #[derive(Component)]
 pub struct OrbitHistory(pub VecDeque<Vec3>);
@@ -234,6 +236,20 @@ pub struct GravityAcceleration(pub Vec3);
 /// Latest positive gravitational potential U returned by the radial GPU model.
 #[derive(Resource, Default)]
 pub struct GravityPotential(pub Option<f32>);
+
+/// Browser-visible GPU memory accounting. WebGPU does not expose portable
+/// driver VRAM counters, so these values are the exact sizes of the buffers
+/// allocated by each project pipeline, reported as an auditable estimate.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuMemoryEstimate {
+    pub bytes: [u64; 5],
+}
+
+impl GpuMemoryEstimate {
+    pub fn total_bytes(self) -> u64 {
+        self.bytes.iter().sum()
+    }
+}
 
 /// Main-world state captured when a render-world gravity dispatch is submitted.
 /// The returned acceleration and potential are only valid for this snapshot.
@@ -617,6 +633,16 @@ impl PerformanceComparisonState {
 }
 
 impl ActiveGravityMethod {
+    pub fn performance_index(self) -> usize {
+        match self {
+            Self::RadialAnalytic => 0,
+            Self::HomogeneousWerner => 1,
+            Self::CurvedArcEq106 => 2,
+            Self::MmfftCompressed => 3,
+            Self::Fmm => 4,
+        }
+    }
+
     pub fn from_performance_index(index: usize) -> Self {
         match index {
             0 => Self::RadialAnalytic,

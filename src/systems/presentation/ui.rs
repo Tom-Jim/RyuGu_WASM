@@ -1,6 +1,7 @@
 use crate::components::*;
 use crate::systems::{
     curved_arc::{CurvedArcPlannerState, CurvedArcResidualHistory, PeriodicityDetector},
+    eq106_operator::Eq106OperatorTensorResource,
     werner_pipeline::{WernerAcceleration, WernerPotential},
 };
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
@@ -783,6 +784,24 @@ pub fn setup_fps_ui(mut commands: Commands) {
             ..default()
         },
         FpsTextMarker,
+    ));
+    commands.spawn((
+        Text::new("VRAM estimate: --"),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(11.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.65, 0.85, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            // The acceleration panel occupies approximately 43..125 px on
+            // the right edge; keep the VRAM readout below it.
+            top: Val::Px(134.0),
+            right: Val::Px(15.0),
+            max_width: Val::Px(460.0),
+            ..default()
+        },
+        VramTextMarker,
     ));
 }
 
@@ -1763,7 +1782,10 @@ fn method_for_phase(phase: usize) -> ActiveGravityMethod {
 
 pub fn fps_update_system(
     diagnostics: Res<DiagnosticsStore>,
+    active_method: Res<ActiveGravityMethod>,
+    memory: Res<GpuMemoryEstimate>,
     mut query: Query<&mut Text, With<FpsTextMarker>>,
+    mut vram_query: Query<&mut Text, (With<VramTextMarker>, Without<FpsTextMarker>)>,
 ) {
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
@@ -1771,6 +1793,80 @@ pub fn fps_update_system(
         .unwrap_or(0.0);
     if let Some(mut text) = query.iter_mut().next() {
         *text = Text::new(format!("FPS: {fps:.0}"));
+    }
+    if let Some(mut text) = vram_query.iter_mut().next() {
+        *text = Text::new(format_vram_text(*active_method, *memory));
+    }
+}
+
+/// Estimates the persistent GPU allocation for each algorithm from the exact
+/// buffer sizes used by its render-world pipeline. WebGPU intentionally has no
+/// portable API for driver-level VRAM usage, so this is labeled as an estimate.
+pub fn update_gpu_memory_estimate_system(
+    radial: Option<Res<RadialGravitySource>>,
+    topology: Option<Res<AsteroidTopologyGpuData>>,
+    eq106_sources: Option<Res<crate::systems::curved_arc::Eq106SourceData>>,
+    eq106_tensor: Option<Res<Eq106OperatorTensorResource>>,
+    mmfft: Option<Res<MmfftCompressedSource>>,
+    fmm: Option<Res<FmmSource>>,
+    mut estimate: ResMut<GpuMemoryEstimate>,
+) {
+    let mut bytes = [0_u64; 5];
+    if let Some(source) = radial {
+        bytes[0] = source.bytes.len() as u64 + 32 + 2 * reduction_buffer_bytes(source.count);
+    }
+    if let Some(topology) = topology {
+        let face_count = (topology.triangles.len() / 3) as u64;
+        let edge_count = face_count * 3 / 2;
+        let item_count = edge_count.max(face_count) as u32;
+        bytes[1] = edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
+    }
+    if let (Some(source), Some(tensor)) = (eq106_sources, eq106_tensor) {
+        bytes[2] = source.sources.len() as u64 * 16
+            + 256 * 8
+            + tensor.tensor.coefficients.len() as u64 * 4
+            + 64
+            + 257 * 32
+            + 2 * 32;
+    }
+    if let Some(source) = mmfft {
+        bytes[3] = source.bytes.len() as u64 + 48 + 2 * reduction_buffer_bytes(source.count);
+    }
+    if let Some(source) = fmm {
+        bytes[4] = source.bytes.len() as u64 + 32 + 2 * reduction_buffer_bytes(source.node_count);
+    }
+    estimate.bytes = bytes;
+}
+
+fn reduction_buffer_bytes(item_count: u32) -> u64 {
+    item_count.div_ceil(64) as u64 * 16
+}
+
+fn format_vram_text(method: ActiveGravityMethod, memory: GpuMemoryEstimate) -> String {
+    let labels = ["R", "W", "106", "MM", "FMM"];
+    let total = memory.total_bytes().max(1);
+    let active_index = method.performance_index();
+    let active_bytes = memory.bytes[active_index];
+    let active_share = active_bytes as f64 / total as f64 * 100.0;
+    let details = labels
+        .iter()
+        .zip(memory.bytes)
+        .map(|(label, bytes)| format!("{label} {}", format_bytes(bytes)))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "VRAM estimate: {} {} ({active_share:.1}% of total)\n{}",
+        labels[active_index],
+        format_bytes(active_bytes),
+        details
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
     }
 }
 
@@ -1944,10 +2040,10 @@ pub fn update_hint_on_mode_change(
 #[cfg(test)]
 mod performance_chart_tests {
     use super::{
-        PerformanceChartSegment, clear_performance_method_history, performance_chart_series_count,
-        performance_chart_series_enabled,
+        PerformanceChartSegment, clear_performance_method_history, format_vram_text,
+        performance_chart_series_count, performance_chart_series_enabled,
     };
-    use crate::components::PerformanceComparisonState;
+    use crate::components::{ActiveGravityMethod, GpuMemoryEstimate, PerformanceComparisonState};
     use std::collections::VecDeque;
 
     #[test]
@@ -1996,5 +2092,16 @@ mod performance_chart_tests {
                 jacobi: true,
             }
         ));
+    }
+
+    #[test]
+    fn vram_label_follows_active_method_and_reports_all_slots() {
+        let memory = GpuMemoryEstimate {
+            bytes: [1024, 2048, 3 * 1024, 4 * 1024, 5 * 1024],
+        };
+        let text = format_vram_text(ActiveGravityMethod::Fmm, memory);
+        assert!(text.starts_with("VRAM estimate: FMM 5.0 KB"));
+        assert!(text.contains("R 1.0 KB"));
+        assert!(text.contains("106 3.0 KB"));
     }
 }

@@ -44,6 +44,7 @@ The five slots use different source representations and have different validity 
 - A scrolling rotating-frame Jacobi-constant chart with automatic vertical scaling.
 - An Eq.157 dual-representation residual chart while the curved-arc solver is active.
 - A five-method performance workspace with per-method checkboxes, repeat testing, FPS curves, and Jacobi curves.
+- A live `VRAM estimate` readout below the simulation-acceleration control. It reports the current algorithm's allocated GPU-buffer estimate, its share of the five-method total, and all five per-method estimates.
 - Blocking numerical-error overlay; integration pauses while a selected evaluator is warming up and stops if certification fails.
 
 ## Requirements
@@ -327,6 +328,13 @@ main-world source data
 An atomic `in_flight` flag prevents overlapping maps of the same staging buffer. Buffers and bind groups are reused instead of being allocated every frame.
 
 The GPU result is computed in Ryugu's body-fixed frame and rotated back into world space before integration.
+
+The FPS counter is followed by a `VRAM estimate` readout. Because WebGPU does
+not expose a portable driver-level VRAM-usage counter, the displayed values are
+calculated from the actual source, uniform, output, staging, spectrum, LUT,
+and operator-table buffer sizes used by the five render-world pipelines. The
+readout is positioned below the simulation-acceleration panel and updates as
+source data or the active gravity method changes.
 
 Each dispatch carries a monotonically increasing request ID, simulation epoch, simulation time, and a snapshot of the probe and Ryugu transforms. The asynchronous readback returns that snapshot together with its acceleration and potential, so an old body-frame result is never rotated with a newer asteroid attitude. Completed samples are kept in a bounded eight-entry history instead of being reduced to an unlabelled "latest value".
 
