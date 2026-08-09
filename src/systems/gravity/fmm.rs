@@ -1,0 +1,522 @@
+//! GPU fast multipole method for the fifth gravity slot.
+//!
+//! The immutable radial density records are compressed into a six-level linear
+//! octree once. P2M/M2M mass, center-of-mass, and traceless quadrupole moments
+//! are stored in breadth-first order. The real-time WGSL pass applies a
+//! fixed-depth multipole acceptance criterion in parallel and asynchronously
+//! reads back only workgroup reductions.
+
+use crate::components::*;
+use bevy::math::DVec3;
+use bevy::prelude::*;
+use bevy::render::{
+    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+    render_resource::{
+        BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+        Buffer, BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
+        CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
+        ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
+    },
+    renderer::{RenderDevice, RenderQueue},
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+const WORKGROUP_SIZE: u32 = 64;
+const MAXIMUM_LEVEL: u32 = 5;
+const THETA: f32 = 0.55;
+const INVALID_PARENT: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MomentAccumulator {
+    mass: f64,
+    first: DVec3,
+    second: [f64; 6],
+}
+
+impl MomentAccumulator {
+    fn add(&mut self, position: DVec3, mass: f64) {
+        self.mass += mass;
+        self.first += position * mass;
+        let [x, y, z] = position.to_array();
+        for (slot, value) in self
+            .second
+            .iter_mut()
+            .zip([x * x, x * y, x * z, y * y, y * z, z * z])
+        {
+            *slot += mass * value;
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct ExtractedFmmInput {
+    enabled: bool,
+    probe: Vec3,
+    snapshot: Option<GravityRequestSnapshot>,
+    node_bytes: Option<Vec<u8>>,
+    node_count: u32,
+    maximum_level: u32,
+}
+
+#[derive(Resource, Default)]
+struct FmmGpuBuffers(Option<FmmGpuBuffersInner>);
+
+struct FmmGpuBuffersInner {
+    uniform: Buffer,
+    output: Buffer,
+    staging: Buffer,
+    bind_group: BindGroup,
+    workgroup_count: u32,
+    output_size: u64,
+    last_submitted: Option<(u64, u64)>,
+}
+
+#[derive(Resource)]
+struct FmmComputePipeline {
+    pipeline_id: CachedComputePipelineId,
+}
+
+pub struct FmmComputePlugin;
+
+impl Plugin for FmmComputePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<FmmReadbackChannel>();
+        app.init_resource::<FmmGravityHistory>();
+        app.add_systems(Update, build_fmm_source_system);
+        app.add_systems(Update, clear_fmm_history_on_probe_reset);
+        app.add_systems(PreUpdate, poll_fmm_readback);
+
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app.init_resource::<ExtractedFmmInput>();
+        render_app.init_resource::<FmmGpuBuffers>();
+        render_app.add_systems(ExtractSchedule, extract_fmm_input);
+        render_app.add_systems(Render, dispatch_fmm.in_set(RenderSystems::Render));
+    }
+
+    fn finish(&self, app: &mut App) {
+        let channel = app.world().resource::<FmmReadbackChannel>().clone();
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app.insert_resource(channel);
+        render_app.init_resource::<FmmComputePipeline>();
+    }
+}
+
+impl FromWorld for FmmComputePipeline {
+    fn from_world(world: &mut World) -> Self {
+        let entries = [uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)];
+        let layout = BindGroupLayoutDescriptor::new("fmm_gravity_bgl", &entries);
+        let shader = world
+            .resource::<AssetServer>()
+            .load("shaders/fmm_gravity.wgsl");
+        let pipeline_id =
+            world
+                .resource::<PipelineCache>()
+                .queue_compute_pipeline(ComputePipelineDescriptor {
+                    label: Some("fmm_gravity_compute".into()),
+                    layout: vec![layout],
+                    immediate_size: 0,
+                    shader,
+                    shader_defs: vec![],
+                    entry_point: None,
+                    zero_initialize_workgroup_memory: false,
+                });
+        Self { pipeline_id }
+    }
+}
+
+pub fn build_fmm_source_system(
+    mut commands: Commands,
+    radial: Option<Res<RadialGravitySource>>,
+    existing: Option<Res<FmmSource>>,
+) {
+    if existing.is_some() {
+        return;
+    }
+    let Some(radial) = radial else { return };
+    let mut records = Vec::with_capacity(radial.count as usize);
+    let mut radius = 0.0_f64;
+    for chunk in radial.bytes.chunks_exact(32) {
+        let direction = DVec3::new(
+            read_f32(chunk, 0) as f64,
+            read_f32(chunk, 4) as f64,
+            read_f32(chunk, 8) as f64,
+        )
+        .try_normalize()
+        .unwrap_or(DVec3::Z);
+        let solid_angle = (read_f32(chunk, 12) as f64).max(0.0);
+        let inner = (read_f32(chunk, 16) as f64).max(0.0);
+        let outer = (read_f32(chunk, 20) as f64).max(inner);
+        let density = (read_f32(chunk, 24) as f64).max(0.0);
+        if outer <= inner || density <= 0.0 || solid_angle <= 0.0 {
+            continue;
+        }
+        let volume = solid_angle * (outer.powi(3) - inner.powi(3)) / 3.0;
+        let mass = density * volume;
+        let centroid_radius = 0.75 * (outer.powi(4) - inner.powi(4))
+            / (outer.powi(3) - inner.powi(3)).max(f64::MIN_POSITIVE);
+        records.push((direction * centroid_radius, mass));
+        radius = radius.max(outer);
+    }
+    if records.is_empty() || radius <= 0.0 {
+        return;
+    }
+
+    let mut levels: Vec<Vec<((u32, u32, u32), MomentAccumulator)>> = Vec::new();
+    for level in 0..=MAXIMUM_LEVEL {
+        let grid = 1u32 << level;
+        let mut cells: HashMap<(u32, u32, u32), MomentAccumulator> = HashMap::new();
+        for &(position, mass) in &records {
+            let normalized = (position / radius + DVec3::ONE) * 0.5;
+            let key = (
+                ((normalized.x.clamp(0.0, 1.0 - f64::EPSILON) * grid as f64) as u32).min(grid - 1),
+                ((normalized.y.clamp(0.0, 1.0 - f64::EPSILON) * grid as f64) as u32).min(grid - 1),
+                ((normalized.z.clamp(0.0, 1.0 - f64::EPSILON) * grid as f64) as u32).min(grid - 1),
+            );
+            cells.entry(key).or_default().add(position, mass);
+        }
+        let mut sorted = cells.into_iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|(key, _)| *key);
+        levels.push(sorted);
+    }
+
+    let mut level_offsets = Vec::with_capacity(levels.len());
+    let mut offset = 0u32;
+    for level in &levels {
+        level_offsets.push(offset);
+        offset += level.len() as u32;
+    }
+    let mut index_maps = Vec::with_capacity(levels.len());
+    for (level_index, level) in levels.iter().enumerate() {
+        let map = level
+            .iter()
+            .enumerate()
+            .map(|(index, (key, _))| (*key, level_offsets[level_index] + index as u32))
+            .collect::<HashMap<_, _>>();
+        index_maps.push(map);
+    }
+
+    let mut bytes = Vec::with_capacity(offset as usize * 80);
+    for (level_index, level) in levels.iter().enumerate() {
+        let grid = 1u32 << level_index;
+        let cell_width = 2.0 * radius / grid as f64;
+        for (key, moment) in level {
+            let center = DVec3::new(
+                -radius + (key.0 as f64 + 0.5) * cell_width,
+                -radius + (key.1 as f64 + 0.5) * cell_width,
+                -radius + (key.2 as f64 + 0.5) * cell_width,
+            );
+            let com = moment.first / moment.mass.max(f64::MIN_POSITIVE);
+            let [x, y, z] = com.to_array();
+            let central = [
+                moment.second[0] - moment.mass * x * x,
+                moment.second[1] - moment.mass * x * y,
+                moment.second[2] - moment.mass * x * z,
+                moment.second[3] - moment.mass * y * y,
+                moment.second[4] - moment.mass * y * z,
+                moment.second[5] - moment.mass * z * z,
+            ];
+            let trace = central[0] + central[3] + central[5];
+            let quadrupole = [
+                3.0 * central[0] - trace,
+                3.0 * central[1],
+                3.0 * central[2],
+                3.0 * central[3] - trace,
+                3.0 * central[4],
+                3.0 * central[5] - trace,
+            ];
+            for value in [
+                center.x as f32,
+                center.y as f32,
+                center.z as f32,
+                (0.5 * cell_width) as f32,
+                com.x as f32,
+                com.y as f32,
+                com.z as f32,
+                moment.mass as f32,
+                quadrupole[0] as f32,
+                quadrupole[1] as f32,
+                quadrupole[2] as f32,
+                0.0,
+                quadrupole[3] as f32,
+                quadrupole[4] as f32,
+                quadrupole[5] as f32,
+                0.0,
+            ] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let parent = if level_index == 0 {
+                INVALID_PARENT
+            } else {
+                index_maps[level_index - 1][&(key.0 / 2, key.1 / 2, key.2 / 2)]
+            };
+            for value in [parent, level_index as u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    info!(
+        "[fmm] built {} octree nodes through level {}",
+        offset, MAXIMUM_LEVEL
+    );
+    commands.insert_resource(FmmSource {
+        bytes,
+        node_count: offset,
+        maximum_level: MAXIMUM_LEVEL,
+    });
+}
+
+fn read_f32(bytes: &[u8], offset: usize) -> f32 {
+    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4]))
+}
+
+fn clear_fmm_history_on_probe_reset(
+    probe: Res<ProbeInitialConditions>,
+    mut history: ResMut<FmmGravityHistory>,
+) {
+    if probe.is_changed() {
+        history.0.clear();
+    }
+}
+
+fn poll_fmm_readback(channel: Res<FmmReadbackChannel>, mut history: ResMut<FmmGravityHistory>) {
+    let Ok(mut guard) = channel.data.try_lock() else {
+        return;
+    };
+    let Some(packet) = guard.take() else { return };
+    let total = packet
+        .partial_sums
+        .iter()
+        .fold(Vec4::ZERO, |sum, value| sum + Vec4::from_array(*value));
+    if total.xyz().is_finite() && total.w.is_finite() && total.w > 0.0 {
+        history.0.push(GravityFieldSample {
+            snapshot: packet.snapshot,
+            body_acceleration: total.xyz(),
+            positive_potential: total.w,
+        });
+    }
+}
+
+fn extract_fmm_input(
+    mut extracted: ResMut<ExtractedFmmInput>,
+    source: Extract<Option<Res<FmmSource>>>,
+    active: Extract<Res<ActiveGravityMethod>>,
+    clock: Extract<Res<SimulationClock>>,
+    cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
+    ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
+) {
+    extracted.enabled = **active == ActiveGravityMethod::Fmm;
+    if !extracted.enabled {
+        return;
+    }
+    let (Some(source), Ok((probe, velocity)), Ok(ryugu)) =
+        (source.as_ref(), cassini.single(), ryugu.single())
+    else {
+        return;
+    };
+    extracted.probe = ryugu.rotation.inverse() * (probe.translation - ryugu.translation);
+    extracted.snapshot = Some(GravityRequestSnapshot {
+        request_id: clock.request_id,
+        epoch: clock.epoch,
+        simulation_time_seconds: clock.elapsed_seconds,
+        body_position: extracted.probe,
+        ryugu_transform: *ryugu,
+        probe_position: probe.translation,
+        probe_velocity: velocity.0,
+    });
+    extracted.node_count = source.node_count;
+    extracted.maximum_level = source.maximum_level;
+    if extracted.node_bytes.is_none() {
+        extracted.node_bytes = Some(source.bytes.clone());
+    }
+}
+
+fn dispatch_fmm(
+    mut buffers: ResMut<FmmGpuBuffers>,
+    pipeline: Option<Res<FmmComputePipeline>>,
+    cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    extracted: Res<ExtractedFmmInput>,
+    channel: Res<FmmReadbackChannel>,
+) {
+    let Some(pipeline) =
+        pipeline.and_then(|pipeline| cache.get_compute_pipeline(pipeline.pipeline_id))
+    else {
+        return;
+    };
+    if !extracted.enabled || extracted.node_count == 0 {
+        return;
+    }
+    if buffers.0.is_none() {
+        let Some(node_bytes) = extracted.node_bytes.as_ref() else {
+            return;
+        };
+        let workgroup_count = extracted.node_count.div_ceil(WORKGROUP_SIZE);
+        let output_size = workgroup_count as u64 * 16;
+        let uniform = render_device.create_buffer(&BufferDescriptor {
+            label: Some("fmm_uniform"),
+            size: 32,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let nodes = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("fmm_nodes"),
+            contents: node_bytes,
+            usage: BufferUsages::STORAGE,
+        });
+        let output = render_device.create_buffer(&BufferDescriptor {
+            label: Some("fmm_output"),
+            size: output_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("fmm_staging"),
+            size: output_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let layout = render_device.create_bind_group_layout(
+            "fmm_gravity_bgl_runtime",
+            &[uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)],
+        );
+        let bind_group = render_device.create_bind_group(
+            "fmm_gravity_bg",
+            &layout,
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: nodes.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        );
+        buffers.0 = Some(FmmGpuBuffersInner {
+            uniform,
+            output,
+            staging,
+            bind_group,
+            workgroup_count,
+            output_size,
+            last_submitted: None,
+        });
+    }
+    let inner = buffers.0.as_mut().expect("FMM buffers initialized");
+    let Some(snapshot) = extracted.snapshot.as_ref() else {
+        return;
+    };
+    let key = (snapshot.epoch, snapshot.request_id);
+    if inner.last_submitted == Some(key) {
+        return;
+    }
+    if channel
+        .in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    inner.last_submitted = Some(key);
+    render_queue.write_buffer(
+        &inner.uniform,
+        0,
+        &uniform_bytes(
+            extracted.probe,
+            extracted.node_count,
+            extracted.maximum_level,
+        ),
+    );
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("fmm_encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("fmm_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &inner.bind_group, &[]);
+        pass.dispatch_workgroups(inner.workgroup_count, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);
+    render_queue.submit([encoder.finish()]);
+    let shared = Arc::clone(&channel.data);
+    let in_flight = Arc::clone(&channel.in_flight);
+    let staging = inner.staging.clone();
+    let map_staging = staging.clone();
+    let snapshot = snapshot.clone();
+    map_staging
+        .slice(..)
+        .map_async(MapMode::Read, move |result| {
+            if result.is_ok() {
+                let view = staging.slice(..).get_mapped_range();
+                if let Ok(mut guard) = shared.lock() {
+                    *guard = Some(GravityReadbackPacket {
+                        partial_sums: bytes_to_f32x4(&view),
+                        snapshot,
+                    });
+                }
+                drop(view);
+                staging.unmap();
+            }
+            in_flight.store(false, Ordering::Release);
+        });
+}
+
+fn uniform_bytes(probe: Vec3, node_count: u32, maximum_level: u32) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    for (offset, value) in [
+        (0, probe.x),
+        (4, probe.y),
+        (8, probe.z),
+        (12, G),
+        (24, THETA),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[16..20].copy_from_slice(&node_count.to_le_bytes());
+    bytes[20..24].copy_from_slice(&maximum_level.to_le_bytes());
+    bytes
+}
+
+fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Uniform)
+}
+fn storage_ro_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Storage { read_only: true })
+}
+fn storage_rw_entry(binding: u32) -> BindGroupLayoutEntry {
+    buffer_entry(binding, BufferBindingType::Storage { read_only: false })
+}
+fn buffer_entry(binding: u32, ty: BufferBindingType) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+fn bytes_to_f32x4(bytes: &[u8]) -> Vec<[f32; 4]> {
+    bytes
+        .chunks_exact(16)
+        .map(|chunk| {
+            std::array::from_fn(|index| {
+                let start = index * 4;
+                f32::from_le_bytes(chunk[start..start + 4].try_into().unwrap())
+            })
+        })
+        .collect()
+}

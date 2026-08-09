@@ -16,18 +16,20 @@
 
 Ryugu WASM is an interactive gravitational-dynamics simulator for asteroid (162173) Ryugu. The runtime is implemented in Rust with Bevy 0.19, compiled to WebAssembly, and uses WebGPU compute shaders for selected forward-field evaluations. The project is intended for numerical experimentation and software validation; it is not an orbit-determination or flight-certification tool.
 
-The simulator exposes three complementary gravity algorithms through the `G` key:
+The simulator exposes five complementary gravity algorithm slots through the `G` key:
 
 - **Werner--Scheeres homogeneous polyhedron:** the classical reference algorithm. It reduces the exterior field of a closed, consistently oriented, constant-density polyhedron to edge and face sums.
 - **Radial-analytic GPU method:** a project-specific discretization for a star-shaped body with radially structured density. It uses angular cells, mass-preserving radial layers, analytic radial primitives, and GPU reduction.
 - **Equation (106) adaptive curved-trajectory method:** a project-specific trajectory representation. It transports the Equation (70) straight-line operator to curved arcs with an adaptive spatial Taylor expansion.
+- **MMFFT + GPU-memory compression:** a dedicated 16-byte compressed source buffer, decode shader, tiled workgroup reduction, snapshot-tagged readback, Jacobi series, and performance slot.
+- **FMM:** an octree-compressed inverse-density source representation with GPU traversal, multipole moments, and snapshot-tagged readback.
 
-The three algorithms use different source representations and have different validity conditions. Werner--Scheeres provides the homogeneous polyhedron reference. The radial-analytic method is useful when a star-shaped, radially structured density model is acceptable. Equation (106) is useful only when the trajectory can be segmented so that its Taylor convergence conditions remain satisfied. None of the three methods should be treated as universally optimal.
+The five slots use different source representations and have different validity conditions. MMFFT and FMM use compressed inverse-density source data; their compression and truncation errors should still be characterized against an independent high-precision reference before scientific use.
 
 ## Features
 
 - Equation spatial-domain GPU forward evaluation.
-- Four equal-volume radial layers per angular cell.
+- Four equal-volume radial layers per angular cell, shared by the radial, Eq.(106), MMFFT, and FMM source paths.
 - Mass-preserving discretization of $\rho(r)=C/(r+10)$.
 - Homogeneous Werner polyhedron reference using shared-edge dyads and signed face solid angles.
 - One-shot GPU surface-normal computation from welded-mesh CSR topology.
@@ -35,11 +37,14 @@ The three algorithms use different source representations and have different val
 - 60 Hz fixed-step physics and Ryugu rotation.
 - 60 FPS frame pacing, VSync, and a 30 Hz unfocused mode.
 - Method-aware density cross-section visualization.
+- A centered 16:9 presentation frame with letterboxing on non-16:9 browser viewports.
+- A top-center `Rotate 90 deg` control that rotates the complete presentation frame by one quarter turn per press.
 - Four on-screen sliders for the probe's initial position and velocity multiplier.
 - A `1x`--`8x` simulation-acceleration slider that skips presentation of fully integrated intermediate frames without enlarging the stable physics step.
 - A scrolling rotating-frame Jacobi-constant chart with automatic vertical scaling.
 - An Eq.157 dual-representation residual chart while the curved-arc solver is active.
-- Newtonian point-mass fallback while a GPU result is unavailable or invalid.
+- A five-method performance workspace with per-method checkboxes, repeat testing, FPS curves, and Jacobi curves.
+- Blocking numerical-error overlay; integration pauses while a selected evaluator is warming up and stops if certification fails.
 
 ## Requirements
 
@@ -89,12 +94,13 @@ headless run may report those imports and omit the numeric export call while
 still providing a reproducible compile benchmark.
 
 The top-center **Performance comparison** button opens an opaque performance
-workspace that hides the 3D scene. The application cycles through the three
+workspace that hides the 3D scene. The application cycles through the five
 algorithms in repeated 120-frame measurement windows and continues until the
 top-center **3D display** button is selected. The workspace shows a rolling
-FPS plot and a rolling plot of four Jacobi-constant series: radial-analytic,
-Werner, Equation (106) before residual correction, and Equation (106) after
-residual correction. These measurements describe the current browser, GPU,
+FPS plot and one Jacobi series for each selected method. Every method has a
+checkbox; unchecking it removes its curves and excludes it from the queue.
+The **Repeat benchmark** button starts a fresh pass without changing the
+current selection. These measurements describe the current browser, GPU,
 driver, window size, and selected probe state; they are not portable hardware
 benchmarks or accuracy guarantees.
 
@@ -197,7 +203,7 @@ The choice is therefore workload-specific. It should not be interpreted as evide
 
 ## Gravity models
 
->The project-specific radial-analytic and Equation (106) constructions are experimental methods described in [mathpub.md](mathpub.md). Werner--Scheeres is used as the classical reference. The two project-specific methods are not presented as universal replacements for established gravity solvers.
+>The project-specific radial-analytic, Eq.(106), MMFFT, and FMM constructions are experimental methods. Their mathematical scope and convergence conditions are documented in [`docs/mathtidy.md`](docs/mathtidy.md) and [`docs/mathtidy_EN.md`](docs/mathtidy_EN.md). Werner--Scheeres is the classical homogeneous reference.
 
 ### Radial Analytic: Equation
 
@@ -212,7 +218,7 @@ The surface mesh is converted into angular cells. Each cell stores a representat
 
 Each layer stores the volume-weighted mean density of the continuous model. This preserves the layer mass, and $C$ is normalized so the complete discretization has mass `RYUGU_MASS`.
 
-At runtime, one GPU invocation evaluates one angular-layer contribution. Workgroups contain 64 invocations and reduce their results to one partial acceleration. See [mathpub.md](mathpub.md) for the public GPU evaluation form of Equation.
+At runtime, one GPU invocation evaluates one angular-layer contribution. Workgroups contain 64 invocations and reduce their results to one partial acceleration. Acceleration and positive potential use the same quadrature nodes.
 
 The implementation assumes Ryugu is star-shaped relative to the model origin. A body with multiple disjoint radial intervals in one direction would require an extended source layout.
 
@@ -236,7 +242,19 @@ $$
 \mathbf q(t)=\overline{\mathbf q}(t)+\delta\mathbf q(t).
 $$
 
-In a fixed Cartesian basis, the field is transported by
+The production browser path uses a bounded point-source representation of
+the radial density. Its CPU reference directly evaluates the complex Laplace
+kernel and derives the horizontal and vertical kernels. WGSL assembles the
+same discrete source set on a fixed 257-frequency grid with fixed half-line
+quadrature. A segmented Chebyshev table for $Q_{m-1/2}(\chi)$ is uploaded to
+WGSL and used for an independent Fourier-kernel cross-check.
+
+This matches the *discretized* Eq.(106) operator. The full continuous-density
+mode coefficients of Eqs.(81)--(86), explicit Type-2/Type-3 NUFFT matrices of
+Eqs.(89)--(95), and a matrix-valued GPU Padé sideband evaluator are not
+claimed to be implemented.
+
+In a fixed Cartesian basis, the mathematical transport operator is
 
 $$
 \mathbf g(\overline{\mathbf q}+\delta\mathbf q)
@@ -244,7 +262,12 @@ $$
 \mathbf g(\overline{\mathbf q}).
 $$
 
-Finite non-periodic arcs use local polynomial displacement models and mixed spatial/complex-frequency derivatives by default. The periodic sideband representation is enabled only after at least ten consecutive orbit closures satisfy the configured position, velocity, and period tolerances. A failed closure resets the counter.
+Finite non-periodic arcs use local polynomial displacement models and mixed
+spatial/complex-frequency derivatives by default. The periodic planner is
+enabled only after at least ten consecutive orbit closures satisfy the
+configured position, velocity, and period tolerances. CPU Taylor and Padé
+certificates are diagnostic gates; the current WGSL force path uses analytic
+point-field translation correction rather than a full matrix-valued Padé jet.
 
 Each candidate arc is divided into as many straight reference segments as required by the convergence guard
 
@@ -255,18 +278,18 @@ $$
 
 where $d(h)$ is a conservative distance from the reference line to the density support. The solver selects the lowest permitted Taylor order whose remainder estimate is below tolerance and bisects a segment when that order is insufficient.
 
-While this algorithm is active, the lower-right chart displays the Equation (157) dual-representation potential residual. It compares curved-path acceleration work with an independently accumulated gravitational-potential difference and therefore monitors Taylor transport, path resolution, potential/acceleration consistency, and floating-point error.
+While this algorithm is active, the lower-right chart displays an Eq.(157)-inspired dual residual: accumulated curved-path acceleration work minus the independently read-back potential difference. It is a consistency diagnostic, not a proof that the two continuous operators are independently implemented.
 
 ### Density section view
 
 Press `D` to show a camera-facing density section:
 
-- Radial-analytic and Equation (106) modes show the continuous radial color field $C/(r+10)$.
+- Radial-analytic, Equation (106), MMFFT, and FMM modes show the inverse-density color field $C/(r+10)$.
 - Werner mode shows one uniform color throughout the interior because its density is constant.
 
-The section is a visualization of the selected model. The radial-analytic and
-Equation (106) modes use the same four piecewise-constant, mass-preserving
-radial layers; Werner remains homogeneous.
+The section is a visualization of the selected model. Eq.(106) aggregates
+the radial layers into certified point sources, MMFFT quantizes those layers,
+and FMM builds an octree from them; Werner remains homogeneous.
 
 ## Comparative scope
 
@@ -277,7 +300,9 @@ not according to a single aggregate performance number.
 |---|---|---|
 | Werner--Scheeres | A closed, consistently oriented, homogeneous polyhedron is an adequate model or an independent reference is required. | It does not represent heterogeneous density without decomposing the body into multiple polyhedra. Near-degenerate mesh geometry and cancellation in the scalar potential still require care. |
 | Radial-analytic GPU | The body is approximately star-shaped and a radial density law such as $\rho(r)=C/(r+\varepsilon)$ is acceptable. Repeated pointwise evaluations can reuse the angular/layer source. | The star-shaped assumption excludes general multi-interval radial geometry. Angular and radial discretization introduce approximation error, and near-surface cells require conservative handling. |
-| Equation (106) curved trajectory | A trajectory can be divided into segments satisfying the Taylor convergence guard and the same field representation is reused along structured arcs. | It is not a general pointwise replacement for direct gravity. Strong curvature, near-surface motion, changing density models, or insufficient closure can force fallback or reduce the benefit of the compressed representation. |
+| Equation (106) curved trajectory | A trajectory can be divided into segments satisfying the Taylor convergence guard and the same complex-frequency representation is reused along structured arcs. | The CPU reference uses mass/moment-compressed density cells and a certified frequency window. Strong curvature, near-surface motion, or failed residual checks stop the simulation instead of selecting another force model. |
+| MMFFT + compression | A compact quantized source buffer and tiled GPU reduction are useful when memory bandwidth is the limiting resource. | Quantization and source discretization are approximate; the runtime path is not a continuous FFT/NUFFT proof. |
+| FMM | Hierarchical inverse-density sources reduce far-field work for repeated evaluations. | The current tree/multipole order is truncated and requires an independent error study near the body surface. |
 
 The current implementation is therefore a comparative research prototype. A
 method should be considered acceptable only after comparison with an
@@ -319,7 +344,7 @@ position += velocity * substep_dt
 velocity += 0.5 * acceleration(position, t + substep_dt) * substep_dt
 ```
 
-Before the first valid GPU sample, the integrator uses a softened Newtonian point-mass acceleration. Once samples arrive, the integrator predicts only the non-spherical residual relative to a point mass: it evaluates the point-mass anchor at the current substep position and adds a history-derived residual. This avoids extrapolating the dominant radial field from a stale probe position.
+Before the selected evaluator has a valid snapshot or Equation (106) certificate, the integrator pauses. It never advances a trajectory using another force model. Radial mode interpolates completed body-frame samples and permits only bounded, slope-limited extrapolation; Werner, MMFFT, and FMM hold the newest valid sample.
 
 Within the known sample interval, residual acceleration uses cubic Hermite interpolation. Beyond the newest sample, radial mode permits at most two sample intervals of slope-limited extrapolation; Werner mode holds the newest residual because browser measurements showed that extrapolating its more cancellation-sensitive samples increased drift. Ryugu's known rotation is evaluated analytically at every substep boundary. A valid combined acceleration is clamped to `1.5e-3 m/s²` and blended in over 60 fixed updates.
 
@@ -372,8 +397,9 @@ scene so that the displayed frame rate is not visually confused with the
 ordinary 3D view. The corresponding **3D display** button returns to the
 simulation.
 
-The workspace cycles through radial-analytic, Werner--Scheeres, and Equation
-(106) modes. Each mode is sampled in a 120-frame window, after which the next
+The workspace cycles through radial-analytic, Werner--Scheeres, Equation
+(106), MMFFT + GPU-memory-compression, and FMM. Each selected mode is sampled in a
+120-frame window, after which the next
 mode is selected. The cycle repeats until the user returns to the 3D view. The
 reported value is the observed browser frame rate during the current window;
 it includes UI, rendering, WebGPU dispatch, readback scheduling, and the
@@ -382,11 +408,10 @@ measurement and should not be compared across machines without recording the
 browser version, GPU, driver, window size, and probe settings.
 
 The workspace contains two rolling plots. The first stores one FPS series per
-gravity method. The second stores four Jacobi-related series: the
-radial-analytic value, the Werner value, the Equation (106) near-straight
-value before the dual residual correction, and the residual-adjusted value.
-The latter two are diagnostic representations of the same trajectory-level
-calculation; they are not independent physical models.
+gravity method. The second stores one Jacobi series per selected method. Eq.
+(106) keeps its near-straight and residual diagnostics in the 3D view's
+dedicated history; MMFFT and FMM use their own compressed GPU source and
+readback channels.
 
 For a headless compilation and instantiation measurement, use the Python
 Wasmtime script after building the browser artifact:
@@ -422,14 +447,14 @@ One-shot initialization is guarded by the `ScaleNormalized` and
 | `S` | Switch between overview and probe-follow camera modes. |
 | `F` | Toggle GPU-computed surface-normal gizmos. |
 | `D` | Toggle the density section for the active gravity model. |
-| `G` | Cycle through radial-analytic, homogeneous Werner, and Eq.106 adaptive curved-arc gravity. |
+| `G` | Cycle through radial-analytic, homogeneous Werner, Eq.106 adaptive curved-arc, MMFFT + memory-compression, and FMM gravity. |
 | `X`, `Y`, `Z` sliders | Set the three components of the initial probe position from `-2000` to `2000` in 100 intervals (`40` per step). |
 | `Speed` slider | Set the circular-speed multiplier from `0` to `2` in 100 intervals (`0.02` per step). |
 | Upper-right acceleration slider | Advance `1`--`8` complete stable physics frames per displayed frame. |
 | Mouse drag | Orbit the camera. |
 | Scroll wheel | Zoom. |
 
-Moving a probe slider immediately clears the old trajectory, applies the new position and tangent velocity, resets Ryugu's rotation, and warms the active GPU result from the Newtonian fallback. Switching with `G` performs the same reset using the current slider values.
+Moving a probe slider immediately clears the old trajectory, applies the new position and tangent velocity, resets Ryugu's rotation, and warms the selected evaluator. Switching with `G` performs the same reset using the current slider values. Physics remains paused until that evaluator has a valid sample or certificate.
 
 The orbit line is cyan in radial-analytic mode, red in Werner mode, and purple in Eq.106 curved-arc mode.
 
@@ -441,7 +466,6 @@ The orbit line is cyan in radial-analytic mode, red in Werner mode, and purple i
 | `RYUGU_MASS` | `4.5e11 kg` | Total asteroid mass. |
 | `CASSINI_MASS` | `2500 kg` | Probe mass. |
 | `DENSITY_EPSILON` | `10 m` | Radial-density regularization. |
-| `GRAVITY_EPSILON` | `1 m` | Point-mass fallback softening. |
 | `RYUGU_ROTATION_PERIOD_SECS` | `7.63 h` | Physical rotation period. |
 | `TIME_SCALE` | `500` | Simulation speed multiplier chosen to keep asynchronous interpolation and integration error controlled. |
 | `PHYSICS_SUBSTEPS` | `12` | Leapfrog substeps per 60 Hz fixed update. |
@@ -504,7 +528,6 @@ Ryugu_wasm/
 ├── package.json
 ├── index.html
 ├── server.ts
-├── mathpub.md
 ├── docs/
 │   ├── mathtidy.md
 │   ├── mathtidy_EN.md
@@ -516,15 +539,11 @@ Ryugu_wasm/
 │   ├── welding.rs
 │   └── systems/
 │       ├── mod.rs
-│       ├── energy.rs
-│       ├── curved_arc.rs
-│       ├── scale.rs
-│       ├── compute_pipeline.rs
-│       ├── gravity_pipeline.rs
-│       ├── werner_pipeline.rs
-│       ├── physics.rs
-│       ├── render.rs
-│       └── ui.rs
+│       ├── gravity/        # radial, Werner, Eq.(106), MMFFT, FMM
+│       ├── gpu/            # shared render-world compute helpers
+│       ├── model/          # scale and topology preparation
+│       ├── presentation/   # camera, section view, controls, charts
+│       └── simulation/     # physics and Jacobi diagnostics
 ├── assets/
 │   ├── models/
 │   │   ├── ryugu.glb
@@ -550,24 +569,31 @@ Ryugu_wasm/
 | `src/components.rs` | Physical constants, runtime probe initial conditions, ECS components, gravity mode, shared sources, and readback resources. |
 | `src/topology.rs` | CSR adjacency construction from the welded mesh. |
 | `src/welding.rs` | Quantized vertex deduplication. |
-| `src/systems/scale.rs` | One-shot model normalization and topology creation. |
-| `src/systems/energy.rs` | Snapshot-aligned body-frame Jacobi evaluation, relative-drift reporting, rolling history, automatic chart scaling, and right-edge point rendering. |
-| `src/systems/curved_arc.rs` | Equation (106) trajectory classification, stable-closure tracking, adaptive segmentation, Taylor-order selection, and curved-path residual state. |
-| `src/systems/compute_pipeline.rs` | One-shot GPU surface-normal computation and readback. |
-| `src/systems/gravity_pipeline.rs` | Radial angular/layer preprocessing, snapshot-tagged GPU dispatch, f64 partial reduction, and history insertion. |
-| `src/systems/werner_pipeline.rs` | Homogeneous closed-polyhedron preprocessing, snapshot-tagged Werner dispatch, f64 partial reduction, and history insertion. |
-| `src/systems/physics.rs` | Point-mass residual interpolation, bounded async prediction, 12-substep leapfrog integration, and asteroid rotation. |
-| `src/systems/render.rs` | Scene, camera, orbit gizmos, normals, and method-aware density section. |
-| `src/systems/ui.rs` | FPS display, keyboard controls, probe sliders, simulation acceleration, and the continuous performance workspace. |
+| `src/systems/gravity/eq106_reference.rs` | Independent f64 Eq.(106) kernels, common-frequency inversion, direct residuals, Taylor jets, and Padé certificates. |
+| `src/systems/gravity/eq106_operator.rs` | Segmented Chebyshev coefficients for $Q_{m-1/2}(\chi)$, CPU certification, and GPU buffer serialization. |
+| `src/systems/gravity/eq106_gpu.rs` | Render-world Eq.(106) spectrum assembly, Bromwich evaluation, and toroidal-harmonic cross-check. |
+| `src/systems/gravity/radial.rs` | Radial angular/layer preprocessing, snapshot-tagged GPU dispatch, f64 partial reduction, and history insertion. |
+| `src/systems/gravity/werner.rs` | Homogeneous closed-polyhedron preprocessing and Werner GPU dispatch/readback. |
+| `src/systems/gravity/mmfft.rs` | Quantized inverse-density source packing, tiled GPU reduction, and readback. |
+| `src/systems/gravity/fmm.rs` | Octree/multipole source construction, GPU traversal, and readback. |
+| `src/systems/gpu/normals.rs` | One-shot GPU surface-normal computation and readback. |
+| `src/systems/model/scale.rs` | One-shot model normalization and topology creation. |
+| `src/systems/presentation/render.rs` | Scene, camera, orbit gizmos, normals, and method-aware density section. |
+| `src/systems/presentation/ui.rs` | FPS display, keyboard controls, probe sliders, simulation acceleration, and performance workspace. |
+| `src/systems/simulation/physics.rs` | Point-mass residual interpolation, bounded async prediction, fixed-step integration, and asteroid rotation. |
+| `src/systems/simulation/energy.rs` | Snapshot-aligned rotating-frame Jacobi evaluation and residual charts. |
 | `assets/shaders/gravity.wgsl` | Joint eight-node radial acceleration/potential quadrature and workgroup reduction. |
 | `assets/shaders/werner_gravity.wgsl` | Shared-edge and signed-face Werner field evaluation with compensated potential summation. |
+| `assets/shaders/eq106_complex.wgsl` | Fixed-frequency Eq.(106) spectrum, Bromwich inversion, and branch-free Chebyshev toroidal cross-check. |
+| `assets/shaders/mmfft_compressed.wgsl` | Quantized inverse-density decode and tiled reduction. |
+| `assets/shaders/fmm_gravity.wgsl` | Octree/multipole GPU traversal. |
 | `assets/shaders/normals.wgsl` | CSR-neighbor surface normals. |
 | `server.ts` | Static Bun server with COOP/COEP headers. |
 | `index.html` | WebGPU preflight and WASM bootstrap. |
 | `scripts/wasmtime_benchmark.py` | Headless Wasmtime compilation and instantiation benchmark for the generated browser module. |
 | `tests/test_gravity_models.py` | Python checks for the inverse-density law and Equation (106) convergence guards. |
-| `mathpub.md` | Academic English taxonomy and mathematical principles of the three gravity algorithms. |
-| `docs/mathtidy_EN.md` | Rigorous English derivation of Equations (70), (106), and (157), including convergence and residual analysis. |
+| `docs/mathtidy.md` | Chinese derivation and implementation conditions for the near-straight and Fourier-Chebyshev formulations. |
+| `docs/mathtidy_EN.md` | English derivation of Equations (70), (79)--(110), (155)--(158), including convergence and residual analysis. |
 
 ## Testing
 
@@ -582,6 +608,7 @@ The Rust tests cover:
 - the rotating-frame Jacobi definition and invalid-input handling;
 - mass-density radial integration;
 - solid-angle construction;
+- segmented $Q_{m-1/2}(\chi)$ Chebyshev tensor certification and truncated Fourier reconstruction;
 - Rust/WGSL uniform-buffer layouts;
 - Werner far-field behavior for a closed tetrahedron;
 - WGSL parsing and semantic validation with Naga.
@@ -591,13 +618,36 @@ The Rust tests cover:
 - The radial-analytic method assumes a star-shaped body and one radial interval per direction.
 - Four radial layers approximate the continuous density pointwise, although each layer mass is preserved.
 - Werner mode is homogeneous and is not a non-uniform-density Werner extension.
-- Equation (106) requires every accepted segment to remain inside the Taylor convergence radius relative to the density support; strongly curved or near-surface arcs may require many segments or a direct fallback.
+- MMFFT and FMM use quantized or truncated hierarchical source representations; neither is a zero-error continuous-density solver.
+- Eq.(106) requires every accepted Taylor segment to remain inside the convergence radius relative to the density support. CPU Taylor/Padé constructors and pole checks are present, but the full matrix-valued Padé sideband evaluator is not in WGSL; unresolved segments stop with an error.
+- The GPU Eq.(106) path uses eight-point-source mass/moment compression, 257 common frequencies, fixed half-line quadrature, f32 spectrum storage, and analytic point-field translation correction. It does not yet implement the document's full continuous-density Fourier-Chebyshev coefficient assembly or explicit Type-2/Type-3 NUFFT matrix.
+- The segmented toroidal-harmonic table is an independently certified Q-function cross-check. Mode truncation, interval coverage, f32 coefficient storage, and near-field fallback remain explicit approximation sources.
+- The Eq.(157)-inspired chart residual compares curved-path work with read-back potential; it is not an independent continuous-density proof because both paths use the same discrete source model.
 - The periodic Equation (106) branch is a promoted optimization after ten stable closures, not an assumption applied to a newly observed orbit.
 - GPU readback remains asynchronous. Snapshot tags prevent state mismatch, but force prediction between completed samples is still a numerical approximation.
 - At acceleration above `1x`, the integration step remains unchanged but GPU field samples are farther apart in simulation time; the `8x` cap limits this interpolation tradeoff.
 - Leapfrog substeps greatly reduce secular integration drift, but this remains an interactive f32 visualization rather than a precision orbit-determination tool.
 - The current `TIME_SCALE = 500` is a deliberate fidelity/performance compromise; increasing it without increasing the GPU sampling rate or changing the predictor can reintroduce drift.
 - The browser page requires WebGPU; it does not load the full simulation after the preflight fails.
+
+## Mathematical coverage audit
+
+The implementation was checked against [`docs/mathtidy.md`](docs/mathtidy.md)
+and [`docs/mathtidy_EN.md`](docs/mathtidy_EN.md):
+
+| Document result | Status in this project |
+|---|---|
+| Eq.(79) toroidal-harmonic identity | CPU adaptive quadrature plus segmented Chebyshev $Q_{m-1/2}$ table; WGSL cross-check with explicit mode truncation. |
+| Eqs.(81)--(86) density Fourier/Chebyshev separation | Not the production source assembly; the runtime uses eight mass/moment point sources. |
+| Eqs.(89)--(95) explicit trajectory transform / NUFFT | Common-frequency Bromwich summation is present; explicit Type-2/Type-3 NUFFT matrices are not. |
+| Eq.(106) straight-line complex-frequency field | Implemented for the discrete point-source representation on CPU and WGSL, including the vertical boundary identity in the CPU reference. |
+| Eqs.(109)--(110) Bromwich inversion | Implemented on the shared 257-frequency grid with finite frequency and half-line truncation. |
+| Eqs.(155)--(158) dual residual and convergence guard | CPU Taylor/Padé certificates and runtime residual gate are present; the residual is a discrete consistency diagnostic. |
+
+Accordingly, the project is a validated GPU/CPU implementation of a
+**discretized and truncated** Eq.(106) operator. It is not a proof of the
+untruncated continuous-density formula, machine-precision equality, or a
+guaranteed frame rate for every browser and trajectory.
 
 ## Deployment
 

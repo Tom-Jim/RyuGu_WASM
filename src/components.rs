@@ -6,8 +6,6 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 pub const G: f32 = 6.6743e-11;
 pub const RYUGU_MASS: f32 = 4.5e11;
-pub const CASSINI_MASS: f32 = 2500.0;
-pub const GRAVITY_EPSILON: f32 = 1.0;
 pub const TIME_SCALE: f32 = 500.0;
 pub const ORBIT_HISTORY_LEN: usize = 27500;
 pub const JACOBI_HISTORY_CAPACITY: usize = 256;
@@ -91,8 +89,6 @@ pub struct UiTextMarker;
 #[derive(Component)]
 pub struct FpsTextMarker;
 #[derive(Component)]
-pub struct Mass(pub f32);
-#[derive(Component)]
 pub struct Velocity(pub Vec3);
 #[derive(Component)]
 pub struct OrbitHistory(pub VecDeque<Vec3>);
@@ -109,6 +105,7 @@ pub struct JacobiHistory {
     pub elapsed_simulation_seconds: f64,
     pub origin_simulation_seconds: Option<f64>,
     pub last_request_id: Option<u64>,
+    pub last_sample_method: Option<ActiveGravityMethod>,
 }
 
 impl Default for JacobiHistory {
@@ -118,6 +115,7 @@ impl Default for JacobiHistory {
             elapsed_simulation_seconds: 0.0,
             origin_simulation_seconds: None,
             last_request_id: None,
+            last_sample_method: None,
         }
     }
 }
@@ -128,6 +126,7 @@ impl JacobiHistory {
         self.elapsed_simulation_seconds = 0.0;
         self.origin_simulation_seconds = None;
         self.last_request_id = None;
+        self.last_sample_method = None;
     }
 }
 
@@ -300,14 +299,136 @@ pub struct RadialGravityHistory(pub GravitySampleHistory);
 #[derive(Resource, Default)]
 pub struct WernerGravityHistory(pub GravitySampleHistory);
 
-/// Blend weight for smooth GPU gravity warm-up transition.
-/// 0.0 = 100% Newtonian fallback, 1.0 = 100% GPU-computed.
-/// Increments by 1/GRAVITY_BLEND_FRAMES per frame once the first valid GPU result
-/// arrives, reaching 1.0 after GRAVITY_BLEND_FRAMES frames.
+/// Snapshot-aligned samples produced by the GPU Equation (106) pipeline.
+#[derive(Resource, Default)]
+pub struct Eq106GpuHistory(pub GravitySampleHistory);
+
+#[derive(Resource, Clone)]
+pub struct Eq106GpuReadbackChannel {
+    pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
+    pub in_flight: Arc<AtomicBool>,
+}
+
+#[derive(Resource, Default)]
+pub struct FmmGravityHistory(pub GravitySampleHistory);
+
+#[derive(Resource)]
+pub struct FmmSource {
+    pub bytes: Vec<u8>,
+    pub node_count: u32,
+    pub maximum_level: u32,
+}
+
+#[derive(Resource, Clone)]
+pub struct FmmReadbackChannel {
+    pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
+    pub in_flight: Arc<AtomicBool>,
+}
+
+impl Default for FmmReadbackChannel {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Default for Eq106GpuReadbackChannel {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Runtime configuration for the MMFFT + GPU-memory-compression implementation.
+///
+/// The first integration keeps this resource independent from the existing
+/// radial/Werner layouts so a future implementation can change packing,
+/// quantization, and tiled dispatch without changing ECS call sites.
+#[allow(dead_code)]
+#[derive(Resource, Clone, Debug)]
+pub struct MmfftCompressedConfig {
+    /// Number of source records represented by one compressed tile.
+    pub tile_size: u32,
+    /// Bytes per source record after compression (future format contract).
+    pub compressed_record_bytes: u32,
+    /// Whether the render pipeline should decode records in shared memory.
+    pub decode_in_workgroup: bool,
+}
+
+impl Default for MmfftCompressedConfig {
+    fn default() -> Self {
+        Self {
+            tile_size: 256,
+            compressed_record_bytes: 8,
+            decode_in_workgroup: true,
+        }
+    }
+}
+
+/// Snapshot-aligned history populated by the dedicated compressed readback
+/// channel. Its layout matches the shared gravity sample contract so physics
+/// and Jacobi diagnostics can consume it without special-case math.
+#[allow(dead_code)]
+#[derive(Resource, Default)]
+pub struct MmfftCompressedHistory(pub GravitySampleHistory);
+
+#[derive(Resource)]
+pub struct MmfftCompressedSource {
+    pub bytes: Vec<u8>,
+    pub count: u32,
+    pub tile_size: u32,
+    pub solid_angle_scale: f32,
+    pub radius_scale: f32,
+    pub density_scale: f32,
+}
+
+#[derive(Resource, Clone)]
+pub struct MmfftReadbackChannel {
+    pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
+    pub in_flight: Arc<AtomicBool>,
+}
+
+impl Default for MmfftReadbackChannel {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Blend weight retained for performance/Jacobi warm-up bookkeeping.
+/// Physics never substitutes an alternate force model while this value ramps.
 #[derive(Resource, Default)]
 pub struct GravityBlendFactor(pub f32);
 
-pub const GRAVITY_BLEND_FRAMES: f32 = 60.0;
+/// A non-recoverable numerical or pipeline failure. The UI renders this as a
+/// blocking modal so an invalid force sample can never silently advance the
+/// trajectory with a different physical model.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct GravityRuntimeError {
+    pub message: Option<String>,
+}
+
+impl GravityRuntimeError {
+    pub fn raise(&mut self, message: impl Into<String>) {
+        if self.message.is_none() {
+            self.message = Some(message.into());
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.message = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.message.is_some()
+    }
+}
 
 /// Shared channel: render world writes workgroup sums, main world reduces them.
 /// `in_flight` prevents mapping the same staging buffer twice.
@@ -334,10 +455,27 @@ pub enum ActiveGravityMethod {
     /// Eq. (106) adaptive curved-arc mode; it starts non-periodic and promotes
     /// itself to periodic only after the planner sees stable orbit closures.
     CurvedArcEq106,
+    /// Fourth method: tiled MMFFT source evaluation with compressed GPU
+    /// records and a dedicated snapshot-tagged readback channel.
+    MmfftCompressed,
+    /// Fifth method: fixed-depth GPU fast multipole evaluation.
+    Fmm,
 }
 
 pub const PERFORMANCE_PHASE_FRAMES: u32 = 120;
 pub const PERFORMANCE_HISTORY_CAPACITY: usize = 180;
+pub const PERFORMANCE_TEST_DURATION_HOURS: f64 = 100.0;
+
+/// Quarter-turn rotation applied to the complete browser display frame.
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
+pub struct DisplayRotation(pub u8);
+
+impl DisplayRotation {
+    pub fn advance(&mut self) -> u8 {
+        self.0 = (self.0 + 1) % 4;
+        self.0
+    }
+}
 
 #[derive(Resource, Debug)]
 pub struct PerformanceComparisonState {
@@ -346,11 +484,21 @@ pub struct PerformanceComparisonState {
     pub phase: usize,
     pub phase_frames: u32,
     pub phase_elapsed_seconds: f64,
-    pub frames_per_second: [f64; 3],
+    pub frames_per_second: [f64; 5],
     pub pending_method: Option<ActiveGravityMethod>,
     pub return_method: ActiveGravityMethod,
-    pub fps_history: [VecDeque<f32>; 3],
-    pub jacobi_history: [VecDeque<f64>; 4],
+    pub fps_history: [VecDeque<f32>; 5],
+    pub jacobi_history: [VecDeque<f64>; 6],
+    pub jacobi_last_request_ids: [Option<u64>; 5],
+    pub jacobi_initial_constant: Option<f64>,
+    pub jacobi_seeded: [bool; 5],
+    /// Algorithms included in the performance rotation. The five entries map
+    /// to Radial, Werner, Eq.106, MMFFT, and FMM respectively.
+    pub enabled_methods: [bool; 5],
+    /// One benchmark pass visits each enabled method once. Keeping this
+    /// separate from `enabled_methods` prevents phase wrap-around from
+    /// concatenating independently reset trajectories into one curve.
+    pub completed_methods: [bool; 5],
 }
 
 impl Default for PerformanceComparisonState {
@@ -361,7 +509,7 @@ impl Default for PerformanceComparisonState {
             phase: 0,
             phase_frames: 0,
             phase_elapsed_seconds: 0.0,
-            frames_per_second: [0.0; 3],
+            frames_per_second: [0.0; 5],
             pending_method: None,
             return_method: ActiveGravityMethod::RadialAnalytic,
             fps_history: std::array::from_fn(|_| {
@@ -370,19 +518,39 @@ impl Default for PerformanceComparisonState {
             jacobi_history: std::array::from_fn(|_| {
                 VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
             }),
+            jacobi_last_request_ids: [None; 5],
+            jacobi_initial_constant: None,
+            jacobi_seeded: [false; 5],
+            enabled_methods: [true; 5],
+            completed_methods: [false; 5],
         }
     }
 }
 
 impl PerformanceComparisonState {
+    #[allow(dead_code)]
     pub fn start(&mut self, return_method: ActiveGravityMethod) {
+        self.start_with_baseline(return_method, None);
+    }
+
+    pub fn start_with_baseline(
+        &mut self,
+        return_method: ActiveGravityMethod,
+        jacobi_initial_constant: Option<f64>,
+    ) {
         self.active = true;
-        self.measuring = true;
+        self.measuring = self.enabled_methods.iter().any(|enabled| *enabled);
         self.phase = 0;
         self.phase_frames = 0;
         self.phase_elapsed_seconds = 0.0;
-        self.frames_per_second = [0.0; 3];
-        self.pending_method = Some(ActiveGravityMethod::RadialAnalytic);
+        self.frames_per_second = [0.0; 5];
+        self.pending_method = self
+            .first_uncompleted_enabled_method()
+            .map(|(_, method)| method);
+        self.completed_methods = [false; 5];
+        self.jacobi_last_request_ids = [None; 5];
+        self.jacobi_initial_constant = jacobi_initial_constant.filter(|value| value.is_finite());
+        self.jacobi_seeded = [false; 5];
         self.return_method = return_method;
         for history in &mut self.fps_history {
             history.clear();
@@ -397,14 +565,78 @@ impl PerformanceComparisonState {
         self.measuring = false;
         self.pending_method = Some(self.return_method);
     }
+
+    #[allow(dead_code)]
+    pub fn restart(&mut self) {
+        self.start(self.return_method);
+    }
+
+    pub fn restart_with_baseline(&mut self, jacobi_initial_constant: Option<f64>) {
+        self.start_with_baseline(self.return_method, jacobi_initial_constant);
+    }
+
+    pub fn first_enabled_method(&self) -> Option<(usize, ActiveGravityMethod)> {
+        (0..self.enabled_methods.len()).find_map(|index| {
+            self.enabled_methods[index]
+                .then(|| (index, ActiveGravityMethod::from_performance_index(index)))
+        })
+    }
+
+    pub fn first_uncompleted_enabled_method(&self) -> Option<(usize, ActiveGravityMethod)> {
+        (0..self.enabled_methods.len()).find_map(|index| {
+            (self.enabled_methods[index] && !self.completed_methods[index])
+                .then(|| (index, ActiveGravityMethod::from_performance_index(index)))
+        })
+    }
+
+    /// Legacy cyclic selector retained for future continuous benchmark modes.
+    #[allow(dead_code)]
+    pub fn next_enabled_method(
+        &self,
+        current_index: usize,
+    ) -> Option<(usize, ActiveGravityMethod)> {
+        if self.enabled_methods.iter().all(|enabled| !*enabled) {
+            return None;
+        }
+        (1..=self.enabled_methods.len()).find_map(|offset| {
+            let index = (current_index + offset) % self.enabled_methods.len();
+            self.enabled_methods[index]
+                .then(|| (index, ActiveGravityMethod::from_performance_index(index)))
+        })
+    }
+
+    pub fn next_uncompleted_enabled_method(
+        &self,
+        current_index: usize,
+    ) -> Option<(usize, ActiveGravityMethod)> {
+        ((current_index + 1)..self.enabled_methods.len()).find_map(|index| {
+            (self.enabled_methods[index] && !self.completed_methods[index])
+                .then(|| (index, ActiveGravityMethod::from_performance_index(index)))
+        })
+    }
 }
 
 impl ActiveGravityMethod {
+    pub fn from_performance_index(index: usize) -> Self {
+        match index {
+            0 => Self::RadialAnalytic,
+            1 => Self::HomogeneousWerner,
+            2 => Self::CurvedArcEq106,
+            3 => Self::MmfftCompressed,
+            4 => Self::Fmm,
+            // Keep malformed UI state deterministic instead of silently
+            // selecting a different algorithm.
+            _ => Self::RadialAnalytic,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::RadialAnalytic => "GPU Radial Analytic",
             Self::HomogeneousWerner => "GPU Werner Polyhedron",
             Self::CurvedArcEq106 => "Eq.106 Adaptive Curved-Arc",
+            Self::MmfftCompressed => "GPU MMFFT + VRAM Compression",
+            Self::Fmm => "GPU Fast Multipole Method",
         }
     }
 }
@@ -431,5 +663,112 @@ mod probe_initial_condition_tests {
         assert_eq!(SimulationAcceleration(0).stable_steps(), 1);
         assert_eq!(SimulationAcceleration(4).stable_steps(), 4);
         assert_eq!(SimulationAcceleration(99).stable_steps(), 8);
+    }
+
+    #[test]
+    fn display_rotation_advances_in_quarter_turns() {
+        let mut rotation = DisplayRotation::default();
+        assert_eq!(rotation.advance(), 1);
+        assert_eq!(rotation.advance(), 2);
+        assert_eq!(rotation.advance(), 3);
+        assert_eq!(rotation.advance(), 0);
+    }
+
+    #[test]
+    fn performance_selection_defaults_to_all_methods() {
+        let state = PerformanceComparisonState::default();
+        assert_eq!(state.enabled_methods, [true; 5]);
+        assert_eq!(
+            state.first_enabled_method().map(|(index, _)| index),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn performance_indices_cover_all_five_methods_without_aliasing() {
+        assert_eq!(
+            (0..5)
+                .map(ActiveGravityMethod::from_performance_index)
+                .collect::<Vec<_>>(),
+            vec![
+                ActiveGravityMethod::RadialAnalytic,
+                ActiveGravityMethod::HomogeneousWerner,
+                ActiveGravityMethod::CurvedArcEq106,
+                ActiveGravityMethod::MmfftCompressed,
+                ActiveGravityMethod::Fmm,
+            ]
+        );
+        assert_eq!(
+            ActiveGravityMethod::from_performance_index(99),
+            ActiveGravityMethod::RadialAnalytic
+        );
+    }
+
+    #[test]
+    fn performance_rotation_skips_disabled_methods() {
+        let state = PerformanceComparisonState {
+            enabled_methods: [true, false, false, true, true],
+            ..Default::default()
+        };
+        assert_eq!(
+            state.next_enabled_method(0).map(|(index, _)| index),
+            Some(3)
+        );
+        assert_eq!(
+            state.next_enabled_method(3).map(|(index, _)| index),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn performance_rotation_handles_all_methods_disabled() {
+        let mut state = PerformanceComparisonState {
+            enabled_methods: [false; 5],
+            ..Default::default()
+        };
+        state.start(ActiveGravityMethod::RadialAnalytic);
+        assert!(!state.measuring);
+        assert!(state.pending_method.is_none());
+        assert!(state.next_enabled_method(0).is_none());
+    }
+
+    #[test]
+    fn benchmark_pass_does_not_wrap_to_a_completed_method() {
+        let state = PerformanceComparisonState {
+            enabled_methods: [true, true, false, true, true],
+            completed_methods: [true, false, false, false, false],
+            ..Default::default()
+        };
+        assert_eq!(
+            state
+                .next_uncompleted_enabled_method(0)
+                .map(|(index, _)| index),
+            Some(1)
+        );
+        assert_eq!(
+            PerformanceComparisonState {
+                completed_methods: [true, true, false, true, true],
+                ..state
+            }
+            .next_uncompleted_enabled_method(1),
+            None
+        );
+    }
+
+    #[test]
+    fn repeat_benchmark_preserves_original_return_method() {
+        let mut state = PerformanceComparisonState::default();
+        state.start(ActiveGravityMethod::RadialAnalytic);
+        state.phase = 3;
+        state.frames_per_second = [60.0; 5];
+        state.restart();
+
+        assert_eq!(state.return_method, ActiveGravityMethod::RadialAnalytic);
+        assert_eq!(
+            state.pending_method,
+            Some(ActiveGravityMethod::RadialAnalytic)
+        );
+        assert_eq!(state.frames_per_second, [0.0; 5]);
+        assert_eq!(state.completed_methods, [false; 5]);
     }
 }

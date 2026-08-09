@@ -6,7 +6,23 @@
     <title>Ryugu WASM — WebGPU</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+        }
+        body {
+            display: grid;
+            place-items: center;
+        }
+        #viewport-frame {
+            --display-scale: 1;
+            --quarter-turn: 0;
+            aspect-ratio: 16 / 9;
+            transform: rotate(calc(var(--quarter-turn) * 90deg)) scale(var(--display-scale));
+            transform-origin: center;
+        }
         #bevy { width: 100%; height: 100%; display: block; }
         #no-webgpu {
             display: none;
@@ -27,7 +43,9 @@
     </style>
 </head>
 <body>
-    <canvas id="bevy"></canvas>
+    <div id="viewport-frame">
+        <canvas id="bevy"></canvas>
+    </div>
     <div id="no-webgpu">
         <h2>⚠ WebGPU Not Available</h2>
         <p>This app requires <strong>WebGPU</strong>, which is not enabled in your browser.</p>
@@ -40,6 +58,35 @@
     </div>
 
     <script type="module">
+        const viewportFrame = document.getElementById('viewport-frame');
+
+        function updateViewportFrame() {
+            const aspectRatio = 16 / 9;
+            const frameWidth = Math.min(window.innerWidth, window.innerHeight * aspectRatio);
+            const frameHeight = frameWidth / aspectRatio;
+            const quarterTurn = Number(viewportFrame.dataset.quarterTurn ?? 0) % 4;
+            const rotatedWidth = quarterTurn % 2 === 0 ? frameWidth : frameHeight;
+            const rotatedHeight = quarterTurn % 2 === 0 ? frameHeight : frameWidth;
+            const scale = Math.min(
+                window.innerWidth / rotatedWidth,
+                window.innerHeight / rotatedHeight,
+            );
+
+            viewportFrame.style.width = `${frameWidth}px`;
+            viewportFrame.style.height = `${frameHeight}px`;
+            viewportFrame.style.setProperty('--display-scale', String(scale));
+        }
+
+        window.setRyuguDisplayRotation = (quarterTurn) => {
+            const normalizedTurn = ((Number(quarterTurn) % 4) + 4) % 4;
+            viewportFrame.dataset.quarterTurn = String(normalizedTurn);
+            viewportFrame.style.setProperty('--quarter-turn', String(normalizedTurn));
+            updateViewportFrame();
+        };
+
+        window.addEventListener('resize', updateViewportFrame, { passive: true });
+        window.setRyuguDisplayRotation(0);
+
         // WebGPU availability check before loading WASM
         if (!navigator.gpu) {
             document.getElementById('bevy').style.display = 'none';

@@ -60,6 +60,8 @@ pub fn record_probe_jacobi_system(
     active_method: Res<ActiveGravityMethod>,
     radial_samples: Option<Res<RadialGravityHistory>>,
     werner_samples: Option<Res<WernerGravityHistory>>,
+    mmfft_samples: Option<Res<MmfftCompressedHistory>>,
+    fmm_samples: Option<Res<FmmGravityHistory>>,
     gravity_blend: Res<GravityBlendFactor>,
     clock: Res<SimulationClock>,
     mut history: ResMut<JacobiHistory>,
@@ -78,6 +80,14 @@ pub fn record_probe_jacobi_system(
         // near-straight operator; the second performance curve adds its dual
         // residual after this base Jacobi value is recorded.
         ActiveGravityMethod::CurvedArcEq106 => radial_samples
+            .as_ref()
+            .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
+        // MMFFT emits acceleration and positive potential from its dedicated
+        // compressed-source readback, so Jacobi remains snapshot-aligned.
+        ActiveGravityMethod::MmfftCompressed => mmfft_samples
+            .as_ref()
+            .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
+        ActiveGravityMethod::Fmm => fmm_samples
             .as_ref()
             .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
     };
@@ -113,6 +123,7 @@ pub fn record_probe_jacobi_system(
         .get_or_insert(sample.snapshot.simulation_time_seconds);
     history.elapsed_simulation_seconds = sample.snapshot.simulation_time_seconds - origin;
     history.last_request_id = Some(sample.snapshot.request_id);
+    history.last_sample_method = Some(*active_method);
     if history.samples.len() == JACOBI_HISTORY_CAPACITY {
         history.samples.pop_front();
     }

@@ -1,4 +1,9 @@
 use crate::components::*;
+use crate::systems::eq106::{self, Eq106PointSource};
+#[cfg(test)]
+use crate::systems::eq106::{
+    Eq106Certificate, Eq106Error, Eq106FrequencyGrid, Eq106ReferenceLine, Eq106TransformSample,
+};
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use std::collections::VecDeque;
@@ -8,6 +13,9 @@ const MIN_SEGMENT_POINTS: usize = 4;
 const EPSILON_TARGET: f64 = 0.25;
 const TAYLOR_REMAINDER_TARGET: f64 = 1.0e-3;
 const MAX_TAYLOR_ORDER: u32 = 8;
+const MAX_PADE_ORDER: u32 = 8;
+const PADE_REMAINDER_TARGET: f64 = 1.0e-3;
+const PADE_CERTIFICATION_TOLERANCE: f64 = 1.0e-3;
 const CLOSURE_POSITION_TOLERANCE: f32 = 1.0e-3;
 const CLOSURE_VELOCITY_TOLERANCE: f32 = 1.0e-3;
 const CLOSURE_PERIOD_TOLERANCE: f64 = 1.0e-3;
@@ -19,7 +27,7 @@ pub enum CurvedArcMode {
     Bootstrap,
     NonPeriodic,
     Periodic,
-    Fallback,
+    Error,
 }
 
 impl CurvedArcMode {
@@ -28,7 +36,7 @@ impl CurvedArcMode {
             Self::Bootstrap => "Non-periodic warm-up",
             Self::NonPeriodic => "Eq.106 non-periodic",
             Self::Periodic => "Eq.106 periodic",
-            Self::Fallback => "Newton fallback / split required",
+            Self::Error => "Eq.106 evaluation error",
         }
     }
 
@@ -37,18 +45,50 @@ impl CurvedArcMode {
             Self::Bootstrap => "Warm-up",
             Self::NonPeriodic => "Non-periodic",
             Self::Periodic => "Periodic",
-            Self::Fallback => "Fallback",
+            Self::Error => "Error",
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct CurvedArcSegment {
+    pub start_index: usize,
     pub end_index: usize,
     pub epsilon_max: f64,
     pub distance_lower_bound: f64,
     pub taylor_order: Option<u32>,
+    /// Rational continuation selected when the Taylor disk is too small. The
+    /// certificate is directional and CPU-side; WGSL currently uses the
+    /// certified spectrum plus analytic point-field translation correction.
+    pub pade_order: Option<(u32, u32)>,
+    pub pade_certified: bool,
     pub remainder_bound: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Eq106KernelStatus {
+    #[default]
+    AwaitingSource,
+    Ready,
+    Failed,
+}
+
+#[derive(Resource, Default)]
+pub struct Eq106SourceData {
+    pub sources: Vec<Eq106PointSource>,
+    pub total_mass: f64,
+    pub radius: f64,
+    pub source_hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PadeContinuationPlan {
+    pub numerator_order: u32,
+    pub denominator_order: u32,
+    pub estimated_remainder: f64,
+    /// Must remain false until the independent spectral residual certifies the
+    /// rational continuation for the full density operator.
+    pub certified: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,7 +101,7 @@ pub struct CurvedArcResidualSample {
     /// Eq. (157) dual-representation residual from the curved-path work
     /// integral and the independently accumulated GPU potential.
     pub dual_residual: Option<f64>,
-    /// Taylor truncation order actually used (1, 2, or 3). See `taylor_order`.
+    /// Taylor truncation order actually used (1..=MAX_TAYLOR_ORDER).
     pub taylor_order: u32,
 }
 
@@ -147,6 +187,8 @@ pub struct CurvedArcPlannerState {
     pub kernel_ready: bool,
     pub active_segment: Option<CurvedArcSegment>,
     pub taylor_order: u32,
+    pub pade_plan: Option<PadeContinuationPlan>,
+    pub kernel_status: Eq106KernelStatus,
 }
 
 impl CurvedArcPlannerState {
@@ -179,17 +221,137 @@ impl PeriodicityDetector {
     }
 }
 
+const EQ106_AZIMUTH_BINS: usize = 4;
+const EQ106_POLAR_BINS: usize = 2;
+const EQ106_SOURCE_BUDGET: usize = EQ106_AZIMUTH_BINS * EQ106_POLAR_BINS;
+
+/// Decodes a bounded, mass-preserving quadrature view of the radial density
+/// records. The full GPU source remains authoritative for the radial method;
+/// this independent view exists solely to certify the complex-frequency
+/// Equation (106) operator before it is allowed to drive physics.
+pub fn build_eq106_source_system(
+    mut commands: Commands,
+    radial: Option<Res<RadialGravitySource>>,
+    existing: Option<Res<Eq106SourceData>>,
+) {
+    if existing.is_some() {
+        return;
+    }
+    let Some(radial) = radial else { return };
+    let record_count = radial.bytes.len() / 32;
+    if record_count == 0 {
+        return;
+    }
+    let mut bin_masses = [0.0_f64; EQ106_SOURCE_BUDGET];
+    let mut bin_moments = [DVec3::ZERO; EQ106_SOURCE_BUDGET];
+    let mut total_mass = 0.0;
+    let mut radius = 0.0_f64;
+    for chunk in radial.bytes.chunks_exact(32) {
+        let direction = DVec3::new(
+            read_f32_le(chunk, 0) as f64,
+            read_f32_le(chunk, 4) as f64,
+            read_f32_le(chunk, 8) as f64,
+        )
+        .try_normalize()
+        .unwrap_or(DVec3::Z);
+        let solid_angle = (read_f32_le(chunk, 12) as f64).max(0.0);
+        let inner = (read_f32_le(chunk, 16) as f64).max(0.0);
+        let outer = (read_f32_le(chunk, 20) as f64).max(inner);
+        let density = (read_f32_le(chunk, 24) as f64).max(0.0);
+        let shell_volume = solid_angle * (outer.powi(3) - inner.powi(3)) / 3.0;
+        let mass = shell_volume * density;
+        if !mass.is_finite() || mass <= 0.0 || outer <= inner {
+            continue;
+        }
+        let radial_centroid = 0.75 * (outer.powi(4) - inner.powi(4))
+            / (outer.powi(3) - inner.powi(3)).max(f64::MIN_POSITIVE);
+        let azimuth =
+            (direction.y.atan2(direction.x) + std::f64::consts::PI) / std::f64::consts::TAU;
+        let polar = 0.5 * (direction.z.clamp(-1.0, 1.0) + 1.0);
+        let azimuth_index =
+            ((azimuth * EQ106_AZIMUTH_BINS as f64).floor() as usize).min(EQ106_AZIMUTH_BINS - 1);
+        let polar_index =
+            ((polar * EQ106_POLAR_BINS as f64).floor() as usize).min(EQ106_POLAR_BINS - 1);
+        let bin_index = polar_index * EQ106_AZIMUTH_BINS + azimuth_index;
+        bin_masses[bin_index] += mass;
+        bin_moments[bin_index] += direction * radial_centroid * mass;
+        total_mass += mass;
+        radius = radius.max(outer);
+    }
+    let sources = bin_masses
+        .iter()
+        .zip(bin_moments)
+        .filter_map(|(mass, moment)| {
+            (*mass > 0.0).then_some(Eq106PointSource {
+                position: moment / *mass,
+                mass: *mass,
+            })
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() || !total_mass.is_finite() {
+        return;
+    }
+    commands.insert_resource(Eq106SourceData {
+        sources,
+        total_mass,
+        radius,
+        source_hash: hash_source_bytes(&radial.bytes),
+    });
+}
+
+fn read_f32_le(bytes: &[u8], offset: usize) -> f32 {
+    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0_u8; 4]))
+}
+
+fn hash_source_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(1469598103934665603_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(1099511628211_u64)
+    })
+}
+
+#[cfg(test)]
+fn certify_runtime_line(
+    line: Eq106ReferenceLine,
+    sources: &[Eq106PointSource],
+    radius: f64,
+) -> Result<(Vec<Eq106TransformSample>, Eq106Certificate), Eq106Error> {
+    let scale = radius.max(1.0);
+    let grid = Eq106FrequencyGrid {
+        sigma: 2.0 / scale,
+        omega_step: 0.002,
+        half_count: 128,
+    };
+    let h_values = [0.0, (0.01 * scale).min(25.0), 50.0, 100.0];
+    let (samples, certificate) =
+        eq106::certify_eq106_line(line, sources, grid, G as f64, &h_values, 10.0)?;
+    if certificate.max_acceleration_relative_error > 0.2
+        || certificate.max_potential_relative_error > 0.2
+        || certificate.max_boundary_identity_error > 2.0e-6
+    {
+        warn!(
+            "[eq106] rejected certificate: acceleration={:.3e}, potential={:.3e}, boundary={:.3e}",
+            certificate.max_acceleration_relative_error,
+            certificate.max_potential_relative_error,
+            certificate.max_boundary_identity_error
+        );
+        return Err(Eq106Error::CertificationFailed);
+    }
+    Ok((samples, certificate))
+}
+
 /// Plans the finite non-periodic Eq. (106) arc first. Periodic mode is enabled
 /// only after ten stable closures; both paths use convergent Taylor transport.
 pub fn monitor_curved_arc_system(
     active_method: Res<ActiveGravityMethod>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
     radial_history: Option<Res<RadialGravityHistory>>,
+    source_data: Option<Res<Eq106SourceData>>,
     clock: Res<SimulationClock>,
     cassini: Query<(&Transform, &Velocity, &OrbitHistory), With<CassiniMarker>>,
     mut planner: ResMut<CurvedArcPlannerState>,
     mut detector: ResMut<PeriodicityDetector>,
     mut residual_history: ResMut<CurvedArcResidualHistory>,
+    mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
     if *active_method != ActiveGravityMethod::CurvedArcEq106 {
         return;
@@ -203,9 +365,33 @@ pub fn monitor_curved_arc_system(
         return;
     };
     let Some(radius) = enclosing_radius(&topology) else {
-        planner.mode = CurvedArcMode::Fallback;
+        planner.mode = CurvedArcMode::Error;
+        planner.kernel_status = Eq106KernelStatus::Failed;
+        runtime_error.raise("Equation (106) cannot determine a finite density-support radius.");
         return;
     };
+    let Some(source_data) = source_data else {
+        planner.mode = CurvedArcMode::Bootstrap;
+        planner.kernel_status = Eq106KernelStatus::AwaitingSource;
+        return;
+    };
+    if source_data.sources.is_empty()
+        || !source_data.total_mass.is_finite()
+        || source_data.total_mass <= 0.0
+    {
+        planner.mode = CurvedArcMode::Error;
+        planner.kernel_status = Eq106KernelStatus::Failed;
+        runtime_error.raise("Equation (106) has no finite density quadrature sources.");
+        return;
+    }
+
+    if planner.kernel_status != Eq106KernelStatus::Ready {
+        // The render-world Eq.106 pipeline assembles and certifies the shared
+        // complex-frequency line on the GPU. The main thread only plans the
+        // convergent arc and waits for a snapshot-tagged readback.
+        planner.kernel_status = Eq106KernelStatus::Ready;
+        planner.kernel_ready = true;
+    }
 
     let points: Vec<Vec3> = history
         .0
@@ -218,7 +404,10 @@ pub fn monitor_curved_arc_system(
         .rev()
         .collect();
     if points.len() < MIN_SEGMENT_POINTS {
-        planner.mode = CurvedArcMode::Bootstrap;
+        planner.mode = CurvedArcMode::NonPeriodic;
+        planner.kernel_ready = planner.kernel_status == Eq106KernelStatus::Ready;
+        planner.taylor_order = 1;
+        planner.epsilon_max = Some(0.0);
         update_periodicity(
             &mut detector,
             &mut planner,
@@ -231,13 +420,26 @@ pub fn monitor_curved_arc_system(
 
     let mut segments = Vec::new();
     split_until_convergent(&points, 0, points.len() - 1, radius, &mut segments);
+    for segment in &mut segments {
+        if segment.taylor_order.is_none()
+            && let Some((numerator_order, denominator_order)) = segment.pade_order
+            && numerator_order == denominator_order
+        {
+            segment.pade_certified = certify_segment_pade(
+                &points,
+                segment,
+                &source_data.sources,
+                numerator_order as usize,
+            );
+        }
+    }
     let epsilon_max = segments
         .iter()
         .map(|segment| segment.epsilon_max)
         .reduce(f64::max);
-    let rejected = segments
-        .iter()
-        .any(|segment| segment.taylor_order.is_none());
+    let rejected = segments.iter().any(|segment| {
+        segment.taylor_order.is_none() && (segment.pade_order.is_none() || !segment.pade_certified)
+    });
 
     planner.active_segment = segments
         .iter()
@@ -251,14 +453,35 @@ pub fn monitor_curved_arc_system(
         .as_ref()
         .and_then(|segment| segment.taylor_order)
         .unwrap_or(1);
-    planner.kernel_ready = !rejected && !planner.segments.is_empty();
-    planner.mode = if rejected {
-        CurvedArcMode::Fallback
+    planner.pade_plan = planner.active_segment.as_ref().and_then(|segment| {
+        segment.pade_order.map(
+            |(numerator_order, denominator_order)| PadeContinuationPlan {
+                numerator_order,
+                denominator_order,
+                estimated_remainder: segment.remainder_bound,
+                certified: segment.pade_certified,
+            },
+        )
+    });
+    planner.kernel_ready = !rejected
+        && !planner.segments.is_empty()
+        && planner.kernel_status == Eq106KernelStatus::Ready;
+    planner.mode = if rejected || planner.kernel_status != Eq106KernelStatus::Ready {
+        CurvedArcMode::Error
     } else if planner.mode == CurvedArcMode::Periodic {
         CurvedArcMode::Periodic
     } else {
         CurvedArcMode::NonPeriodic
     };
+
+    if planner.mode == CurvedArcMode::Error {
+        let message = if rejected {
+            "Equation (106) Taylor and Pade continuation both failed their remainder test."
+        } else {
+            "Equation (106) complex-frequency kernel is not certified; evaluation is disabled."
+        };
+        runtime_error.raise(message);
+    }
 
     if let Some(epsilon_max) = epsilon_max {
         // Adaptive Taylor order: Eq. (118) truncation. ε = |δq|/d_safe; the
@@ -306,7 +529,8 @@ fn split_until_convergent(
 ) {
     let segment = evaluate_segment(points, start_index, end_index, radius);
     let point_count = end_index - start_index + 1;
-    if (segment.epsilon_max <= EPSILON_TARGET && segment.taylor_order.is_some())
+    if (segment.epsilon_max <= EPSILON_TARGET
+        && (segment.taylor_order.is_some() || segment.pade_order.is_some()))
         || point_count <= MIN_SEGMENT_POINTS
         || segment.distance_lower_bound <= 0.0
     {
@@ -365,17 +589,59 @@ fn evaluate_segment(
     };
 
     let taylor_order = select_taylor_order(epsilon_max);
+    let pade_plan = taylor_order
+        .is_none()
+        .then(|| select_pade_plan(epsilon_max))
+        .flatten();
     let remainder_bound = taylor_order
         .and_then(|order| taylor_remainder_bound(epsilon_max, order))
+        .or_else(|| pade_plan.map(|plan| plan.estimated_remainder))
         .unwrap_or(f64::INFINITY);
 
     CurvedArcSegment {
+        start_index,
         end_index,
         epsilon_max,
         distance_lower_bound,
         taylor_order,
+        pade_order: pade_plan.map(|plan| (plan.numerator_order, plan.denominator_order)),
+        pade_certified: false,
         remainder_bound,
     }
+}
+
+fn certify_segment_pade(
+    points: &[Vec3],
+    segment: &CurvedArcSegment,
+    sources: &[Eq106PointSource],
+    order: usize,
+) -> bool {
+    let start = points[segment.start_index];
+    let end = points[segment.end_index];
+    let chord = end - start;
+    let chord_length = chord.length();
+    let direction = chord.try_normalize().unwrap_or(Vec3::ZERO);
+    points[segment.start_index..=segment.end_index]
+        .iter()
+        .all(|point| {
+            let projection = if direction == Vec3::ZERO {
+                0.0
+            } else {
+                (*point - start).dot(direction).clamp(0.0, chord_length)
+            };
+            let reference = start + direction * projection;
+            let center = reference.as_dvec3();
+            let displacement = (*point - reference).as_dvec3();
+            eq106::certify_directional_pade(
+                center,
+                displacement,
+                sources,
+                G as f64,
+                order,
+                PADE_CERTIFICATION_TOLERANCE,
+            )
+            .is_ok()
+        })
 }
 
 /// Adaptive Taylor truncation order for Eq. (118).
@@ -386,17 +652,13 @@ fn evaluate_segment(
 /// Order 0 is forbidden (zeroth-order = straight line, Eq. (106) requires
 /// at least first-order correction, Eq. (119)).
 fn select_taylor_order(epsilon_max: f64) -> Option<u32> {
-    if !epsilon_max.is_finite() || epsilon_max < 0.0 || epsilon_max >= 1.0 {
+    if !epsilon_max.is_finite() || !(0.0..1.0).contains(&epsilon_max) {
         return None;
     }
-    for order in 1u32..=MAX_TAYLOR_ORDER {
-        if taylor_remainder_bound(epsilon_max, order)
+    (1u32..=MAX_TAYLOR_ORDER).find(|&order| {
+        taylor_remainder_bound(epsilon_max, order)
             .is_some_and(|bound| bound <= TAYLOR_REMAINDER_TARGET)
-        {
-            return Some(order);
-        }
-    }
-    None
+    })
 }
 
 fn taylor_remainder_bound(epsilon_max: f64, taylor_order: u32) -> Option<f64> {
@@ -408,101 +670,24 @@ fn taylor_remainder_bound(epsilon_max: f64, taylor_order: u32) -> Option<f64> {
     bound.is_finite().then_some(bound)
 }
 
-/// Eq. (118) transport of a completed straight-line field sample onto the
-/// current curved point. The point-mass derivatives are a bounded local proxy
-/// for omitted spatial derivatives; ε >= 1 is rejected by the planner.
-pub fn approximate_eq106_acceleration(
-    history: &GravitySampleHistory,
-    epoch: u64,
-    position_world: Vec3,
-    ryugu_transform: Transform,
-    source_mass: f32,
-    planner: &CurvedArcPlannerState,
-) -> Option<Vec3> {
-    if !planner.kernel_ready || planner.mode == CurvedArcMode::Fallback {
+/// Selects a rational continuation candidate after the Taylor disk is
+/// exhausted. The candidate remains unusable until `certify_segment_pade`
+/// constructs its real directional jet, rejects poles, compares adjacent
+/// orders, and checks every sampled point against the independent field form.
+fn select_pade_plan(epsilon_max: f64) -> Option<PadeContinuationPlan> {
+    if !epsilon_max.is_finite() || epsilon_max <= 1.0 {
         return None;
     }
-    let sample = history.latest_for_epoch(epoch)?;
-    let sample_body = sample.snapshot.body_position;
-    let target_body =
-        ryugu_transform.rotation.inverse() * (position_world - ryugu_transform.translation);
-    let delta = target_body - sample_body;
-    let safe_distance = planner
-        .active_segment
-        .as_ref()
-        .map(|segment| segment.distance_lower_bound)
-        .unwrap_or(f64::INFINITY);
-    if !delta.is_finite() || delta.length() as f64 >= safe_distance.max(0.0) {
-        return None;
-    }
-
-    let correction = point_mass_taylor_correction(
-        sample_body,
-        delta,
-        G as f64 * source_mass as f64,
-        planner.taylor_order,
-    )?;
-    let transported = sample.body_acceleration + correction;
-    let world = ryugu_transform.rotation * transported;
-    world.is_finite().then_some(world)
-}
-
-fn point_mass_taylor_correction(reference: Vec3, delta: Vec3, mu: f64, order: u32) -> Option<Vec3> {
-    let reference = reference.as_dvec3();
-    let delta = delta.as_dvec3();
-    let radius_squared = reference.length_squared();
-    if !radius_squared.is_finite() || radius_squared <= f64::EPSILON || order == 0 {
-        return None;
-    }
-
-    // For r(t)=r+tδ, expand (1+a t+b t²)^(-3/2) as a polynomial in t and
-    // retain only degrees <= A. This is the directional Taylor series from
-    // Eq. (118), evaluated at t=1, without hard-coding derivative tensors.
-    let a = 2.0 * reference.dot(delta) / radius_squared;
-    let b = delta.length_squared() / radius_squared;
-    let size = order as usize + 1;
-    let mut y = vec![0.0_f64; size];
-    if size > 1 {
-        y[1] = a;
-    }
-    if size > 2 {
-        y[2] = b;
-    }
-    let mut power = vec![0.0_f64; size];
-    power[0] = 1.0;
-    let mut scale = vec![0.0_f64; size];
-    let mut binomial = 1.0_f64;
-    for n in 0..=order as usize {
-        for degree in 0..size {
-            scale[degree] += binomial * power[degree];
-        }
-        if n == order as usize {
-            break;
-        }
-        let mut next = vec![0.0_f64; size];
-        for left in 0..size {
-            for right in 0..(size - left) {
-                next[left + right] += power[left] * y[right];
-            }
-        }
-        power = next;
-        binomial *= (-1.5 - n as f64) / (n as f64 + 1.0);
-    }
-
-    let inverse_radius_cubed = radius_squared.sqrt().recip() / radius_squared;
-    let mut taylor_acceleration = DVec3::ZERO;
-    for degree in 0..size {
-        let numerator = reference * scale[degree]
-            + if degree > 0 {
-                delta * scale[degree - 1]
-            } else {
-                DVec3::ZERO
-            };
-        taylor_acceleration += -mu * inverse_radius_cubed * numerator;
-    }
-    let base_acceleration = -mu * inverse_radius_cubed * reference;
-    let correction = (taylor_acceleration - base_acceleration).as_vec3();
-    correction.is_finite().then_some(correction)
+    let transformed_ratio = epsilon_max / (1.0 + epsilon_max);
+    (2u32..=MAX_PADE_ORDER).find_map(|order| {
+        let estimated_remainder = transformed_ratio.powi((2 * order + 1) as i32);
+        (estimated_remainder <= PADE_REMAINDER_TARGET).then_some(PadeContinuationPlan {
+            numerator_order: order,
+            denominator_order: order,
+            estimated_remainder,
+            certified: false,
+        })
+    })
 }
 
 fn update_periodicity(
@@ -606,16 +791,21 @@ mod tests {
     }
 
     #[test]
-    fn point_mass_taylor_converges_toward_exact_translation() {
-        let reference = Vec3::new(1200.0, -300.0, 200.0);
-        let delta = Vec3::new(20.0, 10.0, -5.0);
-        let mu = G as f64 * RYUGU_MASS as f64;
-        let exact = (-mu * (reference + delta).as_dvec3()
-            / (reference + delta).as_dvec3().length().powi(3))
-        .as_vec3();
-        let base = (-mu * reference.as_dvec3() / reference.as_dvec3().length().powi(3)).as_vec3();
-        let second = base + point_mass_taylor_correction(reference, delta, mu, 2).unwrap();
-        let sixth = base + point_mass_taylor_correction(reference, delta, mu, 6).unwrap();
-        assert!(sixth.distance(exact) < second.distance(exact));
+    fn pade_plan_is_adaptive_and_requires_runtime_certification() {
+        let plan = select_pade_plan(1.5).expect("a rational continuation candidate");
+        assert!(plan.numerator_order >= 2);
+        assert_eq!(plan.numerator_order, plan.denominator_order);
+        assert!(!plan.certified);
+    }
+
+    #[test]
+    fn runtime_frequency_certificate_accepts_external_line() {
+        let line = Eq106ReferenceLine::new(DVec3::new(0.0, 0.0, 1_000.0), DVec3::X).unwrap();
+        let sources = vec![Eq106PointSource {
+            position: DVec3::ZERO,
+            mass: RYUGU_MASS as f64,
+        }];
+        let result = certify_runtime_line(line, &sources, 1_000.0);
+        assert!(result.is_ok(), "certificate failed: {result:?}");
     }
 }

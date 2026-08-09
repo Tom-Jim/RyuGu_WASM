@@ -1,22 +1,15 @@
 use crate::components::*;
-use crate::systems::curved_arc::{CurvedArcPlannerState, approximate_eq106_acceleration};
 use bevy::prelude::*;
 
 const MAX_ACC: f32 = 1.5e-3;
 const MAX_EXTRAPOLATION_INTERVALS: f64 = 2.0;
 
-fn newtonian_acceleration(source: Vec3, target: Vec3, source_mass: f32) -> Vec3 {
-    let displacement = source - target;
-    let distance_squared = displacement.length_squared() + GRAVITY_EPSILON * GRAVITY_EPSILON;
-    displacement / distance_squared.sqrt() * (G * source_mass / distance_squared)
-}
-
-fn clamp_acceleration(acceleration: Vec3) -> Vec3 {
+fn validate_acceleration(acceleration: Vec3) -> Option<Vec3> {
     let magnitude = acceleration.length();
-    if magnitude > MAX_ACC {
-        acceleration * (MAX_ACC / magnitude)
+    if acceleration.is_finite() && magnitude.is_finite() && magnitude <= MAX_ACC {
+        Some(acceleration)
     } else {
-        acceleration
+        None
     }
 }
 
@@ -27,11 +20,6 @@ fn hermite_vector(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32) ->
         + (t3 - 2.0 * t2 + t) * tangent_a
         + (-2.0 * t3 + 3.0 * t2) * b
         + (t3 - t2) * tangent_b
-}
-
-fn body_gravity_residual(sample: &GravityFieldSample) -> Vec3 {
-    let point_mass = newtonian_acceleration(Vec3::ZERO, sample.snapshot.body_position, RYUGU_MASS);
-    sample.body_acceleration - point_mass
 }
 
 /// Interpolates completed body-frame GPU samples and performs only a bounded,
@@ -51,7 +39,7 @@ fn predict_body_acceleration(
         .collect();
     let latest = *samples.last()?;
     if samples.len() == 1 {
-        return Some(body_gravity_residual(latest));
+        return Some(latest.body_acceleration);
     }
 
     if target_time <= latest.snapshot.simulation_time_seconds {
@@ -60,7 +48,7 @@ fn predict_body_acceleration(
             .position(|sample| sample.snapshot.simulation_time_seconds >= target_time)
             .unwrap_or(samples.len() - 1);
         if upper_index == 0 {
-            return Some(body_gravity_residual(samples[0]));
+            return Some(samples[0].body_acceleration);
         }
         let lower = samples[upper_index - 1];
         let upper = samples[upper_index];
@@ -81,12 +69,11 @@ fn predict_body_acceleration(
         let upper_span = (next.snapshot.simulation_time_seconds
             - lower.snapshot.simulation_time_seconds)
             .max(interval);
-        let lower_value = body_gravity_residual(lower);
-        let upper_value = body_gravity_residual(upper);
+        let lower_value = lower.body_acceleration;
+        let upper_value = upper.body_acceleration;
         let lower_tangent =
-            (upper_value - body_gravity_residual(previous)) * (interval / lower_span) as f32;
-        let upper_tangent =
-            (body_gravity_residual(next) - lower_value) * (interval / upper_span) as f32;
+            (upper_value - previous.body_acceleration) * (interval / lower_span) as f32;
+        let upper_tangent = (next.body_acceleration - lower_value) * (interval / upper_span) as f32;
         return Some(hermite_vector(
             lower_value,
             upper_value,
@@ -100,8 +87,8 @@ fn predict_body_acceleration(
     let interval = (latest.snapshot.simulation_time_seconds
         - previous.snapshot.simulation_time_seconds)
         .max(f64::EPSILON);
-    let latest_value = body_gravity_residual(latest);
-    let previous_value = body_gravity_residual(previous);
+    let latest_value = latest.body_acceleration;
+    let previous_value = previous.body_acceleration;
     let latest_delta = latest_value - previous_value;
     let mut slope = latest_delta / interval as f32;
     if samples.len() >= 3 {
@@ -109,7 +96,7 @@ fn predict_body_acceleration(
         let older_interval = (previous.snapshot.simulation_time_seconds
             - older.snapshot.simulation_time_seconds)
             .max(f64::EPSILON);
-        let older_slope = (previous_value - body_gravity_residual(older)) / older_interval as f32;
+        let older_slope = (previous_value - older.body_acceleration) / older_interval as f32;
         // A weighted two-interval derivative suppresses readback jitter while
         // retaining the phase trend of the moving probe.
         slope = slope * 0.75 + older_slope * 0.25;
@@ -141,28 +128,34 @@ fn gpu_world_residual(
     frame_start_rotation: Quat,
     maximum_extrapolation_intervals: f64,
 ) -> Option<Vec3> {
-    let body_residual =
+    let body_acceleration =
         predict_body_acceleration(history, epoch, target_time, maximum_extrapolation_intervals)?;
     let rotation = rotation_after(frame_start_rotation, target_time - frame_start_time);
-    Some(rotation * body_residual)
+    Some(rotation * body_acceleration)
 }
 
 pub fn physics_system(
-    ryugu_query: Query<(&Transform, &Mass), (With<RyuguMarker>, Without<CassiniMarker>)>,
+    ryugu_query: Query<&Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
     mut cassini_query: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         (With<CassiniMarker>, Without<RyuguMarker>),
     >,
     radial_history: Option<Res<RadialGravityHistory>>,
     werner_history: Option<Res<WernerGravityHistory>>,
+    eq106_history: Option<Res<Eq106GpuHistory>>,
+    mmfft_history: Option<Res<MmfftCompressedHistory>>,
+    fmm_history: Option<Res<FmmGravityHistory>>,
     mut blend: ResMut<GravityBlendFactor>,
+    mut runtime_error: ResMut<GravityRuntimeError>,
     mut clock: ResMut<SimulationClock>,
     time: Res<Time<Fixed>>,
     active_method: Res<ActiveGravityMethod>,
-    curved_planner: Res<CurvedArcPlannerState>,
     simulation_acceleration: Res<SimulationAcceleration>,
 ) {
-    let Some((ryugu_transform, ryugu_mass)) = ryugu_query.iter().next() else {
+    if runtime_error.is_active() {
+        return;
+    }
+    let Some(ryugu_transform) = ryugu_query.iter().next() else {
         return;
     };
     let Some((mut probe_transform, mut probe_velocity, mut orbit_history)) =
@@ -174,22 +167,24 @@ pub fn physics_system(
     let active_history = match *active_method {
         ActiveGravityMethod::RadialAnalytic => radial_history.as_ref().map(|history| &history.0),
         ActiveGravityMethod::HomogeneousWerner => werner_history.as_ref().map(|history| &history.0),
-        // Eq. (106) transports the radial 70-style sample along the planned
-        // convergent arc; the planner controls when this branch is usable.
-        ActiveGravityMethod::CurvedArcEq106 => radial_history.as_ref().map(|history| &history.0),
+        ActiveGravityMethod::CurvedArcEq106 => eq106_history.as_ref().map(|history| &history.0),
+        // MMFFT uses its own compressed-source readback history.
+        ActiveGravityMethod::MmfftCompressed => mmfft_history.as_ref().map(|history| &history.0),
+        ActiveGravityMethod::Fmm => fmm_history.as_ref().map(|history| &history.0),
     };
     let maximum_extrapolation_intervals = match *active_method {
         ActiveGravityMethod::RadialAnalytic => MAX_EXTRAPOLATION_INTERVALS,
         ActiveGravityMethod::HomogeneousWerner => 0.0,
-        ActiveGravityMethod::CurvedArcEq106 => 0.0,
+        ActiveGravityMethod::CurvedArcEq106 => 8.0,
+        ActiveGravityMethod::MmfftCompressed => 0.0,
+        ActiveGravityMethod::Fmm => 8.0,
     };
     let gpu_ready = active_history
         .and_then(|history| history.latest_for_epoch(clock.epoch))
         .is_some();
     if gpu_ready {
-        blend.0 = (blend.0 + 1.0 / GRAVITY_BLEND_FRAMES).min(1.0);
+        blend.0 = 1.0;
     }
-    let blend_weight = blend.0;
 
     let stable_frame_dt = time.delta_secs_f64() * TIME_SCALE as f64;
     let substep_dt = stable_frame_dt / PHYSICS_SUBSTEPS as f64;
@@ -198,28 +193,11 @@ pub fn physics_system(
     let frame_start_time = clock.elapsed_seconds;
     let frame_start_rotation = ryugu_transform.rotation;
 
-    let acceleration_at = |position: Vec3, sample_time: f64| {
-        let fallback = newtonian_acceleration(ryugu_transform.translation, position, ryugu_mass.0);
-        if *active_method == ActiveGravityMethod::CurvedArcEq106 {
-            let Some(history) = active_history else {
-                return fallback;
-            };
-            let Some(curved) = approximate_eq106_acceleration(
-                history,
-                clock.epoch,
-                position,
-                *ryugu_transform,
-                ryugu_mass.0,
-                &curved_planner,
-            ) else {
-                return fallback;
-            };
-            return clamp_acceleration(fallback + blend_weight * (curved - fallback));
-        }
+    let acceleration_at = |position: Vec3, sample_time: f64| -> Result<Vec3, &'static str> {
         let Some(history) = active_history else {
-            return fallback;
+            return Err("The selected GPU gravity evaluator is not registered.");
         };
-        let Some(gpu_residual) = gpu_world_residual(
+        let Some(gpu_acceleration) = gpu_world_residual(
             history,
             clock.epoch,
             sample_time,
@@ -227,13 +205,14 @@ pub fn physics_system(
             frame_start_rotation,
             maximum_extrapolation_intervals,
         ) else {
-            return fallback;
+            // Readback latency is normal during warm-up. Pause the integrator
+            // until the selected evaluator produces a snapshot; no alternate
+            // force model is substituted.
+            return Err("Waiting for a valid gravity readback snapshot.");
         };
-        if !gpu_residual.is_finite() {
-            fallback
-        } else {
-            clamp_acceleration(fallback + blend_weight * gpu_residual)
-        }
+        let _ = position;
+        validate_acceleration(gpu_acceleration)
+            .ok_or("The selected gravity evaluator returned an invalid acceleration.")
     };
 
     // Each acceleration step completes an unchanged 12-substep leapfrog frame.
@@ -244,10 +223,35 @@ pub fn physics_system(
         for substep in 0..PHYSICS_SUBSTEPS {
             let start_time = stable_step_start + substep as f64 * substep_dt;
             let end_time = start_time + substep_dt;
-            let acceleration_start = acceleration_at(probe_transform.translation, start_time);
+            let acceleration_start = match acceleration_at(probe_transform.translation, start_time)
+            {
+                Ok(acceleration) => acceleration,
+                Err("Waiting for a valid gravity readback snapshot.") => {
+                    return;
+                }
+                Err("Waiting for Equation (106) source quadrature.") => {
+                    return;
+                }
+                Err(message) => {
+                    runtime_error.raise(message);
+                    return;
+                }
+            };
             probe_velocity.0 += acceleration_start * (0.5 * substep_dt as f32);
             probe_transform.translation += probe_velocity.0 * substep_dt as f32;
-            let acceleration_end = acceleration_at(probe_transform.translation, end_time);
+            let acceleration_end = match acceleration_at(probe_transform.translation, end_time) {
+                Ok(acceleration) => acceleration,
+                Err("Waiting for a valid gravity readback snapshot.") => {
+                    return;
+                }
+                Err("Waiting for Equation (106) source quadrature.") => {
+                    return;
+                }
+                Err(message) => {
+                    runtime_error.raise(message);
+                    return;
+                }
+            };
             probe_velocity.0 += acceleration_end * (0.5 * substep_dt as f32);
         }
 

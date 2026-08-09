@@ -19,19 +19,25 @@ use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use components::{
-    ActiveGravityMethod, CameraMode, DensityC, GravityAcceleration, GravityBlendFactor,
-    GravityPotential, JacobiHistory, PerformanceComparisonState, ProbeInitialConditions,
-    ShowNormals, ShowSection, SimulationAcceleration, SimulationClock,
+    ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GravityAcceleration,
+    GravityBlendFactor, GravityPotential, GravityRuntimeError, JacobiHistory,
+    PerformanceComparisonState, ProbeInitialConditions, ShowNormals, ShowSection,
+    SimulationAcceleration, SimulationClock,
 };
 use std::time::Duration;
+pub use systems::eq106;
 use systems::{
     compute_pipeline::NormalsComputePlugin,
     curved_arc::{
         CurvedArcPlannerState, CurvedArcResidualHistory, PeriodicityDetector,
-        monitor_curved_arc_system,
+        build_eq106_source_system, monitor_curved_arc_system,
     },
     energy::{record_probe_jacobi_system, setup_jacobi_chart, update_jacobi_chart_system},
-    gravity_pipeline::GravityComputePlugin,
+    eq106_gpu_pipeline::Eq106GpuComputePlugin,
+    eq106_operator::build_eq106_operator_tensor_system,
+    fmm_pipeline::FmmComputePlugin,
+    gravity_pipeline::{GravityComputePlugin, build_radial_gravity_source_system},
+    mmfft_pipeline::MmfftCompressedComputePlugin,
     physics::{physics_system, ryugu_rotation_system},
     render::{
         camera_follow_system, camera_switch_system, render_gizmos_system, render_section_system,
@@ -39,12 +45,14 @@ use systems::{
     },
     scale::{build_topology_system, normalize_model_scale_system},
     ui::{
-        fps_update_system, method_toggle_system, normal_toggle_system, performance_button_system,
-        performance_comparison_system, probe_slider_system, probe_slider_visual_system,
-        section_toggle_system, setup_fps_ui, setup_performance_chart_segments,
-        setup_performance_controls, setup_probe_controls, setup_simulation_acceleration_control,
+        clear_runtime_error_on_probe_change, fps_update_system, method_toggle_system,
+        normal_toggle_system, performance_button_system, performance_comparison_system,
+        performance_method_checkbox_system, probe_slider_system, probe_slider_visual_system,
+        runtime_error_overlay_system, runtime_error_reset_system, section_toggle_system,
+        setup_fps_ui, setup_performance_chart_segments, setup_performance_controls,
+        setup_probe_controls, setup_runtime_error_overlay, setup_simulation_acceleration_control,
         simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
-        update_hint_on_mode_change,
+        update_hint_on_mode_change, update_ui_scale_system,
     },
     werner_pipeline::WernerComputePlugin,
 };
@@ -52,14 +60,15 @@ use systems::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-// Browser capability check and fallback warning.
+// Browser capability check. WebGPU is mandatory because no alternate force
+// model is allowed to run when the GPU evaluator is unavailable.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = r#"
     export function has_webgpu() {
         return typeof navigator !== "undefined" && navigator.gpu !== undefined;
     }
 
-    export function show_webgpu_warning() {
+    export function show_webgpu_error() {
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.9);color:white;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:99999;font-family:sans-serif;text-align:center;padding:20px;box-sizing:border-box;";
         div.innerHTML = `
@@ -68,25 +77,36 @@ use wasm_bindgen::prelude::*;
                 This simulation features a custom <b>GPU-accelerated Gravity architecture</b>.
             </p>
             <p style="font-size:1.1rem;max-width:700px;line-height:1.6;color:#ccc;margin-top:15px;">
-                Your current browser does not support WebGPU. The simulation has fallen back to a standard Newtonian CPU calculation,
-                <b style="color:#ffaa00;">which bypasses the core parallel compute optimization of this research.</b>
+                No valid GPU gravity evaluator is available. The simulation is stopped because it never substitutes a different physical model.
             </p>
             <p style="font-size:0.95rem;color:#888;margin-top:30px;">
                 <i>* Please open this page in a modern browser (e.g., Chrome 113+, Edge) or enable WebGPU flags in Safari to evaluate the actual GPU rendering performance.</i>
             </p>
-            <button onclick="this.parentElement.style.display='none'" style="margin-top:40px;padding:12px 24px;font-size:1rem;cursor:pointer;background:#444;color:white;border:1px solid #666;border-radius:5px;transition:0.2s;">
-                Acknowledge & View CPU Fallback
-            </button>
         `;
         document.body.appendChild(div);
+    }
+
+    export function set_display_rotation(quarter_turn) {
+        window.setRyuguDisplayRotation?.(quarter_turn);
     }
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = has_webgpu)]
     fn browser_has_webgpu() -> bool;
 
-    fn show_webgpu_warning();
+    fn show_webgpu_error();
+
+    #[wasm_bindgen(js_name = set_display_rotation)]
+    fn browser_set_display_rotation(quarter_turn: u8);
 }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_display_rotation(quarter_turn: u8) {
+    browser_set_display_rotation(quarter_turn);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn set_display_rotation(_quarter_turn: u8) {}
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub fn main() {
@@ -101,10 +121,12 @@ pub fn main() {
         }
     };
 
-    // warning if no WebGPU
+    // WebGPU is a hard requirement. Do not create a GL app that could hide a
+    // missing gravity evaluator behind an alternate execution path.
     #[cfg(target_arch = "wasm32")]
     if !has_webgpu {
-        show_webgpu_warning();
+        show_webgpu_error();
+        return;
     }
 
     let (backends, limits) = if has_webgpu {
@@ -117,7 +139,7 @@ pub fn main() {
             },
         )
     } else {
-        (Backends::GL, WgpuLimits::downlevel_webgl2_defaults())
+        unreachable!("WebGPU absence is handled before app construction");
     };
 
     let mut app = App::new();
@@ -131,10 +153,12 @@ pub fn main() {
         .init_resource::<GravityAcceleration>()
         .init_resource::<GravityPotential>()
         .init_resource::<GravityBlendFactor>()
+        .init_resource::<GravityRuntimeError>()
         .init_resource::<JacobiHistory>()
         .init_resource::<SimulationClock>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
+        .init_resource::<DisplayRotation>()
         .init_resource::<PerformanceComparisonState>()
         .init_resource::<CurvedArcPlannerState>()
         .init_resource::<CurvedArcResidualHistory>()
@@ -192,6 +216,12 @@ pub fn main() {
         app.add_plugins(NormalsComputePlugin);
         app.add_plugins(GravityComputePlugin);
         app.add_plugins(WernerComputePlugin);
+        app.add_plugins(Eq106GpuComputePlugin);
+        // MMFFT+compression is the fourth GPU integration slot. Its packed
+        // source buffer and tiled reduction are built once and evaluated in
+        // the render-world compute pass.
+        app.add_plugins(MmfftCompressedComputePlugin);
+        app.add_plugins(FmmComputePlugin);
     }
 
     app.add_systems(
@@ -200,6 +230,7 @@ pub fn main() {
             setup_scene,
             setup_ui,
             setup_fps_ui,
+            setup_runtime_error_overlay,
             setup_probe_controls,
             setup_simulation_acceleration_control,
             setup_jacobi_chart,
@@ -219,18 +250,39 @@ pub fn main() {
         )
             .chain(),
     )
-    .add_systems(Update, section_toggle_system)
     .add_systems(
         Update,
-        (performance_button_system, method_toggle_system).chain(),
+        build_eq106_source_system.after(build_radial_gravity_source_system),
     )
     .add_systems(
         Update,
-        (probe_slider_system, probe_slider_visual_system).chain(),
+        build_eq106_operator_tensor_system.after(build_eq106_source_system),
+    )
+    .add_systems(Update, section_toggle_system)
+    .add_systems(
+        Update,
+        (
+            performance_button_system,
+            performance_method_checkbox_system,
+            method_toggle_system,
+        )
+            .chain(),
     )
     .add_systems(
         Update,
         (
+            probe_slider_system,
+            runtime_error_reset_system,
+            clear_runtime_error_on_probe_change,
+            probe_slider_visual_system,
+        )
+            .chain(),
+    )
+    .add_systems(
+        Update,
+        (
+            update_ui_scale_system,
+            runtime_error_overlay_system,
             simulation_acceleration_slider_system,
             simulation_acceleration_slider_visual_system,
             update_hint_on_mode_change,
@@ -249,10 +301,10 @@ pub fn main() {
     .add_systems(
         FixedUpdate,
         (
+            monitor_curved_arc_system,
             physics_system,
             ryugu_rotation_system,
             record_probe_jacobi_system,
-            monitor_curved_arc_system,
         )
             .chain(),
     )
@@ -300,5 +352,20 @@ mod shader_tests {
     #[test]
     fn werner_shader_is_valid() {
         validate_wgsl(include_str!("../assets/shaders/werner_gravity.wgsl"));
+    }
+
+    #[test]
+    fn mmfft_compressed_shader_is_valid() {
+        validate_wgsl(include_str!("../assets/shaders/mmfft_compressed.wgsl"));
+    }
+
+    #[test]
+    fn eq106_complex_shader_is_valid() {
+        validate_wgsl(include_str!("../assets/shaders/eq106_complex.wgsl"));
+    }
+
+    #[test]
+    fn fmm_shader_is_valid() {
+        validate_wgsl(include_str!("../assets/shaders/fmm_gravity.wgsl"));
     }
 }

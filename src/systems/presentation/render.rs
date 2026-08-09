@@ -37,7 +37,6 @@ pub fn setup_scene(
         WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/ryugu.glb"))),
         TargetSize(900.0),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        Mass(RYUGU_MASS),
         RyuguMarker,
     ));
 
@@ -47,7 +46,6 @@ pub fn setup_scene(
         ),
         TargetSize(6.7),
         Transform::from_translation(probe_initial.position),
-        Mass(CASSINI_MASS),
         Velocity(probe_initial.velocity()),
         OrbitHistory(std::collections::VecDeque::with_capacity(ORBIT_HISTORY_LEN)),
         CassiniMarker,
@@ -121,6 +119,8 @@ pub fn render_gizmos_system(
             ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
             ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
             ActiveGravityMethod::CurvedArcEq106 => Color::srgba(0.8, 0.35, 1.0, 0.9),
+            ActiveGravityMethod::MmfftCompressed => Color::srgba(1.0, 0.72, 0.2, 0.9),
+            ActiveGravityMethod::Fmm => Color::srgba(0.25, 0.9, 0.55, 0.9),
         };
         gizmos.linestrip(pts, orbit_color);
 
@@ -187,9 +187,8 @@ pub fn render_section_system(
     let Some(topo) = topo else { return };
     let c = density_c.map(|r| r.0).unwrap_or(1.0);
     let uniform_density = werner_density.map(|r| r.0).unwrap_or(0.0);
-    if (*active_method == ActiveGravityMethod::RadialAnalytic && c <= 0.0)
+    if (*active_method != ActiveGravityMethod::HomogeneousWerner && c <= 0.0)
         || (*active_method == ActiveGravityMethod::HomogeneousWerner && uniform_density <= 0.0)
-        || (*active_method == ActiveGravityMethod::CurvedArcEq106 && c <= 0.0)
     {
         return;
     }
@@ -208,7 +207,8 @@ pub fn render_section_system(
     let tangent_u = plane_normal.cross(up).normalize();
     let tangent_v = plane_normal.cross(tangent_u).normalize();
 
-    // Linear normalization for 1/r density field
+    // Linear normalization for the shared rho(r)=C/(r+epsilon) field. The
+    // radial, Eq.106, and MMFFT paths all use this same source law.
     let max_density = inverse_radial_density(0.0, c);
     let min_density = inverse_radial_density(SECTION_CLIP_RADIUS, c);
     let density_range = (max_density - min_density).max(1e-6);
@@ -250,42 +250,62 @@ pub fn render_section_system(
                 continue;
             }
 
-            let color = match *active_method {
-                ActiveGravityMethod::RadialAnalytic => {
-                    // Continuous rho(r)=C/(r+epsilon) used by the radial model.
-                    let r = (point - com).length().max(0.01);
-                    let density = inverse_radial_density(r, c);
-                    let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
-
-                    // Red center → yellow → cyan → blue/purple edge.
-                    if t > 0.75 {
-                        Color::srgb(1.0, (1.0 - t) * 4.0, 0.0)
-                    } else if t > 0.35 {
-                        Color::srgb((t - 0.35) * 2.5, 1.0, (0.75 - t) * 2.5)
-                    } else {
-                        Color::srgb(0.0, t * 2.85, 0.5 + 0.5 * (1.0 - t * 2.85))
-                    }
-                }
+            let color = if *active_method == ActiveGravityMethod::HomogeneousWerner {
                 // Every interior point has rho=M/V in the Werner model, so a
                 // single color is the only faithful normalized visualization.
-                ActiveGravityMethod::HomogeneousWerner => Color::srgb(0.15, 0.8, 1.0),
-                // Eq. (106) is defined over the existing radial-density source.
-                ActiveGravityMethod::CurvedArcEq106 => {
-                    let r = (point - com).length().max(0.01);
-                    let density = inverse_radial_density(r, c);
-                    let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
-                    if t > 0.75 {
-                        Color::srgb(1.0, (1.0 - t) * 4.0, 0.0)
-                    } else if t > 0.35 {
-                        Color::srgb((t - 0.35) * 2.5, 1.0, (0.75 - t) * 2.5)
-                    } else {
-                        Color::srgb(0.0, t * 2.85, 0.5 + 0.5 * (1.0 - t * 2.85))
-                    }
-                }
+                Color::srgb(0.15, 0.8, 1.0)
+            } else {
+                // Radial, Eq.106, MMFFT, and FMM all consume the same
+                // mass-preserving inverse-radial source. Use the actual
+                // normalized density at this section sample for every one of
+                // those modes; only the method-specific palette changes.
+                let r = (point - com).length().max(0.01);
+                let density = inverse_radial_density(r, c);
+                let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
+                inverse_density_color(t, *active_method)
             };
             gizmos.sphere(point, dot_radius, color);
         }
     }
+}
+
+fn inverse_density_color(t: f32, method: ActiveGravityMethod) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let (outer, middle, core) = match method {
+        // Cyan trajectory: warm density complement.
+        ActiveGravityMethod::RadialAnalytic => (
+            Vec3::new(0.18, 0.015, 0.01),
+            Vec3::new(1.0, 0.18, 0.015),
+            Vec3::new(1.0, 0.95, 0.12),
+        ),
+        // Violet trajectory: green/teal density complement.
+        ActiveGravityMethod::CurvedArcEq106 => (
+            Vec3::new(0.01, 0.12, 0.18),
+            Vec3::new(0.02, 0.9, 0.42),
+            Vec3::new(0.82, 1.0, 0.12),
+        ),
+        // Orange trajectory: blue/cyan density complement.
+        ActiveGravityMethod::MmfftCompressed => (
+            Vec3::new(0.01, 0.04, 0.24),
+            Vec3::new(0.02, 0.58, 1.0),
+            Vec3::new(0.72, 1.0, 1.0),
+        ),
+        // Green trajectory: magenta/pink density complement.
+        ActiveGravityMethod::Fmm => (
+            Vec3::new(0.16, 0.01, 0.22),
+            Vec3::new(0.95, 0.06, 0.72),
+            Vec3::new(1.0, 0.78, 0.92),
+        ),
+        ActiveGravityMethod::HomogeneousWerner => {
+            return Color::srgb(0.15, 0.8, 1.0);
+        }
+    };
+    let rgb = if t < 0.5 {
+        outer.lerp(middle, t * 2.0)
+    } else {
+        middle.lerp(core, (t - 0.5) * 2.0)
+    };
+    Color::srgb(rgb.x, rgb.y, rgb.z)
 }
 
 /// Toggles Ryugu's material alpha when ShowSection changes.
@@ -322,6 +342,26 @@ pub fn section_alpha_system(
             for child in children.iter() {
                 stack.push(child);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod section_density_color_tests {
+    use super::*;
+
+    #[test]
+    fn every_inverse_density_method_has_a_visible_gradient() {
+        for method in [
+            ActiveGravityMethod::RadialAnalytic,
+            ActiveGravityMethod::CurvedArcEq106,
+            ActiveGravityMethod::MmfftCompressed,
+            ActiveGravityMethod::Fmm,
+        ] {
+            assert_ne!(
+                inverse_density_color(0.0, method),
+                inverse_density_color(1.0, method)
+            );
         }
     }
 }
