@@ -129,7 +129,7 @@ Rust fits the current Bevy/WASM/WebGPU pipeline. C++ is equally viable for nativ
 
 ## Gravity models
 
-Detailed derivations and convergence conditions are in [`docs/mathtidy.md`](docs/mathtidy.md) and [`docs/mathtidy_EN.md`](docs/mathtidy_EN.md).
+Detailed derivations and convergence conditions are in [`mathpub.md`](mathpub.md).
 
 ### Radial Analytic: Equation
 
