@@ -501,8 +501,11 @@ fn poll_werner_readback(
     if acceleration_is_valid && potential_is_valid {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
+            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
+            independent_positive_potential: None,
+            body_acceleration_jacobian: None,
         });
     }
 }

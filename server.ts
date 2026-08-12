@@ -1,6 +1,6 @@
 import { join } from "path";
 
-const PORT = 3000;
+const PORT = Number.parseInt(Bun.env.PORT ?? "3000", 10);
 const ROOT = import.meta.dir;
 
 const MIME: Record<string, string> = {

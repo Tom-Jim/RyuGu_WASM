@@ -1,8 +1,9 @@
 use crate::components::*;
-use crate::systems::eq106::{self, Eq106PointSource};
+use crate::systems::eq106::Eq106PointSource;
 #[cfg(test)]
 use crate::systems::eq106::{
-    Eq106Certificate, Eq106Error, Eq106FrequencyGrid, Eq106ReferenceLine, Eq106TransformSample,
+    self, Eq106Certificate, Eq106Error, Eq106FrequencyGrid, Eq106ReferenceLine,
+    Eq106TransformSample,
 };
 use bevy::math::DVec3;
 use bevy::prelude::*;
@@ -13,9 +14,6 @@ const MIN_SEGMENT_POINTS: usize = 4;
 const EPSILON_TARGET: f64 = 0.25;
 const TAYLOR_REMAINDER_TARGET: f64 = 1.0e-3;
 const MAX_TAYLOR_ORDER: u32 = 8;
-const MAX_PADE_ORDER: u32 = 8;
-const PADE_REMAINDER_TARGET: f64 = 1.0e-3;
-const PADE_CERTIFICATION_TOLERANCE: f64 = 1.0e-3;
 const CLOSURE_POSITION_TOLERANCE: f32 = 1.0e-3;
 const CLOSURE_VELOCITY_TOLERANCE: f32 = 1.0e-3;
 const CLOSURE_PERIOD_TOLERANCE: f64 = 1.0e-3;
@@ -52,14 +50,16 @@ impl CurvedArcMode {
 
 #[derive(Clone, Debug)]
 pub struct CurvedArcSegment {
-    pub start_index: usize,
     pub end_index: usize,
     pub epsilon_max: f64,
     pub distance_lower_bound: f64,
+    /// Maximum discrete curvature on the sampled arc, in inverse metres.
+    pub maximum_curvature: f64,
+    /// Arc length represented by this segment, in metres.
+    pub arc_length: f64,
     pub taylor_order: Option<u32>,
-    /// Rational continuation selected when the Taylor disk is too small. The
-    /// certificate is directional and CPU-side; WGSL currently uses the
-    /// certified spectrum plus analytic point-field translation correction.
+    /// Retained for UI compatibility. Runtime Eq. (106) never uses a rational
+    /// continuation outside the Taylor convergence disk.
     pub pade_order: Option<(u32, u32)>,
     pub pade_certified: bool,
     pub remainder_bound: f64,
@@ -109,10 +109,10 @@ pub struct CurvedArcResidualSample {
 pub struct CurvedArcResidualHistory {
     pub samples: VecDeque<CurvedArcResidualSample>,
     origin_potential: Option<f64>,
+    origin_curve_work: Option<f64>,
     previous_request_id: Option<u64>,
-    previous_body_position: Option<Vec3>,
-    previous_body_acceleration: Option<Vec3>,
     accumulated_curve_work: f64,
+    curve_work_samples: VecDeque<(f64, f64)>,
 }
 
 impl Default for CurvedArcResidualHistory {
@@ -120,10 +120,10 @@ impl Default for CurvedArcResidualHistory {
         Self {
             samples: VecDeque::with_capacity(JACOBI_HISTORY_CAPACITY),
             origin_potential: None,
+            origin_curve_work: None,
             previous_request_id: None,
-            previous_body_position: None,
-            previous_body_acceleration: None,
             accumulated_curve_work: 0.0,
+            curve_work_samples: VecDeque::with_capacity(4096),
         }
     }
 }
@@ -132,10 +132,10 @@ impl CurvedArcResidualHistory {
     pub fn reset(&mut self) {
         self.samples.clear();
         self.origin_potential = None;
+        self.origin_curve_work = None;
         self.previous_request_id = None;
-        self.previous_body_position = None;
-        self.previous_body_acceleration = None;
         self.accumulated_curve_work = 0.0;
+        self.curve_work_samples.clear();
     }
 
     fn push(&mut self, sample: CurvedArcResidualSample) {
@@ -145,35 +145,74 @@ impl CurvedArcResidualHistory {
         self.samples.push_back(sample);
     }
 
+    pub fn accumulate_curve_work(
+        &mut self,
+        start_simulation_time_seconds: f64,
+        simulation_time_seconds: f64,
+        start_body_position: Vec3,
+        end_body_position: Vec3,
+        start_body_acceleration: Vec3,
+        end_body_acceleration: Vec3,
+    ) {
+        let displacement = end_body_position - start_body_position;
+        let average_acceleration = 0.5 * (start_body_acceleration + end_body_acceleration);
+        let work = average_acceleration.dot(displacement) as f64;
+        if !simulation_time_seconds.is_finite() || !work.is_finite() {
+            return;
+        }
+        if self.curve_work_samples.is_empty() && start_simulation_time_seconds.is_finite() {
+            self.curve_work_samples
+                .push_back((start_simulation_time_seconds, self.accumulated_curve_work));
+        }
+        self.accumulated_curve_work += work;
+        if self.curve_work_samples.len() == 4096 {
+            self.curve_work_samples.pop_front();
+        }
+        self.curve_work_samples
+            .push_back((simulation_time_seconds, self.accumulated_curve_work));
+    }
+
+    pub(crate) fn curve_work_at(&self, simulation_time_seconds: f64) -> Option<f64> {
+        let first = *self.curve_work_samples.front()?;
+        if simulation_time_seconds <= first.0 {
+            return Some(first.1);
+        }
+        for (&lower, &upper) in self
+            .curve_work_samples
+            .iter()
+            .zip(self.curve_work_samples.iter().skip(1))
+        {
+            if simulation_time_seconds <= upper.0 {
+                let interval = (upper.0 - lower.0).max(f64::EPSILON);
+                let weight = ((simulation_time_seconds - lower.0) / interval).clamp(0.0, 1.0);
+                return Some(lower.1 + weight * (upper.1 - lower.1));
+            }
+        }
+        self.curve_work_samples.back().map(|sample| sample.1)
+    }
+
     fn dual_residual_for(&mut self, sample: &GravityFieldSample) -> Option<f64> {
+        if sample.predictive {
+            return None;
+        }
         if self.previous_request_id == Some(sample.snapshot.request_id) {
             return None;
         }
-        let potential = sample.positive_potential as f64;
-        if !potential.is_finite()
-            || !sample.snapshot.body_position.is_finite()
-            || !sample.body_acceleration.is_finite()
-        {
+        let potential = sample.independent_positive_potential? as f64;
+        if !potential.is_finite() {
             return None;
         }
 
+        let curve_work = self.curve_work_at(sample.snapshot.simulation_time_seconds)?;
         let origin = *self.origin_potential.get_or_insert(potential);
-        if let (Some(previous_position), Some(previous_acceleration)) =
-            (self.previous_body_position, self.previous_body_acceleration)
-        {
-            let displacement = sample.snapshot.body_position - previous_position;
-            let average_acceleration = 0.5 * (previous_acceleration + sample.body_acceleration);
-            self.accumulated_curve_work += average_acceleration.dot(displacement) as f64;
-        }
+        let origin_curve_work = *self.origin_curve_work.get_or_insert(curve_work);
 
         self.previous_request_id = Some(sample.snapshot.request_id);
-        self.previous_body_position = Some(sample.snapshot.body_position);
-        self.previous_body_acceleration = Some(sample.body_acceleration);
 
         // Eq. (147) supplies P_70 through the curved-path work integral, while
         // the independently accumulated GPU potential supplies P_spec. Their
         // finite-discretization difference is the Eq. (157) dual residual.
-        let residual = self.accumulated_curve_work - (potential - origin);
+        let residual = (curve_work - origin_curve_work) - (potential - origin);
         residual.is_finite().then_some(residual)
     }
 }
@@ -221,9 +260,14 @@ impl PeriodicityDetector {
     }
 }
 
-const EQ106_AZIMUTH_BINS: usize = 4;
-const EQ106_POLAR_BINS: usize = 2;
-const EQ106_SOURCE_BUDGET: usize = EQ106_AZIMUTH_BINS * EQ106_POLAR_BINS;
+// Eight aggregate masses were enough for a pipeline smoke test, but they turn
+// Ryugu into a visibly lumpy eight-point field and can noticeably precess the
+// probe orbit. Keep a bounded GPU-friendly quadrature while retaining enough
+// angular structure for the Eq. (106) density integral.
+const EQ106_AZIMUTH_BINS: usize = 16;
+const EQ106_POLAR_BINS: usize = 8;
+const EQ106_RADIAL_BINS: usize = 4;
+const EQ106_SOURCE_BUDGET: usize = EQ106_AZIMUTH_BINS * EQ106_POLAR_BINS * EQ106_RADIAL_BINS;
 
 /// Decodes a bounded, mass-preserving quadrature view of the radial density
 /// records. The full GPU source remains authoritative for the radial method;
@@ -246,7 +290,7 @@ pub fn build_eq106_source_system(
     let mut bin_moments = [DVec3::ZERO; EQ106_SOURCE_BUDGET];
     let mut total_mass = 0.0;
     let mut radius = 0.0_f64;
-    for chunk in radial.bytes.chunks_exact(32) {
+    for (record_index, chunk) in radial.bytes.chunks_exact(32).enumerate() {
         let direction = DVec3::new(
             read_f32_le(chunk, 0) as f64,
             read_f32_le(chunk, 4) as f64,
@@ -272,7 +316,12 @@ pub fn build_eq106_source_system(
             ((azimuth * EQ106_AZIMUTH_BINS as f64).floor() as usize).min(EQ106_AZIMUTH_BINS - 1);
         let polar_index =
             ((polar * EQ106_POLAR_BINS as f64).floor() as usize).min(EQ106_POLAR_BINS - 1);
-        let bin_index = polar_index * EQ106_AZIMUTH_BINS + azimuth_index;
+        // Radial records are emitted four layers per angular cell. Preserve
+        // that coordinate instead of collapsing the entire ray to one point;
+        // this is the tensor-product density quadrature used by Eq. (106).
+        let radial_index = record_index % EQ106_RADIAL_BINS;
+        let bin_index =
+            (radial_index * EQ106_POLAR_BINS + polar_index) * EQ106_AZIMUTH_BINS + azimuth_index;
         bin_masses[bin_index] += mass;
         bin_moments[bin_index] += direction * radial_centroid * mass;
         total_mass += mass;
@@ -344,10 +393,11 @@ fn certify_runtime_line(
 pub fn monitor_curved_arc_system(
     active_method: Res<ActiveGravityMethod>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
-    radial_history: Option<Res<RadialGravityHistory>>,
+    eq106_history: Option<Res<Eq106GpuHistory>>,
     source_data: Option<Res<Eq106SourceData>>,
     clock: Res<SimulationClock>,
     cassini: Query<(&Transform, &Velocity, &OrbitHistory), With<CassiniMarker>>,
+    ryugu: Query<&Transform, With<RyuguMarker>>,
     mut planner: ResMut<CurvedArcPlannerState>,
     mut detector: ResMut<PeriodicityDetector>,
     mut residual_history: ResMut<CurvedArcResidualHistory>,
@@ -364,7 +414,7 @@ pub fn monitor_curved_arc_system(
         planner.mode = CurvedArcMode::Bootstrap;
         return;
     };
-    let Some(radius) = enclosing_radius(&topology) else {
+    let Some(_topology_radius) = enclosing_radius(&topology) else {
         planner.mode = CurvedArcMode::Error;
         planner.kernel_status = Eq106KernelStatus::Failed;
         runtime_error.raise("Equation (106) cannot determine a finite density-support radius.");
@@ -375,6 +425,13 @@ pub fn monitor_curved_arc_system(
         planner.kernel_status = Eq106KernelStatus::AwaitingSource;
         return;
     };
+    let Ok(ryugu_transform) = ryugu.single() else {
+        planner.mode = CurvedArcMode::Bootstrap;
+        return;
+    };
+    // Eq. (106) and its density support are body-fixed.  OrbitHistory stores
+    // world positions, so plan in the same body frame used by the GPU kernel.
+    let radius = source_data.radius;
     if source_data.sources.is_empty()
         || !source_data.total_mass.is_finite()
         || source_data.total_mass <= 0.0
@@ -398,7 +455,7 @@ pub fn monitor_curved_arc_system(
         .iter()
         .rev()
         .take(PLANNING_WINDOW_POINTS)
-        .copied()
+        .map(|point| ryugu_transform.rotation.inverse() * (*point - ryugu_transform.translation))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -420,25 +477,14 @@ pub fn monitor_curved_arc_system(
 
     let mut segments = Vec::new();
     split_until_convergent(&points, 0, points.len() - 1, radius, &mut segments);
-    for segment in &mut segments {
-        if segment.taylor_order.is_none()
-            && let Some((numerator_order, denominator_order)) = segment.pade_order
-            && numerator_order == denominator_order
-        {
-            segment.pade_certified = certify_segment_pade(
-                &points,
-                segment,
-                &source_data.sources,
-                numerator_order as usize,
-            );
-        }
-    }
     let epsilon_max = segments
         .iter()
         .map(|segment| segment.epsilon_max)
         .reduce(f64::max);
     let rejected = segments.iter().any(|segment| {
-        segment.taylor_order.is_none() && (segment.pade_order.is_none() || !segment.pade_certified)
+        segment.distance_lower_bound <= 0.0
+            || segment.epsilon_max >= 1.0
+            || segment.taylor_order.is_none()
     });
 
     planner.active_segment = segments
@@ -476,7 +522,7 @@ pub fn monitor_curved_arc_system(
 
     if planner.mode == CurvedArcMode::Error {
         let message = if rejected {
-            "Equation (106) Taylor and Pade continuation both failed their remainder test."
+            "Equation (106) stopped: adaptive bisection could not keep every Taylor segment inside its convergence disk."
         } else {
             "Equation (106) complex-frequency kernel is not certified; evaluation is disabled."
         };
@@ -488,10 +534,11 @@ pub fn monitor_curved_arc_system(
         // truncation remainder of order A is bounded by ε^(A+1). Pick the
         // smallest A that keeps the next term below 1e-3.
         let taylor_order = planner.taylor_order;
-        if let Some(sample) = radial_history
-            .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch))
-            && let Some(dual_residual) = residual_history.dual_residual_for(sample)
+        if let Some(sample) = eq106_history.as_ref().and_then(|history| {
+            history
+                .0
+                .completed_at_or_before(clock.epoch, clock.elapsed_seconds)
+        }) && let Some(dual_residual) = residual_history.dual_residual_for(sample)
         {
             residual_history.push(CurvedArcResidualSample {
                 simulation_time_seconds: sample.snapshot.simulation_time_seconds,
@@ -529,11 +576,10 @@ fn split_until_convergent(
 ) {
     let segment = evaluate_segment(points, start_index, end_index, radius);
     let point_count = end_index - start_index + 1;
-    if (segment.epsilon_max <= EPSILON_TARGET
-        && (segment.taylor_order.is_some() || segment.pade_order.is_some()))
-        || point_count <= MIN_SEGMENT_POINTS
-        || segment.distance_lower_bound <= 0.0
-    {
+    let convergent = segment.distance_lower_bound > 0.0
+        && segment.epsilon_max <= EPSILON_TARGET
+        && segment.taylor_order.is_some();
+    if convergent || point_count <= MIN_SEGMENT_POINTS {
         output.push(segment);
         return;
     }
@@ -565,6 +611,20 @@ fn evaluate_segment(
 
     let mut maximum_offset = 0.0_f64;
     let mut minimum_line_radius = f64::INFINITY;
+    let mut arc_length = 0.0_f64;
+    let mut maximum_curvature = 0.0_f64;
+    for pair in points[start_index..=end_index].windows(2) {
+        arc_length += pair[0].distance(pair[1]) as f64;
+    }
+    for triple in points[start_index..=end_index].windows(3) {
+        let first = (triple[1] - triple[0]).as_dvec3();
+        let second = (triple[2] - triple[1]).as_dvec3();
+        let chord = (triple[2] - triple[0]).as_dvec3();
+        let divisor = first.length() * second.length() * chord.length();
+        if divisor > f64::MIN_POSITIVE {
+            maximum_curvature = maximum_curvature.max(2.0 * first.cross(second).length() / divisor);
+        }
+    }
     for point in &points[start_index..=end_index] {
         let projection = if direction == Vec3::ZERO {
             0.0
@@ -582,66 +642,33 @@ fn evaluate_segment(
     // this radius. Subtracting it gives a conservative lower bound to the true
     // source distance, so passing this test cannot overstate Taylor convergence.
     let distance_lower_bound = minimum_line_radius - radius;
+    // docs/mathtidy.md: kappa*l^2/(2*d_min) < 1.  Here l is the
+    // segment half-length.  Taking the maximum of the measured chord offset
+    // and this curvature sagitta bound makes high-curvature arcs split sooner.
+    let curvature_offset = 0.5 * maximum_curvature * (0.5 * arc_length).powi(2);
+    let certified_offset = maximum_offset.max(curvature_offset);
     let epsilon_max = if distance_lower_bound > 0.0 {
-        maximum_offset / distance_lower_bound
+        certified_offset / distance_lower_bound
     } else {
         f64::INFINITY
     };
 
     let taylor_order = select_taylor_order(epsilon_max);
-    let pade_plan = taylor_order
-        .is_none()
-        .then(|| select_pade_plan(epsilon_max))
-        .flatten();
     let remainder_bound = taylor_order
         .and_then(|order| taylor_remainder_bound(epsilon_max, order))
-        .or_else(|| pade_plan.map(|plan| plan.estimated_remainder))
         .unwrap_or(f64::INFINITY);
 
     CurvedArcSegment {
-        start_index,
         end_index,
         epsilon_max,
         distance_lower_bound,
+        maximum_curvature,
+        arc_length,
         taylor_order,
-        pade_order: pade_plan.map(|plan| (plan.numerator_order, plan.denominator_order)),
+        pade_order: None,
         pade_certified: false,
         remainder_bound,
     }
-}
-
-fn certify_segment_pade(
-    points: &[Vec3],
-    segment: &CurvedArcSegment,
-    sources: &[Eq106PointSource],
-    order: usize,
-) -> bool {
-    let start = points[segment.start_index];
-    let end = points[segment.end_index];
-    let chord = end - start;
-    let chord_length = chord.length();
-    let direction = chord.try_normalize().unwrap_or(Vec3::ZERO);
-    points[segment.start_index..=segment.end_index]
-        .iter()
-        .all(|point| {
-            let projection = if direction == Vec3::ZERO {
-                0.0
-            } else {
-                (*point - start).dot(direction).clamp(0.0, chord_length)
-            };
-            let reference = start + direction * projection;
-            let center = reference.as_dvec3();
-            let displacement = (*point - reference).as_dvec3();
-            eq106::certify_directional_pade(
-                center,
-                displacement,
-                sources,
-                G as f64,
-                order,
-                PADE_CERTIFICATION_TOLERANCE,
-            )
-            .is_ok()
-        })
 }
 
 /// Adaptive Taylor truncation order for Eq. (118).
@@ -668,26 +695,6 @@ fn taylor_remainder_bound(epsilon_max: f64, taylor_order: u32) -> Option<f64> {
     let next_term = epsilon_max.powi((taylor_order + 1) as i32);
     let bound = next_term / (1.0 - epsilon_max).max(f64::EPSILON);
     bound.is_finite().then_some(bound)
-}
-
-/// Selects a rational continuation candidate after the Taylor disk is
-/// exhausted. The candidate remains unusable until `certify_segment_pade`
-/// constructs its real directional jet, rejects poles, compares adjacent
-/// orders, and checks every sampled point against the independent field form.
-fn select_pade_plan(epsilon_max: f64) -> Option<PadeContinuationPlan> {
-    if !epsilon_max.is_finite() || epsilon_max <= 1.0 {
-        return None;
-    }
-    let transformed_ratio = epsilon_max / (1.0 + epsilon_max);
-    (2u32..=MAX_PADE_ORDER).find_map(|order| {
-        let estimated_remainder = transformed_ratio.powi((2 * order + 1) as i32);
-        (estimated_remainder <= PADE_REMAINDER_TARGET).then_some(PadeContinuationPlan {
-            numerator_order: order,
-            denominator_order: order,
-            estimated_remainder,
-            certified: false,
-        })
-    })
 }
 
 fn update_periodicity(
@@ -791,11 +798,23 @@ mod tests {
     }
 
     #[test]
-    fn pade_plan_is_adaptive_and_requires_runtime_certification() {
-        let plan = select_pade_plan(1.5).expect("a rational continuation candidate");
-        assert!(plan.numerator_order >= 2);
-        assert_eq!(plan.numerator_order, plan.denominator_order);
-        assert!(!plan.certified);
+    fn curvature_bound_forces_tighter_segments() {
+        let gentle = [
+            Vec3::new(0.0, 1_000.0, 0.0),
+            Vec3::new(10.0, 1_000.1, 0.0),
+            Vec3::new(20.0, 1_000.4, 0.0),
+            Vec3::new(30.0, 1_000.9, 0.0),
+        ];
+        let sharp = [
+            Vec3::new(0.0, 1_000.0, 0.0),
+            Vec3::new(10.0, 1_010.0, 0.0),
+            Vec3::new(20.0, 1_000.0, 0.0),
+            Vec3::new(30.0, 990.0, 0.0),
+        ];
+        let gentle = evaluate_segment(&gentle, 0, 3, 400.0);
+        let sharp = evaluate_segment(&sharp, 0, 3, 400.0);
+        assert!(sharp.maximum_curvature > gentle.maximum_curvature);
+        assert!(sharp.epsilon_max > gentle.epsilon_max);
     }
 
     #[test]

@@ -25,7 +25,10 @@ use std::sync::atomic::Ordering;
 
 const WORKGROUP_SIZE: u32 = 64;
 const MAXIMUM_LEVEL: u32 = 5;
-const THETA: f32 = 0.55;
+// Bounds the complete source-box plus target-box radius used by M2L/L2L.
+// 0.20 keeps the order-two local expansion well inside its disk; the shader
+// independently certifies each translated value against its node multipole.
+const THETA: f32 = 0.20;
 const INVALID_PARENT: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,6 +49,18 @@ impl MomentAccumulator {
             .zip([x * x, x * y, x * z, y * y, y * z, z * z])
         {
             *slot += mass * value;
+        }
+    }
+
+    /// Exact raw-moment M2M translation. Raw moments are expressed in the
+    /// common body frame, so summing children is algebraically identical to
+    /// translating their central moments to the parent center, without the
+    /// cancellation introduced by repeated f32 translations.
+    fn merge(&mut self, child: Self) {
+        self.mass += child.mass;
+        self.first += child.first;
+        for (parent, child) in self.second.iter_mut().zip(child.second) {
+            *parent += child;
         }
     }
 }
@@ -163,19 +178,41 @@ pub fn build_fmm_source_system(
         return;
     }
 
-    let mut levels: Vec<Vec<((u32, u32, u32), MomentAccumulator)>> = Vec::new();
-    for level in 0..=MAXIMUM_LEVEL {
-        let grid = 1u32 << level;
-        let mut cells: HashMap<(u32, u32, u32), MomentAccumulator> = HashMap::new();
-        for &(position, mass) in &records {
-            let normalized = (position / radius + DVec3::ONE) * 0.5;
-            let key = (
-                ((normalized.x.clamp(0.0, 1.0 - f64::EPSILON) * grid as f64) as u32).min(grid - 1),
-                ((normalized.y.clamp(0.0, 1.0 - f64::EPSILON) * grid as f64) as u32).min(grid - 1),
-                ((normalized.z.clamp(0.0, 1.0 - f64::EPSILON) * grid as f64) as u32).min(grid - 1),
-            );
-            cells.entry(key).or_default().add(position, mass);
+    // P2M is performed only at the leaves. Every coarser level is then built
+    // exclusively through M2M aggregation, which makes the hierarchy itself
+    // (rather than a repeated particle scan) the authoritative source.
+    let leaf_grid = 1u32 << MAXIMUM_LEVEL;
+    let mut level_maps = vec![HashMap::new(); MAXIMUM_LEVEL as usize + 1];
+    for &(position, mass) in &records {
+        let normalized = (position / radius + DVec3::ONE) * 0.5;
+        let key = (
+            ((normalized.x.clamp(0.0, 1.0 - f64::EPSILON) * leaf_grid as f64) as u32)
+                .min(leaf_grid - 1),
+            ((normalized.y.clamp(0.0, 1.0 - f64::EPSILON) * leaf_grid as f64) as u32)
+                .min(leaf_grid - 1),
+            ((normalized.z.clamp(0.0, 1.0 - f64::EPSILON) * leaf_grid as f64) as u32)
+                .min(leaf_grid - 1),
+        );
+        level_maps[MAXIMUM_LEVEL as usize]
+            .entry(key)
+            .or_insert_with(MomentAccumulator::default)
+            .add(position, mass);
+    }
+    for level in (1..=MAXIMUM_LEVEL as usize).rev() {
+        let children = level_maps[level]
+            .iter()
+            .map(|(key, moment)| (*key, *moment))
+            .collect::<Vec<_>>();
+        for (key, child) in children {
+            level_maps[level - 1]
+                .entry((key.0 / 2, key.1 / 2, key.2 / 2))
+                .or_insert_with(MomentAccumulator::default)
+                .merge(child);
         }
+    }
+
+    let mut levels: Vec<Vec<((u32, u32, u32), MomentAccumulator)>> = Vec::new();
+    for cells in level_maps {
         let mut sorted = cells.into_iter().collect::<Vec<_>>();
         sorted.sort_by_key(|(key, _)| *key);
         levels.push(sorted);
@@ -257,7 +294,7 @@ pub fn build_fmm_source_system(
         }
     }
     info!(
-        "[fmm] built {} octree nodes through level {}",
+        "[fmm] built {} octree nodes through level {} (leaf P2M + exact M2M)",
         offset, MAXIMUM_LEVEL
     );
     commands.insert_resource(FmmSource {
@@ -285,15 +322,24 @@ fn poll_fmm_readback(channel: Res<FmmReadbackChannel>, mut history: ResMut<FmmGr
         return;
     };
     let Some(packet) = guard.take() else { return };
-    let total = packet
+    let total_f64 = packet
         .partial_sums
         .iter()
-        .fold(Vec4::ZERO, |sum, value| sum + Vec4::from_array(*value));
+        .fold([0.0_f64; 4], |mut sum, value| {
+            for index in 0..4 {
+                sum[index] += value[index] as f64;
+            }
+            sum
+        });
+    let total = Vec4::from_array(total_f64.map(|value| value as f32));
     if total.xyz().is_finite() && total.w.is_finite() && total.w > 0.0 {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
+            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
+            independent_positive_potential: None,
+            body_acceleration_jacobian: None,
         });
     }
 }
@@ -519,4 +565,84 @@ fn bytes_to_f32x4(bytes: &[u8]) -> Vec<[f32; 4]> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct_field(observer: DVec3, sources: &[(DVec3, f64)]) -> (DVec3, f64) {
+        sources.iter().fold(
+            (DVec3::ZERO, 0.0),
+            |(acceleration, potential), &(position, mass)| {
+                let d = position - observer;
+                let r = d.length();
+                (acceleration + mass * d / r.powi(3), potential + mass / r)
+            },
+        )
+    }
+
+    fn m2l_is_acceptable(source_half: f64, target_half: f64, distance: f64, theta: f64) -> bool {
+        let expansion_radius = 3.0_f64.sqrt() * (source_half + target_half);
+        distance > expansion_radius && expansion_radius / distance < theta
+    }
+
+    #[test]
+    fn m2l_rejects_a_large_target_box_even_when_the_source_is_small() {
+        // The previous source-only test accepted this coarse target box:
+        // source_half / distance = 0.037. Its actual L2L radius ratio is 0.63,
+        // so an order-two local expansion there is not convergent enough.
+        assert!(!m2l_is_acceptable(232.0, 3_720.0, 10_800.0, THETA as f64));
+        assert!(m2l_is_acceptable(14.5, 100.0, 1_500.0, THETA as f64));
+    }
+
+    #[test]
+    fn quadrupole_far_field_matches_direct_sources() {
+        let sources = [
+            (DVec3::new(-12.0, 3.0, 1.0), 2.0),
+            (DVec3::new(8.0, -4.0, 5.0), 3.0),
+            (DVec3::new(2.0, 7.0, -6.0), 4.0),
+            (DVec3::new(-1.0, -5.0, 2.0), 5.0),
+        ];
+        let mut moment = MomentAccumulator::default();
+        for &(position, mass) in &sources {
+            moment.add(position, mass);
+        }
+        let com = moment.first / moment.mass;
+        let [x, y, z] = com.to_array();
+        let central = [
+            moment.second[0] - moment.mass * x * x,
+            moment.second[1] - moment.mass * x * y,
+            moment.second[2] - moment.mass * x * z,
+            moment.second[3] - moment.mass * y * y,
+            moment.second[4] - moment.mass * y * z,
+            moment.second[5] - moment.mass * z * z,
+        ];
+        let trace = central[0] + central[3] + central[5];
+        let q = [
+            [3.0 * central[0] - trace, 3.0 * central[1], 3.0 * central[2]],
+            [3.0 * central[1], 3.0 * central[3] - trace, 3.0 * central[4]],
+            [3.0 * central[2], 3.0 * central[4], 3.0 * central[5] - trace],
+        ];
+        let observer = DVec3::new(1_200.0, -800.0, 600.0);
+        let d = com - observer;
+        let qd = DVec3::new(
+            q[0][0] * d.x + q[0][1] * d.y + q[0][2] * d.z,
+            q[1][0] * d.x + q[1][1] * d.y + q[1][2] * d.z,
+            q[2][0] * d.x + q[2][1] * d.y + q[2][2] * d.z,
+        );
+        let r2 = d.length_squared();
+        let r = r2.sqrt();
+        let scalar = d.dot(qd);
+        let multipole_acceleration =
+            moment.mass * d / r.powi(3) - qd / r.powi(5) + 2.5 * scalar * d / r.powi(7);
+        let multipole_potential = moment.mass / r + 0.5 * scalar / r.powi(5);
+        let (direct_acceleration, direct_potential) = direct_field(observer, &sources);
+
+        let acceleration_error =
+            (multipole_acceleration - direct_acceleration).length() / direct_acceleration.length();
+        let potential_error = (multipole_potential - direct_potential).abs() / direct_potential;
+        assert!(acceleration_error < 1.0e-6, "{acceleration_error:.3e}");
+        assert!(potential_error < 1.0e-7, "{potential_error:.3e}");
+    }
 }

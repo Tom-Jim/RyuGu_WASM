@@ -32,7 +32,10 @@ use systems::{
         CurvedArcPlannerState, CurvedArcResidualHistory, PeriodicityDetector,
         build_eq106_source_system, monitor_curved_arc_system,
     },
-    energy::{record_probe_jacobi_system, setup_jacobi_chart, update_jacobi_chart_system},
+    energy::{
+        record_probe_jacobi_system, setup_eq106_residual_chart, setup_jacobi_chart,
+        update_eq106_residual_chart_system, update_jacobi_chart_system,
+    },
     eq106_gpu_pipeline::Eq106GpuComputePlugin,
     eq106_operator::build_eq106_operator_tensor_system,
     fmm_pipeline::FmmComputePlugin,
@@ -235,6 +238,7 @@ pub fn main() {
             setup_probe_controls,
             setup_simulation_acceleration_control,
             setup_jacobi_chart,
+            setup_eq106_residual_chart,
         ),
     )
     .add_systems(
@@ -292,6 +296,7 @@ pub fn main() {
             update_gpu_memory_estimate_system,
             fps_update_system,
             update_jacobi_chart_system,
+            update_eq106_residual_chart_system,
             section_alpha_system,
         )
             .chain(),
@@ -323,8 +328,8 @@ pub fn benchmark_gravity_algorithms(iterations: u32) -> f64 {
     let mut checksum = 0.0_f64;
     for index in 0..iterations {
         let radius = 120.0 + (index % 4096) as f64 * 0.125;
-        let inverse_density = 1.0 / (radius + components::DENSITY_EPSILON as f64);
-        let radial = inverse_density * radius * radius;
+        let logarithmic_density = (1.0 + radius / components::DENSITY_EPSILON as f64).ln();
+        let radial = logarithmic_density * radius * radius;
         let edge_log = ((radius + 900.0 + 42.0) / (radius + 900.0 - 42.0)).ln();
         let werner = edge_log * (radius + 1.0).recip();
         let displacement = 0.05 * (index as f64 * 0.017).sin();

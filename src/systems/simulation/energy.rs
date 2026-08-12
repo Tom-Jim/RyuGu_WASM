@@ -9,6 +9,7 @@ const FIXED_UPDATES_PER_SECOND: f64 = 60.0;
 const JACOBI_BASE_WINDOW_SECONDS: f64 =
     (JACOBI_HISTORY_CAPACITY - 1) as f64 * TIME_SCALE as f64 / FIXED_UPDATES_PER_SECOND;
 const CHART_LINE_COLOR: Color = Color::srgb(0.2, 0.9, 0.45);
+const RESIDUAL_LINE_COLOR: Color = Color::srgb(1.0, 0.55, 0.2);
 
 #[derive(Component)]
 pub(crate) struct JacobiChartSegment(usize);
@@ -26,6 +27,25 @@ pub(crate) struct JacobiChartAxisLabel;
 pub(crate) enum JacobiChartLabel {
     Current,
     RelativeDrift,
+    Minimum,
+    Maximum,
+    TimeStart,
+    TimeEnd,
+}
+
+#[derive(Component)]
+pub(crate) struct Eq106ResidualChartRoot;
+
+#[derive(Component)]
+pub(crate) struct Eq106ResidualChartSegment(usize);
+
+#[derive(Component)]
+pub(crate) struct Eq106ResidualLatestPoint;
+
+#[derive(Component, Clone, Copy)]
+pub(crate) enum Eq106ResidualChartLabel {
+    Current,
+    Status,
     Minimum,
     Maximum,
     TimeStart,
@@ -60,6 +80,7 @@ pub fn record_probe_jacobi_system(
     active_method: Res<ActiveGravityMethod>,
     radial_samples: Option<Res<RadialGravityHistory>>,
     werner_samples: Option<Res<WernerGravityHistory>>,
+    eq106_samples: Option<Res<Eq106GpuHistory>>,
     mmfft_samples: Option<Res<MmfftCompressedHistory>>,
     fmm_samples: Option<Res<FmmGravityHistory>>,
     gravity_blend: Res<GravityBlendFactor>,
@@ -76,12 +97,14 @@ pub fn record_probe_jacobi_system(
         ActiveGravityMethod::HomogeneousWerner => werner_samples
             .as_ref()
             .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
-        // Eq. (106) starts from the same radial potential sample as the
-        // near-straight operator; the second performance curve adds its dual
-        // residual after this base Jacobi value is recorded.
-        ActiveGravityMethod::CurvedArcEq106 => radial_samples
-            .as_ref()
-            .and_then(|samples| samples.0.latest_for_epoch(clock.epoch)),
+        // Jacobi must use acceleration and potential emitted by the same
+        // Eq.(106) request. Mixing the radial potential with Eq.(106) motion
+        // produces a deterministic secular drift rather than a diagnostic.
+        ActiveGravityMethod::CurvedArcEq106 => eq106_samples.as_ref().and_then(|samples| {
+            samples
+                .0
+                .completed_at_or_before(clock.epoch, clock.elapsed_seconds)
+        }),
         // MMFFT emits acceleration and positive potential from its dedicated
         // compressed-source readback, so Jacobi remains snapshot-aligned.
         ActiveGravityMethod::MmfftCompressed => mmfft_samples
@@ -350,6 +373,191 @@ pub fn setup_jacobi_chart(mut commands: Commands) {
         });
 }
 
+pub fn setup_eq106_residual_chart(mut commands: Commands) {
+    commands
+        .spawn((
+            Eq106ResidualChartRoot,
+            Visibility::Hidden,
+            Node {
+                position_type: PositionType::Absolute,
+                right: px(15),
+                bottom: px(300),
+                width: px(450),
+                height: px(270),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(7)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.06, 0.9)),
+            BorderColor::all(Color::srgba(0.8, 0.45, 0.2, 0.7)),
+        ))
+        .with_children(|panel| {
+            panel.spawn(chart_text(
+                "Eq.106 dual-representation residual",
+                15.0,
+                Color::srgb(1.0, 0.88, 0.75),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(12),
+                    top: px(9),
+                    ..default()
+                },
+            ));
+            panel.spawn((
+                chart_text(
+                    "|r_dual| = -- m^2/s^2",
+                    11.0,
+                    Color::srgb(1.0, 0.65, 0.3),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: px(12),
+                        top: px(31),
+                        ..default()
+                    },
+                ),
+                Eq106ResidualChartLabel::Current,
+            ));
+            panel.spawn((
+                chart_text(
+                    "Eq.106 warm-up",
+                    10.0,
+                    Color::srgb(0.65, 0.82, 0.9),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(12),
+                        top: px(31),
+                        ..default()
+                    },
+                ),
+                Eq106ResidualChartLabel::Status,
+            ));
+            for (label, top) in [
+                (Eq106ResidualChartLabel::Maximum, 49.0),
+                (Eq106ResidualChartLabel::Minimum, 211.0),
+            ] {
+                panel.spawn((
+                    chart_text(
+                        "--",
+                        10.0,
+                        Color::srgb(0.7, 0.75, 0.8),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(7),
+                            top: px(top),
+                            ..default()
+                        },
+                    ),
+                    label,
+                ));
+            }
+            panel.spawn(chart_text(
+                "|r_dual| (m^2/s^2)",
+                10.0,
+                Color::srgb(0.65, 0.75, 0.8),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(7),
+                    top: px(128),
+                    ..default()
+                },
+            ));
+            panel.spawn((
+                chart_text(
+                    "0 s",
+                    10.0,
+                    Color::srgb(0.7, 0.75, 0.8),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(70),
+                        bottom: px(9),
+                        ..default()
+                    },
+                ),
+                Eq106ResidualChartLabel::TimeStart,
+            ));
+            panel.spawn((
+                chart_text(
+                    "--",
+                    10.0,
+                    Color::srgb(0.7, 0.75, 0.8),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: px(20),
+                        bottom: px(9),
+                        ..default()
+                    },
+                ),
+                Eq106ResidualChartLabel::TimeEnd,
+            ));
+            panel.spawn(chart_text(
+                "Simulation time",
+                10.0,
+                Color::srgb(0.65, 0.75, 0.8),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(202),
+                    bottom: px(9),
+                    ..default()
+                },
+            ));
+            panel
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(73),
+                        top: px(48),
+                        width: px(CHART_WIDTH),
+                        height: px(CHART_HEIGHT),
+                        overflow: Overflow::clip(),
+                        border: UiRect::all(px(1)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.005, 0.01, 0.02, 0.8)),
+                    BorderColor::all(Color::srgba(0.55, 0.4, 0.3, 0.75)),
+                ))
+                .with_children(|plot| {
+                    for fraction in [0.25, 0.5, 0.75] {
+                        plot.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(0),
+                                top: percent(fraction * 100.0),
+                                width: percent(100),
+                                height: px(1),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.45, 0.35, 0.3, 0.22)),
+                        ));
+                    }
+                    for index in 0..(JACOBI_HISTORY_CAPACITY - 1) {
+                        plot.spawn((
+                            Eq106ResidualChartSegment(index),
+                            Node {
+                                position_type: PositionType::Absolute,
+                                display: Display::None,
+                                height: px(2),
+                                ..default()
+                            },
+                            UiTransform::IDENTITY,
+                            BackgroundColor(RESIDUAL_LINE_COLOR),
+                        ));
+                    }
+                    plot.spawn((
+                        Eq106ResidualLatestPoint,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            display: Display::None,
+                            width: px(7),
+                            height: px(7),
+                            border_radius: BorderRadius::MAX,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(1.0, 0.85, 0.25)),
+                    ));
+                });
+        });
+}
+
 fn format_axis_time(seconds: f64) -> String {
     if seconds.abs() >= 3600.0 {
         format!("{:.1} h", seconds / 3600.0)
@@ -380,8 +588,6 @@ fn jacobi_time_bounds(
 pub fn update_jacobi_chart_system(
     active_method: Res<ActiveGravityMethod>,
     history: Res<JacobiHistory>,
-    curved_history: Res<CurvedArcResidualHistory>,
-    curved_planner: Res<CurvedArcPlannerState>,
     simulation_acceleration: Res<SimulationAcceleration>,
     mut segments: Query<
         (&JacobiChartSegment, &mut Node, &mut UiTransform),
@@ -409,19 +615,6 @@ pub fn update_jacobi_chart_system(
         ),
     >,
 ) {
-    if *active_method == ActiveGravityMethod::CurvedArcEq106 {
-        update_curved_arc_chart(
-            &curved_history,
-            &curved_planner,
-            &mut segments,
-            &mut latest_point,
-            &mut labels,
-            &mut titles,
-            &mut axis_labels,
-        );
-        return;
-    }
-
     if !history.is_changed() && !simulation_acceleration.is_changed() && !active_method.is_changed()
     {
         return;
@@ -533,60 +726,57 @@ pub fn update_jacobi_chart_system(
     }
 }
 
-fn update_curved_arc_chart(
-    history: &CurvedArcResidualHistory,
-    planner: &CurvedArcPlannerState,
-    segments: &mut Query<
-        (&JacobiChartSegment, &mut Node, &mut UiTransform),
-        Without<JacobiLatestPoint>,
+/// Displays Eq. (157): the difference between the curved-path work potential
+/// and the independently reconstructed Eq.106 spectral potential. This chart
+/// is deliberately separate from the physical Jacobi invariant.
+pub fn update_eq106_residual_chart_system(
+    active_method: Res<ActiveGravityMethod>,
+    history: Res<CurvedArcResidualHistory>,
+    planner: Res<CurvedArcPlannerState>,
+    mut roots: Query<&mut Visibility, With<Eq106ResidualChartRoot>>,
+    mut segments: Query<
+        (&Eq106ResidualChartSegment, &mut Node, &mut UiTransform),
+        Without<Eq106ResidualLatestPoint>,
     >,
-    latest_point: &mut Query<&mut Node, (With<JacobiLatestPoint>, Without<JacobiChartSegment>)>,
-    labels: &mut Query<
-        (&JacobiChartLabel, &mut Text),
-        (Without<JacobiChartTitle>, Without<JacobiChartAxisLabel>),
-    >,
-    titles: &mut Query<
-        &mut Text,
+    mut latest_point: Query<
+        &mut Node,
         (
-            With<JacobiChartTitle>,
-            Without<JacobiChartAxisLabel>,
-            Without<JacobiChartLabel>,
+            With<Eq106ResidualLatestPoint>,
+            Without<Eq106ResidualChartSegment>,
         ),
     >,
-    axis_labels: &mut Query<
-        &mut Text,
-        (
-            With<JacobiChartAxisLabel>,
-            Without<JacobiChartTitle>,
-            Without<JacobiChartLabel>,
-        ),
-    >,
+    mut labels: Query<(&Eq106ResidualChartLabel, &mut Text)>,
 ) {
-    for mut title in titles.iter_mut() {
-        **title = "Eq.106 curved-path residual".to_owned();
+    let visible = *active_method == ActiveGravityMethod::CurvedArcEq106;
+    for mut visibility in roots.iter_mut() {
+        *visibility = if visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
-    for mut axis in axis_labels.iter_mut() {
-        **axis = "|r_dual| (m^2/s^2)".to_owned();
+    if !visible {
+        return;
     }
 
     let samples: Vec<_> = history.samples.iter().copied().collect();
     if samples.is_empty() {
-        for (_, mut node, _) in segments.iter_mut() {
+        for (_, mut node, _) in &mut segments {
             node.display = Display::None;
         }
         if let Some(mut node) = latest_point.iter_mut().next() {
             node.display = Display::None;
         }
-        for (label, mut text) in labels.iter_mut() {
+        for (label, mut text) in &mut labels {
             **text = match label {
-                JacobiChartLabel::Current => "|r_dual| = --".to_owned(),
-                JacobiChartLabel::RelativeDrift => format!(
+                Eq106ResidualChartLabel::Current => "|r_dual| = -- m^2/s^2".to_owned(),
+                Eq106ResidualChartLabel::Status => format!(
                     "{} | segments: {} | closures: {}/10",
                     planner.mode.as_str(),
                     planner.segments.len(),
                     planner.stable_closures,
                 ),
-                JacobiChartLabel::TimeStart => "0 s".to_owned(),
+                Eq106ResidualChartLabel::TimeStart => "0 s".to_owned(),
                 _ => "--".to_owned(),
             };
         }
@@ -629,7 +819,7 @@ fn update_curved_arc_chart(
         Vec2::new(x, y)
     };
 
-    for (segment, mut node, mut transform) in segments.iter_mut() {
+    for (segment, mut node, mut transform) in &mut segments {
         let Some((from, to)) = samples
             .get(segment.0)
             .zip(samples.get(segment.0 + 1))
@@ -657,13 +847,13 @@ fn update_curved_arc_chart(
         node.top = px(point.y - 3.5);
     }
 
-    for (label, mut text) in labels.iter_mut() {
+    for (label, mut text) in &mut labels {
         let latest = residual_value(*samples.last().unwrap());
         **text = match label {
-            JacobiChartLabel::Current => {
+            Eq106ResidualChartLabel::Current => {
                 format!("|r_dual| = {latest:.3e} m^2/s^2")
             }
-            JacobiChartLabel::RelativeDrift => {
+            Eq106ResidualChartLabel::Status => {
                 let order = samples
                     .last()
                     .map_or(planner.taylor_order, |sample| sample.taylor_order);
@@ -682,10 +872,10 @@ fn update_curved_arc_chart(
                     planner.stable_closures,
                 )
             }
-            JacobiChartLabel::Minimum => format!("{minimum:.3e}"),
-            JacobiChartLabel::Maximum => format!("{maximum:.3e}"),
-            JacobiChartLabel::TimeStart => format_axis_time(time_start),
-            JacobiChartLabel::TimeEnd => format_axis_time(time_end),
+            Eq106ResidualChartLabel::Minimum => format!("{minimum:.3e}"),
+            Eq106ResidualChartLabel::Maximum => format!("{maximum:.3e}"),
+            Eq106ResidualChartLabel::TimeStart => format_axis_time(time_start),
+            Eq106ResidualChartLabel::TimeEnd => format_axis_time(time_end),
         };
     }
 }

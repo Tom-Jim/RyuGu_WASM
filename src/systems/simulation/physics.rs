@@ -1,4 +1,5 @@
 use crate::components::*;
+use crate::systems::curved_arc::CurvedArcResidualHistory;
 use bevy::prelude::*;
 
 const MAX_ACC: f32 = 1.5e-3;
@@ -120,17 +121,64 @@ fn rotation_after(base: Quat, elapsed_seconds: f64) -> Quat {
     ) * base
 }
 
-fn gpu_world_residual(
+fn eq106_local_body_acceleration(
     history: &GravitySampleHistory,
     epoch: u64,
     target_time: f64,
+    target_body_position: Vec3,
+) -> Option<Vec3> {
+    let (lower, upper) = history.bracketing(epoch, target_time)?;
+    let evaluate = |sample: &GravityFieldSample| {
+        let jacobian = sample.body_acceleration_jacobian?;
+        let displacement = target_body_position - sample.snapshot.body_position;
+        if !displacement.is_finite() || !jacobian.is_finite() {
+            return None;
+        }
+        // The shader derives this Jacobian from the same scalar potential as
+        // the returned field. Symmetrizing removes only f32 accumulation
+        // asymmetry and keeps each local model conservative to first order.
+        let symmetric_jacobian = (jacobian + jacobian.transpose()) * 0.5;
+        Some(sample.body_acceleration + symmetric_jacobian * displacement)
+    };
+    let lower_acceleration = evaluate(lower)?;
+    if std::ptr::eq(lower, upper) {
+        return Some(lower_acceleration);
+    }
+    let upper_acceleration = evaluate(upper)?;
+    let interval = upper.snapshot.simulation_time_seconds - lower.snapshot.simulation_time_seconds;
+    if interval <= f64::EPSILON {
+        return Some(lower_acceleration);
+    }
+    let weight =
+        ((target_time - lower.snapshot.simulation_time_seconds) / interval).clamp(0.0, 1.0) as f32;
+    Some(lower_acceleration.lerp(upper_acceleration, weight))
+}
+
+fn eq106_snapshot_matches_clock(sample: &GravityFieldSample, clock: &SimulationClock) -> bool {
+    sample.snapshot.epoch == clock.epoch
+        && sample.snapshot.request_id == clock.request_id
+        && (sample.snapshot.simulation_time_seconds - clock.elapsed_seconds).abs() <= 1.0e-6
+}
+
+fn gpu_world_residual(
+    history: &GravitySampleHistory,
+    epoch: u64,
+    target_world_position: Vec3,
+    target_time: f64,
     frame_start_time: f64,
+    frame_start_translation: Vec3,
     frame_start_rotation: Quat,
     maximum_extrapolation_intervals: f64,
+    use_local_potential_hessian: bool,
 ) -> Option<Vec3> {
-    let body_acceleration =
-        predict_body_acceleration(history, epoch, target_time, maximum_extrapolation_intervals)?;
     let rotation = rotation_after(frame_start_rotation, target_time - frame_start_time);
+    let body_acceleration = if use_local_potential_hessian {
+        let target_body_position =
+            rotation.inverse() * (target_world_position - frame_start_translation);
+        eq106_local_body_acceleration(history, epoch, target_time, target_body_position)?
+    } else {
+        predict_body_acceleration(history, epoch, target_time, maximum_extrapolation_intervals)?
+    };
     Some(rotation * body_acceleration)
 }
 
@@ -148,6 +196,7 @@ pub fn physics_system(
     mut blend: ResMut<GravityBlendFactor>,
     mut runtime_error: ResMut<GravityRuntimeError>,
     mut clock: ResMut<SimulationClock>,
+    mut curved_residual: ResMut<CurvedArcResidualHistory>,
     time: Res<Time<Fixed>>,
     active_method: Res<ActiveGravityMethod>,
     simulation_acceleration: Res<SimulationAcceleration>,
@@ -174,14 +223,31 @@ pub fn physics_system(
     };
     let maximum_extrapolation_intervals = match *active_method {
         ActiveGravityMethod::RadialAnalytic => MAX_EXTRAPOLATION_INTERVALS,
-        ActiveGravityMethod::HomogeneousWerner => 0.0,
-        ActiveGravityMethod::CurvedArcEq106 => 8.0,
-        ActiveGravityMethod::MmfftCompressed => 0.0,
-        ActiveGravityMethod::Fmm => 8.0,
+        ActiveGravityMethod::HomogeneousWerner => MAX_EXTRAPOLATION_INTERVALS,
+        // Eq.106 readback is validated against completed GPU snapshots only.
+        // During this diagnostic phase, do not extrapolate across a missing
+        // asynchronous result; doing so changes the force model being tested.
+        ActiveGravityMethod::CurvedArcEq106 => 0.0,
+        ActiveGravityMethod::MmfftCompressed => MAX_EXTRAPOLATION_INTERVALS,
+        ActiveGravityMethod::Fmm => MAX_EXTRAPOLATION_INTERVALS,
     };
-    let gpu_ready = active_history
-        .and_then(|history| history.latest_for_epoch(clock.epoch))
-        .is_some();
+    let latest_sample = active_history.and_then(|history| {
+        if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+            history.at_or_before(clock.epoch, clock.elapsed_seconds)
+        } else {
+            history.latest_for_epoch(clock.epoch)
+        }
+    });
+    if *active_method == ActiveGravityMethod::CurvedArcEq106
+        && !latest_sample.is_some_and(|sample| eq106_snapshot_matches_clock(sample, &clock))
+    {
+        // A local Eq.106 field is consumed exactly once. Advancing several
+        // accelerated frames from one asynchronous readback leaves the local
+        // Taylor/Hessian neighborhood and creates the large secular Jacobi
+        // drift visible at 8x.
+        return;
+    }
+    let gpu_ready = latest_sample.is_some();
     if gpu_ready {
         blend.0 = 1.0;
     }
@@ -191,7 +257,9 @@ pub fn physics_system(
     let stable_steps = simulation_acceleration.stable_steps();
     let presented_frame_dt = stable_frame_dt * stable_steps as f64;
     let frame_start_time = clock.elapsed_seconds;
+    let frame_start_translation = ryugu_transform.translation;
     let frame_start_rotation = ryugu_transform.rotation;
+    let use_local_potential_hessian = *active_method == ActiveGravityMethod::CurvedArcEq106;
 
     let acceleration_at = |position: Vec3, sample_time: f64| -> Result<Vec3, &'static str> {
         let Some(history) = active_history else {
@@ -200,17 +268,19 @@ pub fn physics_system(
         let Some(gpu_acceleration) = gpu_world_residual(
             history,
             clock.epoch,
+            position,
             sample_time,
             frame_start_time,
+            frame_start_translation,
             frame_start_rotation,
             maximum_extrapolation_intervals,
+            use_local_potential_hessian,
         ) else {
             // Readback latency is normal during warm-up. Pause the integrator
             // until the selected evaluator produces a snapshot; no alternate
             // force model is substituted.
             return Err("Waiting for a valid gravity readback snapshot.");
         };
-        let _ = position;
         validate_acceleration(gpu_acceleration)
             .ok_or("The selected gravity evaluator returned an invalid acceleration.")
     };
@@ -223,8 +293,8 @@ pub fn physics_system(
         for substep in 0..PHYSICS_SUBSTEPS {
             let start_time = stable_step_start + substep as f64 * substep_dt;
             let end_time = start_time + substep_dt;
-            let acceleration_start = match acceleration_at(probe_transform.translation, start_time)
-            {
+            let start_world_position = probe_transform.translation;
+            let acceleration_start = match acceleration_at(start_world_position, start_time) {
                 Ok(acceleration) => acceleration,
                 Err("Waiting for a valid gravity readback snapshot.") => {
                     return;
@@ -252,6 +322,21 @@ pub fn physics_system(
                     return;
                 }
             };
+            if use_local_potential_hessian {
+                let start_rotation =
+                    rotation_after(frame_start_rotation, start_time - frame_start_time);
+                let end_rotation =
+                    rotation_after(frame_start_rotation, end_time - frame_start_time);
+                curved_residual.accumulate_curve_work(
+                    start_time,
+                    end_time,
+                    start_rotation.inverse() * (start_world_position - frame_start_translation),
+                    end_rotation.inverse()
+                        * (probe_transform.translation - frame_start_translation),
+                    start_rotation.inverse() * acceleration_start,
+                    end_rotation.inverse() * acceleration_end,
+                );
+            }
             probe_velocity.0 += acceleration_end * (0.5 * substep_dt as f32);
         }
 
@@ -266,13 +351,18 @@ pub fn physics_system(
 
 pub fn ryugu_rotation_system(
     mut ryugu_query: Query<&mut Transform, With<RyuguMarker>>,
-    time: Res<Time<Fixed>>,
-    simulation_acceleration: Res<SimulationAcceleration>,
+    clock: Res<SimulationClock>,
 ) {
-    let dt =
-        time.delta_secs_f64() * TIME_SCALE as f64 * simulation_acceleration.stable_steps() as f64;
+    let angular_speed = std::f64::consts::TAU / RYUGU_ROTATION_PERIOD_SECS as f64;
+    let rotation = Quat::from_axis_angle(
+        RYUGU_SPIN_AXIS.normalize(),
+        (angular_speed * clock.elapsed_seconds) as f32,
+    );
     for mut transform in ryugu_query.iter_mut() {
-        transform.rotation = rotation_after(transform.rotation, dt);
+        // Derive body attitude from the authoritative simulation clock. If
+        // physics is waiting for a GPU readback, both clock and body frame now
+        // remain frozen instead of silently diverging.
+        transform.rotation = rotation;
     }
 }
 
@@ -291,8 +381,11 @@ mod tests {
                 probe_position: Vec3::ZERO,
                 probe_velocity: Vec3::ZERO,
             },
+            predictive: false,
             body_acceleration: acceleration,
             positive_potential: 1.0,
+            independent_positive_potential: None,
+            body_acceleration_jacobian: None,
         }
     }
 
@@ -307,11 +400,81 @@ mod tests {
     }
 
     #[test]
+    fn completed_lookup_skips_accelerated_predictive_anchors() {
+        let mut history = GravitySampleHistory::default();
+        let completed = sample(10, 100.0, Vec3::X);
+        let mut predictive = sample(11, 200.0, Vec3::Y);
+        predictive.predictive = true;
+        history.push(completed);
+        history.push(predictive);
+
+        assert_eq!(
+            history
+                .completed_at_or_before(1, 200.0)
+                .expect("completed anchor")
+                .snapshot
+                .request_id,
+            10
+        );
+    }
+
+    #[test]
+    fn maximum_eq106_batch_keeps_its_authoritative_anchor() {
+        let mut history = GravitySampleHistory::default();
+        for block_index in 0..=MAX_SIMULATION_ACCELERATION {
+            let mut anchor = sample(100 + block_index as u64, block_index as f64 * 10.0, Vec3::X);
+            anchor.predictive = block_index > 0;
+            history.push(anchor);
+        }
+
+        assert_eq!(history.samples.len(), 9);
+        assert_eq!(
+            history
+                .completed_at_or_before(1, 80.0)
+                .expect("authoritative 8x batch anchor")
+                .snapshot
+                .request_id,
+            100
+        );
+    }
+
+    #[test]
     fn predictor_bounds_long_extrapolation() {
         let mut history = GravitySampleHistory::default();
         history.push(sample(1, 0.0, Vec3::ZERO));
         history.push(sample(2, 10.0, Vec3::X));
         let predicted = predict_body_acceleration(&history, 1, 1_000.0, 2.0).unwrap();
         assert!((predicted - Vec3::X * 3.0).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn eq106_substep_uses_the_local_potential_hessian() {
+        let mut history = GravitySampleHistory::default();
+        let mut field = sample(1, 0.0, Vec3::new(1.0e-4, 0.0, 0.0));
+        field.body_acceleration_jacobian = Some(Mat3::from_diagonal(Vec3::splat(2.0e-7)));
+        history.push(field);
+
+        let predicted =
+            eq106_local_body_acceleration(&history, 1, 0.0, Vec3::new(10.0, -5.0, 2.0)).unwrap();
+        let expected = Vec3::new(1.02e-4, -1.0e-6, 4.0e-7);
+        assert!((predicted - expected).length() < 1.0e-10);
+    }
+
+    #[test]
+    fn eq106_snapshot_must_match_the_unadvanced_clock() {
+        let sample = sample(7, 42.0, Vec3::ZERO);
+        let clock = SimulationClock {
+            request_id: 7,
+            epoch: 1,
+            elapsed_seconds: 42.0,
+        };
+        assert!(eq106_snapshot_matches_clock(&sample, &clock));
+        assert!(!eq106_snapshot_matches_clock(
+            &sample,
+            &SimulationClock {
+                request_id: 8,
+                ..clock
+            }
+        ));
     }
 }

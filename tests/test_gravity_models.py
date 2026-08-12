@@ -6,8 +6,8 @@ import math
 DENSITY_EPSILON = 10.0
 
 
-def inverse_density(radius: float, density_c: float) -> float:
-    return density_c / (max(radius, 0.0) + DENSITY_EPSILON)
+def logarithmic_density(radius: float, density_c: float) -> float:
+    return density_c * math.log1p(max(radius, 0.0) / DENSITY_EPSILON)
 
 
 def taylor_remainder_bound(epsilon: float, order: int) -> float | None:
@@ -16,14 +16,14 @@ def taylor_remainder_bound(epsilon: float, order: int) -> float | None:
     return epsilon ** (order + 1) / (1.0 - epsilon)
 
 
-def test_inverse_density_is_finite_and_monotone() -> None:
-    values = [inverse_density(radius, 12.0) for radius in (0.0, 10.0, 100.0, 1000.0)]
-    assert all(math.isfinite(value) and value > 0.0 for value in values)
-    assert values == sorted(values, reverse=True)
+def test_logarithmic_density_is_finite_and_monotone() -> None:
+    values = [logarithmic_density(radius, 12.0) for radius in (0.0, 10.0, 100.0, 1000.0)]
+    assert all(math.isfinite(value) and value >= 0.0 for value in values)
+    assert values == sorted(values)
 
 
-def test_inverse_density_matches_equation_used_by_section_view() -> None:
-    assert math.isclose(inverse_density(90.0, 4.5), 4.5 / 100.0)
+def test_logarithmic_density_matches_equation_used_by_section_view() -> None:
+    assert math.isclose(logarithmic_density(90.0, 4.5), 4.5 * math.log(10.0))
 
 
 def test_taylor_guard_rejects_non_convergent_segments() -> None:

@@ -211,8 +211,8 @@ pub(crate) struct PerformanceChartSegment {
     pub jacobi: bool,
 }
 
-fn performance_chart_series_count(is_jacobi_plot: bool) -> usize {
-    if is_jacobi_plot { 6 } else { 5 }
+fn performance_chart_series_count(_is_jacobi_plot: bool) -> usize {
+    5
 }
 
 fn probe_value_text(parameter: ProbeParameter, conditions: ProbeInitialConditions) -> String {
@@ -1054,8 +1054,11 @@ pub fn setup_performance_controls(mut commands: Commands) {
                 Color::srgb(0.25, 0.9, 0.55),
             ),
             (
-                Text::new("Jacobi curves: radial | Werner | Eq.106 | Eq.106 residual | MMFFT compressed | FMM"),
-                TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                Text::new("Jacobi curves: radial | Werner | Eq.106 | MMFFT compressed | FMM"),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(11.0),
+                    ..default()
+                },
                 TextColor(Color::srgb(0.7, 0.82, 0.9)),
             ),
             (
@@ -1164,39 +1167,73 @@ pub fn setup_performance_controls(mut commands: Commands) {
                     ),
                     (
                         Text::new("Radial analytic"),
-                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(11.0),
+                            ..default()
+                        },
                         TextColor(Color::srgb(0.2, 0.95, 1.0)),
-                        Node { position_type: PositionType::Absolute, left: px(220), top: px(30), ..default() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(220),
+                            top: px(30),
+                            ..default()
+                        },
                     ),
                     (
                         Text::new("Werner"),
-                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(11.0),
+                            ..default()
+                        },
                         TextColor(Color::srgb(1.0, 0.3, 0.3)),
-                        Node { position_type: PositionType::Absolute, left: px(360), top: px(30), ..default() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(360),
+                            top: px(30),
+                            ..default()
+                        },
                     ),
                     (
                         Text::new("Eq.106 near-straight"),
-                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(11.0),
+                            ..default()
+                        },
                         TextColor(Color::srgb(0.85, 0.45, 1.0)),
-                        Node { position_type: PositionType::Absolute, left: px(470), top: px(30), ..default() },
-                    ),
-                    (
-                        Text::new("Eq.106 residual-adjusted"),
-                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
-                        TextColor(Color::srgb(1.0, 0.78, 0.2)),
-                        Node { position_type: PositionType::Absolute, left: px(690), top: px(30), ..default() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(470),
+                            top: px(30),
+                            ..default()
+                        },
                     ),
                     (
                         Text::new("MMFFT compressed"),
-                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(11.0),
+                            ..default()
+                        },
                         TextColor(Color::srgb(1.0, 0.72, 0.2)),
-                        Node { position_type: PositionType::Absolute, left: px(880), top: px(30), ..default() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(690),
+                            top: px(30),
+                            ..default()
+                        },
                     ),
                     (
                         Text::new("FMM"),
-                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(11.0),
+                            ..default()
+                        },
                         TextColor(Color::srgb(0.25, 0.9, 0.55)),
-                        Node { position_type: PositionType::Absolute, left: px(1010), top: px(30), ..default() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(820),
+                            top: px(30),
+                            ..default()
+                        },
                     ),
                     axis_text("C_J", 8.0, 168.0),
                     jacobi_axis_text(0, 2.0, 50.0),
@@ -1279,9 +1316,8 @@ pub fn setup_performance_chart_segments(
                         0 => Color::srgb(0.2, 0.95, 1.0),
                         1 => Color::srgb(1.0, 0.3, 0.3),
                         2 => Color::srgb(0.85, 0.45, 1.0),
-                        3 => Color::srgb(1.0, 0.78, 0.2),
-                        4 => Color::srgb(1.0, 0.72, 0.2),
-                        5 => Color::srgb(0.25, 0.9, 0.55),
+                        3 => Color::srgb(1.0, 0.72, 0.2),
+                        4 => Color::srgb(0.25, 0.9, 0.55),
                         _ => Color::srgb(0.7, 0.7, 0.7),
                     };
                     plot.spawn((
@@ -1319,7 +1355,6 @@ pub fn performance_button_system(
         (Changed<Interaction>, With<Button>),
     >,
     active_method: Res<ActiveGravityMethod>,
-    jacobi: Res<JacobiHistory>,
     mut state: ResMut<PerformanceComparisonState>,
     mut display_rotation: ResMut<DisplayRotation>,
 ) {
@@ -1329,13 +1364,12 @@ pub fn performance_button_system(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let baseline = jacobi.samples.back().map(|sample| sample.jacobi_constant);
         if performance_button.is_some() && !state.active {
-            state.start_with_baseline(*active_method, baseline);
+            state.start(*active_method);
         } else if three_d_button.is_some() && state.active {
             state.stop();
         } else if repeat_button.is_some() && state.active && !state.measuring {
-            state.restart_with_baseline(baseline);
+            state.restart();
         } else if rotation_button.is_some() {
             crate::set_display_rotation(display_rotation.advance());
         }
@@ -1409,7 +1443,6 @@ pub fn performance_comparison_system(
     mut state: ResMut<PerformanceComparisonState>,
     active_method: Res<ActiveGravityMethod>,
     jacobi: Res<JacobiHistory>,
-    curved_history: Res<CurvedArcResidualHistory>,
     mut nodes: ParamSet<(
         Query<&mut Node, With<PerformanceComparisonPanel>>,
         Query<&mut Node, (With<PerformanceViewButton>, Without<ThreeDViewButton>)>,
@@ -1491,39 +1524,10 @@ pub fn performance_comparison_system(
             && state.jacobi_last_request_ids[phase] != jacobi_request_id
             && let Some(sample) = jacobi.samples.back()
         {
-            let series = match *active_method {
-                ActiveGravityMethod::RadialAnalytic => 0,
-                ActiveGravityMethod::HomogeneousWerner => 1,
-                ActiveGravityMethod::CurvedArcEq106 => 2,
-                ActiveGravityMethod::MmfftCompressed => 4,
-                ActiveGravityMethod::Fmm => 5,
-            };
-            let seeded = state.jacobi_seeded[phase];
-            let baseline = state.jacobi_initial_constant;
+            let series = active_method.performance_index();
             if let Some(history) = state.jacobi_history.get_mut(series) {
-                let value = if seeded {
-                    sample.jacobi_constant
-                } else {
-                    baseline.unwrap_or(sample.jacobi_constant)
-                };
-                push_performance_sample(history, value);
+                push_performance_sample(history, sample.jacobi_constant);
             }
-            if *active_method == ActiveGravityMethod::CurvedArcEq106 {
-                let residual = curved_history
-                    .samples
-                    .back()
-                    .and_then(|sample| sample.dual_residual)
-                    .unwrap_or(0.0);
-                if let Some(history) = state.jacobi_history.get_mut(3) {
-                    let value = if seeded {
-                        sample.jacobi_constant + 2.0 * residual
-                    } else {
-                        baseline.unwrap_or(sample.jacobi_constant)
-                    };
-                    push_performance_sample(history, value);
-                }
-            }
-            state.jacobi_seeded[phase] = true;
             state.jacobi_last_request_ids[phase] = jacobi_request_id;
         }
         state.phase_frames = state.phase_frames.saturating_add(1);
@@ -1606,6 +1610,10 @@ fn push_performance_sample<T>(history: &mut std::collections::VecDeque<T>, value
     history.push_back(value);
 }
 
+fn jacobi_series_visual_offset(series: usize) -> f32 {
+    (series as f32 - 2.0) * 4.0
+}
+
 fn update_performance_chart_segments(
     state: &PerformanceComparisonState,
     segments: &mut Query<(&PerformanceChartSegment, &mut Node, &mut UiTransform)>,
@@ -1615,15 +1623,7 @@ fn update_performance_chart_segments(
         .iter()
         .flat_map(|series| series.iter().copied())
         .fold(1.0_f32, f32::max);
-    let jacobi_values = state
-        .jacobi_history
-        .iter()
-        .flat_map(|series| series.iter().copied());
-    let (jacobi_min, jacobi_max) = jacobi_values
-        .clone()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
-            (min.min(value), max.max(value))
-        });
+    let (jacobi_min, jacobi_max) = performance_jacobi_bounds(state).unwrap_or((0.0, 1.0));
     let jacobi_span = (jacobi_max - jacobi_min).max(1.0e-9);
 
     for (segment, mut node, mut transform) in segments.iter_mut() {
@@ -1645,8 +1645,8 @@ fn update_performance_chart_segments(
             let a = ((from - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
             let b = ((to - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
             (
-                (1.0 - a) * 220.0 + (segment.series as f32 - 1.5) * 2.0,
-                (1.0 - b) * 220.0 + (segment.series as f32 - 1.5) * 2.0,
+                (1.0 - a) * 220.0 + jacobi_series_visual_offset(segment.series),
+                (1.0 - b) * 220.0 + jacobi_series_visual_offset(segment.series),
             )
         } else {
             let Some(history) = state.fps_history.get(segment.series) else {
@@ -1703,7 +1703,13 @@ fn performance_jacobi_bounds(state: &PerformanceComparisonState) -> Option<(f64,
     let (minimum, maximum) = values.fold((first, first), |(minimum, maximum), value| {
         (minimum.min(value), maximum.max(value))
     });
-    Some((minimum, maximum))
+    let span = maximum - minimum;
+    let padding = if span > f64::EPSILON {
+        0.08 * span
+    } else {
+        (maximum.abs() * 0.02).max(1.0e-9)
+    };
+    Some((minimum - padding, maximum + padding))
 }
 
 fn format_axis_value(value: f64) -> String {
@@ -1724,31 +1730,8 @@ fn clear_performance_method_history(state: &mut PerformanceComparisonState, meth
     if let Some(request_id) = state.jacobi_last_request_ids.get_mut(method) {
         *request_id = None;
     }
-    match method {
-        0..=1 => {
-            if let Some(history) = state.jacobi_history.get_mut(method) {
-                history.clear();
-            }
-        }
-        2 => {
-            if let Some(history) = state.jacobi_history.get_mut(2) {
-                history.clear();
-            }
-            if let Some(history) = state.jacobi_history.get_mut(3) {
-                history.clear();
-            }
-        }
-        3 => {
-            if let Some(history) = state.jacobi_history.get_mut(4) {
-                history.clear();
-            }
-        }
-        4 => {
-            if let Some(history) = state.jacobi_history.get_mut(5) {
-                history.clear();
-            }
-        }
-        _ => {}
+    if let Some(history) = state.jacobi_history.get_mut(method) {
+        history.clear();
     }
 }
 
@@ -1758,10 +1741,7 @@ fn performance_chart_series_enabled(
 ) -> bool {
     let method = if segment.jacobi {
         match segment.series {
-            0..=2 => segment.series,
-            3 => 2,
-            4 => 3,
-            5 => 4,
+            0..=4 => segment.series,
             _ => return false,
         }
     } else {
@@ -1823,11 +1803,11 @@ pub fn update_gpu_memory_estimate_system(
     }
     if let (Some(source), Some(tensor)) = (eq106_sources, eq106_tensor) {
         bytes[2] = source.sources.len() as u64 * 16
-            + 256 * 8
+            + 64 * 8
             + tensor.tensor.coefficients.len() as u64 * 4
             + 64
-            + 257 * 32
-            + 2 * 32;
+            + 129 * 32
+            + 2 * 8 * 9 * 16;
     }
     if let Some(source) = mmfft {
         bytes[3] = source.bytes.len() as u64 + 48 + 2 * reduction_buffer_bytes(source.count);
@@ -2041,7 +2021,8 @@ pub fn update_hint_on_mode_change(
 mod performance_chart_tests {
     use super::{
         PerformanceChartSegment, clear_performance_method_history, format_vram_text,
-        performance_chart_series_count, performance_chart_series_enabled,
+        jacobi_series_visual_offset, performance_chart_series_count,
+        performance_chart_series_enabled,
     };
     use crate::components::{ActiveGravityMethod, GpuMemoryEstimate, PerformanceComparisonState};
     use std::collections::VecDeque;
@@ -2049,7 +2030,7 @@ mod performance_chart_tests {
     #[test]
     fn fps_and_jacobi_plot_series_have_matching_history_slots() {
         assert_eq!(performance_chart_series_count(false), 5);
-        assert_eq!(performance_chart_series_count(true), 6);
+        assert_eq!(performance_chart_series_count(true), 5);
     }
 
     #[test]
@@ -2075,7 +2056,7 @@ mod performance_chart_tests {
     }
 
     #[test]
-    fn disabling_eq106_clears_near_straight_and_residual_series() {
+    fn disabling_eq106_clears_only_its_real_jacobi_series() {
         let mut state = PerformanceComparisonState::default();
         state.jacobi_history[2] = VecDeque::from([1.0]);
         state.jacobi_history[3] = VecDeque::from([2.0]);
@@ -2083,15 +2064,36 @@ mod performance_chart_tests {
         state.enabled_methods[2] = false;
 
         assert!(state.jacobi_history[2].is_empty());
-        assert!(state.jacobi_history[3].is_empty());
+        assert_eq!(state.jacobi_history[3], VecDeque::from([2.0]));
         assert!(!performance_chart_series_enabled(
             &state,
             &PerformanceChartSegment {
-                series: 3,
+                series: 2,
                 index: 0,
                 jacobi: true,
             }
         ));
+    }
+
+    #[test]
+    fn jacobi_series_follow_the_five_algorithm_slots() {
+        let state = PerformanceComparisonState::default();
+        for series in 0..5 {
+            assert!(performance_chart_series_enabled(
+                &state,
+                &PerformanceChartSegment {
+                    series,
+                    index: 0,
+                    jacobi: true,
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn overlapping_jacobi_series_receive_distinct_visual_offsets() {
+        let offsets: Vec<f32> = (0..5).map(jacobi_series_visual_offset).collect();
+        assert_eq!(offsets, [-8.0, -4.0, 0.0, 4.0, 8.0]);
     }
 
     #[test]

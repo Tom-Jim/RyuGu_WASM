@@ -9,7 +9,11 @@ pub const RYUGU_MASS: f32 = 4.5e11;
 pub const TIME_SCALE: f32 = 500.0;
 pub const ORBIT_HISTORY_LEN: usize = 27500;
 pub const JACOBI_HISTORY_CAPACITY: usize = 256;
-pub const GRAVITY_SAMPLE_HISTORY_CAPACITY: usize = 8;
+/// Keep at least two complete maximum-acceleration Eq.106 batches.  A batch
+/// contains the authoritative anchor plus one endpoint for every accelerated
+/// stable step (9 samples at 8x).  A capacity smaller than that silently
+/// evicts the authoritative sample before the integrator can consume it.
+pub const GRAVITY_SAMPLE_HISTORY_CAPACITY: usize = 2 * (MAX_SIMULATION_ACCELERATION as usize + 1);
 pub const PHYSICS_SUBSTEPS: usize = 12;
 pub const MIN_SIMULATION_ACCELERATION: u32 = 1;
 pub const MAX_SIMULATION_ACCELERATION: u32 = 8;
@@ -24,10 +28,11 @@ pub const SECTION_CLIP_RADIUS: f32 = 450.0;
 pub const PROBE_R0: Vec3 = Vec3::new(-1000.0, 1200.0, 100.0);
 pub const PROBE_SPEED_FACTOR: f32 = 1.053;
 
-/// Shared inverse-radial density law used by the radial-analytic and
-/// Equation (106) modes: rho(r) = C / (r + epsilon).
-pub fn inverse_radial_density(radius: f32, density_c: f32) -> f32 {
-    density_c / (radius.max(0.0) + DENSITY_EPSILON)
+/// Shared outward-increasing logarithmic density law used by the radial,
+/// Equation (106), MMFFT, and FMM modes:
+/// `rho(r) = C ln(1 + r / epsilon)`.
+pub fn logarithmic_radial_density(radius: f32, density_c: f32) -> f32 {
+    density_c * (1.0 + radius.max(0.0) / DENSITY_EPSILON).ln()
 }
 
 pub fn probe_initial_velocity(position: Vec3, speed_factor: f32) -> Vec3 {
@@ -183,8 +188,7 @@ pub struct ShowNormals(pub bool);
 #[derive(Resource, Default)]
 pub struct ShowSection(pub bool);
 
-/// Solved density constant: C = RYUGU_MASS / ∫(1/(||r||+ε))dV
-/// Kernel is 1/(||r||+ε), NOT 1/(r³+ε³). Used for section-view colormap.
+/// Solved density constant for `rho(r)=C ln(1+r/epsilon)`.
 #[derive(Resource)]
 pub struct DensityC(pub f32);
 
@@ -273,8 +277,19 @@ pub struct GravityReadbackPacket {
 #[derive(Clone, Debug)]
 pub struct GravityFieldSample {
     pub snapshot: GravityRequestSnapshot,
+    /// Batch elements after the first are predicted GPU anchors used only by
+    /// the integrator; diagnostics must never treat them as observed states.
+    pub predictive: bool,
     pub body_acceleration: Vec3,
     pub positive_potential: f32,
+    /// Optional independent full-space potential used by Eq. (157). It must
+    /// never replace `positive_potential` in Jacobi calculations because that
+    /// field is paired with the acceleration actually driving the trajectory.
+    pub independent_positive_potential: Option<f32>,
+    /// Optional body-frame Jacobian d(acceleration)/d(position). Eq.106
+    /// supplies a symmetric potential Hessian so fixed-update substeps can
+    /// evaluate the same conservative local field between GPU readbacks.
+    pub body_acceleration_jacobian: Option<Mat3>,
 }
 
 #[derive(Default)]
@@ -306,6 +321,57 @@ impl GravitySampleHistory {
             .iter()
             .rev()
             .find(|sample| sample.snapshot.epoch == epoch)
+    }
+
+    pub fn at_or_before(
+        &self,
+        epoch: u64,
+        simulation_time_seconds: f64,
+    ) -> Option<&GravityFieldSample> {
+        self.samples.iter().rev().find(|sample| {
+            sample.snapshot.epoch == epoch
+                && sample.snapshot.simulation_time_seconds <= simulation_time_seconds + 1.0e-6
+        })
+    }
+
+    /// Returns the temporal anchors surrounding a fixed-update substep. Eq.106
+    /// batches include one extra endpoint anchor so the CPU can blend two
+    /// conservative local Hessian models instead of extrapolating the entire
+    /// interval from its start.
+    pub fn bracketing(
+        &self,
+        epoch: u64,
+        simulation_time_seconds: f64,
+    ) -> Option<(&GravityFieldSample, &GravityFieldSample)> {
+        let lower = self.samples.iter().rev().find(|sample| {
+            sample.snapshot.epoch == epoch
+                && sample.snapshot.simulation_time_seconds <= simulation_time_seconds + 1.0e-6
+        })?;
+        let upper = self
+            .samples
+            .iter()
+            .find(|sample| {
+                sample.snapshot.epoch == epoch
+                    && sample.snapshot.simulation_time_seconds >= simulation_time_seconds - 1.0e-6
+            })
+            .unwrap_or(lower);
+        Some((lower, upper))
+    }
+
+    /// Returns the newest completed GPU anchor at or before the requested
+    /// simulation time. Accelerated Eq.106 batches also contain predictive
+    /// anchors; diagnostics must skip over them instead of selecting one and
+    /// then abandoning the whole update.
+    pub fn completed_at_or_before(
+        &self,
+        epoch: u64,
+        simulation_time_seconds: f64,
+    ) -> Option<&GravityFieldSample> {
+        self.samples.iter().rev().find(|sample| {
+            !sample.predictive
+                && sample.snapshot.epoch == epoch
+                && sample.snapshot.simulation_time_seconds <= simulation_time_seconds + 1.0e-6
+        })
     }
 }
 
@@ -379,7 +445,7 @@ impl Default for MmfftCompressedConfig {
     fn default() -> Self {
         Self {
             tile_size: 256,
-            compressed_record_bytes: 8,
+            compressed_record_bytes: 16,
             decode_in_workgroup: true,
         }
     }
@@ -396,10 +462,8 @@ pub struct MmfftCompressedHistory(pub GravitySampleHistory);
 pub struct MmfftCompressedSource {
     pub bytes: Vec<u8>,
     pub count: u32,
-    pub tile_size: u32,
-    pub solid_angle_scale: f32,
-    pub radius_scale: f32,
-    pub density_scale: f32,
+    pub ring_count: u32,
+    pub azimuth_bins: u32,
 }
 
 #[derive(Resource, Clone)]
@@ -504,10 +568,10 @@ pub struct PerformanceComparisonState {
     pub pending_method: Option<ActiveGravityMethod>,
     pub return_method: ActiveGravityMethod,
     pub fps_history: [VecDeque<f32>; 5],
-    pub jacobi_history: [VecDeque<f64>; 6],
+    /// Jacobi histories map to Radial, Werner, Eq.106, MMFFT, and FMM.
+    /// Each series contains only samples emitted by that algorithm.
+    pub jacobi_history: [VecDeque<f64>; 5],
     pub jacobi_last_request_ids: [Option<u64>; 5],
-    pub jacobi_initial_constant: Option<f64>,
-    pub jacobi_seeded: [bool; 5],
     /// Algorithms included in the performance rotation. The five entries map
     /// to Radial, Werner, Eq.106, MMFFT, and FMM respectively.
     pub enabled_methods: [bool; 5],
@@ -535,8 +599,6 @@ impl Default for PerformanceComparisonState {
                 VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
             }),
             jacobi_last_request_ids: [None; 5],
-            jacobi_initial_constant: None,
-            jacobi_seeded: [false; 5],
             enabled_methods: [true; 5],
             completed_methods: [false; 5],
         }
@@ -546,14 +608,6 @@ impl Default for PerformanceComparisonState {
 impl PerformanceComparisonState {
     #[allow(dead_code)]
     pub fn start(&mut self, return_method: ActiveGravityMethod) {
-        self.start_with_baseline(return_method, None);
-    }
-
-    pub fn start_with_baseline(
-        &mut self,
-        return_method: ActiveGravityMethod,
-        jacobi_initial_constant: Option<f64>,
-    ) {
         self.active = true;
         self.measuring = self.enabled_methods.iter().any(|enabled| *enabled);
         self.phase = 0;
@@ -565,8 +619,6 @@ impl PerformanceComparisonState {
             .map(|(_, method)| method);
         self.completed_methods = [false; 5];
         self.jacobi_last_request_ids = [None; 5];
-        self.jacobi_initial_constant = jacobi_initial_constant.filter(|value| value.is_finite());
-        self.jacobi_seeded = [false; 5];
         self.return_method = return_method;
         for history in &mut self.fps_history {
             history.clear();
@@ -585,10 +637,6 @@ impl PerformanceComparisonState {
     #[allow(dead_code)]
     pub fn restart(&mut self) {
         self.start(self.return_method);
-    }
-
-    pub fn restart_with_baseline(&mut self, jacobi_initial_constant: Option<f64>) {
-        self.start_with_baseline(self.return_method, jacobi_initial_constant);
     }
 
     pub fn first_enabled_method(&self) -> Option<(usize, ActiveGravityMethod)> {

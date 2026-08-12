@@ -207,10 +207,10 @@ pub fn render_section_system(
     let tangent_u = plane_normal.cross(up).normalize();
     let tangent_v = plane_normal.cross(tangent_u).normalize();
 
-    // Linear normalization for the shared rho(r)=C/(r+epsilon) field. The
+    // Linear normalization for the shared rho(r)=C ln(1+r/epsilon) field. The
     // radial, Eq.106, and MMFFT paths all use this same source law.
-    let max_density = inverse_radial_density(0.0, c);
-    let min_density = inverse_radial_density(SECTION_CLIP_RADIUS, c);
+    let min_density = logarithmic_radial_density(0.0, c);
+    let max_density = logarithmic_radial_density(SECTION_CLIP_RADIUS, c);
     let density_range = (max_density - min_density).max(1e-6);
 
     // Stride-sampled local vertices for mesh-boundary clipping (limits to ~2000 samples)
@@ -256,20 +256,20 @@ pub fn render_section_system(
                 Color::srgb(0.15, 0.8, 1.0)
             } else {
                 // Radial, Eq.106, MMFFT, and FMM all consume the same
-                // mass-preserving inverse-radial source. Use the actual
+                // mass-preserving logarithmic radial source. Use the actual
                 // normalized density at this section sample for every one of
                 // those modes; only the method-specific palette changes.
                 let r = (point - com).length().max(0.01);
-                let density = inverse_radial_density(r, c);
+                let density = logarithmic_radial_density(r, c);
                 let t = ((density - min_density) / density_range).clamp(0.0, 1.0);
-                inverse_density_color(t, *active_method)
+                heterogeneous_density_color(t, *active_method)
             };
             gizmos.sphere(point, dot_radius, color);
         }
     }
 }
 
-fn inverse_density_color(t: f32, method: ActiveGravityMethod) -> Color {
+fn heterogeneous_density_color(t: f32, method: ActiveGravityMethod) -> Color {
     let t = t.clamp(0.0, 1.0);
     let (outer, middle, core) = match method {
         // Cyan trajectory: warm density complement.
@@ -351,7 +351,7 @@ mod section_density_color_tests {
     use super::*;
 
     #[test]
-    fn every_inverse_density_method_has_a_visible_gradient() {
+    fn every_log_density_method_has_a_visible_gradient() {
         for method in [
             ActiveGravityMethod::RadialAnalytic,
             ActiveGravityMethod::CurvedArcEq106,
@@ -359,8 +359,8 @@ mod section_density_color_tests {
             ActiveGravityMethod::Fmm,
         ] {
             assert_ne!(
-                inverse_density_color(0.0, method),
-                inverse_density_color(1.0, method)
+                heterogeneous_density_color(0.0, method),
+                heterogeneous_density_color(1.0, method)
             );
         }
     }

@@ -1,10 +1,10 @@
-//! MMFFT + GPU-memory-compression forward-field pipeline.
+//! MMFFT spherical-ring convolution with an explicit radix-2 FFT/IFFT.
 //!
-//! The source is packed independently from the radial path. Each 32-byte
-//! radial record becomes a 16-byte quantized record, while workgroups decode
-//! and reduce acceleration plus positive potential on the GPU. The packed
-//! layout is intentionally tile-friendly: a future hierarchical MMFFT pass
-//! can replace `record_field` without changing the ECS snapshot/readback API.
+//! The irregular radial cells are conservatively deposited into azimuthal
+//! rings. Each GPU workgroup transforms one 64-sample mass ring and four
+//! Newton-kernel channels, multiplies them in frequency space, and inverse
+//! transforms the convolution. The hierarchy is therefore an actual FFT
+//! operator rather than a direct quadrature hidden behind the MMFFT label.
 
 use crate::components::*;
 use bevy::prelude::*;
@@ -21,8 +21,13 @@ use bevy::render::{
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
 const WORKGROUP_SIZE: u32 = 64;
 const COMPRESSED_RECORD_BYTES: usize = 16;
+const AZIMUTH_BINS: usize = 64;
+const POLAR_BINS: usize = 16;
+const RADIAL_LAYERS: usize = 4;
+const RING_COUNT: usize = POLAR_BINS * RADIAL_LAYERS;
 
 #[derive(Resource, Default)]
 struct ExtractedMmfftInput {
@@ -31,10 +36,8 @@ struct ExtractedMmfftInput {
     snapshot: Option<GravityRequestSnapshot>,
     source_bytes: Option<Vec<u8>>,
     record_count: u32,
-    solid_angle_scale: f32,
-    radius_scale: f32,
-    density_scale: f32,
-    tile_size: u32,
+    ring_count: u32,
+    azimuth_bins: u32,
 }
 
 #[derive(Resource, Default)]
@@ -114,13 +117,20 @@ impl FromWorld for MmfftComputePipeline {
     }
 }
 
-/// Compresses the already mass-normalized radial records. Keeping this as a
-/// separate ECS resource means the later MMFFT hierarchy can replace only this
-/// builder and the shader while preserving all snapshot semantics.
+#[derive(Clone, Copy, Default)]
+struct RingBin {
+    mass: f64,
+    radial_moment: f64,
+    cosine_moment: f64,
+}
+
+/// Deposits the mass-normalized radial records onto periodic azimuth rings.
+/// Every deposited bin stores mass plus the ring's shared mass-weighted radius
+/// and polar cosine; consequently the FFT convolution is circulant in azimuth.
 pub fn build_mmfft_compressed_source_system(
     mut commands: Commands,
     radial: Option<Res<RadialGravitySource>>,
-    config: Res<MmfftCompressedConfig>,
+    _config: Res<MmfftCompressedConfig>,
     existing: Option<Res<MmfftCompressedSource>>,
 ) {
     if existing.is_some() {
@@ -131,78 +141,74 @@ pub fn build_mmfft_compressed_source_system(
         return;
     }
 
-    let mut records = Vec::with_capacity(radial.count as usize);
-    let mut solid_angle_scale = 0.0_f32;
-    let mut radius_scale = 0.0_f32;
-    let mut density_scale = 0.0_f32;
-    for chunk in radial.bytes.chunks_exact(32) {
+    let mut bins = vec![RingBin::default(); RING_COUNT * AZIMUTH_BINS];
+    for (record_index, chunk) in radial.bytes.chunks_exact(32).enumerate() {
         let direction = Vec3::new(read_f32(chunk, 0), read_f32(chunk, 4), read_f32(chunk, 8));
         let solid_angle = read_f32(chunk, 12).max(0.0);
         let inner = read_f32(chunk, 16).max(0.0);
         let outer = read_f32(chunk, 20).max(inner);
         let density = read_f32(chunk, 24).max(0.0);
-        solid_angle_scale = solid_angle_scale.max(solid_angle);
-        radius_scale = radius_scale.max(outer);
-        density_scale = density_scale.max(density);
-        records.push((direction, solid_angle, inner, outer, density));
-    }
-    if solid_angle_scale <= 0.0 || radius_scale <= 0.0 || density_scale <= 0.0 {
-        return;
+        if outer <= inner || density <= 0.0 || solid_angle <= 0.0 {
+            continue;
+        }
+        let mass =
+            density as f64 * solid_angle as f64 * ((outer as f64).powi(3) - (inner as f64).powi(3))
+                / 3.0;
+        let radius = 0.75 * ((outer as f64).powi(4) - (inner as f64).powi(4))
+            / ((outer as f64).powi(3) - (inner as f64).powi(3)).max(f64::MIN_POSITIVE);
+        let direction = direction.normalize_or_zero();
+        let azimuth = direction
+            .y
+            .atan2(direction.x)
+            .rem_euclid(std::f32::consts::TAU);
+        let azimuth_bin = ((azimuth / std::f32::consts::TAU * AZIMUTH_BINS as f32).floor()
+            as usize)
+            .min(AZIMUTH_BINS - 1);
+        let polar_bin =
+            (((direction.z + 1.0) * 0.5 * POLAR_BINS as f32).floor() as usize).min(POLAR_BINS - 1);
+        let layer = record_index % RADIAL_LAYERS;
+        let bin = &mut bins[(layer * POLAR_BINS + polar_bin) * AZIMUTH_BINS + azimuth_bin];
+        bin.mass += mass;
+        bin.radial_moment += mass * radius;
+        bin.cosine_moment += mass * direction.z as f64;
     }
 
-    let mut bytes = Vec::with_capacity(records.len() * COMPRESSED_RECORD_BYTES);
-    for (direction, solid_angle, inner, outer, density) in records {
-        let direction = direction.normalize_or_zero();
-        let dx = pack_i16(direction.x);
-        let dy = pack_i16(direction.y);
-        let dz = pack_i16(direction.z);
-        let w0 = pack_u16_pair(dx, dy);
-        let w1 = pack_u16_pair(dz, quantize_u16(solid_angle, solid_angle_scale));
-        let w2 = pack_u16_pair(
-            quantize_u16(inner, radius_scale),
-            quantize_u16(outer, radius_scale),
-        );
-        let w3 = pack_u16_pair(quantize_u16(density, density_scale), 0);
-        for word in [w0, w1, w2, w3] {
-            bytes.extend_from_slice(&word.to_le_bytes());
+    let mut bytes = Vec::with_capacity(bins.len() * COMPRESSED_RECORD_BYTES);
+    for ring in 0..RING_COUNT {
+        let ring_slice = &bins[ring * AZIMUTH_BINS..(ring + 1) * AZIMUTH_BINS];
+        let ring_mass = ring_slice.iter().map(|bin| bin.mass).sum::<f64>();
+        let radius = ring_slice.iter().map(|bin| bin.radial_moment).sum::<f64>()
+            / ring_mass.max(f64::MIN_POSITIVE);
+        let cosine = ring_slice.iter().map(|bin| bin.cosine_moment).sum::<f64>()
+            / ring_mass.max(f64::MIN_POSITIVE);
+        for bin in ring_slice {
+            for value in [
+                bin.mass as f32,
+                radius as f32,
+                cosine.clamp(-1.0, 1.0) as f32,
+                0.0,
+            ] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
     }
-
-    let tile_size = config.tile_size.max(WORKGROUP_SIZE);
     info!(
-        "[mmfft] compressed source: {} records, {} -> {} bytes, tile_size={}, scales=({:.4e}, {:.4e}, {:.4e})",
+        "[mmfft] {} radial records -> {} periodic rings x {} bins ({} bytes, radix-2 FFT/IFFT)",
         radial.count,
-        radial.bytes.len(),
-        bytes.len(),
-        tile_size,
-        solid_angle_scale,
-        radius_scale,
-        density_scale
+        RING_COUNT,
+        AZIMUTH_BINS,
+        bytes.len()
     );
     commands.insert_resource(MmfftCompressedSource {
         bytes,
-        count: radial.count,
-        tile_size,
-        solid_angle_scale,
-        radius_scale,
-        density_scale,
+        count: (RING_COUNT * AZIMUTH_BINS) as u32,
+        ring_count: RING_COUNT as u32,
+        azimuth_bins: AZIMUTH_BINS as u32,
     });
 }
 
 fn read_f32(bytes: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-fn pack_i16(value: f32) -> u16 {
-    (value.clamp(-1.0, 1.0) * 32767.0).round() as i16 as u16
-}
-
-fn quantize_u16(value: f32, scale: f32) -> u16 {
-    ((value / scale.max(f32::MIN_POSITIVE)).clamp(0.0, 1.0) * 65535.0).round() as u16
-}
-
-fn pack_u16_pair(low: u16, high: u16) -> u32 {
-    u32::from(low) | (u32::from(high) << 16)
 }
 
 fn poll_mmfft_readback(
@@ -228,8 +234,11 @@ fn poll_mmfft_readback(
     if total.xyz().is_finite() && total.w.is_finite() && total.w > 0.0 {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
+            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
+            independent_positive_potential: None,
+            body_acceleration_jacobian: None,
         });
     } else {
         warn!("[mmfft] discarded non-finite compressed GPU result");
@@ -264,10 +273,8 @@ fn extract_mmfft_input_system(
         probe_velocity: velocity.0,
     });
     extracted.record_count = source.count;
-    extracted.solid_angle_scale = source.solid_angle_scale;
-    extracted.radius_scale = source.radius_scale;
-    extracted.density_scale = source.density_scale;
-    extracted.tile_size = source.tile_size;
+    extracted.ring_count = source.ring_count;
+    extracted.azimuth_bins = source.azimuth_bins;
     if extracted.source_bytes.is_none() {
         extracted.source_bytes = Some(source.bytes.clone());
     }
@@ -295,7 +302,7 @@ fn dispatch_mmfft_system(
         let Some(source_bytes) = extracted.source_bytes.as_ref() else {
             return;
         };
-        let workgroup_count = extracted.record_count.div_ceil(WORKGROUP_SIZE);
+        let workgroup_count = extracted.ring_count;
         let output_size = workgroup_count as u64 * 16;
         let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("mmfft_compressed_uniform"),
@@ -373,10 +380,8 @@ fn dispatch_mmfft_system(
     let uniform = mmfft_uniform_bytes(
         extracted.probe,
         inner.record_count,
-        extracted.solid_angle_scale,
-        extracted.radius_scale,
-        extracted.density_scale,
-        extracted.tile_size,
+        extracted.ring_count,
+        extracted.azimuth_bins,
     );
     render_queue.write_buffer(&inner.uniform, 0, &uniform);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
@@ -421,10 +426,8 @@ fn dispatch_mmfft_system(
 fn mmfft_uniform_bytes(
     probe: Vec3,
     record_count: u32,
-    solid_angle_scale: f32,
-    radius_scale: f32,
-    density_scale: f32,
-    tile_size: u32,
+    ring_count: u32,
+    azimuth_bins: u32,
 ) -> [u8; 48] {
     let mut bytes = [0_u8; 48];
     for (offset, value) in [(0, probe.x), (4, probe.y), (8, probe.z), (12, G)] {
@@ -432,10 +435,8 @@ fn mmfft_uniform_bytes(
     }
     for (offset, value) in [
         (16, record_count.to_le_bytes()),
-        (20, solid_angle_scale.to_le_bytes()),
-        (24, radius_scale.to_le_bytes()),
-        (28, density_scale.to_le_bytes()),
-        (32, tile_size.to_le_bytes()),
+        (20, ring_count.to_le_bytes()),
+        (24, azimuth_bins.to_le_bytes()),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value);
     }
@@ -492,9 +493,17 @@ mod tests {
     }
 
     #[test]
-    fn signed_direction_quantization_is_bounded() {
-        assert_eq!(pack_i16(-2.0), i16::MIN as u16 + 1);
-        assert_eq!(pack_i16(2.0), i16::MAX as u16);
-        assert_eq!(quantize_u16(5.0, 10.0), 32768);
+    fn radix_two_ring_layout_is_exactly_one_workgroup() {
+        assert_eq!(AZIMUTH_BINS as u32, WORKGROUP_SIZE);
+        assert!(AZIMUTH_BINS.is_power_of_two());
+    }
+
+    #[test]
+    fn runtime_record_size_matches_the_packed_shader_layout() {
+        let config = MmfftCompressedConfig::default();
+        assert_eq!(
+            config.compressed_record_bytes as usize,
+            COMPRESSED_RECORD_BYTES
+        );
     }
 }

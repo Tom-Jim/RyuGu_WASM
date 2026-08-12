@@ -12,7 +12,9 @@
 //! remain separate from this real-time WGSL evaluator.
 
 use crate::components::*;
-use crate::systems::curved_arc::Eq106SourceData;
+use crate::systems::curved_arc::{
+    CurvedArcPlannerState, CurvedArcResidualHistory, Eq106SourceData,
+};
 use crate::systems::eq106_operator::Eq106OperatorTensorResource;
 use bevy::prelude::*;
 use bevy::render::{
@@ -28,12 +30,17 @@ use bevy::render::{
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-const HALF_COUNT: u32 = 128;
+const HALF_COUNT: u32 = 64;
 const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
-const QUADRATURE_COUNT: u32 = 256;
-const EVALUATION_CADENCE_FRAMES: u32 = 6;
+const QUADRATURE_COUNT: u32 = 64;
+const MAX_BATCH_COUNT: u32 = MAX_SIMULATION_ACCELERATION + 1;
+// Spectrum assembly remains segment-scoped. Evaluate often enough that the
+// CPU leapfrog stays inside the certified local Hessian neighborhood without
+// forcing a synchronous GPU readback on every rendered frame.
+const EVALUATION_CADENCE_FRAMES: u32 = 1;
+const OUTPUT_ROWS_PER_BLOCK: u64 = 9;
 const SPECTRUM_BYTES: u64 = FREQUENCY_COUNT as u64 * 32;
-const OUTPUT_BYTES: u64 = 32;
+const OUTPUT_BYTES: u64 = MAX_BATCH_COUNT as u64 * OUTPUT_ROWS_PER_BLOCK * 16;
 
 #[derive(Resource, Default)]
 struct ExtractedEq106Input {
@@ -46,10 +53,27 @@ struct ExtractedEq106Input {
     source_count: u32,
     radius: f32,
     source_hash: u64,
+    batch_count: u32,
+    block_dt: f32,
+    certified_line_limit: f32,
 }
 
 #[derive(Resource, Default)]
 struct Eq106GpuBuffers(Option<Eq106GpuBuffersInner>);
+
+/// Additive potential gauge shared by consecutive local Eq.106 spectral
+/// elements. The GPU correction is tapered to zero before a reference-line
+/// transition, so this is only a defensive C0 alignment for f32 roundoff. It
+/// must never add a force bias: doing that recursively changes the physical
+/// field every time an accelerated batch crosses a segment boundary.
+#[derive(Resource, Default)]
+struct Eq106PotentialGauge {
+    epoch: Option<u64>,
+    line_origin: Option<Vec3>,
+    offset: f32,
+    anchor_potential: Option<f32>,
+    anchor_curve_work: Option<f64>,
+}
 
 struct Eq106GpuBuffersInner {
     uniform: Buffer,
@@ -66,6 +90,7 @@ struct Eq106GpuBuffersInner {
 
 #[derive(Resource)]
 struct Eq106ComputePipeline {
+    line_samples_id: CachedComputePipelineId,
     assemble_id: CachedComputePipelineId,
     evaluate_id: CachedComputePipelineId,
 }
@@ -76,6 +101,7 @@ impl Plugin for Eq106GpuComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Eq106GpuReadbackChannel>();
         app.init_resource::<Eq106GpuHistory>();
+        app.init_resource::<Eq106PotentialGauge>();
         app.add_systems(PreUpdate, poll_eq106_readback);
         app.add_systems(Update, clear_eq106_history_on_probe_reset);
 
@@ -103,12 +129,22 @@ impl FromWorld for Eq106ComputePipeline {
             storage_rw_entry(3),
             storage_rw_entry(4),
             storage_ro_entry(5),
+            storage_rw_entry(6),
         ];
         let layout = BindGroupLayoutDescriptor::new("eq106_complex_bgl", &entries);
         let shader = world
             .resource::<AssetServer>()
             .load("shaders/eq106_complex.wgsl");
         let cache = world.resource::<PipelineCache>();
+        let line_samples_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("eq106_assemble_line_samples".into()),
+            layout: vec![layout.clone()],
+            immediate_size: 0,
+            shader: shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("assemble_line_samples".into()),
+            zero_initialize_workgroup_memory: false,
+        });
         let assemble_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_assemble_spectrum".into()),
             layout: vec![layout.clone()],
@@ -128,6 +164,7 @@ impl FromWorld for Eq106ComputePipeline {
             zero_initialize_workgroup_memory: false,
         });
         Self {
+            line_samples_id,
             assemble_id,
             evaluate_id,
         }
@@ -137,48 +174,165 @@ impl FromWorld for Eq106ComputePipeline {
 fn clear_eq106_history_on_probe_reset(
     probe: Res<ProbeInitialConditions>,
     mut history: ResMut<Eq106GpuHistory>,
+    mut gauge: ResMut<Eq106PotentialGauge>,
 ) {
     if probe.is_changed() {
         history.0.clear();
+        *gauge = Eq106PotentialGauge::default();
     }
 }
 
 fn poll_eq106_readback(
     channel: Res<Eq106GpuReadbackChannel>,
     mut history: ResMut<Eq106GpuHistory>,
+    mut gauge: ResMut<Eq106PotentialGauge>,
+    curved_residual: Res<CurvedArcResidualHistory>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
     let Ok(mut guard) = channel.data.try_lock() else {
         return;
     };
     let Some(packet) = guard.take() else { return };
-    let Some(field) = packet.partial_sums.first().copied() else {
+    let Some(first_anchor) = packet.partial_sums.get(7).copied() else {
         return;
     };
-    let certificate = packet
-        .partial_sums
-        .get(1)
-        .copied()
-        .unwrap_or([f32::INFINITY; 4]);
-    if certificate[0] > 0.25
-        || certificate[1] > 0.05
-        || (certificate[3] > 0.99 && certificate[2] > 0.25)
-    {
-        runtime_error.raise(format!(
-            "Equation (106) GPU certification failed (field={:.3e}, imaginary={:.3e}, toroidal={:.3e}, coverage={:.3e}).",
-            certificate[0], certificate[1], certificate[2], certificate[3]
-        ));
-        return;
-    }
-    let acceleration = Vec3::new(field[0], field[1], field[2]);
-    if acceleration.is_finite() && field[3].is_finite() && field[3] > 0.0 {
+    let batch_count = (first_anchor[3].round() as usize).clamp(1, MAX_BATCH_COUNT as usize);
+    let base_snapshot = packet.snapshot;
+    let angular_velocity_world =
+        RYUGU_SPIN_AXIS.normalize() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
+
+    for block_index in 0..batch_count {
+        let output_base = block_index * OUTPUT_ROWS_PER_BLOCK as usize;
+        let Some(rows) = packet
+            .partial_sums
+            .get(output_base..output_base + OUTPUT_ROWS_PER_BLOCK as usize)
+        else {
+            runtime_error.raise("Equation (106) GPU readback omitted a batch spectral element.");
+            return;
+        };
+        let field = rows[0];
+        let certificate = rows[1];
+        let potentials = rows[6];
+        let anchor_row = rows[7];
+        let origin_row = rows[8];
+        if certificate[0] > 0.25
+            || certificate[1] > 0.05
+            || (certificate[3] > 0.99 && certificate[2] > 0.25)
+        {
+            runtime_error.raise(format!(
+                "Equation (106) GPU batch element {} certification failed (field={:.3e}, imaginary={:.3e}, toroidal={:.3e}, coverage={:.3e}).",
+                block_index + 1,
+                certificate[0], certificate[1], certificate[2], certificate[3]
+            ));
+            return;
+        }
+        let acceleration = Vec3::new(field[0], field[1], field[2]);
+        let segmented_potential = potentials[0];
+        let independent_potential = potentials[1];
+        let elapsed = potentials[3] as f64;
+        let anchor_position = Vec3::new(anchor_row[0], anchor_row[1], anchor_row[2]);
+        let line_origin = Vec3::new(origin_row[0], origin_row[1], origin_row[2]);
+        let predicted_body_velocity = Vec3::new(rows[5][0], rows[5][1], rows[5][2]);
+        let jacobian = Mat3::from_cols(
+            Vec3::new(rows[2][0], rows[3][0], rows[4][0]),
+            Vec3::new(rows[2][1], rows[3][1], rows[4][1]),
+            Vec3::new(rows[2][2], rows[3][2], rows[4][2]),
+        );
+        if !acceleration.is_finite()
+            || !segmented_potential.is_finite()
+            || segmented_potential <= 0.0
+            || !independent_potential.is_finite()
+            || independent_potential <= 0.0
+            || !anchor_position.is_finite()
+            || !line_origin.is_finite()
+            || !predicted_body_velocity.is_finite()
+            || !jacobian.is_finite()
+        {
+            runtime_error.raise(
+                "Equation (106) GPU returned a non-finite batched field sample or local potential Hessian.",
+            );
+            return;
+        }
+
+        let mut snapshot = base_snapshot.clone();
+        if block_index > 0 {
+            snapshot.request_id = snapshot
+                .request_id
+                .wrapping_mul(MAX_BATCH_COUNT as u64)
+                .wrapping_add(block_index as u64);
+        }
+        snapshot.simulation_time_seconds += elapsed;
+        snapshot.body_position = anchor_position;
+        let future_rotation = Quat::from_axis_angle(
+            RYUGU_SPIN_AXIS.normalize(),
+            std::f32::consts::TAU * elapsed as f32 / RYUGU_ROTATION_PERIOD_SECS,
+        ) * base_snapshot.ryugu_transform.rotation;
+        snapshot.ryugu_transform.rotation = future_rotation;
+        snapshot.probe_position =
+            snapshot.ryugu_transform.translation + future_rotation * anchor_position;
+        let angular_velocity_body = future_rotation.inverse() * angular_velocity_world;
+        snapshot.probe_velocity = future_rotation
+            * (predicted_body_velocity + angular_velocity_body.cross(anchor_position));
+
+        if gauge.epoch != Some(base_snapshot.epoch) {
+            *gauge = Eq106PotentialGauge {
+                epoch: Some(snapshot.epoch),
+                line_origin: Some(line_origin),
+                offset: 0.0,
+                anchor_potential: None,
+                anchor_curve_work: None,
+            };
+        } else if gauge
+            .line_origin
+            .is_none_or(|previous| previous.distance_squared(line_origin) > 1.0e-6)
+        {
+            // Continue the scalar potential from the last authoritative anchor
+            // using the same curved-path work used by Eq.(157). The endpoint
+            // anchor makes this a first-order accurate overlap continuation;
+            // no acceleration bias is introduced.
+            if let Some(current_work) =
+                curved_residual.curve_work_at(snapshot.simulation_time_seconds)
+            {
+                gauge.offset = gauge
+                    .anchor_potential
+                    .zip(gauge.anchor_curve_work)
+                    .map(|(anchor_potential, anchor_work)| {
+                        (anchor_potential as f64 + current_work - anchor_work) as f32
+                            - segmented_potential
+                    })
+                    .filter(|offset| offset.is_finite())
+                    .unwrap_or(0.0);
+            }
+            gauge.line_origin = Some(line_origin);
+        }
+
+        let positive_potential = segmented_potential + gauge.offset;
+        if !positive_potential.is_finite() || positive_potential <= 0.0 {
+            runtime_error
+                .raise("Equation (106) potential gauge alignment produced an invalid value.");
+            return;
+        }
+        if block_index == 0
+            && let Some(curve_work) =
+                curved_residual.curve_work_at(snapshot.simulation_time_seconds)
+        {
+            gauge.anchor_potential = Some(positive_potential);
+            gauge.anchor_curve_work = Some(curve_work);
+        }
         history.0.push(GravityFieldSample {
-            snapshot: packet.snapshot,
+            snapshot,
+            predictive: block_index > 0,
             body_acceleration: acceleration,
-            positive_potential: field[3],
+            // This segmented potential is generated by the same Eq.106 field
+            // that drives integration. The independent direct potential below
+            // is reserved for the Eq. (157) dual-representation residual.
+            positive_potential,
+            // Eq. (157) must remain an actual dual-representation check.  The
+            // shader evaluates this direct full-space point potential
+            // independently of the segmented spectral potential above.
+            independent_positive_potential: Some(independent_potential),
+            body_acceleration_jacobian: Some(jacobian),
         });
-    } else {
-        runtime_error.raise("Equation (106) GPU returned a non-finite field sample.");
     }
 }
 
@@ -188,6 +342,9 @@ fn extract_eq106_input(
     operator_tensor: Extract<Option<Res<Eq106OperatorTensorResource>>>,
     active: Extract<Res<ActiveGravityMethod>>,
     clock: Extract<Res<SimulationClock>>,
+    fixed_time: Extract<Res<Time<Fixed>>>,
+    simulation_acceleration: Extract<Res<SimulationAcceleration>>,
+    planner: Extract<Res<CurvedArcPlannerState>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
@@ -200,8 +357,16 @@ fn extract_eq106_input(
     else {
         return;
     };
-    extracted.probe = ryugu.rotation.inverse() * (probe.translation - ryugu.translation);
-    extracted.velocity = ryugu.rotation.inverse() * velocity.0;
+    let relative_world_position = probe.translation - ryugu.translation;
+    let angular_velocity_world =
+        RYUGU_SPIN_AXIS.normalize() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
+    extracted.probe = ryugu.rotation.inverse() * relative_world_position;
+    // Eq.106's reference line lives in the body-fixed density coordinates, so
+    // its tangent must be dq_body/dt, not the inertial velocity merely rotated
+    // into body axes. Omitting omega x r tilts the spectral line by a large
+    // fraction of the orbital velocity and causes secular trajectory error.
+    extracted.velocity = ryugu.rotation.inverse()
+        * (velocity.0 - angular_velocity_world.cross(relative_world_position));
     extracted.snapshot = Some(GravityRequestSnapshot {
         request_id: clock.request_id,
         epoch: clock.epoch,
@@ -211,8 +376,26 @@ fn extract_eq106_input(
         probe_position: probe.translation,
         probe_velocity: velocity.0,
     });
+    // Include the endpoint of the final stable interval. Physics blends the
+    // two surrounding local Hessian models at every substep, eliminating the
+    // one-sided field extrapolation that produced Jacobi steps.
+    extracted.batch_count = simulation_acceleration.stable_steps() + 1;
+    extracted.block_dt = fixed_time.delta_secs() * TIME_SCALE;
     extracted.source_count = source.sources.len() as u32;
     extracted.radius = source.radius as f32;
+    extracted.certified_line_limit = planner
+        .active_segment
+        .as_ref()
+        .filter(|segment| segment.taylor_order.is_some() && segment.epsilon_max < 1.0)
+        .map(|segment| {
+            let curvature_limit = if segment.maximum_curvature > f64::MIN_POSITIVE {
+                (8.0 * 0.25 * segment.distance_lower_bound / segment.maximum_curvature).sqrt()
+            } else {
+                f64::INFINITY
+            };
+            segment.arc_length.max(1.0).min(curvature_limit) as f32
+        })
+        .unwrap_or(f32::INFINITY);
     let source_hash = source.source_hash;
     if extracted.sources.is_none() || extracted.source_hash != source_hash {
         let mut bytes = Vec::with_capacity(source.sources.len() * 16);
@@ -246,7 +429,8 @@ fn dispatch_eq106(
     channel: Res<Eq106GpuReadbackChannel>,
 ) {
     let Some(pipelines) = pipelines else { return };
-    let (Some(assemble), Some(evaluate)) = (
+    let (Some(line_samples), Some(assemble), Some(evaluate)) = (
+        cache.get_compute_pipeline(pipelines.line_samples_id),
         cache.get_compute_pipeline(pipelines.assemble_id),
         cache.get_compute_pipeline(pipelines.evaluate_id),
     ) else {
@@ -273,7 +457,11 @@ fn dispatch_eq106(
         };
         let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_uniform"),
-            size: 64,
+            // WGSL's final vec3<u32> member is rounded to the uniform
+            // structure's 16-byte alignment. Keep the allocation at the
+            // validated 112-byte size even though the populated fields end
+            // at offset 96.
+            size: 112,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -282,7 +470,7 @@ fn dispatch_eq106(
             contents: source_bytes,
             usage: BufferUsages::STORAGE,
         });
-        let quadrature_bytes = half_line_quadrature_bytes();
+        let quadrature_bytes = half_line_quadrature_bytes(0.5 * extracted.radius.max(1.0));
         let quadrature = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_quadrature_lut"),
             contents: &quadrature_bytes,
@@ -296,6 +484,12 @@ fn dispatch_eq106(
         let spectrum = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_spectrum"),
             size: SPECTRUM_BYTES,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let line_samples = render_device.create_buffer(&BufferDescriptor {
+            label: Some("eq106_line_samples"),
+            size: QUADRATURE_COUNT as u64 * 16,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -320,6 +514,7 @@ fn dispatch_eq106(
                 storage_rw_entry(3),
                 storage_rw_entry(4),
                 storage_ro_entry(5),
+                storage_rw_entry(6),
             ],
         );
         let bind_group = render_device.create_bind_group(
@@ -350,6 +545,10 @@ fn dispatch_eq106(
                     binding: 5,
                     resource: operator_tensor.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: line_samples.as_entire_binding(),
+                },
             ],
         );
         buffers.0 = Some(Eq106GpuBuffersInner {
@@ -374,11 +573,32 @@ fn dispatch_eq106(
     let relative = extracted.probe - inner.line_origin;
     let h = relative.dot(inner.line_direction);
     let transverse = (relative - h * inner.line_direction).length();
-    let spectral_horizon = 0.75 * std::f32::consts::TAU / 0.002;
+    // Eq. (106) is a straight-reference operator; the curved trajectory must
+    // be covered by local spectral elements. The frequency-grid Nyquist range
+    // is not a convergence radius, so do not reuse one line for kilometres.
+    let predicted_batch_travel = extracted.velocity.length()
+        * extracted.block_dt
+        * extracted.batch_count.saturating_sub(1) as f32;
+    // At 8x the probe advances roughly one old 0.15R segment per presented
+    // frame. Size the cached line for two accelerated batches so spectrum
+    // assembly is not repeated every frame, while keeping the operator local.
+    let longitudinal_limit = (0.35 * extracted.radius)
+        .max(2.25 * predicted_batch_travel)
+        // Keep at least ~18 authoritative 1x frames in one element. This
+        // gives the previous sample time to enter the zero-correction overlap
+        // before the next reference line is installed, avoiding a visible
+        // potential step without extending the spectral work per frame.
+        .max(160.0)
+        // The curved-arc planner supplies the docs/mathtidy.md curvature
+        // bound.  Unlike the throughput heuristic above, this is a hard cap:
+        // spectral correction is tapered to zero before leaving this disk.
+        .min(extracted.certified_line_limit)
+        .max(1.0);
+    let transverse_limit = (0.10 * extracted.radius).max(20.0);
     let line_expired = inner.source_hash != extracted.source_hash
         || h < 0.0
-        || h > spectral_horizon
-        || transverse > (0.25 * extracted.radius).max(20.0);
+        || h > 0.85 * longitudinal_limit
+        || transverse > transverse_limit;
     if line_expired {
         inner.line_origin = extracted.probe;
         inner.line_direction = extracted.velocity.normalize_or_zero();
@@ -389,9 +609,8 @@ fn dispatch_eq106(
         return;
     }
     let key = (snapshot.epoch, snapshot.request_id);
-    if inner.spectrum_ready
-        && (!inner.render_frame.is_multiple_of(EVALUATION_CADENCE_FRAMES)
-            || inner.last_submitted == Some(key))
+    if !inner.render_frame.is_multiple_of(EVALUATION_CADENCE_FRAMES)
+        || inner.last_submitted == Some(key)
     {
         return;
     }
@@ -409,12 +628,24 @@ fn dispatch_eq106(
         inner.line_direction,
         extracted.source_count,
         extracted.radius,
+        extracted.velocity,
+        extracted.block_dt,
+        extracted.batch_count,
+        longitudinal_limit,
     );
     render_queue.write_buffer(&inner.uniform, 0, &uniform);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("eq106_complex_encoder"),
     });
     if !inner.spectrum_ready {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("eq106_line_samples_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(line_samples);
+        pass.set_bind_group(0, &inner.bind_group, &[]);
+        pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
+        drop(pass);
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("eq106_assemble_pass"),
             timestamp_writes: None,
@@ -432,7 +663,7 @@ fn dispatch_eq106(
         });
         pass.set_pipeline(evaluate);
         pass.set_bind_group(0, &inner.bind_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.dispatch_workgroups(extracted.batch_count.clamp(1, MAX_BATCH_COUNT), 1, 1);
     }
     encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, OUTPUT_BYTES);
     render_queue.submit([encoder.finish()]);
@@ -461,14 +692,18 @@ fn dispatch_eq106(
         });
 }
 
-fn half_line_quadrature_bytes() -> Vec<u8> {
+fn half_line_quadrature_bytes(length_scale: f32) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(QUADRATURE_COUNT as usize * 8);
     let du = 1.0 / QUADRATURE_COUNT as f32;
+    let length_scale = length_scale.max(1.0);
     for index in 0..QUADRATURE_COUNT {
         let u = (index as f32 + 0.5) * du;
         let denominator = 1.0 - u;
-        let h = u / denominator;
-        let weight = du / (denominator * denominator);
+        // h = L u/(1-u), dh/du = L/(1-u)^2. Choosing L=1/sigma
+        // resolves the physical Laplace-decay length instead of concentrating
+        // nearly every node inside the first few metres.
+        let h = length_scale * u / denominator;
+        let weight = length_scale * du / (denominator * denominator);
         bytes.extend_from_slice(&h.to_le_bytes());
         bytes.extend_from_slice(&weight.to_le_bytes());
     }
@@ -481,8 +716,12 @@ fn uniform_bytes(
     direction: Vec3,
     source_count: u32,
     radius: f32,
-) -> [u8; 64] {
-    let mut bytes = [0_u8; 64];
+    body_velocity: Vec3,
+    block_dt: f32,
+    batch_count: u32,
+    longitudinal_limit: f32,
+) -> [u8; 112] {
+    let mut bytes = [0_u8; 112];
     for (offset, value) in [
         (0, probe.x),
         (4, probe.y),
@@ -504,6 +743,19 @@ fn uniform_bytes(
         (52, HALF_COUNT),
         (56, QUADRATURE_COUNT),
         (60, 0),
+        (80, batch_count.clamp(1, MAX_BATCH_COUNT)),
+        (84, 0),
+        (88, 0),
+        (92, 0),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [
+        (64, body_velocity.x),
+        (68, body_velocity.y),
+        (72, body_velocity.z),
+        (76, block_dt.max(1.0e-3)),
+        (96, longitudinal_limit.max(1.0)),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }

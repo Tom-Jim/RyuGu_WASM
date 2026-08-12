@@ -204,10 +204,13 @@ fn angular_cell(p0: Vec3, p1: Vec3, p2: Vec3) -> Option<(Vec3, f32, f32)> {
     (radius > 0.0).then_some((direction, radius, solid_angle))
 }
 
-/// Integral of r²/(r+epsilon), evaluated in f64 to avoid cancellation near 0.
+/// Integral of `r² ln(1+r/epsilon)`, evaluated in f64.  This primitive makes
+/// every radial layer exactly mass preserving for the shared logarithmic law.
 fn radial_density_integral(inner: f64, outer: f64, epsilon: f64) -> f64 {
     fn primitive(r: f64, epsilon: f64) -> f64 {
-        0.5 * r * r - epsilon * r + epsilon * epsilon * (1.0 + r / epsilon).ln()
+        let logarithm = (1.0 + r / epsilon).ln();
+        (r.powi(3) + epsilon.powi(3)) * logarithm / 3.0 - r.powi(3) / 9.0 + epsilon * r * r / 6.0
+            - epsilon * epsilon * r / 3.0
     }
     primitive(outer, epsilon) - primitive(inner, epsilon)
 }
@@ -256,8 +259,11 @@ fn poll_gravity_readback(
     if acceleration_is_valid && potential_is_valid {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
+            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
+            independent_positive_potential: None,
+            body_acceleration_jacobian: None,
         });
     }
 }
@@ -560,7 +566,7 @@ mod tests {
         let numerical = (0..steps)
             .map(|i| {
                 let r = 3.0 + (i as f64 + 0.5) * h;
-                r * r / (r + 10.0) * h
+                r * r * (1.0 + r / 10.0).ln() * h
             })
             .sum::<f64>();
         assert!((analytic - numerical).abs() / analytic < 1.0e-9);
