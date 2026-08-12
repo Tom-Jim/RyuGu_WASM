@@ -1803,6 +1803,7 @@ pub fn update_gpu_memory_estimate_system(
     }
     if let (Some(source), Some(tensor)) = (eq106_sources, eq106_tensor) {
         bytes[2] = source.sources.len() as u64 * 16
+            + source.fourier_modes.len() as u64 * 16
             + 64 * 8
             + tensor.tensor.coefficients.len() as u64 * 4
             + 64
@@ -1810,10 +1811,13 @@ pub fn update_gpu_memory_estimate_system(
             + 2 * 8 * 9 * 16;
     }
     if let Some(source) = mmfft {
-        bytes[3] = source.bytes.len() as u64 + 48 + 2 * reduction_buffer_bytes(source.count);
+        bytes[3] = source.bytes.len() as u64 + 48 + 32;
     }
     if let Some(source) = fmm {
-        bytes[4] = source.bytes.len() as u64 + 32 + 2 * reduction_buffer_bytes(source.node_count);
+        bytes[4] = source.bytes.len() as u64
+            + source.particle_bytes.len() as u64
+            + 32
+            + 2 * reduction_buffer_bytes(source.node_count);
     }
     estimate.bytes = bytes;
 }

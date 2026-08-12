@@ -28,7 +28,7 @@ const MAXIMUM_LEVEL: u32 = 5;
 // Bounds the complete source-box plus target-box radius used by M2L/L2L.
 // 0.20 keeps the order-two local expansion well inside its disk; the shader
 // independently certifies each translated value against its node multipole.
-const THETA: f32 = 0.20;
+const THETA: f32 = 0.10;
 const INVALID_PARENT: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,7 +71,9 @@ struct ExtractedFmmInput {
     probe: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
     node_bytes: Option<Vec<u8>>,
+    particle_bytes: Option<Vec<u8>>,
     node_count: u32,
+    particle_count: u32,
     maximum_level: u32,
 }
 
@@ -120,7 +122,12 @@ impl Plugin for FmmComputePlugin {
 
 impl FromWorld for FmmComputePipeline {
     fn from_world(world: &mut World) -> Self {
-        let entries = [uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)];
+        let entries = [
+            uniform_entry(0),
+            storage_ro_entry(1),
+            storage_rw_entry(2),
+            storage_ro_entry(3),
+        ];
         let layout = BindGroupLayoutDescriptor::new("fmm_gravity_bgl", &entries);
         let shader = world
             .resource::<AssetServer>()
@@ -183,6 +190,7 @@ pub fn build_fmm_source_system(
     // (rather than a repeated particle scan) the authoritative source.
     let leaf_grid = 1u32 << MAXIMUM_LEVEL;
     let mut level_maps = vec![HashMap::new(); MAXIMUM_LEVEL as usize + 1];
+    let mut leaf_particles: HashMap<(u32, u32, u32), Vec<(DVec3, f64)>> = HashMap::new();
     for &(position, mass) in &records {
         let normalized = (position / radius + DVec3::ONE) * 0.5;
         let key = (
@@ -197,6 +205,10 @@ pub fn build_fmm_source_system(
             .entry(key)
             .or_insert_with(MomentAccumulator::default)
             .add(position, mass);
+        leaf_particles
+            .entry(key)
+            .or_default()
+            .push((position, mass));
     }
     for level in (1..=MAXIMUM_LEVEL as usize).rev() {
         let children = level_maps[level]
@@ -232,6 +244,26 @@ pub fn build_fmm_source_system(
             .map(|(index, (key, _))| (*key, level_offsets[level_index] + index as u32))
             .collect::<HashMap<_, _>>();
         index_maps.push(map);
+    }
+
+    let mut particle_bytes = Vec::with_capacity(records.len() * 16);
+    let mut leaf_ranges = HashMap::new();
+    let mut sorted_leaf_keys = leaf_particles.keys().copied().collect::<Vec<_>>();
+    sorted_leaf_keys.sort_unstable();
+    for key in sorted_leaf_keys {
+        let particles = &leaf_particles[&key];
+        let start = (particle_bytes.len() / 16) as u32;
+        for &(position, mass) in particles {
+            for value in [
+                position.x as f32,
+                position.y as f32,
+                position.z as f32,
+                mass as f32,
+            ] {
+                particle_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        leaf_ranges.insert(key, (start, particles.len() as u32));
     }
 
     let mut bytes = Vec::with_capacity(offset as usize * 80);
@@ -288,18 +320,27 @@ pub fn build_fmm_source_system(
             } else {
                 index_maps[level_index - 1][&(key.0 / 2, key.1 / 2, key.2 / 2)]
             };
-            for value in [parent, level_index as u32, 0, 0] {
+            let (particle_start, particle_count) = if level_index == MAXIMUM_LEVEL as usize {
+                leaf_ranges.get(key).copied().unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            };
+            for value in [parent, level_index as u32, particle_start, particle_count] {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
     }
     info!(
-        "[fmm] built {} octree nodes through level {} (leaf P2M + exact M2M)",
-        offset, MAXIMUM_LEVEL
+        "[fmm] built {} octree nodes and {} retained leaf particles through level {} (P2M/M2M + M2L/L2L + P2P)",
+        offset,
+        records.len(),
+        MAXIMUM_LEVEL
     );
     commands.insert_resource(FmmSource {
         bytes,
+        particle_bytes,
         node_count: offset,
+        particle_count: records.len() as u32,
         maximum_level: MAXIMUM_LEVEL,
     });
 }
@@ -372,9 +413,13 @@ fn extract_fmm_input(
         probe_velocity: velocity.0,
     });
     extracted.node_count = source.node_count;
+    extracted.particle_count = source.particle_count;
     extracted.maximum_level = source.maximum_level;
     if extracted.node_bytes.is_none() {
         extracted.node_bytes = Some(source.bytes.clone());
+    }
+    if extracted.particle_bytes.is_none() {
+        extracted.particle_bytes = Some(source.particle_bytes.clone());
     }
 }
 
@@ -396,7 +441,10 @@ fn dispatch_fmm(
         return;
     }
     if buffers.0.is_none() {
-        let Some(node_bytes) = extracted.node_bytes.as_ref() else {
+        let (Some(node_bytes), Some(particle_bytes)) = (
+            extracted.node_bytes.as_ref(),
+            extracted.particle_bytes.as_ref(),
+        ) else {
             return;
         };
         let workgroup_count = extracted.node_count.div_ceil(WORKGROUP_SIZE);
@@ -410,6 +458,11 @@ fn dispatch_fmm(
         let nodes = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("fmm_nodes"),
             contents: node_bytes,
+            usage: BufferUsages::STORAGE,
+        });
+        let particles = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("fmm_leaf_particles"),
+            contents: particle_bytes,
             usage: BufferUsages::STORAGE,
         });
         let output = render_device.create_buffer(&BufferDescriptor {
@@ -426,7 +479,12 @@ fn dispatch_fmm(
         });
         let layout = render_device.create_bind_group_layout(
             "fmm_gravity_bgl_runtime",
-            &[uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)],
+            &[
+                uniform_entry(0),
+                storage_ro_entry(1),
+                storage_rw_entry(2),
+                storage_ro_entry(3),
+            ],
         );
         let bind_group = render_device.create_bind_group(
             "fmm_gravity_bg",
@@ -443,6 +501,10 @@ fn dispatch_fmm(
                 BindGroupEntry {
                     binding: 2,
                     resource: output.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: particles.as_entire_binding(),
                 },
             ],
         );
@@ -479,6 +541,7 @@ fn dispatch_fmm(
             extracted.probe,
             extracted.node_count,
             extracted.maximum_level,
+            extracted.particle_count,
         ),
     );
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
@@ -518,7 +581,12 @@ fn dispatch_fmm(
         });
 }
 
-fn uniform_bytes(probe: Vec3, node_count: u32, maximum_level: u32) -> [u8; 32] {
+fn uniform_bytes(
+    probe: Vec3,
+    node_count: u32,
+    maximum_level: u32,
+    particle_count: u32,
+) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     for (offset, value) in [
         (0, probe.x),
@@ -531,6 +599,7 @@ fn uniform_bytes(probe: Vec3, node_count: u32, maximum_level: u32) -> [u8; 32] {
     }
     bytes[16..20].copy_from_slice(&node_count.to_le_bytes());
     bytes[20..24].copy_from_slice(&maximum_level.to_le_bytes());
+    bytes[28..32].copy_from_slice(&particle_count.to_le_bytes());
     bytes
 }
 
@@ -593,7 +662,7 @@ mod tests {
         // source_half / distance = 0.037. Its actual L2L radius ratio is 0.63,
         // so an order-two local expansion there is not convergent enough.
         assert!(!m2l_is_acceptable(232.0, 3_720.0, 10_800.0, THETA as f64));
-        assert!(m2l_is_acceptable(14.5, 100.0, 1_500.0, THETA as f64));
+        assert!(m2l_is_acceptable(14.5, 100.0, 2_500.0, THETA as f64));
     }
 
     #[test]

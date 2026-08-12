@@ -76,6 +76,9 @@ pub enum Eq106KernelStatus {
 #[derive(Resource, Default)]
 pub struct Eq106SourceData {
     pub sources: Vec<Eq106PointSource>,
+    /// Eq. (81) density modes packed as `(cylindrical_radius, z, re, im)`;
+    /// records are ring-major with modes `0..=16`.
+    pub fourier_modes: Vec<[f32; 4]>,
     pub total_mass: f64,
     pub radius: f64,
     pub source_hash: u64,
@@ -264,7 +267,7 @@ impl PeriodicityDetector {
 // Ryugu into a visibly lumpy eight-point field and can noticeably precess the
 // probe orbit. Keep a bounded GPU-friendly quadrature while retaining enough
 // angular structure for the Eq. (106) density integral.
-const EQ106_AZIMUTH_BINS: usize = 16;
+const EQ106_AZIMUTH_BINS: usize = 32;
 const EQ106_POLAR_BINS: usize = 8;
 const EQ106_RADIAL_BINS: usize = 4;
 const EQ106_SOURCE_BUDGET: usize = EQ106_AZIMUTH_BINS * EQ106_POLAR_BINS * EQ106_RADIAL_BINS;
@@ -340,8 +343,52 @@ pub fn build_eq106_source_system(
     if sources.is_empty() || !total_mass.is_finite() {
         return;
     }
+    let mut fourier_modes = Vec::with_capacity(EQ106_RADIAL_BINS * EQ106_POLAR_BINS * 17);
+    for radial_index in 0..EQ106_RADIAL_BINS {
+        for polar_index in 0..EQ106_POLAR_BINS {
+            let ring_start = (radial_index * EQ106_POLAR_BINS + polar_index) * EQ106_AZIMUTH_BINS;
+            let ring_mass = bin_masses[ring_start..ring_start + EQ106_AZIMUTH_BINS]
+                .iter()
+                .sum::<f64>();
+            if ring_mass <= 0.0 {
+                continue;
+            }
+            let ring_z = bin_moments[ring_start..ring_start + EQ106_AZIMUTH_BINS]
+                .iter()
+                .map(|moment| moment.z)
+                .sum::<f64>()
+                / ring_mass;
+            let ring_radius = (bin_moments[ring_start..ring_start + EQ106_AZIMUTH_BINS]
+                .iter()
+                .map(|moment| moment.x.hypot(moment.y))
+                .sum::<f64>()
+                / ring_mass)
+                .max(1.0e-6);
+            for mode in 0..=16 {
+                let mut coefficient = [0.0_f64; 2];
+                for azimuth_index in 0..EQ106_AZIMUTH_BINS {
+                    let index = ring_start + azimuth_index;
+                    let mass = bin_masses[index];
+                    if mass <= 0.0 {
+                        continue;
+                    }
+                    let position = bin_moments[index] / mass;
+                    let phi = position.y.atan2(position.x);
+                    coefficient[0] += mass * (-(mode as f64) * phi).cos();
+                    coefficient[1] += mass * (-(mode as f64) * phi).sin();
+                }
+                fourier_modes.push([
+                    ring_radius as f32,
+                    ring_z as f32,
+                    coefficient[0] as f32,
+                    coefficient[1] as f32,
+                ]);
+            }
+        }
+    }
     commands.insert_resource(Eq106SourceData {
         sources,
+        fourier_modes,
         total_mass,
         radius,
         source_hash: hash_source_bytes(&radial.bytes),
@@ -815,6 +862,36 @@ mod tests {
         let sharp = evaluate_segment(&sharp, 0, 3, 400.0);
         assert!(sharp.maximum_curvature > gentle.maximum_curvature);
         assert!(sharp.epsilon_max > gentle.epsilon_max);
+    }
+
+    #[test]
+    fn thirty_two_bin_density_fourier_modes_reconstruct_without_alias_loss() {
+        let density = std::array::from_fn::<_, EQ106_AZIMUTH_BINS, _>(|index| {
+            let phi = std::f64::consts::TAU * index as f64 / EQ106_AZIMUTH_BINS as f64;
+            3.0 + 0.7 * (5.0 * phi).cos() - 0.2 * (9.0 * phi).sin()
+        });
+        let coefficients = std::array::from_fn::<_, 17, _>(|mode| {
+            density
+                .iter()
+                .enumerate()
+                .fold([0.0, 0.0], |mut sum, (index, value)| {
+                    let phi = std::f64::consts::TAU * index as f64 / EQ106_AZIMUTH_BINS as f64;
+                    sum[0] += value * (-(mode as f64) * phi).cos();
+                    sum[1] += value * (-(mode as f64) * phi).sin();
+                    sum
+                })
+        });
+        for (index, expected) in density.into_iter().enumerate() {
+            let phi = std::f64::consts::TAU * index as f64 / EQ106_AZIMUTH_BINS as f64;
+            let mut reconstructed = coefficients[0][0] + coefficients[16][0] * (16.0 * phi).cos();
+            for (mode, coefficient) in coefficients.iter().enumerate().take(16).skip(1) {
+                reconstructed += 2.0
+                    * (coefficient[0] * (mode as f64 * phi).cos()
+                        - coefficient[1] * (mode as f64 * phi).sin());
+            }
+            reconstructed /= EQ106_AZIMUTH_BINS as f64;
+            assert!((reconstructed - expected).abs() < 1.0e-12);
+        }
     }
 
     #[test]

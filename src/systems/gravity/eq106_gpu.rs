@@ -1,15 +1,15 @@
 //! GPU-resident Equation (106) engineering evaluator.
 //!
 //! Expensive half-line kernel assembly is performed only when the reference
-//! line changes. Real-time frames reuse the assembled 257-frequency buffer and
-//! dispatch a single lightweight Bromwich/translation pass every six render
-//! frames. The main WASM thread only polls the asynchronous readback.
+//! line changes. Real-time frames reuse the assembled 129-frequency buffer and
+//! dispatch a Bromwich/high-order Taylor translation pass each render frame.
+//! The main WASM thread only polls the asynchronous readback.
 //!
 //! The pass is deliberately documented as an engineering approximation to the
-//! derivation in `docs/mathtidy_EN.md`: it uses fixed quadrature over the
-//! point-mass source representation, an analytic Cartesian field correction,
-//! and a certified toroidal-harmonic cross-check. CPU Taylor/Padé certificates
-//! remain separate from this real-time WGSL evaluator.
+//! derivation in `docs/mathtidy.md`: it uses fixed quadrature over the
+//! mass-preserving source representation, an independently transformed density
+//! Fourier representation, and the complete planner-selected Eq. (118)
+//! directional Taylor jet. Runtime guards forbid leaving its convergence disk.
 
 use crate::components::*;
 use crate::systems::curved_arc::{
@@ -49,13 +49,16 @@ struct ExtractedEq106Input {
     velocity: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
     sources: Option<Vec<u8>>,
+    fourier_modes: Option<Vec<u8>>,
     operator_tensor: Option<Vec<u8>>,
     source_count: u32,
+    density_mode_count: u32,
     radius: f32,
     source_hash: u64,
     batch_count: u32,
     block_dt: f32,
     certified_line_limit: f32,
+    taylor_order: u32,
 }
 
 #[derive(Resource, Default)]
@@ -130,6 +133,7 @@ impl FromWorld for Eq106ComputePipeline {
             storage_rw_entry(4),
             storage_ro_entry(5),
             storage_rw_entry(6),
+            storage_ro_entry(7),
         ];
         let layout = BindGroupLayoutDescriptor::new("eq106_complex_bgl", &entries);
         let shader = world
@@ -382,6 +386,7 @@ fn extract_eq106_input(
     extracted.batch_count = simulation_acceleration.stable_steps() + 1;
     extracted.block_dt = fixed_time.delta_secs() * TIME_SCALE;
     extracted.source_count = source.sources.len() as u32;
+    extracted.density_mode_count = source.fourier_modes.len() as u32;
     extracted.radius = source.radius as f32;
     extracted.certified_line_limit = planner
         .active_segment
@@ -396,6 +401,7 @@ fn extract_eq106_input(
             segment.arc_length.max(1.0).min(curvature_limit) as f32
         })
         .unwrap_or(f32::INFINITY);
+    extracted.taylor_order = planner.taylor_order.clamp(1, 8);
     let source_hash = source.source_hash;
     if extracted.sources.is_none() || extracted.source_hash != source_hash {
         let mut bytes = Vec::with_capacity(source.sources.len() * 16);
@@ -410,6 +416,13 @@ fn extract_eq106_input(
             }
         }
         extracted.sources = Some(bytes);
+        let mut mode_bytes = Vec::with_capacity(source.fourier_modes.len() * 16);
+        for record in &source.fourier_modes {
+            for value in record {
+                mode_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        extracted.fourier_modes = Some(mode_bytes);
     }
     extracted.source_hash = source_hash;
     if extracted.operator_tensor.is_none() {
@@ -449,9 +462,10 @@ fn dispatch_eq106(
         buffers.0 = None;
     }
     if buffers.0.is_none() {
-        let (Some(source_bytes), Some(operator_bytes)) = (
+        let (Some(source_bytes), Some(operator_bytes), Some(mode_bytes)) = (
             extracted.sources.as_ref(),
             extracted.operator_tensor.as_ref(),
+            extracted.fourier_modes.as_ref(),
         ) else {
             return;
         };
@@ -479,6 +493,11 @@ fn dispatch_eq106(
         let operator_tensor = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_toroidal_operator_tensor"),
             contents: operator_bytes,
+            usage: BufferUsages::STORAGE,
+        });
+        let density_modes = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("eq106_density_fourier_modes"),
+            contents: mode_bytes,
             usage: BufferUsages::STORAGE,
         });
         let spectrum = render_device.create_buffer(&BufferDescriptor {
@@ -515,6 +534,7 @@ fn dispatch_eq106(
                 storage_rw_entry(4),
                 storage_ro_entry(5),
                 storage_rw_entry(6),
+                storage_ro_entry(7),
             ],
         );
         let bind_group = render_device.create_bind_group(
@@ -548,6 +568,10 @@ fn dispatch_eq106(
                 BindGroupEntry {
                     binding: 6,
                     resource: line_samples.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: density_modes.as_entire_binding(),
                 },
             ],
         );
@@ -632,6 +656,8 @@ fn dispatch_eq106(
         extracted.block_dt,
         extracted.batch_count,
         longitudinal_limit,
+        extracted.taylor_order,
+        extracted.density_mode_count,
     );
     render_queue.write_buffer(&inner.uniform, 0, &uniform);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
@@ -720,6 +746,8 @@ fn uniform_bytes(
     block_dt: f32,
     batch_count: u32,
     longitudinal_limit: f32,
+    taylor_order: u32,
+    density_mode_count: u32,
 ) -> [u8; 112] {
     let mut bytes = [0_u8; 112];
     for (offset, value) in [
@@ -742,9 +770,9 @@ fn uniform_bytes(
         (48, source_count),
         (52, HALF_COUNT),
         (56, QUADRATURE_COUNT),
-        (60, 0),
+        (60, taylor_order.clamp(1, 8)),
         (80, batch_count.clamp(1, MAX_BATCH_COUNT)),
-        (84, 0),
+        (84, density_mode_count),
         (88, 0),
         (92, 0),
     ] {

@@ -1,12 +1,13 @@
-//! MMFFT spherical-ring convolution with an explicit radix-2 FFT/IFFT.
+//! Two-level three-dimensional MMFFT gravity operator.
 //!
-//! The irregular radial cells are conservatively deposited into azimuthal
-//! rings. Each GPU workgroup transforms one 64-sample mass ring and four
-//! Newton-kernel channels, multiplies them in frequency space, and inverse
-//! transforms the convolution. The hierarchy is therefore an actual FFT
-//! operator rather than a direct quadrature hidden behind the MMFFT label.
+//! Each level conservatively deposits the irregular density cells on a
+//! Cartesian mesh, zero pads it to twice the physical extent, performs a real
+//! 3-D FFT convolution with the Newton kernel, and applies the matching IFFT.
+//! The runtime GPU pass only interpolates the finest containing level; no
+//! direct quadrature is hidden behind the MMFFT name.
 
 use crate::components::*;
+use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
@@ -21,13 +22,8 @@ use bevy::render::{
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-#[cfg(test)]
-const WORKGROUP_SIZE: u32 = 64;
-const COMPRESSED_RECORD_BYTES: usize = 16;
-const AZIMUTH_BINS: usize = 64;
-const POLAR_BINS: usize = 16;
-const RADIAL_LAYERS: usize = 4;
-const RING_COUNT: usize = POLAR_BINS * RADIAL_LAYERS;
+const LEVEL_GRID_SIZES: [usize; 2] = [64, 16];
+const LEVEL_HALF_EXTENTS: [f64; 2] = [4096.0, 16384.0];
 
 #[derive(Resource, Default)]
 struct ExtractedMmfftInput {
@@ -35,9 +31,10 @@ struct ExtractedMmfftInput {
     probe: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
     source_bytes: Option<Vec<u8>>,
-    record_count: u32,
-    ring_count: u32,
-    azimuth_bins: u32,
+    grid_sizes: [u32; 2],
+    level_count: u32,
+    half_extents: [f32; 2],
+    total_mass: f32,
 }
 
 #[derive(Resource, Default)]
@@ -48,8 +45,6 @@ struct MmfftGpuBuffersInner {
     output: Buffer,
     staging: Buffer,
     bind_group: BindGroup,
-    record_count: u32,
-    workgroup_count: u32,
     output_size: u64,
     last_submitted: Option<(u64, u64)>,
 }
@@ -117,16 +112,213 @@ impl FromWorld for MmfftComputePipeline {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct RingBin {
-    mass: f64,
-    radial_moment: f64,
-    cosine_moment: f64,
+#[derive(Clone, Copy, Debug, Default)]
+struct Complex64 {
+    re: f64,
+    im: f64,
 }
 
-/// Deposits the mass-normalized radial records onto periodic azimuth rings.
-/// Every deposited bin stores mass plus the ring's shared mass-weighted radius
-/// and polar cosine; consequently the FFT convolution is circulant in azimuth.
+impl Complex64 {
+    fn polar(radius: f64, angle: f64) -> Self {
+        Self {
+            re: radius * angle.cos(),
+            im: radius * angle.sin(),
+        }
+    }
+}
+
+impl std::ops::Add for Complex64 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            re: self.re + rhs.re,
+            im: self.im + rhs.im,
+        }
+    }
+}
+impl std::ops::Sub for Complex64 {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            re: self.re - rhs.re,
+            im: self.im - rhs.im,
+        }
+    }
+}
+impl std::ops::Mul for Complex64 {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        Self {
+            re: self.re * rhs.re - self.im * rhs.im,
+            im: self.re * rhs.im + self.im * rhs.re,
+        }
+    }
+}
+
+fn fft_1d(values: &mut [Complex64], inverse: bool) {
+    let count = values.len();
+    debug_assert!(count.is_power_of_two());
+    let mut j = 0usize;
+    for i in 1..count {
+        let mut bit = count >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            values.swap(i, j);
+        }
+    }
+    let mut size = 2;
+    while size <= count {
+        let angle = if inverse { 1.0 } else { -1.0 } * std::f64::consts::TAU / size as f64;
+        let root = Complex64::polar(1.0, angle);
+        for block in (0..count).step_by(size) {
+            let mut twiddle = Complex64 { re: 1.0, im: 0.0 };
+            for offset in 0..size / 2 {
+                let even = values[block + offset];
+                let odd = values[block + offset + size / 2] * twiddle;
+                values[block + offset] = even + odd;
+                values[block + offset + size / 2] = even - odd;
+                twiddle = twiddle * root;
+            }
+        }
+        size <<= 1;
+    }
+    if inverse {
+        for value in values {
+            value.re /= count as f64;
+            value.im /= count as f64;
+        }
+    }
+}
+
+fn fft_3d(values: &mut [Complex64], n: usize, inverse: bool) {
+    let mut line = vec![Complex64::default(); n];
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                line[x] = values[(z * n + y) * n + x];
+            }
+            fft_1d(&mut line, inverse);
+            for x in 0..n {
+                values[(z * n + y) * n + x] = line[x];
+            }
+        }
+    }
+    for z in 0..n {
+        for x in 0..n {
+            for y in 0..n {
+                line[y] = values[(z * n + y) * n + x];
+            }
+            fft_1d(&mut line, inverse);
+            for y in 0..n {
+                values[(z * n + y) * n + x] = line[y];
+            }
+        }
+    }
+    for y in 0..n {
+        for x in 0..n {
+            for z in 0..n {
+                line[z] = values[(z * n + y) * n + x];
+            }
+            fft_1d(&mut line, inverse);
+            for z in 0..n {
+                values[(z * n + y) * n + x] = line[z];
+            }
+        }
+    }
+}
+
+fn grid_index(x: usize, y: usize, z: usize, side: usize) -> usize {
+    (z * side + y) * side + x
+}
+
+/// Full zero-padded 3-D FFT/IFFT convolution for one hierarchy level.
+fn build_level(records: &[(DVec3, f64)], half_extent: f64, n: usize) -> Vec<[f32; 4]> {
+    let p = 2 * n;
+    let spacing = 2.0 * half_extent / n as f64;
+    let mut density = vec![Complex64::default(); p * p * p];
+    // Cloud-in-cell deposition is conservative and avoids nearest-cell phase
+    // jumps when the irregular radial quadrature is mapped to the FFT mesh.
+    for &(position, mass) in records {
+        let grid = (position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
+        let base = grid.floor();
+        let fraction = grid - base;
+        for dz in 0..=1 {
+            for dy in 0..=1 {
+                for dx in 0..=1 {
+                    let ix = base.x as isize + dx;
+                    let iy = base.y as isize + dy;
+                    let iz = base.z as isize + dz;
+                    if ix < 0
+                        || iy < 0
+                        || iz < 0
+                        || ix >= n as isize
+                        || iy >= n as isize
+                        || iz >= n as isize
+                    {
+                        continue;
+                    }
+                    let weight = if dx == 0 {
+                        1.0 - fraction.x
+                    } else {
+                        fraction.x
+                    } * if dy == 0 {
+                        1.0 - fraction.y
+                    } else {
+                        fraction.y
+                    } * if dz == 0 {
+                        1.0 - fraction.z
+                    } else {
+                        fraction.z
+                    };
+                    density[grid_index(ix as usize, iy as usize, iz as usize, p)].re +=
+                        mass * weight;
+                }
+            }
+        }
+    }
+    fft_3d(&mut density, p, false);
+    let mass_spectrum = density;
+    let mut field = vec![[0.0_f32; 4]; n * n * n];
+    // Convolve the Newton potential. The runtime differentiates the same
+    // trilinear interpolant analytically, so acceleration and potential remain
+    // a discrete conservative pair without three redundant inverse FFTs.
+    let mut kernel = vec![Complex64::default(); p * p * p];
+    for z in 0..p {
+        for y in 0..p {
+            for x in 0..p {
+                let signed = |index: usize| {
+                    if index < n {
+                        index as isize
+                    } else {
+                        index as isize - p as isize
+                    }
+                };
+                let displacement =
+                    DVec3::new(signed(x) as f64, signed(y) as f64, signed(z) as f64) * spacing;
+                kernel[grid_index(x, y, z, p)].re = 1.0 / displacement.length().max(0.5 * spacing);
+            }
+        }
+    }
+    fft_3d(&mut kernel, p, false);
+    for (value, mass) in kernel.iter_mut().zip(&mass_spectrum) {
+        *value = *value * *mass;
+    }
+    fft_3d(&mut kernel, p, true);
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                field[grid_index(x, y, z, n)][3] =
+                    (G as f64 * kernel[grid_index(x, y, z, p)].re) as f32;
+            }
+        }
+    }
+    field
+}
+
 pub fn build_mmfft_compressed_source_system(
     mut commands: Commands,
     radial: Option<Res<RadialGravitySource>>,
@@ -141,9 +333,15 @@ pub fn build_mmfft_compressed_source_system(
         return;
     }
 
-    let mut bins = vec![RingBin::default(); RING_COUNT * AZIMUTH_BINS];
-    for (record_index, chunk) in radial.bytes.chunks_exact(32).enumerate() {
-        let direction = Vec3::new(read_f32(chunk, 0), read_f32(chunk, 4), read_f32(chunk, 8));
+    let mut records = Vec::with_capacity(radial.count as usize);
+    let mut total_mass = 0.0_f64;
+    for chunk in radial.bytes.chunks_exact(32) {
+        let direction = DVec3::new(
+            read_f32(chunk, 0) as f64,
+            read_f32(chunk, 4) as f64,
+            read_f32(chunk, 8) as f64,
+        )
+        .normalize_or_zero();
         let solid_angle = read_f32(chunk, 12).max(0.0);
         let inner = read_f32(chunk, 16).max(0.0);
         let outer = read_f32(chunk, 20).max(inner);
@@ -156,54 +354,30 @@ pub fn build_mmfft_compressed_source_system(
                 / 3.0;
         let radius = 0.75 * ((outer as f64).powi(4) - (inner as f64).powi(4))
             / ((outer as f64).powi(3) - (inner as f64).powi(3)).max(f64::MIN_POSITIVE);
-        let direction = direction.normalize_or_zero();
-        let azimuth = direction
-            .y
-            .atan2(direction.x)
-            .rem_euclid(std::f32::consts::TAU);
-        let azimuth_bin = ((azimuth / std::f32::consts::TAU * AZIMUTH_BINS as f32).floor()
-            as usize)
-            .min(AZIMUTH_BINS - 1);
-        let polar_bin =
-            (((direction.z + 1.0) * 0.5 * POLAR_BINS as f32).floor() as usize).min(POLAR_BINS - 1);
-        let layer = record_index % RADIAL_LAYERS;
-        let bin = &mut bins[(layer * POLAR_BINS + polar_bin) * AZIMUTH_BINS + azimuth_bin];
-        bin.mass += mass;
-        bin.radial_moment += mass * radius;
-        bin.cosine_moment += mass * direction.z as f64;
+        records.push((direction * radius, mass));
+        total_mass += mass;
     }
-
-    let mut bytes = Vec::with_capacity(bins.len() * COMPRESSED_RECORD_BYTES);
-    for ring in 0..RING_COUNT {
-        let ring_slice = &bins[ring * AZIMUTH_BINS..(ring + 1) * AZIMUTH_BINS];
-        let ring_mass = ring_slice.iter().map(|bin| bin.mass).sum::<f64>();
-        let radius = ring_slice.iter().map(|bin| bin.radial_moment).sum::<f64>()
-            / ring_mass.max(f64::MIN_POSITIVE);
-        let cosine = ring_slice.iter().map(|bin| bin.cosine_moment).sum::<f64>()
-            / ring_mass.max(f64::MIN_POSITIVE);
-        for bin in ring_slice {
-            for value in [
-                bin.mass as f32,
-                radius as f32,
-                cosine.clamp(-1.0, 1.0) as f32,
-                0.0,
-            ] {
+    let mut bytes =
+        Vec::with_capacity(LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() * 16);
+    for (grid_size, half_extent) in LEVEL_GRID_SIZES.into_iter().zip(LEVEL_HALF_EXTENTS) {
+        for sample in build_level(&records, half_extent, grid_size) {
+            for value in sample {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
     }
     info!(
-        "[mmfft] {} radial records -> {} periodic rings x {} bins ({} bytes, radix-2 FFT/IFFT)",
+        "[mmfft] {} radial records -> nested {:?} grids (zero-padded 3D FFT/IFFT, {} bytes)",
         radial.count,
-        RING_COUNT,
-        AZIMUTH_BINS,
+        LEVEL_GRID_SIZES,
         bytes.len()
     );
     commands.insert_resource(MmfftCompressedSource {
         bytes,
-        count: (RING_COUNT * AZIMUTH_BINS) as u32,
-        ring_count: RING_COUNT as u32,
-        azimuth_bins: AZIMUTH_BINS as u32,
+        grid_sizes: LEVEL_GRID_SIZES.map(|value| value as u32),
+        level_count: LEVEL_HALF_EXTENTS.len() as u32,
+        half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
+        total_mass: total_mass as f32,
     });
 }
 
@@ -272,9 +446,10 @@ fn extract_mmfft_input_system(
         probe_position: cassini.translation,
         probe_velocity: velocity.0,
     });
-    extracted.record_count = source.count;
-    extracted.ring_count = source.ring_count;
-    extracted.azimuth_bins = source.azimuth_bins;
+    extracted.grid_sizes = source.grid_sizes;
+    extracted.level_count = source.level_count;
+    extracted.half_extents = source.half_extents;
+    extracted.total_mass = source.total_mass;
     if extracted.source_bytes.is_none() {
         extracted.source_bytes = Some(source.bytes.clone());
     }
@@ -295,15 +470,14 @@ fn dispatch_mmfft_system(
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
         return;
     };
-    if !extracted.enabled || extracted.record_count == 0 {
+    if !extracted.enabled || extracted.grid_sizes[0] == 0 || extracted.level_count == 0 {
         return;
     }
     if buffers.0.is_none() {
         let Some(source_bytes) = extracted.source_bytes.as_ref() else {
             return;
         };
-        let workgroup_count = extracted.ring_count;
-        let output_size = workgroup_count as u64 * 16;
+        let output_size = 16;
         let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("mmfft_compressed_uniform"),
             size: 48,
@@ -354,8 +528,6 @@ fn dispatch_mmfft_system(
             output,
             staging,
             bind_group,
-            record_count: extracted.record_count,
-            workgroup_count,
             output_size,
             last_submitted: None,
         });
@@ -379,9 +551,10 @@ fn dispatch_mmfft_system(
     inner.last_submitted = Some(key);
     let uniform = mmfft_uniform_bytes(
         extracted.probe,
-        inner.record_count,
-        extracted.ring_count,
-        extracted.azimuth_bins,
+        extracted.grid_sizes,
+        extracted.level_count,
+        extracted.half_extents,
+        extracted.total_mass,
     );
     render_queue.write_buffer(&inner.uniform, 0, &uniform);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
@@ -394,7 +567,7 @@ fn dispatch_mmfft_system(
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &inner.bind_group, &[]);
-        pass.dispatch_workgroups(inner.workgroup_count, 1, 1);
+        pass.dispatch_workgroups(1, 1, 1);
     }
     encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);
     render_queue.submit([encoder.finish()]);
@@ -425,20 +598,28 @@ fn dispatch_mmfft_system(
 
 fn mmfft_uniform_bytes(
     probe: Vec3,
-    record_count: u32,
-    ring_count: u32,
-    azimuth_bins: u32,
+    grid_sizes: [u32; 2],
+    level_count: u32,
+    half_extents: [f32; 2],
+    total_mass: f32,
 ) -> [u8; 48] {
     let mut bytes = [0_u8; 48];
     for (offset, value) in [(0, probe.x), (4, probe.y), (8, probe.z), (12, G)] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     for (offset, value) in [
-        (16, record_count.to_le_bytes()),
-        (20, ring_count.to_le_bytes()),
-        (24, azimuth_bins.to_le_bytes()),
+        (16, grid_sizes[0].to_le_bytes()),
+        (20, grid_sizes[1].to_le_bytes()),
+        (24, level_count.to_le_bytes()),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value);
+    }
+    for (offset, value) in [
+        (32, half_extents[0]),
+        (36, half_extents[1]),
+        (40, total_mass),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     bytes
 }
@@ -485,25 +666,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compressed_record_halves_source_storage() {
-        let source = vec![0_u8; 32 * 128];
-        let compressed = source.len() / 2;
-        assert_eq!(compressed, 16 * 128);
-        assert_eq!(COMPRESSED_RECORD_BYTES, 16);
+    fn fft_ifft_round_trip() {
+        let padded_size = 2 * LEVEL_GRID_SIZES[1];
+        let mut values = (0..padded_size)
+            .map(|index| Complex64 {
+                re: index as f64,
+                im: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let expected = values.clone();
+        fft_1d(&mut values, false);
+        fft_1d(&mut values, true);
+        for (actual, expected) in values.iter().zip(expected) {
+            assert!((actual.re - expected.re).abs() < 1.0e-9);
+        }
     }
 
     #[test]
-    fn radix_two_ring_layout_is_exactly_one_workgroup() {
-        assert_eq!(AZIMUTH_BINS as u32, WORKGROUP_SIZE);
-        assert!(AZIMUTH_BINS.is_power_of_two());
+    fn zero_padding_prevents_circular_aliasing() {
+        for grid_size in LEVEL_GRID_SIZES {
+            assert!((2 * grid_size).is_power_of_two());
+        }
     }
 
     #[test]
     fn runtime_record_size_matches_the_packed_shader_layout() {
         let config = MmfftCompressedConfig::default();
-        assert_eq!(
-            config.compressed_record_bytes as usize,
-            COMPRESSED_RECORD_BYTES
+        assert_eq!(config.compressed_record_bytes, 16);
+    }
+
+    #[test]
+    fn three_dimensional_convolution_matches_exterior_direct_field() {
+        let sources = [
+            (DVec3::new(-80.0, 20.0, 35.0), 2.0e11),
+            (DVec3::new(60.0, -45.0, -10.0), 3.0e11),
+            (DVec3::new(10.0, 70.0, -55.0), 5.0e11),
+        ];
+        let grid_size = LEVEL_GRID_SIZES[0];
+        let grid = build_level(&sources, LEVEL_HALF_EXTENTS[0], grid_size);
+        let observer = DVec3::new(700.0, 100.0, -100.0);
+        let spacing = 2.0 * LEVEL_HALF_EXTENTS[0] / grid_size as f64;
+        let coordinate =
+            (observer + DVec3::splat(LEVEL_HALF_EXTENTS[0])) / spacing - DVec3::splat(0.5);
+        let center = coordinate.floor().as_uvec3();
+        let fraction = coordinate - center.as_dvec3();
+        let base = center - UVec3::ONE;
+        let weights = |t: f64| {
+            let t2 = t * t;
+            let t3 = t2 * t;
+            [
+                -0.5 * t + t2 - 0.5 * t3,
+                1.0 - 2.5 * t2 + 1.5 * t3,
+                0.5 * t + 2.0 * t2 - 1.5 * t3,
+                -0.5 * t2 + 0.5 * t3,
+            ]
+        };
+        let derivatives = |t: f64| {
+            let t2 = t * t;
+            [
+                -0.5 + 2.0 * t - 1.5 * t2,
+                -5.0 * t + 4.5 * t2,
+                0.5 + 4.0 * t - 4.5 * t2,
+                -t + 1.5 * t2,
+            ]
+        };
+        let wx = weights(fraction.x);
+        let wy = weights(fraction.y);
+        let wz = weights(fraction.z);
+        let dxw = derivatives(fraction.x);
+        let dyw = derivatives(fraction.y);
+        let dzw = derivatives(fraction.z);
+        let mut interpolated_potential = 0.0;
+        let mut interpolated_acceleration = DVec3::ZERO;
+        for dz in 0..4 {
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    let corner_potential = grid[grid_index(
+                        base.x as usize + dx,
+                        base.y as usize + dy,
+                        base.z as usize + dz,
+                        grid_size,
+                    )][3] as f64;
+                    interpolated_potential += wx[dx] * wy[dy] * wz[dz] * corner_potential;
+                    interpolated_acceleration += corner_potential / spacing
+                        * DVec3::new(
+                            dxw[dx] * wy[dy] * wz[dz],
+                            dyw[dy] * wx[dx] * wz[dz],
+                            dzw[dz] * wx[dx] * wy[dy],
+                        );
+                }
+            }
+        }
+        let (direct_acceleration, direct_potential) = sources.iter().fold(
+            (DVec3::ZERO, 0.0),
+            |(acceleration, potential), &(position, mass)| {
+                let displacement = position - observer;
+                let distance = displacement.length();
+                (
+                    acceleration + G as f64 * mass * displacement / distance.powi(3),
+                    potential + G as f64 * mass / distance,
+                )
+            },
+        );
+        let acceleration_error = (interpolated_acceleration - direct_acceleration).length()
+            / direct_acceleration.length();
+        let potential_error = (interpolated_potential - direct_potential).abs() / direct_potential;
+        assert!(
+            acceleration_error < 0.04,
+            "acceleration error {acceleration_error:.3e}"
+        );
+        assert!(
+            potential_error < 0.02,
+            "potential error {potential_error:.3e}"
         );
     }
 }

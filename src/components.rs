@@ -397,7 +397,10 @@ pub struct FmmGravityHistory(pub GravitySampleHistory);
 #[derive(Resource)]
 pub struct FmmSource {
     pub bytes: Vec<u8>,
+    /// Leaf particles packed as `(x, y, z, mass)` for the exact P2P near field.
+    pub particle_bytes: Vec<u8>,
     pub node_count: u32,
+    pub particle_count: u32,
     pub maximum_level: u32,
 }
 
@@ -461,9 +464,13 @@ pub struct MmfftCompressedHistory(pub GravitySampleHistory);
 #[derive(Resource)]
 pub struct MmfftCompressedSource {
     pub bytes: Vec<u8>,
-    pub count: u32,
-    pub ring_count: u32,
-    pub azimuth_bins: u32,
+    /// Number of Cartesian samples on each side of one physical grid.
+    pub grid_sizes: [u32; 2],
+    /// Number of nested grids, ordered finest to coarsest.
+    pub level_count: u32,
+    /// Half-widths of the nested physical grids (metres).
+    pub half_extents: [f32; 2],
+    pub total_mass: f32,
 }
 
 #[derive(Resource, Clone)]

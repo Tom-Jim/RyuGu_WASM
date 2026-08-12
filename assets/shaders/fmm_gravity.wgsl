@@ -11,7 +11,7 @@ struct FmmParams {
     node_count: u32,
     maximum_level: u32,
     theta: f32,
-    _padding0: u32,
+    particle_count: u32,
 };
 
 struct FmmNode {
@@ -25,6 +25,7 @@ struct FmmNode {
 @group(0) @binding(0) var<uniform> params: FmmParams;
 @group(0) @binding(1) var<storage, read> nodes: array<FmmNode>;
 @group(0) @binding(2) var<storage, read_write> output_acc: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> particles: array<vec4<f32>>;
 
 var<workgroup> shared_acc: array<vec4<f32>, 64>;
 
@@ -90,27 +91,42 @@ fn direct_multipole(node: FmmNode, observer: vec3<f32>) -> vec4<f32> {
 
 fn m2l_then_l2l(node: FmmNode) -> vec4<f32> {
     let center = target_box(node.metadata.y).xyz;
-    let rvec = node.com_mass.xyz - center;
-    let r2 = max(dot(rvec, rvec), 1.0e-8);
-    let inv_r = inverseSqrt(r2);
-    let inv_r3 = inv_r / r2;
-    let inv_r5 = inv_r3 / r2;
-    let mass = node.com_mass.w;
-    let local_potential = mass * inv_r;
-    let local_gradient = mass * rvec * inv_r3;
-    // Hessian of +m/|source-target| with respect to target coordinates.
-    let h0 = mass * (3.0 * rvec * rvec.x * inv_r5 - vec3<f32>(inv_r3, 0.0, 0.0));
-    let h1 = mass * (3.0 * rvec * rvec.y * inv_r5 - vec3<f32>(0.0, inv_r3, 0.0));
-    let h2 = mass * (3.0 * rvec * rvec.z * inv_r5 - vec3<f32>(0.0, 0.0, inv_r3));
+    // M2L: translate both monopole and quadrupole source moments into local
+    // potential, gradient, and Hessian coefficients at the target-box center.
+    // Centered differentiation is applied to the analytic source multipole,
+    // never to particles or to the final target value.
+    let local = direct_multipole(node, center);
+    let derivative_step = max(0.01, 0.015625 * node.center_half.w);
+    let ex = vec3<f32>(derivative_step, 0.0, 0.0);
+    let ey = vec3<f32>(0.0, derivative_step, 0.0);
+    let ez = vec3<f32>(0.0, 0.0, derivative_step);
+    let h0 = (direct_multipole(node, center + ex).xyz - direct_multipole(node, center - ex).xyz)
+        / (2.0 * derivative_step);
+    let h1 = (direct_multipole(node, center + ey).xyz - direct_multipole(node, center - ey).xyz)
+        / (2.0 * derivative_step);
+    let h2 = (direct_multipole(node, center + ez).xyz - direct_multipole(node, center - ez).xyz)
+        / (2.0 * derivative_step);
     let delta = params.probe_pos - center;
-    let translated_gradient = local_gradient + vec3<f32>(dot(h0, delta), dot(h1, delta), dot(h2, delta));
-    let translated_potential = local_potential + dot(local_gradient, delta)
-        + 0.5 * dot(delta, vec3<f32>(dot(h0, delta), dot(h1, delta), dot(h2, delta)));
-    // The traceless quadrupole is a higher-order M2L correction. Evaluating it
-    // at the target point preserves the order-two local truncation error.
-    let monopole_at_probe = direct_multipole(FmmNode(node.center_half, node.com_mass, vec4<f32>(0.0), vec4<f32>(0.0), node.metadata), params.probe_pos);
-    let full_at_probe = direct_multipole(node, params.probe_pos);
-    return vec4<f32>(translated_gradient, translated_potential) + (full_at_probe - monopole_at_probe);
+    // L2L: shift the local coefficients from the target box to the probe.
+    let hessian_delta = h0 * delta.x + h1 * delta.y + h2 * delta.z;
+    let translated_gradient = local.xyz + hessian_delta;
+    let translated_potential = local.w + dot(local.xyz, delta)
+        + 0.5 * dot(delta, hessian_delta);
+    return vec4<f32>(translated_gradient, translated_potential);
+}
+
+fn p2p_leaf(node: FmmNode) -> vec4<f32> {
+    var value = vec4<f32>(0.0);
+    let start = node.metadata.z;
+    let end = min(start + node.metadata.w, params.particle_count);
+    for (var index = start; index < end; index += 1u) {
+        let particle = particles[index];
+        let displacement = particle.xyz - params.probe_pos;
+        let distance2 = max(dot(displacement, displacement), 1.0e-8);
+        let distance = sqrt(distance2);
+        value += particle.w * vec4<f32>(displacement / (distance2 * distance), 1.0 / distance);
+    }
+    return value;
 }
 
 fn node_field(index: u32) -> vec4<f32> {
@@ -123,19 +139,16 @@ fn node_field(index: u32) -> vec4<f32> {
     if !accepted(index) && level < params.maximum_level {
         return vec4<f32>(0.0);
     }
-    let direct = direct_multipole(node, params.probe_pos);
-    var value = direct;
+    var value = direct_multipole(node, params.probe_pos);
     if accepted(index) {
-        let local = m2l_then_l2l(node);
-        let acceleration_error = length(local.xyz - direct.xyz)
-            / max(length(direct.xyz), 1.0e-20);
-        let potential_error = abs(local.w - direct.w) / max(abs(direct.w), 1.0e-20);
-        // A finite-order local expansion is used only after an independent
-        // node-multipole certificate. This also removes target-cell boundary
-        // jumps from the physical trajectory.
-        if max(acceleration_error, potential_error) <= 0.005 {
-            value = local;
-        }
+        // Standard far-field path: P2M/M2M -> M2L -> L2L. The geometric
+        // acceptance test enforces the expansion disk; no direct multipole
+        // substitution is used after an interaction has been accepted.
+        value = m2l_then_l2l(node);
+    } else if level == params.maximum_level {
+        // Standard near-field path: exact particle-to-particle accumulation
+        // over the non-separated leaf interaction list.
+        value = p2p_leaf(node);
     }
     return params.g_const * value;
 }

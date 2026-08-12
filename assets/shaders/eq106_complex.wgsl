@@ -16,11 +16,13 @@ struct Eq106Params {
     source_count: u32,
     half_count: u32,
     quadrature_count: u32,
-    _padding0: u32,
+    taylor_order: u32,
     body_velocity: vec3<f32>,
     block_dt: f32,
     batch_count: u32,
-    _padding1: vec3<f32>,
+    density_mode_count: u32,
+    _padding1: vec2<u32>,
+    line_limit: f32,
 };
 
 struct BlockFrame {
@@ -46,6 +48,11 @@ struct PointFieldDifferential {
     _padding_z: f32,
 };
 
+struct TaylorField {
+    field: vec4<f32>,
+    last_term: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> params: Eq106Params;
 @group(0) @binding(1) var<storage, read> sources: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> quadrature: array<vec2<f32>>;
@@ -53,6 +60,7 @@ struct PointFieldDifferential {
 @group(0) @binding(4) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> toroidal_tensor: array<f32>;
 @group(0) @binding(6) var<storage, read_write> line_samples: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> density_modes: array<vec4<f32>>;
 
 const TOROIDAL_X_MIN: f32 = -10.0;
 const TOROIDAL_X_MAX: f32 = 8.0;
@@ -120,9 +128,9 @@ fn toroidal_q(mode: u32, chi: f32) -> f32 {
     return t * b_k1 - b_k2 + toroidal_tensor[base];
 }
 
-// Fourier-Chebyshev potential cross-check for Eq. (79)--(85). It is an
-// independent GPU evaluation of the same discrete source set; the live force
-// still uses the certified complex-frequency spectrum below.
+// Eq. (79)--(83): evaluate the Newton kernel against the independently
+// precomputed azimuthal density modes. Each ring contributes M_m(r,z), not a
+// repeated point-source cosine identity.
 fn toroidal_potential(observer: vec3<f32>) -> vec2<f32> {
     let rho = length(observer.xy);
     if rho <= 1.0e-5 {
@@ -131,34 +139,28 @@ fn toroidal_potential(observer: vec3<f32>) -> vec2<f32> {
     var potential = 0.0;
     var valid_mass = 0.0;
     var total_mass = 0.0;
-    for (var source_index = 0u; source_index < params.source_count; source_index += 1u) {
-        let source = sources[source_index];
-        let source_rho = length(source.xy);
-        let mass = abs(source.w);
-        total_mass += mass;
-        if source_rho <= 1.0e-5 || mass <= 0.0 {
-            continue;
-        }
-        let dz = observer.z - source.z;
+    let observer_phi = atan2(observer.y, observer.x);
+    for (var record_index = 0u; record_index < params.density_mode_count; record_index += 1u) {
+        let record = density_modes[record_index];
+        let mode = record_index % TOROIDAL_MODE_COUNT;
+        let source_rho = record.x;
+        if mode == 0u { total_mass += abs(record.z); }
+        if source_rho <= 1.0e-5 { continue; }
+        let dz = observer.z - record.y;
         let chi = (rho * rho + source_rho * source_rho + dz * dz)
             / (2.0 * rho * source_rho);
         let x = log(max(chi - 1.0, 1.0e-20));
         if x < TOROIDAL_X_MIN || x > TOROIDAL_X_MAX {
             continue;
         }
-        let cosine = clamp(dot(observer.xy, source.xy) / (rho * source_rho), -1.0, 1.0);
-        var cosine_previous = 1.0;
-        var cosine_mode = cosine;
-        var harmonic_sum = toroidal_q(0u, chi);
-        for (var mode = 1u; mode < TOROIDAL_MODE_COUNT; mode += 1u) {
-            harmonic_sum += 2.0 * toroidal_q(mode, chi) * cosine_mode;
-            let next_cosine = 2.0 * cosine * cosine_mode - cosine_previous;
-            cosine_previous = cosine_mode;
-            cosine_mode = next_cosine;
-        }
-        potential += params.g_const * source.w * harmonic_sum
+        let phase = f32(mode) * observer_phi;
+        let rotated_real = record.z * cos(phase) - record.w * sin(phase);
+        // Mode 16 is the real Nyquist mode of the 32-bin density transform
+        // and must not be counted twice.
+        let multiplicity = select(2.0, 1.0, mode == 0u || mode == 16u);
+        potential += params.g_const * multiplicity * toroidal_q(mode, chi) * rotated_real
             / (3.141592653589793 * sqrt(rho * source_rho));
-        valid_mass += mass;
+        if mode == 0u { valid_mass += abs(record.z); }
     }
     return vec2<f32>(potential, valid_mass / max(total_mass, 1.0e-12));
 }
@@ -253,6 +255,51 @@ fn point_field_differential(observer: vec3<f32>) -> PointFieldDifferential {
             - vec3<f32>(0.0, inverse_r3_scale, 0.0);
         result.jacobian_z += three_inverse_r5_scale * displacement.z * displacement
             - vec3<f32>(0.0, 0.0, inverse_r3_scale);
+    }
+    return result;
+}
+
+// Complete directional Taylor jet for Eq. (118). For every source this
+// expands (r0-t*d)|r0-t*d|^-3 and |r0-t*d|^-1 through the planner-selected
+// order. The recurrence is the coefficient identity for
+// (x0+x1*t+x2*t^2)^alpha and is evaluated at t=1.
+fn curved_taylor_field(center: vec3<f32>, displacement: vec3<f32>, order_limit: u32) -> TaylorField {
+    var result: TaylorField;
+    result.field = vec4<f32>(0.0);
+    result.last_term = vec4<f32>(0.0);
+    let maximum_order = min(order_limit, 8u);
+    for (var source_index = 0u; source_index < params.source_count; source_index += 1u) {
+        let source = sources[source_index];
+        let r0 = source.xyz - center;
+        let x0 = max(dot(r0, r0), 1.0e-8);
+        let x1 = -2.0 * dot(r0, displacement);
+        let x2 = dot(displacement, displacement);
+        var inverse_r: array<f32, 9>;
+        var inverse_r3: array<f32, 9>;
+        inverse_r[0] = inverseSqrt(x0);
+        inverse_r3[0] = inverse_r[0] / x0;
+        for (var order = 1u; order <= maximum_order; order += 1u) {
+            let n = f32(order);
+            var numerator_p = ((-0.5 + 1.0) - n) * x1 * inverse_r[order - 1u];
+            var numerator_a = ((-1.5 + 1.0) - n) * x1 * inverse_r3[order - 1u];
+            if order >= 2u {
+                numerator_p += ((-0.5 + 1.0) * 2.0 - n) * x2 * inverse_r[order - 2u];
+                numerator_a += ((-1.5 + 1.0) * 2.0 - n) * x2 * inverse_r3[order - 2u];
+            }
+            inverse_r[order] = numerator_p / (n * x0);
+            inverse_r3[order] = numerator_a / (n * x0);
+        }
+        let scale = params.g_const * source.w;
+        for (var order = 0u; order <= maximum_order; order += 1u) {
+            var previous = 0.0;
+            if order > 0u { previous = inverse_r3[order - 1u]; }
+            let term = scale * vec4<f32>(
+                r0 * inverse_r3[order] - displacement * previous,
+                inverse_r[order],
+            );
+            result.field += term;
+            if order == maximum_order { result.last_term += term; }
+        }
     }
     return result;
 }
@@ -410,6 +457,7 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
         line_origin + h_plus * line_direction,
     );
     let actual = point_field_differential(probe_pos);
+    let curved = curved_taylor_field(reference_point, probe_pos - reference_point, params.taylor_order);
     let spectral_longitudinal_acceleration =
         dot(spectral_acceleration, line_direction);
     let origin_longitudinal_defect = dot(
@@ -433,7 +481,7 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // and its derivative to zero in an overlap region before Rust rebuilds the
     // line. Applying the product rule keeps acceleration = grad(U), so segment
     // transitions do not inject Jacobi energy or Eq.(157) residual.
-    let line_limit = max(params._padding1.x, 1.0);
+    let line_limit = max(params.line_limit, 1.0);
     // Leave a broad zero-correction overlap before Rust expires the line at
     // 0.85L. This covers several 1x authoritative frames and the full tail of
     // an 8x predicted batch, so no consumer ever crosses directly from a
@@ -452,15 +500,16 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let tapered_correction_acceleration =
         taper * correction_acceleration + taper_derivative * correction_potential;
     let corrected_acceleration =
-        actual.field.xyz + tapered_correction_acceleration * line_direction;
-    let corrected_potential = actual.field.w
+        curved.field.xyz + tapered_correction_acceleration * line_direction;
+    let corrected_potential = curved.field.w
         + taper * correction_potential;
 
     let residual_scale = max(length(actual.field.xyz), 1.0e-12);
     // Only the longitudinal Eq.106 defect is applied to the translated field;
     // certify that actual correction rather than unused transverse spectrum
     // components.
-    let relative_residual = abs(tapered_correction_acceleration) / residual_scale;
+    let taylor_residual = length(curved.field.xyz - actual.field.xyz) / residual_scale;
+    let relative_residual = max(abs(tapered_correction_acceleration) / residual_scale, taylor_residual);
     let imaginary_residual = length(imaginary_acceleration) * inversion_scale / residual_scale;
     // `output[5].x` was written once by assemble_spectrum and is intentionally
     // reused for every anchor in this cached line element.

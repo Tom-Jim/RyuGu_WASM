@@ -19,8 +19,8 @@ Interactive Ryugu gravity and trajectory simulator written in Rust/Bevy, compile
 - radial analytic GPU quadrature;
 - homogeneous Werner–Scheeres polyhedron;
 - Equation (106) adaptive curved-trajectory evaluation;
-- spherical-ring MMFFT with radix-2 FFT/IFFT;
-- order-two FMM with P2M, M2M, M2L, L2L, and leaf near field.
+- two-level 3D MMFFT with zero-padded FFT/kernel/IFFT convolution;
+- order-two FMM with P2M, M2M, M2L, L2L, and exact leaf P2P.
 
 The four heterogeneous methods use the mass-normalized density
 
@@ -158,7 +158,7 @@ $$
 =\exp(\delta\mathbf q\!\cdot\!\nabla)\mathbf g(\overline{\mathbf q}).
 $$
 
-The GPU uses a mass-preserving `4×8×16` radial/polar/azimuth source quadrature and a 129-frequency Bromwich grid. Curved arcs are planned in the body frame. A segment is accepted only when
+The GPU uses a mass-preserving `4×8×32` radial/polar/azimuth source quadrature, density modes `m=0..16`, and a 129-frequency Bromwich grid. Curved arcs are planned in the body frame. A segment is accepted only when
 
 $$
 \varepsilon_{\max}=\sup_h\frac{\|\delta\mathbf q(h)\|}{d(h)}<1
@@ -186,8 +186,8 @@ Press `D` to display the selected density:
 | Werner | Closed homogeneous polyhedron reference. | No heterogeneous density. |
 | Radial | Reusable star-shaped angular/radial source. | Four radial layers and angular discretization. |
 | Equation (106) | Structured curved-trajectory spectral reuse. | Finite source/frequency quadrature and Taylor segmentation. |
-| MMFFT | True periodic FFT/kernel/IFFT ring convolution. | Finite spherical-ring deposition. |
-| FMM | Hierarchical P2M/M2M/M2L/L2L evaluation. | Order-two local expansion and leaf discretization. |
+| MMFFT | Two-level 3D zero-padded FFT/kernel/IFFT convolution. | Finite Cartesian mesh spacing and interpolation. |
+| FMM | Hierarchical P2M/M2M/M2L/L2L plus exact leaf P2P. | Order-two source/local expansions. |
 
 Compare methods against a suitable independent reference for the selected density and trajectory. Werner and the other four methods intentionally model different densities.
 
@@ -345,7 +345,7 @@ Rust tests cover density integration, acceleration/potential consistency, Werner
 - Radial sources require a star-shaped body.
 - Werner is homogeneous; the other methods use logarithmic density.
 - Equation (106), MMFFT, and FMM use finite discretizations.
-- FMM local expansions are order two; M2L requires a full source-plus-target radius below `0.20×distance` and a `0.5%` node-field certificate.
+- FMM local expansions are order two; M2L requires the full source-plus-target radius below `0.10×distance`, while non-separated leaves use exact P2P.
 - GPU readback and prediction remain asynchronous numerical approximations.
 - The simulator uses f32 GPU arithmetic and is not an orbit-determination tool.
 - WebGPU is required.
@@ -354,11 +354,12 @@ Rust tests cover density integration, acceleration/potential consistency, Werner
 
 | Document result | Runtime status |
 |---|---|
-| Eq. (79) toroidal identity | Certified segmented Chebyshev table used as a cross-check. |
-| Eqs. (81)–(86) density separation | Approximated by the mass-preserving `4×8×16` source tensor. |
+| Eq. (79) toroidal identity | Certified segmented Chebyshev table used by the independent potential representation. |
+| Eqs. (81)–(86) density separation | Density Fourier modes `m=0..16` from the mass-preserving `4×8×32` tensor. |
 | Eqs. (89)–(95) NUFFT | Common-frequency Bromwich summation; no explicit general NUFFT matrix. |
 | Eq. (106) straight-line field | Implemented for the discrete density representation on CPU and GPU. |
 | Eqs. (109)–(110) inversion | Finite 129-frequency and half-line quadrature. |
+| Eq. (118) curved translation | Planner-selected directional Taylor jet through order eight. |
 | Eqs. (155)–(158) | Adaptive Taylor guard and dual residual implemented. |
 
 The implementation is a tested, discretized Equation (106) evaluator, not an exact untruncated continuous-density identity.

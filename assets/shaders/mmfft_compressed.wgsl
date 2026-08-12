@@ -1,121 +1,105 @@
-// Periodic spherical-ring MMFFT.
-//
-// Each workgroup owns one polar/radial ring of 64 azimuth bins.  It performs
-// forward radix-2 FFTs of the ring mass and four target-dependent Newton
-// kernels, multiplies in frequency space, and performs the matching IFFTs.
+// Runtime evaluation of the two-level 3-D MMFFT hierarchy. The stored field
+// was produced by a conservative deposit, zero-padded forward FFT, Newton
+// kernel multiplication, and inverse FFT for every level.
 
 struct MmfftParams {
     probe_pos: vec3<f32>,
     g_const: f32,
-    record_count: u32,
-    ring_count: u32,
-    azimuth_bins: u32,
+    grid_sizes: vec2<u32>,
+    level_count: u32,
     _padding0: u32,
-    _padding1: u32,
-    _padding2: u32,
-    _padding3: u32,
+    half_extents: vec2<f32>,
+    total_mass: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: MmfftParams;
-@group(0) @binding(1) var<storage, read> records: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> hierarchy: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> output_acc: array<vec4<f32>>;
 
-var<workgroup> spectrum_mass: array<vec2<f32>, 64>;
-var<workgroup> spectrum_x: array<vec2<f32>, 64>;
-var<workgroup> spectrum_y: array<vec2<f32>, 64>;
-var<workgroup> spectrum_z: array<vec2<f32>, 64>;
-var<workgroup> spectrum_p: array<vec2<f32>, 64>;
-
-fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+fn linear_index(cell: vec3<u32>, level: u32) -> u32 {
+    let n = params.grid_sizes[level];
+    let offset = select(params.grid_sizes.x * params.grid_sizes.x * params.grid_sizes.x, 0u, level == 0u);
+    return offset + (cell.z * n + cell.y) * n + cell.x;
 }
 
-fn butterfly_stage(lane: u32, size: u32, inverse: bool) {
-    if lane >= 32u { return; }
-    let half = size >> 1u;
-    let group = lane / half;
-    let j = lane - group * half;
-    let first = group * size + j;
-    let second = first + half;
-    let sign = select(-1.0, 1.0, inverse);
-    let angle = sign * 6.283185307179586 * f32(j) / f32(size);
-    let twiddle = vec2<f32>(cos(angle), sin(angle));
-
-    let m0 = spectrum_mass[first]; let m1 = complex_mul(spectrum_mass[second], twiddle);
-    let x0 = spectrum_x[first]; let x1 = complex_mul(spectrum_x[second], twiddle);
-    let y0 = spectrum_y[first]; let y1 = complex_mul(spectrum_y[second], twiddle);
-    let z0 = spectrum_z[first]; let z1 = complex_mul(spectrum_z[second], twiddle);
-    let p0 = spectrum_p[first]; let p1 = complex_mul(spectrum_p[second], twiddle);
-    spectrum_mass[first] = m0 + m1; spectrum_mass[second] = m0 - m1;
-    spectrum_x[first] = x0 + x1; spectrum_x[second] = x0 - x1;
-    spectrum_y[first] = y0 + y1; spectrum_y[second] = y0 - y1;
-    spectrum_z[first] = z0 + z1; spectrum_z[second] = z0 - z1;
-    spectrum_p[first] = p0 + p1; spectrum_p[second] = p0 - p1;
+fn cubic_weights(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return vec4<f32>(
+        -0.5 * t + t2 - 0.5 * t3,
+        1.0 - 2.5 * t2 + 1.5 * t3,
+        0.5 * t + 2.0 * t2 - 1.5 * t3,
+        -0.5 * t2 + 0.5 * t3,
+    );
 }
 
-fn transform(lane: u32, inverse: bool) {
-    var size = 2u;
-    loop {
-        butterfly_stage(lane, size, inverse);
-        workgroupBarrier();
-        if size == 64u { break; }
-        size = size << 1u;
-    }
+fn cubic_derivatives(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    return vec4<f32>(
+        -0.5 + 2.0 * t - 1.5 * t2,
+        -5.0 * t + 4.5 * t2,
+        0.5 + 4.0 * t - 4.5 * t2,
+        -t + 1.5 * t2,
+    );
 }
 
-@compute @workgroup_size(64, 1, 1)
-fn main(
-    @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) workgroup_id: vec3<u32>,
-) {
-    let lane = local_id.x;
-    let ring = workgroup_id.x;
-    if ring >= params.ring_count { return; }
-    let record = records[ring * 64u + lane];
-    let mass = max(record.x, 0.0);
-    let radius = max(record.y, 0.0);
-    let cosine = clamp(record.z, -1.0, 1.0);
-
-    // For c[0] = sum_j mass[j] kernel[-j], lane k holds kernel[-k].
-    let kernel_angle = -6.283185307179586 * f32(lane) / 64.0;
-    let sine = sqrt(max(1.0 - cosine * cosine, 0.0));
-    let source = radius * vec3<f32>(sine * cos(kernel_angle), sine * sin(kernel_angle), cosine);
-    let displacement = source - params.probe_pos;
-    let distance2 = max(dot(displacement, displacement), 1.0e-8);
-    let distance = sqrt(distance2);
-    let kernel = vec4<f32>(displacement / (distance2 * distance), 1.0 / distance);
-
-    // Decimation-in-time FFT with explicit six-bit bit reversal.
-    let reversed = reverseBits(lane) >> 26u;
-    spectrum_mass[reversed] = vec2<f32>(mass, 0.0);
-    spectrum_x[reversed] = vec2<f32>(kernel.x, 0.0);
-    spectrum_y[reversed] = vec2<f32>(kernel.y, 0.0);
-    spectrum_z[reversed] = vec2<f32>(kernel.z, 0.0);
-    spectrum_p[reversed] = vec2<f32>(kernel.w, 0.0);
-    workgroupBarrier();
-
-    transform(lane, false);
-    if lane < 64u {
-        spectrum_x[lane] = complex_mul(spectrum_mass[lane], spectrum_x[lane]);
-        spectrum_y[lane] = complex_mul(spectrum_mass[lane], spectrum_y[lane]);
-        spectrum_z[lane] = complex_mul(spectrum_mass[lane], spectrum_z[lane]);
-        spectrum_p[lane] = complex_mul(spectrum_mass[lane], spectrum_p[lane]);
-        // IFFT input also needs bit-reversal for the same DIT kernel.
+fn sample_grid(level: u32, position: vec3<f32>) -> vec4<f32> {
+    let n = params.grid_sizes[level];
+    let half_extent = params.half_extents[level];
+    let spacing = 2.0 * half_extent / f32(n);
+    let coordinate = (position + vec3<f32>(half_extent)) / spacing - vec3<f32>(0.5);
+    let base_f = clamp(floor(coordinate), vec3<f32>(1.0), vec3<f32>(f32(n - 3u)));
+    let fraction = clamp(coordinate - base_f, vec3<f32>(0.0), vec3<f32>(1.0));
+    let base = vec3<u32>(base_f) - vec3<u32>(1u);
+    let wx = cubic_weights(fraction.x);
+    let wy = cubic_weights(fraction.y);
+    let wz = cubic_weights(fraction.z);
+    let dxw = cubic_derivatives(fraction.x);
+    let dyw = cubic_derivatives(fraction.y);
+    let dzw = cubic_derivatives(fraction.z);
+    var potential = 0.0;
+    var gradient = vec3<f32>(0.0);
+    for (var dz = 0u; dz < 4u; dz += 1u) {
+        for (var dy = 0u; dy < 4u; dy += 1u) {
+            for (var dx = 0u; dx < 4u; dx += 1u) {
+                let corner_potential = hierarchy[linear_index(base + vec3<u32>(dx, dy, dz), level)].w;
+                potential += wx[dx] * wy[dy] * wz[dz] * corner_potential;
+                gradient += corner_potential / spacing * vec3<f32>(
+                    dxw[dx] * wy[dy] * wz[dz],
+                    dyw[dy] * wx[dx] * wz[dz],
+                    dzw[dz] * wx[dx] * wy[dy],
+                );
+            }
+        }
     }
-    workgroupBarrier();
+    // The acceleration is the analytic gradient of the exact same tricubic
+    // potential returned in w. This discrete identity prevents an interpolant
+    // mismatch from injecting Jacobi energy at accelerated time scales.
+    return vec4<f32>(gradient, potential);
+}
 
-    let x = spectrum_x[lane]; let y = spectrum_y[lane];
-    let z = spectrum_z[lane]; let p = spectrum_p[lane];
-    workgroupBarrier();
-    spectrum_x[reversed] = x; spectrum_y[reversed] = y;
-    spectrum_z[reversed] = z; spectrum_p[reversed] = p;
-    spectrum_mass[reversed] = vec2<f32>(0.0);
-    workgroupBarrier();
-    transform(lane, true);
-
-    if lane == 0u {
-        output_acc[ring] = params.g_const * vec4<f32>(
-            spectrum_x[0].x, spectrum_y[0].x, spectrum_z[0].x, spectrum_p[0].x
-        ) / 64.0;
+@compute @workgroup_size(1, 1, 1)
+fn main() {
+    var value = vec4<f32>(0.0);
+    var found = false;
+    for (var level = 0u; level < params.level_count; level += 1u) {
+        let half_extent = params.half_extents[level];
+        // Leave one interpolation cell at the edge to avoid clamping a target
+        // onto a constant boundary value.
+        let margin = 2.0 * half_extent / f32(params.grid_sizes[level]);
+        if all(abs(params.probe_pos) <= vec3<f32>(half_extent - margin)) {
+            value = sample_grid(level, params.probe_pos);
+            found = true;
+            break;
+        }
     }
+    if !found {
+        let distance2 = max(dot(params.probe_pos, params.probe_pos), 1.0e-8);
+        let distance = sqrt(distance2);
+        value = params.g_const * vec4<f32>(
+            -params.total_mass * params.probe_pos / (distance2 * distance),
+            params.total_mass / distance,
+        );
+    }
+    output_acc[0] = value;
 }
