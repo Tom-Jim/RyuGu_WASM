@@ -20,6 +20,8 @@ pub mod eq106_operator;
 pub mod fmm_pipeline;
 #[path = "gravity/radial.rs"]
 pub mod gravity_pipeline;
+#[path = "simulation/inversion.rs"]
+pub mod inversion;
 #[path = "gravity/mmfft.rs"]
 pub mod mmfft_pipeline;
 #[path = "simulation/physics.rs"]

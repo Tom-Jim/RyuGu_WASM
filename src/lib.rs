@@ -22,7 +22,7 @@ use components::{
     ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GpuMemoryEstimate,
     GravityAcceleration, GravityBlendFactor, GravityPotential, GravityRuntimeError, JacobiHistory,
     PerformanceComparisonState, ProbeInitialConditions, ShowNormals, ShowSection,
-    SimulationAcceleration, SimulationClock,
+    SimulationAcceleration, SimulationClock, TrajectoryInversionState,
 };
 use std::time::Duration;
 pub use systems::eq106;
@@ -40,22 +40,26 @@ use systems::{
     eq106_operator::build_eq106_operator_tensor_system,
     fmm_pipeline::FmmComputePlugin,
     gravity_pipeline::{GravityComputePlugin, build_radial_gravity_source_system},
+    inversion::{simulated_annealing_system, start_density_inversion_system},
     mmfft_pipeline::MmfftCompressedComputePlugin,
     physics::{physics_system, ryugu_rotation_system},
     render::{
-        camera_follow_system, camera_switch_system, render_gizmos_system, render_section_system,
-        section_alpha_system, setup_scene, setup_ui,
+        camera_follow_system, camera_switch_system, capture_trajectory_inversion_system,
+        render_gizmos_system, render_section_system, section_alpha_system, setup_scene, setup_ui,
     },
     scale::{build_topology_system, normalize_model_scale_system},
     ui::{
-        clear_runtime_error_on_probe_change, fps_update_system, method_toggle_system,
-        normal_toggle_system, performance_button_system, performance_comparison_system,
-        performance_method_checkbox_system, probe_slider_system, probe_slider_visual_system,
-        runtime_error_overlay_system, runtime_error_reset_system, section_toggle_system,
-        setup_fps_ui, setup_performance_chart_segments, setup_performance_controls,
-        setup_probe_controls, setup_runtime_error_overlay, setup_simulation_acceleration_control,
-        simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
-        update_gpu_memory_estimate_system, update_hint_on_mode_change, update_ui_scale_system,
+        clear_runtime_error_on_probe_change, density_inversion_timing_ui_system, fps_update_system,
+        method_toggle_system, normal_toggle_system, performance_button_system,
+        performance_comparison_system, performance_method_checkbox_system, probe_slider_system,
+        probe_slider_visual_system, runtime_error_overlay_system, runtime_error_reset_system,
+        section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
+        setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
+        setup_runtime_error_overlay, setup_simulation_acceleration_control,
+        setup_trajectory_inversion_controls, simulation_acceleration_slider_system,
+        simulation_acceleration_slider_visual_system, trajectory_inversion_input_system,
+        trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
+        update_hint_on_mode_change, update_ui_scale_system,
     },
     werner_pipeline::WernerComputePlugin,
 };
@@ -160,6 +164,7 @@ pub fn main() {
         .init_resource::<GravityRuntimeError>()
         .init_resource::<JacobiHistory>()
         .init_resource::<SimulationClock>()
+        .init_resource::<TrajectoryInversionState>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
         .init_resource::<DisplayRotation>()
@@ -243,7 +248,13 @@ pub fn main() {
     )
     .add_systems(
         Startup,
-        (setup_performance_controls, setup_performance_chart_segments).chain(),
+        (
+            setup_performance_controls,
+            setup_trajectory_inversion_controls,
+            setup_density_inversion_timing_panel,
+            setup_performance_chart_segments,
+        )
+            .chain(),
     )
     .add_systems(
         Update,
@@ -270,6 +281,18 @@ pub fn main() {
             performance_button_system,
             performance_method_checkbox_system,
             method_toggle_system,
+        )
+            .chain(),
+    )
+    .add_systems(
+        Update,
+        (
+            capture_trajectory_inversion_system,
+            trajectory_inversion_input_system,
+            start_density_inversion_system,
+            simulated_annealing_system,
+            trajectory_inversion_ui_system,
+            density_inversion_timing_ui_system,
         )
             .chain(),
     )

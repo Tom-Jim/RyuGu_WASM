@@ -37,6 +37,7 @@ Werner remains a homogeneous reference. This project is intended for numerical e
 - Adaptive Equation (106) segmentation using curvature, distance, and Taylor-remainder bounds.
 - Rotating-frame Jacobi and Equation (157) residual charts.
 - Method-aware density section, orbit trail, probe view, surface normals, and performance comparison.
+- Trajectory-to-density inversion from 16 editable position/velocity controls, a continuous Quintic Hermite track, and simulated annealing over the occupied 3D density voxels.
 - Snapshot-tagged asynchronous WebGPU readback and numerical-error blocking.
 
 ## Requirements
@@ -179,6 +180,55 @@ Press `D` to display the selected density:
 - radial, Equation (106), MMFFT, and FMM: outward-increasing logarithmic density;
 - Werner: uniform density.
 
+## Trajectory Density Inversion
+
+After five seconds of simulation, the 3D view exposes two editable columns of
+16 uniformly resampled detector states: position on the left and velocity on
+the right. The `Invert trajectory` button uses those states as **Quintic
+Hermite control nodes**, not as only 16 independent gravity observations.
+
+For the default 16 nodes, the 15 Hermite intervals are sampled at 16 points
+per interval, with shared endpoints, giving
+
+$$
+15\times16+1=241
+$$
+
+trajectory positions and inertial-acceleration observations, or 723 scalar
+acceleration components. The displayed magenta inversion trajectory and the
+inverse solver use the same Hermite position/acceleration evaluator. Knot
+accelerations come from non-uniform three-point quadratic differentiation of
+the editable velocity controls, including second-order endpoint stencils.
+
+The asteroid is voxelized into a `4×4×4` Cartesian grid; only cells that
+intersect the radial source are retained (56 cells for the bundled Ryugu
+model). Every retained voxel has an independent positive density. Simulated
+annealing starts from a total-mass-preserving uniform density and minimizes a
+trajectory-data term together with total-mass, neighbor-smoothness, and weak
+uniform-prior terms. Proposals include smooth zero-mass radial modes for fast
+large-scale convergence and mass-conserving exchanges across adjacent voxel
+faces for three-dimensional structure.
+
+The original forward density is never used as the annealing initial state or
+as an inverse observation. It is retained only after optimization for the
+displayed validation metrics:
+
+- Werner is evaluated against its uniform-density reference.
+- Radial, Equation (106), MMFFT, and FMM are evaluated against the
+  volume-averaged outward-increasing logarithmic reference density.
+
+The upper-right inversion panel reports fit (`1 -` volume-weighted relative
+density RMSE), density RMSE, annealing objective improvement, the number of
+Quintic track samples, voxel count, density range, density spread, mass scale,
+objective value, and annealing iterations. A zero objective improvement is
+reported explicitly as remaining at the uniform start; it is not displayed as
+a successful non-uniform recovery.
+
+When inversion is active, the section visualization follows the rotating
+asteroid and shows the recovered density field rather than the forward-model
+field. Dynamic contours are drawn over each section: the exterior outline is
+always present, while interior contours appear for recoverable density levels.
+
 ## Comparative scope
 
 | Method | Strength | Main approximation |
@@ -246,6 +296,8 @@ After loading the GLTF model, the application normalizes scale, welds vertices a
 | `F` | Toggle surface normals. |
 | `D` | Toggle density section. |
 | `G` | Cycle the five gravity methods. |
+| `Invert trajectory` | Start density inversion from the 16 displayed position/velocity controls after their five-second capture is complete. |
+| Position / Velocity rows | Click a row, enter `x, y, z`, and press Enter to replace one Hermite control value. |
 | `X`, `Y`, `Z` | Set initial probe position. |
 | `Speed` | Set circular-speed multiplier. |
 | Acceleration | Select `1x`–`8x` complete fixed updates per frame. |
@@ -331,14 +383,14 @@ Ryugu_wasm/
 | `src/components.rs` | Constants, ECS state, gravity sources, and histories. |
 | `src/systems/gravity/` | Radial, Werner, Equation (106), MMFFT, and FMM implementations. |
 | `src/systems/presentation/` | Scene, controls, density section, and charts. |
-| `src/systems/simulation/` | Fixed-step physics and diagnostics. |
+| `src/systems/simulation/` | Fixed-step physics, diagnostics, and continuous-trajectory 3D density inversion. |
 | `assets/shaders/` | WebGPU compute shaders. |
 | `tests/` | Independent numerical checks. |
 | `docs/` | Mathematical derivations and convergence conditions. |
 
 ## Testing
 
-Rust tests cover density integration, acceleration/potential consistency, Werner and multipole far fields, M2L acceptance, Equation (106) transforms and convergence, interpolation, Jacobi evaluation, buffer layouts, and WGSL validation. Python tests independently check the logarithmic density and convergence guards.
+Rust tests cover density integration, acceleration/potential consistency, Werner and multipole far fields, M2L acceptance, Equation (106) transforms and convergence, interpolation, Jacobi evaluation, buffer layouts, WGSL validation, and the inversion contract: the original density cannot seed annealing, dense Quintic sampling is used instead of cached gravity, and voxel sensitivities remain spatially distinct. Python tests independently check the logarithmic density and convergence guards.
 
 ## Known limitations
 
@@ -346,6 +398,8 @@ Rust tests cover density integration, acceleration/potential consistency, Werner
 - Werner is homogeneous; the other methods use logarithmic density.
 - Equation (106), MMFFT, and FMM use finite discretizations.
 - FMM local expansions are order two; M2L requires the full source-plus-target radius below `0.10×distance`, while non-separated leaves use exact P2P.
+- Density inversion is a regularized, trajectory-constrained reconstruction. A single external track cannot uniquely resolve every unconstrained interior mode; the mass and smoothness terms select a stable 3D solution in the remaining null space.
+- The inversion sensitivity operator uses the voxelized Newton kernel, with MMFFT's finite-grid softening represented in its inverse operator. It is a reconstruction benchmark for comparing the runtime methods, not a calibrated spacecraft-navigation estimator.
 - GPU readback and prediction remain asynchronous numerical approximations.
 - The simulator uses f32 GPU arithmetic and is not an orbit-determination tool.
 - WebGPU is required.

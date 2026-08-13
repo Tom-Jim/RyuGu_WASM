@@ -100,6 +100,139 @@ pub struct Velocity(pub Vec3);
 #[derive(Component)]
 pub struct OrbitHistory(pub VecDeque<Vec3>);
 
+/// Number of uniformly resampled detector states exposed by the trajectory
+/// inversion controls.  The capture is presentation-only and never feeds the
+/// gravity evaluators or the fixed-step integrator.
+pub const TRAJECTORY_INVERSION_SAMPLE_COUNT: usize = 16;
+pub const TRAJECTORY_INVERSION_CAPTURE_SECONDS: f64 = 5.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrajectoryInversionKnot {
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub simulation_time_seconds: f64,
+    /// World-frame acceleration returned by the selected forward evaluator at
+    /// the baseline density. Gravity is linear in density, so annealing can
+    /// evaluate density candidates without substituting another field model.
+    pub baseline_acceleration: Vec3,
+    pub body_rotation: Quat,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TrajectoryCaptureSample {
+    pub elapsed_seconds: f64,
+    pub knot: TrajectoryInversionKnot,
+}
+
+#[derive(Clone, Debug)]
+pub struct InvertedDensityVoxel {
+    /// Body-fixed centre in metres (the gravity source coordinate system).
+    pub center: Vec3,
+    pub volume: f32,
+    pub density: f32,
+    /// Geometry/total-mass-only annealing prior. This must never contain the
+    /// original density law used later for validation.
+    pub baseline_density: f32,
+    /// Original forward-model density used only after annealing to score the
+    /// recovered field (uniform Werner, logarithmic for all other methods).
+    pub reference_density: f32,
+    pub grid: [u8; 3],
+}
+
+#[derive(Clone, Debug)]
+pub struct DensityInversionResult {
+    pub method: ActiveGravityMethod,
+    pub density: f32,
+    pub density_scale: f32,
+    pub objective: f64,
+    /// Volume-weighted relative RMSE against the density law assumed by the
+    /// selected forward model (uniform Werner, logarithmic for the others).
+    pub model_deviation: f32,
+    /// `1 - model_deviation`, clamped to [0, 1], for direct UI comparison.
+    pub model_fit: f32,
+    /// Relative decrease of the trajectory objective from the uniform start.
+    pub objective_improvement: f32,
+    /// Number of acceleration observations sampled along the complete
+    /// interpolated Quintic Hermite trajectory.
+    pub trajectory_samples: usize,
+    pub iterations: u32,
+    pub voxel_size: f32,
+    pub voxels: Vec<InvertedDensityVoxel>,
+}
+
+#[derive(Debug)]
+pub struct SimulatedAnnealingJob {
+    pub method: ActiveGravityMethod,
+    pub voxels: Vec<InvertedDensityVoxel>,
+    pub sensitivities: Vec<Vec3>,
+    pub observed_accelerations: Vec<Vec3>,
+    pub neighbours: Vec<(usize, usize)>,
+    pub current_densities: Vec<f32>,
+    pub best_densities: Vec<f32>,
+    pub predicted_accelerations: Vec<Vec3>,
+    pub current_mass: f64,
+    pub current_objective: f64,
+    pub best_objective: f64,
+    pub initial_objective: f64,
+    /// Raw trajectory mismatch of the uniform start. Dividing by this value
+    /// prevents the regularizers from overwhelming the very small exterior
+    /// gravity signature of an internal mass redistribution.
+    pub data_error_scale: f64,
+    pub iteration: u32,
+    pub iterations: u32,
+    pub rng_state: u64,
+    pub voxel_size: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrajectoryVectorField {
+    Position,
+    Velocity,
+}
+
+/// UI and rendering state for the user-provided Quintic Hermite trajectory.
+/// `capture_epoch` keeps defaults tied to the currently running simulation;
+/// changing a probe parameter starts a fresh five-second capture automatically.
+#[derive(Resource)]
+pub struct TrajectoryInversionState {
+    pub capture_epoch: u64,
+    pub wall_elapsed_seconds: f64,
+    pub raw_samples: Vec<TrajectoryCaptureSample>,
+    pub knots: Vec<TrajectoryInversionKnot>,
+    pub ready: bool,
+    /// True after a user edits any captured position or velocity. Captured
+    /// knots can use the forward evaluator's acceleration directly; edited
+    /// knots must derive observations from their user-provided velocities.
+    pub knots_edited: bool,
+    pub inverted: bool,
+    pub selected: Option<(usize, TrajectoryVectorField)>,
+    pub edit_buffer: String,
+    pub error: Option<String>,
+    pub annealing: Option<SimulatedAnnealingJob>,
+    pub results: [Option<DensityInversionResult>; 5],
+    pub displayed_density: Option<DensityInversionResult>,
+}
+
+impl Default for TrajectoryInversionState {
+    fn default() -> Self {
+        Self {
+            capture_epoch: 0,
+            wall_elapsed_seconds: 0.0,
+            raw_samples: Vec::with_capacity(384),
+            knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
+            ready: false,
+            knots_edited: false,
+            inverted: false,
+            selected: None,
+            edit_buffer: String::new(),
+            error: None,
+            annealing: None,
+            results: std::array::from_fn(|_| None),
+            displayed_density: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct JacobiSample {
     pub simulation_time_seconds: f64,
