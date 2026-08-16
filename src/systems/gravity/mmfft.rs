@@ -324,8 +324,9 @@ pub fn build_mmfft_compressed_source_system(
     radial: Option<Res<RadialGravitySource>>,
     _config: Res<MmfftCompressedConfig>,
     existing: Option<Res<MmfftCompressedSource>>,
+    active_method: Res<ActiveGravityMethod>,
 ) {
-    if existing.is_some() {
+    if existing.is_some() || *active_method != ActiveGravityMethod::MmfftCompressed {
         return;
     }
     let Some(radial) = radial else { return };
@@ -413,6 +414,7 @@ fn poll_mmfft_readback(
             positive_potential: total.w,
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
+            eq106_diagnostics: None,
         });
     } else {
         warn!("[mmfft] discarded non-finite compressed GPU result");

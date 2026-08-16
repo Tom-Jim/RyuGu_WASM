@@ -264,6 +264,7 @@ fn poll_gravity_readback(
             positive_potential: total.w,
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
+            eq106_diagnostics: None,
         });
     }
 }

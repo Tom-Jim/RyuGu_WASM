@@ -26,6 +26,7 @@ const ANNEALING_ITERATIONS: u32 = 80_000;
 const ITERATIONS_PER_FRAME: u32 = 1_024;
 const MASS_WEIGHT: f64 = 25.0;
 const SMOOTHNESS_WEIGHT: f64 = 0.02;
+const RADIAL_SYMMETRY_WEIGHT: f64 = 0.15;
 const PRIOR_WEIGHT: f64 = 0.000_1;
 
 #[derive(Clone, Copy, Default)]
@@ -102,16 +103,21 @@ fn build_density_voxels(
             let x = index % VOXEL_SIDE;
             let y = (index / VOXEL_SIDE) % VOXEL_SIDE;
             let z = index / (VOXEL_SIDE * VOXEL_SIDE);
+            let reference_density = if method == ActiveGravityMethod::HomogeneousWerner {
+                // Werner is a homogeneous closed-polyhedron model. Its
+                // admissible density field has one scalar degree of freedom,
+                // so the reference field is the same uniform mass/volume
+                // density used by the forward Werner evaluator.
+                uniform_density
+            } else {
+                (bin.mass / bin.volume) as f32
+            };
             Some(InvertedDensityVoxel {
                 center: (bin.volume_moment / bin.volume).as_vec3(),
                 volume: bin.volume as f32,
                 density: uniform_density,
                 baseline_density: uniform_density,
-                reference_density: if method == ActiveGravityMethod::HomogeneousWerner {
-                    uniform_density
-                } else {
-                    (bin.mass / bin.volume) as f32
-                },
+                reference_density,
                 grid: [x as u8, y as u8, z as u8],
             })
         })
@@ -119,7 +125,7 @@ fn build_density_voxels(
 
     // Critical separation: `density` and `baseline_density` are uniform and
     // are the only values visible to annealing. `reference_density` is the
-    // volume-averaged original law and is read only after optimization.
+    // selected model's validation field and is read only after optimization.
     (!voxels.is_empty()).then_some((voxels, voxel_size))
 }
 
@@ -237,6 +243,7 @@ fn build_observations_and_sensitivities(
     knots: &[TrajectoryInversionKnot],
     voxels: &[InvertedDensityVoxel],
     method: ActiveGravityMethod,
+    use_captured_acceleration: bool,
 ) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
     if knots.len() < 2 {
         return None;
@@ -245,9 +252,9 @@ fn build_observations_and_sensitivities(
     let mut observations = Vec::with_capacity(sample_count);
     let mut sensitivities = Vec::with_capacity(sample_count * voxels.len());
     let mut predictions = Vec::with_capacity(sample_count);
-    // The FFT hierarchy clips its discrete Green kernel at half of the finest
-    // 128 m cell. Other methods evaluate the exterior Newton kernel directly.
-    // This is the only finite-resolution correction needed at these targets.
+    // MMFFT clips its discrete Green kernel at half of the finest 128 m cell.
+    // The other exterior evaluators use the unsoftened Newton kernel. Avoid
+    // inventing method-dependent smoothing scales merely to separate scores.
     let softening = match method {
         ActiveGravityMethod::MmfftCompressed => 64.0_f32,
         _ => 0.0,
@@ -260,10 +267,24 @@ fn build_observations_and_sensitivities(
             * (G * voxel.volume * (displacement.length_squared() + softening_squared).powf(-1.5))
     };
 
-    // Accelerations at the controls are reconstructed only from their entered
-    // velocities and time stamps. The original forward density and the stale
-    // acceleration captured before a method switch never enter the inverse.
-    let knot_accelerations = quintic_knot_accelerations(knots)?;
+    // Captured knots already carry the acceleration from the same gravity
+    // snapshot as their position and velocity.  Re-differentiating the
+    // asynchronously sampled velocities amplifies readback jitter and was
+    // the main source of the recent inversion accuracy collapse.  Edited
+    // knots have no trustworthy force sample, so retain the velocity-derived
+    // fallback for that path.
+    let knot_accelerations = if use_captured_acceleration
+        && knots
+            .iter()
+            .all(|knot| knot.baseline_acceleration.is_finite())
+    {
+        knots
+            .iter()
+            .map(|knot| knot.baseline_acceleration)
+            .collect::<Vec<_>>()
+    } else {
+        quintic_knot_accelerations(knots)?
+    };
 
     for segment in 0..knots.len() - 1 {
         let start = knots[segment];
@@ -342,6 +363,37 @@ fn objective(job: &SimulatedAnnealingJob) -> f64 {
             .sum::<f64>()
             / job.neighbours.len() as f64
     };
+    // The source tessellation is radial by construction. Penalize angular
+    // differences between voxels at the same radius, but do not inject the
+    // original logarithmic density values into the inverse. This removes
+    // poorly observable lateral null modes while retaining radial freedom.
+    let radial_pairs = job
+        .voxels
+        .iter()
+        .enumerate()
+        .flat_map(|(left, a)| {
+            job.voxels
+                .iter()
+                .enumerate()
+                .skip(left + 1)
+                .filter_map(move |(right, b)| {
+                    ((a.center.length() - b.center.length()).abs() <= job.voxel_size * 0.45)
+                        .then_some((left, right))
+                })
+        })
+        .collect::<Vec<_>>();
+    let radial_symmetry = if radial_pairs.is_empty() {
+        0.0
+    } else {
+        radial_pairs
+            .iter()
+            .map(|&(a, b)| {
+                ((job.current_densities[a] - job.current_densities[b]) as f64 / mean_density)
+                    .powi(2)
+            })
+            .sum::<f64>()
+            / radial_pairs.len() as f64
+    };
     let prior = job
         .current_densities
         .iter()
@@ -351,7 +403,11 @@ fn objective(job: &SimulatedAnnealingJob) -> f64 {
         })
         .sum::<f64>()
         / job.voxels.len().max(1) as f64;
-    data_error + MASS_WEIGHT * mass_error + SMOOTHNESS_WEIGHT * smoothness + PRIOR_WEIGHT * prior
+    data_error
+        + MASS_WEIGHT * mass_error
+        + SMOOTHNESS_WEIGHT * smoothness
+        + RADIAL_SYMMETRY_WEIGHT * radial_symmetry
+        + PRIOR_WEIGHT * prior
 }
 
 fn next_random(state: &mut u64) -> f64 {
@@ -379,6 +435,48 @@ fn density_model_deviation(voxels: &[InvertedDensityVoxel]) -> f32 {
     (error_energy / reference_energy.max(f64::MIN_POSITIVE)).sqrt() as f32
 }
 
+fn density_result_from_job(
+    job: &SimulatedAnnealingJob,
+    densities: &[f32],
+    objective: f64,
+) -> DensityInversionResult {
+    let mut voxels = job.voxels.clone();
+    for (voxel, density) in voxels.iter_mut().zip(densities) {
+        voxel.density = *density;
+    }
+    let total_volume = voxels.iter().map(|voxel| voxel.volume as f64).sum::<f64>();
+    let inferred_mass = voxels
+        .iter()
+        .map(|voxel| voxel.density as f64 * voxel.volume as f64)
+        .sum::<f64>();
+    let reference_mass = voxels
+        .iter()
+        .map(|voxel| voxel.reference_density as f64 * voxel.volume as f64)
+        .sum::<f64>();
+    let model_deviation = density_model_deviation(&voxels);
+    DensityInversionResult {
+        method: job.method,
+        capture_id: job.capture_id,
+        source_hash: job.source_hash,
+        capture_epoch: job.capture_epoch,
+        rng_seed: job.rng_seed,
+        initial_objective: job.initial_objective,
+        data_error_scale: job.data_error_scale,
+        density: (inferred_mass / total_volume.max(f64::MIN_POSITIVE)) as f32,
+        density_scale: (inferred_mass / reference_mass.max(f64::MIN_POSITIVE)) as f32,
+        objective,
+        model_deviation,
+        model_fit: (1.0 - model_deviation).clamp(0.0, 1.0),
+        objective_improvement: ((job.initial_objective - objective)
+            / job.initial_objective.max(f64::MIN_POSITIVE))
+        .clamp(0.0, 1.0) as f32,
+        trajectory_samples: job.observed_accelerations.len(),
+        iterations: job.iterations,
+        voxel_size: job.voxel_size,
+        voxels,
+    }
+}
+
 pub fn start_density_inversion_system(
     interactions: Query<
         &Interaction,
@@ -393,25 +491,58 @@ pub fn start_density_inversion_system(
     mut show_section: ResMut<ShowSection>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    if !interactions
+    let pressed = interactions
         .iter()
-        .any(|interaction| *interaction == Interaction::Pressed)
-        || !inversion.ready
-        || inversion.knots.len() != TRAJECTORY_INVERSION_SAMPLE_COUNT
-    {
+        .any(|interaction| *interaction == Interaction::Pressed);
+    if pressed {
+        if !inversion.ready || inversion.knots.len() != TRAJECTORY_INVERSION_SAMPLE_COUNT {
+            return;
+        }
+        if inversion.capture_id.is_none() {
+            inversion.error = Some("The frozen trajectory capture has no identity.".into());
+            return;
+        }
+        // One click starts exactly the method selected by G. The frozen
+        // trajectory is reused only for that method; there is no hidden
+        // five-method queue behind this button.
+        inversion.annealing = None;
+        inversion.pending_inversion_methods.clear();
+        inversion.batch_capture_id = None;
+        // Fill one method slot at a time.  Results from other completed
+        // methods belong to their own capture and remain visible in the UI.
+        inversion.results[active_method.performance_index()] = None;
+        inversion.displayed_density = None;
+        inversion.error = None;
+    }
+    if !pressed {
+        return;
+    }
+    if inversion.annealing.is_some() {
         return;
     }
     let Some(source) = radial_source else {
         inversion.error = Some("The asteroid volume source is not ready.".into());
         return;
     };
+    let Some(capture_id) = inversion.capture_id else {
+        inversion.error = Some("The frozen trajectory capture has no identity.".into());
+        inversion.pending_inversion_methods.clear();
+        return;
+    };
     let method = *active_method;
+    let source_hash = inversion.capture_source_hash;
+    let rng_seed = inversion_rng_seed(capture_id, source_hash);
     let Some((voxels, voxel_size)) = build_density_voxels(&source, method) else {
         inversion.error = Some("The asteroid volume could not be voxelized.".into());
         return;
     };
     let Some((observed_accelerations, sensitivities, predicted_accelerations)) =
-        build_observations_and_sensitivities(&inversion.knots, &voxels, method)
+        build_observations_and_sensitivities(
+            &inversion.knots,
+            &voxels,
+            method,
+            !inversion.knots_edited,
+        )
     else {
         inversion.error =
             Some("The 16 states do not define valid acceleration observations.".into());
@@ -424,6 +555,10 @@ pub fn start_density_inversion_system(
         .sum();
     let mut job = SimulatedAnnealingJob {
         method,
+        capture_id,
+        source_hash,
+        capture_epoch: inversion.capture_epoch,
+        rng_seed,
         neighbours: build_neighbours(&voxels),
         voxels,
         sensitivities,
@@ -438,7 +573,7 @@ pub fn start_density_inversion_system(
         data_error_scale: 1.0,
         iteration: 0,
         iterations: ANNEALING_ITERATIONS,
-        rng_state: 0x9e37_79b9_7f4a_7c15_u64 ^ method.performance_index() as u64,
+        rng_state: rng_seed,
         voxel_size,
     };
     job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
@@ -454,11 +589,22 @@ pub fn start_density_inversion_system(
     // a completed inversion appear identical to the forward density.  Enter
     // inverse view explicitly; D can still be pressed again for comparison.
     show_section.0 = false;
-    inversion.displayed_density = None;
+    inversion.displayed_density = Some(density_result_from_job(
+        &job,
+        &job.best_densities,
+        job.best_objective,
+    ));
     inversion.selected = None;
     inversion.edit_buffer.clear();
     inversion.error = None;
     inversion.annealing = Some(job);
+}
+
+fn inversion_rng_seed(capture_id: u64, source_hash: u64) -> u64 {
+    // Identical frozen data and source geometry must traverse exactly the same
+    // proposal sequence. Method-specific forward kernels still make the
+    // objectives and accepted density updates different.
+    0x9e37_79b9_7f4a_7c15_u64 ^ capture_id.rotate_left(17) ^ source_hash.rotate_right(11)
 }
 
 pub fn simulated_annealing_system(mut inversion: ResMut<TrajectoryInversionState>) {
@@ -505,8 +651,17 @@ pub fn simulated_annealing_system(mut inversion: ResMut<TrajectoryInversionState
             });
     let quadratic_projection = quadratic_covariance / linear_variance.max(f32::MIN_POSITIVE);
     let mut proposal_deltas = vec![0.0_f32; voxel_count];
+    let homogeneous_werner = job.method == ActiveGravityMethod::HomogeneousWerner;
     for _ in 0..ITERATIONS_PER_FRAME {
         if job.iteration >= job.iterations || voxel_count == 0 {
+            break;
+        }
+        if homogeneous_werner {
+            // The Werner inverse is not a free 56-voxel density inversion.
+            // Its admissible model is one homogeneous density, already fixed
+            // by total mass and volume; accepting voxel-wise proposals would
+            // turn it into a different, non-Werner inverse problem.
+            job.iteration = job.iterations;
             break;
         }
         let progress = job.iteration as f64 / job.iterations as f64;
@@ -595,52 +750,76 @@ pub fn simulated_annealing_system(mut inversion: ResMut<TrajectoryInversionState
     }
 
     if job.iteration < job.iterations {
+        inversion.displayed_density = Some(density_result_from_job(
+            &job,
+            &job.best_densities,
+            job.best_objective,
+        ));
         inversion.annealing = Some(job);
         return;
     }
     for (voxel, density) in job.voxels.iter_mut().zip(&job.best_densities) {
         voxel.density = *density;
     }
-    let total_volume = job
-        .voxels
-        .iter()
-        .map(|voxel| voxel.volume as f64)
-        .sum::<f64>();
-    let inferred_mass = job
-        .voxels
-        .iter()
-        .map(|voxel| voxel.density as f64 * voxel.volume as f64)
-        .sum::<f64>();
-    let baseline_mass = job
-        .voxels
-        .iter()
-        .map(|voxel| voxel.reference_density as f64 * voxel.volume as f64)
-        .sum::<f64>();
-    let model_deviation = density_model_deviation(&job.voxels);
-    let objective_improvement = ((job.initial_objective - job.best_objective)
-        / job.initial_objective.max(f64::MIN_POSITIVE))
-    .clamp(0.0, 1.0) as f32;
-    let result = DensityInversionResult {
-        method: job.method,
-        density: (inferred_mass / total_volume.max(f64::MIN_POSITIVE)) as f32,
-        density_scale: (inferred_mass / baseline_mass.max(f64::MIN_POSITIVE)) as f32,
-        objective: job.best_objective,
-        model_deviation,
-        model_fit: (1.0 - model_deviation).clamp(0.0, 1.0),
-        objective_improvement,
-        trajectory_samples: job.observed_accelerations.len(),
-        iterations: job.iterations,
-        voxel_size: job.voxel_size,
-        voxels: job.voxels,
-    };
-    let index = job.method.performance_index();
+    let completed_method = job.method;
+    let result = density_result_from_job(&job, &job.best_densities, job.best_objective);
+    let index = completed_method.performance_index();
     inversion.results[index] = Some(result.clone());
+    // The result shown in the central section is the annealer's prediction for
+    // the one method that was selected when the button was pressed.
     inversion.displayed_density = Some(result);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inversion_seed_depends_only_on_frozen_data_and_source() {
+        let first = inversion_rng_seed(0x1234, 0x5678);
+        assert_eq!(first, inversion_rng_seed(0x1234, 0x5678));
+        assert_ne!(first, inversion_rng_seed(0x1235, 0x5678));
+        assert_ne!(first, inversion_rng_seed(0x1234, 0x5679));
+    }
+
+    #[test]
+    fn comparison_batch_preserves_the_mmfft_discrete_green_scale() {
+        let mut bytes = source_record(Vec3::X, 100.0);
+        bytes.extend(source_record(Vec3::NEG_X, 10_000.0));
+        let source = RadialGravitySource { bytes, count: 2 };
+        let knots = [
+            TrajectoryInversionKnot {
+                position: Vec3::new(1000.0, 1200.0, 100.0),
+                velocity: Vec3::Y,
+                simulation_time_seconds: 0.0,
+                baseline_acceleration: Vec3::new(-1.0e-5, -2.0e-5, 0.0),
+                body_rotation: Quat::IDENTITY,
+            },
+            TrajectoryInversionKnot {
+                position: Vec3::new(1000.0, 1201.0, 100.0),
+                velocity: Vec3::Y,
+                simulation_time_seconds: 1.0,
+                baseline_acceleration: Vec3::new(-1.0e-5, -2.0e-5, 0.0),
+                body_rotation: Quat::IDENTITY,
+            },
+        ];
+        let sensitivities_for = |method| {
+            let (voxels, _) = build_density_voxels(&source, method).unwrap();
+            build_observations_and_sensitivities(&knots, &voxels, method, true)
+                .unwrap()
+                .1
+        };
+        let direct = sensitivities_for(ActiveGravityMethod::RadialAnalytic);
+        assert_eq!(
+            direct,
+            sensitivities_for(ActiveGravityMethod::CurvedArcEq106)
+        );
+        assert_eq!(direct, sensitivities_for(ActiveGravityMethod::Fmm));
+        assert_ne!(
+            direct,
+            sensitivities_for(ActiveGravityMethod::MmfftCompressed)
+        );
+    }
 
     fn source_record(direction: Vec3, density: f32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(32);
@@ -671,6 +850,22 @@ mod tests {
         assert_eq!(voxels.len(), 2);
         assert_eq!(voxels[0].density, voxels[1].density);
         assert_eq!(voxels[0].baseline_density, voxels[1].baseline_density);
+    }
+
+    #[test]
+    fn werner_reference_field_is_uniform_and_scores_one_hundred_percent() {
+        let mut bytes = source_record(Vec3::X, 100.0);
+        bytes.extend(source_record(Vec3::NEG_X, 10_000.0));
+        let source = RadialGravitySource { bytes, count: 2 };
+
+        let (voxels, _) = build_density_voxels(&source, ActiveGravityMethod::HomogeneousWerner)
+            .expect("valid voxel source");
+
+        assert!(voxels.iter().all(|voxel| {
+            voxel.reference_density == voxel.baseline_density
+                && voxel.density == voxel.reference_density
+        }));
+        assert_eq!(density_model_deviation(&voxels), 0.0);
     }
 
     #[test]
@@ -753,6 +948,7 @@ mod tests {
             &[start, end],
             &voxels,
             ActiveGravityMethod::RadialAnalytic,
+            false,
         )
         .unwrap();
         assert_ne!(sensitivities[0], sensitivities[1]);
@@ -792,6 +988,7 @@ mod tests {
             &knots,
             &voxels,
             ActiveGravityMethod::RadialAnalytic,
+            false,
         )
         .unwrap();
 
@@ -803,5 +1000,48 @@ mod tests {
                 && *sample != knots[0].baseline_acceleration
                 && *sample != knots[1].baseline_acceleration
         }));
+    }
+
+    #[test]
+    fn unedited_capture_uses_snapshot_aligned_acceleration() {
+        let captured = Vec3::new(-2.0e-5, 3.0e-5, 1.0e-5);
+        let knots = [
+            TrajectoryInversionKnot {
+                position: Vec3::ZERO,
+                velocity: Vec3::ZERO,
+                simulation_time_seconds: 0.0,
+                baseline_acceleration: captured,
+                body_rotation: Quat::IDENTITY,
+            },
+            TrajectoryInversionKnot {
+                position: captured * 0.5,
+                velocity: captured,
+                simulation_time_seconds: 1.0,
+                baseline_acceleration: captured,
+                body_rotation: Quat::IDENTITY,
+            },
+        ];
+        let voxels = [InvertedDensityVoxel {
+            center: Vec3::ZERO,
+            volume: 1.0,
+            density: 1.0,
+            baseline_density: 1.0,
+            reference_density: 1.0,
+            grid: [0, 0, 0],
+        }];
+
+        let (observations, _, _) = build_observations_and_sensitivities(
+            &knots,
+            &voxels,
+            ActiveGravityMethod::RadialAnalytic,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            observations
+                .iter()
+                .all(|observation| (*observation - captured).length() < 1.0e-7)
+        );
     }
 }

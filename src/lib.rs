@@ -26,6 +26,7 @@ use components::{
 };
 use std::time::Duration;
 pub use systems::eq106;
+pub use systems::eq106_operator::{PsiOperatorTable, ToroidalOperatorTensor};
 use systems::{
     compute_pipeline::NormalsComputePlugin,
     curved_arc::{
@@ -51,7 +52,8 @@ use systems::{
     ui::{
         clear_runtime_error_on_probe_change, density_inversion_timing_ui_system, fps_update_system,
         method_toggle_system, normal_toggle_system, performance_button_system,
-        performance_comparison_system, performance_method_checkbox_system, probe_slider_system,
+        performance_comparison_system, performance_method_checkbox_system,
+        preserve_inversion_results_on_manual_method_switch, probe_slider_system,
         probe_slider_visual_system, runtime_error_overlay_system, runtime_error_reset_system,
         section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
         setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
@@ -281,6 +283,7 @@ pub fn main() {
             performance_button_system,
             performance_method_checkbox_system,
             method_toggle_system,
+            preserve_inversion_results_on_manual_method_switch,
         )
             .chain(),
     )

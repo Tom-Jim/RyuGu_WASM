@@ -146,8 +146,9 @@ fn build_werner_source_system(
     topology: Option<Res<AsteroidTopologyGpuData>>,
     ryugu: Query<&Transform, With<RyuguMarker>>,
     existing: Option<Res<WernerSource>>,
+    active_method: Res<ActiveGravityMethod>,
 ) {
-    if existing.is_some() {
+    if existing.is_some() || *active_method != ActiveGravityMethod::HomogeneousWerner {
         return;
     }
     let Some(topology) = topology else { return };
@@ -506,6 +507,7 @@ fn poll_werner_readback(
             positive_potential: total.w,
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
+            eq106_diagnostics: None,
         });
     }
 }

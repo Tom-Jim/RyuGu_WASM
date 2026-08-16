@@ -271,11 +271,12 @@ C_J=2U(\mathbf r_b)
 -\|\mathbf v_b\|^2.
 $$
 
-Every sample uses one completed request's position, velocity, attitude, and potential. The chart holds 256 samples, reports `dC/|C0|`, and adds an 8% vertical margin around visible extrema.
+Every sample uses the CPU-integrated position and velocity. Eq.106 evaluates the matching conservative local potential
+`U_loc = U0 + g0·dx + 1/2 dx^T H dx`, so its displayed force and potential obey `g = grad(U)` within each cached segment. The chart holds 256 samples, reports `dC/|C0|`, and adds an 8% vertical margin around visible extrema.
 
 ## Performance comparison
 
-The top-center button opens a five-method workspace. Each enabled method receives a 120-frame measurement window with FPS and Jacobi histories. Results include the browser, driver, rendering, dispatch, and readback overhead; they are not solver-only or cross-machine benchmarks.
+The top-center button opens a five-method workspace. Each enabled method receives a 120-frame measurement window normalized to 1x simulation acceleration; the previous acceleration is restored on exit. Jacobi curves plot per-method relative drift against each sample's actual simulation time, without visual offsets or a synthetic 100-hour axis. Eq.106 samples retain segment id, line origin, local `(h,u,v)`, and all four runtime certificates. Results include the browser, driver, rendering, dispatch, and readback overhead; they are not solver-only or cross-machine benchmarks.
 
 Headless WASM compilation timing:
 

@@ -76,6 +76,67 @@ pub fn rotating_frame_jacobi_constant(
     jacobi.is_finite().then_some(jacobi)
 }
 
+/// Potential paired with the conservative local field used by the CPU Eq.106
+/// substeps. For `g(x) = g0 + H (x-x0)`, this construction guarantees
+/// `grad(U_loc) = g` when `H` is symmetric.
+fn eq106_local_positive_potential(sample: &GravityFieldSample, body_position: Vec3) -> Option<f32> {
+    let jacobian = sample.body_acceleration_jacobian?;
+    let displacement = body_position - sample.snapshot.body_position;
+    if !body_position.is_finite() || !displacement.is_finite() || !jacobian.is_finite() {
+        return None;
+    }
+    let hessian = (jacobian + jacobian.transpose()) * 0.5;
+    let potential = sample.positive_potential
+        + sample.body_acceleration.dot(displacement)
+        + 0.5 * displacement.dot(hessian * displacement);
+    (potential.is_finite() && potential > 0.0).then_some(potential)
+}
+
+fn eq106_interpolated_positive_potential(
+    history: &GravitySampleHistory,
+    epoch: u64,
+    simulation_time_seconds: f64,
+    body_position: Vec3,
+) -> Option<f32> {
+    let (lower, upper) = history.bracketing(epoch, simulation_time_seconds)?;
+    let lower_potential = eq106_local_positive_potential(lower, body_position)?;
+    if std::ptr::eq(lower, upper) {
+        return Some(lower_potential);
+    }
+    let upper_potential = eq106_local_positive_potential(upper, body_position)?;
+    let interval = upper.snapshot.simulation_time_seconds - lower.snapshot.simulation_time_seconds;
+    if interval <= f64::EPSILON {
+        return Some(lower_potential);
+    }
+    let weight = ((simulation_time_seconds - lower.snapshot.simulation_time_seconds) / interval)
+        .clamp(0.0, 1.0) as f32;
+    lower_potential
+        .lerp(upper_potential, weight)
+        .is_finite()
+        .then_some(lower_potential.lerp(upper_potential, weight))
+}
+
+fn eq106_coordinates_at(
+    diagnostics: Eq106SampleDiagnostics,
+    body_position: Vec3,
+) -> Eq106SampleDiagnostics {
+    let tangent = diagnostics.line_direction.normalize_or_zero();
+    let helper = if tangent.z.abs() > 0.8 {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    let normal = helper.cross(tangent).normalize_or_zero();
+    let binormal = tangent.cross(normal).normalize_or_zero();
+    let relative = body_position - diagnostics.line_origin;
+    Eq106SampleDiagnostics {
+        h: relative.dot(tangent),
+        u: relative.dot(normal),
+        v: relative.dot(binormal),
+        ..diagnostics
+    }
+}
+
 pub fn record_probe_jacobi_system(
     active_method: Res<ActiveGravityMethod>,
     radial_samples: Option<Res<RadialGravityHistory>>,
@@ -85,6 +146,9 @@ pub fn record_probe_jacobi_system(
     fmm_samples: Option<Res<FmmGravityHistory>>,
     gravity_blend: Res<GravityBlendFactor>,
     clock: Res<SimulationClock>,
+    curved_residual: Res<CurvedArcResidualHistory>,
+    cassini: Query<(&Transform, &Velocity), With<CassiniMarker>>,
+    ryugu: Query<&Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
     mut history: ResMut<JacobiHistory>,
 ) {
     if gravity_blend.0 < 1.0 {
@@ -121,21 +185,55 @@ pub fn record_probe_jacobi_system(
         return;
     }
 
-    let world_to_body = sample.snapshot.ryugu_transform.rotation.inverse();
-    let body_position = world_to_body
-        * (sample.snapshot.probe_position - sample.snapshot.ryugu_transform.translation);
-    debug_assert!(
-        body_position.distance(sample.snapshot.body_position) < 1.0e-3,
-        "gravity snapshot body/world positions diverged"
-    );
-    let inertial_velocity_body = world_to_body * sample.snapshot.probe_velocity;
+    // The CPU integrator advances the live state using interpolated GPU
+    // fields. Accumulate the gravitational work along that same path for all
+    // methods, then use the first spectral potential only as the integration
+    // constant. This removes asynchronous snapshot lag and per-segment
+    // potential gauge jumps from the Jacobi diagnostic.
+    let (Ok((probe_transform, probe_velocity)), Ok(ryugu_transform)) =
+        (cassini.single(), ryugu.single())
+    else {
+        return;
+    };
+    let world_to_body = ryugu_transform.rotation.inverse();
+    let body_position = world_to_body * (probe_transform.translation - ryugu_transform.translation);
+    let inertial_velocity_body = world_to_body * probe_velocity.0;
     let angular_velocity_world =
         RYUGU_SPIN_AXIS.normalize() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
     let angular_velocity_body = world_to_body * angular_velocity_world;
+    let base_potential = if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+        let Some(eq106_history) = eq106_samples.as_ref() else {
+            return;
+        };
+        let Some(potential) = eq106_interpolated_positive_potential(
+            &eq106_history.0,
+            clock.epoch,
+            clock.elapsed_seconds,
+            body_position,
+        ) else {
+            return;
+        };
+        potential
+    } else {
+        sample.positive_potential
+    };
+    let positive_potential =
+        if let Some(curve_work) = curved_residual.curve_work_at(clock.elapsed_seconds) {
+            let origin_potential = *history
+                .eq106_origin_potential
+                .get_or_insert(base_potential as f64);
+            let origin_curve_work = *history.eq106_origin_curve_work.get_or_insert(curve_work);
+            (origin_potential + curve_work - origin_curve_work) as f32
+        } else {
+            base_potential
+        };
+    if !positive_potential.is_finite() || positive_potential <= 0.0 {
+        return;
+    }
     let Some(jacobi_constant) = rotating_frame_jacobi_constant(
         body_position,
         inertial_velocity_body,
-        sample.positive_potential,
+        positive_potential,
         angular_velocity_body,
     ) else {
         return;
@@ -143,8 +241,8 @@ pub fn record_probe_jacobi_system(
 
     let origin = *history
         .origin_simulation_seconds
-        .get_or_insert(sample.snapshot.simulation_time_seconds);
-    history.elapsed_simulation_seconds = sample.snapshot.simulation_time_seconds - origin;
+        .get_or_insert(clock.elapsed_seconds);
+    history.elapsed_simulation_seconds = clock.elapsed_seconds - origin;
     history.last_request_id = Some(sample.snapshot.request_id);
     history.last_sample_method = Some(*active_method);
     if history.samples.len() == JACOBI_HISTORY_CAPACITY {
@@ -154,6 +252,9 @@ pub fn record_probe_jacobi_system(
     history.samples.push_back(JacobiSample {
         simulation_time_seconds,
         jacobi_constant,
+        eq106_diagnostics: sample
+            .eq106_diagnostics
+            .map(|diagnostics| eq106_coordinates_at(diagnostics, body_position)),
     });
 }
 
@@ -393,7 +494,7 @@ pub fn setup_eq106_residual_chart(mut commands: Commands) {
         ))
         .with_children(|panel| {
             panel.spawn(chart_text(
-                "Eq.106 dual-representation residual",
+                "Eq.157 dual-representation residual",
                 15.0,
                 Color::srgb(1.0, 0.88, 0.75),
                 Node {
@@ -405,7 +506,7 @@ pub fn setup_eq106_residual_chart(mut commands: Commands) {
             ));
             panel.spawn((
                 chart_text(
-                    "|r_dual| = -- m^2/s^2",
+                    "|r_dual| = --",
                     11.0,
                     Color::srgb(1.0, 0.65, 0.3),
                     Node {
@@ -451,7 +552,7 @@ pub fn setup_eq106_residual_chart(mut commands: Commands) {
                 ));
             }
             panel.spawn(chart_text(
-                "|r_dual| (m^2/s^2)",
+                "|r_dual|",
                 10.0,
                 Color::srgb(0.65, 0.75, 0.8),
                 Node {
@@ -726,9 +827,9 @@ pub fn update_jacobi_chart_system(
     }
 }
 
-/// Displays Eq. (157): the difference between the curved-path work potential
-/// and the independently reconstructed Eq.106 spectral potential. This chart
-/// is deliberately separate from the physical Jacobi invariant.
+/// Displays Eq. (157): curved-path work potential minus the independent
+/// spatial-quadrature potential. This chart is deliberately separate from the
+/// physical Jacobi invariant and never substitutes epsilon for missing data.
 pub fn update_eq106_residual_chart_system(
     active_method: Res<ActiveGravityMethod>,
     history: Res<CurvedArcResidualHistory>,
@@ -759,7 +860,12 @@ pub fn update_eq106_residual_chart_system(
         return;
     }
 
-    let samples: Vec<_> = history.samples.iter().copied().collect();
+    let samples: Vec<_> = history
+        .samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.dual_residual.is_some())
+        .collect();
     if samples.is_empty() {
         for (_, mut node, _) in &mut segments {
             node.display = Display::None;
@@ -769,7 +875,7 @@ pub fn update_eq106_residual_chart_system(
         }
         for (label, mut text) in &mut labels {
             **text = match label {
-                Eq106ResidualChartLabel::Current => "|r_dual| = -- m^2/s^2".to_owned(),
+                Eq106ResidualChartLabel::Current => "|r_dual| = --".to_owned(),
                 Eq106ResidualChartLabel::Status => format!(
                     "{} | segments: {} | closures: {}/10",
                     planner.mode.as_str(),
@@ -784,7 +890,7 @@ pub fn update_eq106_residual_chart_system(
     }
 
     let residual_value = |sample: crate::systems::curved_arc::CurvedArcResidualSample| {
-        sample.dual_residual.unwrap_or(0.0).abs()
+        sample.dual_residual.unwrap_or(f64::NAN).abs()
     };
     let raw_minimum = samples
         .iter()
@@ -851,7 +957,7 @@ pub fn update_eq106_residual_chart_system(
         let latest = residual_value(*samples.last().unwrap());
         **text = match label {
             Eq106ResidualChartLabel::Current => {
-                format!("|r_dual| = {latest:.3e} m^2/s^2")
+                format!("|r_dual| = {latest:.3e}")
             }
             Eq106ResidualChartLabel::Status => {
                 let order = samples
@@ -902,10 +1008,51 @@ mod tests {
     }
 
     #[test]
+    fn eq106_local_potential_gradient_is_the_integrated_local_force() {
+        let hessian = Mat3::from_cols(
+            Vec3::new(2.0e-7, 3.0e-8, -1.0e-8),
+            Vec3::new(3.0e-8, -1.5e-7, 2.0e-8),
+            Vec3::new(-1.0e-8, 2.0e-8, 0.5e-7),
+        );
+        let sample = GravityFieldSample {
+            snapshot: GravityRequestSnapshot {
+                request_id: 1,
+                epoch: 1,
+                simulation_time_seconds: 0.0,
+                body_position: Vec3::new(10.0, -20.0, 5.0),
+                ryugu_transform: Transform::IDENTITY,
+                probe_position: Vec3::ZERO,
+                probe_velocity: Vec3::ZERO,
+            },
+            predictive: false,
+            body_acceleration: Vec3::new(1.0e-4, -2.0e-5, 3.0e-5),
+            positive_potential: 0.04,
+            independent_positive_potential: None,
+            body_acceleration_jacobian: Some(hessian),
+            eq106_diagnostics: None,
+        };
+        let position = sample.snapshot.body_position + Vec3::new(4.0, -3.0, 2.0);
+        let expected =
+            sample.body_acceleration + hessian * (position - sample.snapshot.body_position);
+        let step = 0.01;
+        let mut numerical = Vec3::ZERO;
+        for axis in 0..3 {
+            let direction = [Vec3::X, Vec3::Y, Vec3::Z][axis];
+            let plus =
+                eq106_local_positive_potential(&sample, position + step * direction).unwrap();
+            let minus =
+                eq106_local_positive_potential(&sample, position - step * direction).unwrap();
+            numerical[axis] = (plus - minus) / (2.0 * step);
+        }
+        assert!((numerical - expected).length() < 3.0e-7);
+    }
+
+    #[test]
     fn incomplete_chart_window_scales_with_simulation_acceleration() {
         let samples = [JacobiSample {
             simulation_time_seconds: 8.0,
             jacobi_constant: 1.0,
+            eq106_diagnostics: None,
         }];
         let (_, time_end_1x) = jacobi_time_bounds(&samples, SimulationAcceleration(1));
         let (_, time_end_8x) = jacobi_time_bounds(&samples, SimulationAcceleration(8));

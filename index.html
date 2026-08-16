@@ -99,7 +99,14 @@
                 document.getElementById('bevy').style.display = 'none';
                 document.getElementById('no-webgpu').style.display = 'flex';
             } else {
-                import('./pkg/ryugu_wasm.js').then(({ default: init }) => init());
+                // Reuse the page's optional `?v=` cache key for both glue and
+                // WASM so a newly built physics kernel cannot be paired with a
+                // stale browser-cached binary during verification/deployment.
+                const version = new URL(window.location.href).searchParams.get('v');
+                const suffix = version ? `?v=${encodeURIComponent(version)}` : '';
+                import(`./pkg/ryugu_wasm.js${suffix}`).then(({ default: init }) =>
+                    init(`./pkg/ryugu_wasm_bg.wasm${suffix}`)
+                );
             }
         }
     </script>

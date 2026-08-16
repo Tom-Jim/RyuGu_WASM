@@ -208,6 +208,12 @@ pub(crate) struct PerformanceComparisonStatus;
 #[derive(Component, Clone, Copy)]
 pub(crate) struct PerformanceJacobiAxisLabel(pub u8);
 
+#[derive(Component, Clone, Copy)]
+pub(crate) struct PerformanceTimeAxisLabel {
+    pub jacobi: bool,
+    pub slot: u8,
+}
+
 #[derive(Component)]
 pub(crate) struct PerformanceComparisonResult(pub usize);
 
@@ -989,8 +995,14 @@ pub fn trajectory_inversion_input_system(
                         TrajectoryVectorField::Velocity => knot.velocity = value,
                     }
                     inversion.knots_edited = true;
+                    inversion.capture_id = Some(crate::systems::render::hash_trajectory_capture(
+                        &inversion.knots,
+                    ));
                     inversion.inverted = false;
                     inversion.annealing = None;
+                    inversion.pending_inversion_methods.clear();
+                    inversion.batch_capture_id = None;
+                    inversion.results = std::array::from_fn(|_| None);
                     inversion.displayed_density = None;
                 }
                 inversion.selected = Some((field.index, field.vector));
@@ -1026,8 +1038,14 @@ pub fn trajectory_inversion_input_system(
                             TrajectoryVectorField::Velocity => knot.velocity = value,
                         }
                         inversion.knots_edited = true;
+                        inversion.capture_id = Some(
+                            crate::systems::render::hash_trajectory_capture(&inversion.knots),
+                        );
                         inversion.inverted = false;
                         inversion.annealing = None;
+                        inversion.pending_inversion_methods.clear();
+                        inversion.batch_capture_id = None;
+                        inversion.results = std::array::from_fn(|_| None);
                         inversion.displayed_density = None;
                         inversion.selected = None;
                         inversion.edit_buffer.clear();
@@ -1082,7 +1100,7 @@ pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new("Density inversion vs original model"),
+                Text::new("Density inversion history (G selects the next run)"),
                 TextFont {
                     font_size: bevy::text::FontSize::Px(13.0),
                     ..default()
@@ -1118,6 +1136,7 @@ pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
 
 pub fn density_inversion_timing_ui_system(
     inversion: Res<TrajectoryInversionState>,
+    active_method: Res<ActiveGravityMethod>,
     mut timing_labels: Query<(&DensityInversionTimingLabel, &mut Text)>,
     mut status_labels: Query<
         (&mut Text, &mut TextColor),
@@ -1129,14 +1148,22 @@ pub fn density_inversion_timing_ui_system(
 ) {
     let names = ["Radial", "Werner", "Eq.106", "MMFFT", "FMM"];
     for (label, mut text) in timing_labels.iter_mut() {
+        let marker = if label.0 == active_method.performance_index() {
+            "*"
+        } else {
+            " "
+        };
         **text = match inversion.results[label.0].as_ref() {
             Some(result) => format!(
-                "{:<8} fit {:>7.4}% | RMSE {:>7.4}%",
+                "{}{: <7} fit {:>7.4}% | RMSE {:>7.4}% | cap {:08x} e{}",
+                marker,
                 names[label.0],
                 result.model_fit * 100.0,
                 result.model_deviation * 100.0,
+                result.capture_id as u32,
+                result.capture_epoch,
             ),
-            None => format!("{:<8}  --", names[label.0]),
+            None => format!("{}{: <7}  --", marker, names[label.0]),
         };
     }
     for (mut text, mut color) in status_labels.iter_mut() {
@@ -1173,12 +1200,18 @@ pub fn density_inversion_timing_ui_system(
                 "SA improved the trajectory objective"
             };
             **text = format!(
-                "{}\nfit={:.4}%, density RMSE={:.4}%\n{}; objective gain={:.4}%\n{} Quintic track samples, {} voxels\nmean rho={:.5e}, range={:.4e}..{:.4e}\nsigma/mean={:.3}, mass scale={:.5}\nobjective={:.3e}, {} annealing steps",
+                "{}\nfit={:.4}%, density RMSE={:.4}%\n{}; objective gain={:.4}%\ncapture={:016x}, source={:016x}, epoch={}\nseed={:016x}, J0={:.3e}, data scale={:.3e}\n{} Quintic track samples, {} voxels\nmean rho={:.5e}, range={:.4e}..{:.4e}\nsigma/mean={:.3}, mass scale={:.5}\nobjective={:.3e}, {} annealing steps",
                 model,
                 result.model_fit * 100.0,
                 result.model_deviation * 100.0,
                 convergence,
                 result.objective_improvement * 100.0,
+                result.capture_id,
+                result.source_hash,
+                result.capture_epoch,
+                result.rng_seed,
+                result.initial_objective,
+                result.data_error_scale,
                 result.trajectory_samples,
                 result.voxels.len(),
                 result.density,
@@ -1193,6 +1226,12 @@ pub fn density_inversion_timing_ui_system(
         } else if let Some(error) = inversion.error.as_deref() {
             **text = error.to_owned();
             color.0 = Color::srgb(1.0, 0.4, 0.35);
+        } else if !inversion.ready && inversion.certified_sample_streak > 0 {
+            **text = format!(
+                "Eq.106 certified warm-up: {}/30 consecutive samples",
+                inversion.certified_sample_streak.min(30)
+            );
+            color.0 = Color::srgb(1.0, 0.78, 0.25);
         } else {
             **text = "Waiting for inversion".into();
             color.0 = Color::srgb(0.72, 0.72, 0.76);
@@ -1305,23 +1344,6 @@ fn axis_text(label: &'static str, left: f32, top: f32) -> impl Bundle {
     )
 }
 
-fn axis_text_owned(label: String, left: f32, top: f32) -> impl Bundle {
-    (
-        Text::new(label),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(9.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.58, 0.72, 0.78)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(left),
-            top: px(top),
-            ..default()
-        },
-    )
-}
-
 fn jacobi_axis_text(slot: u8, left: f32, top: f32) -> impl Bundle {
     (
         Text::new("--"),
@@ -1341,14 +1363,37 @@ fn jacobi_axis_text(slot: u8, left: f32, top: f32) -> impl Bundle {
 }
 
 fn performance_time_axis() -> impl Bundle {
-    performance_time_axis_at(224.0)
+    performance_time_axis_at(224.0, false)
 }
 
 fn performance_time_axis_jacobi() -> impl Bundle {
-    performance_time_axis_at(306.0)
+    performance_time_axis_at(306.0, true)
 }
 
-fn performance_time_axis_at(top: f32) -> impl Bundle {
+fn performance_time_axis_text(value: &str, left: f32, jacobi: bool, slot: u8) -> impl Bundle {
+    (
+        Text::new(value),
+        PerformanceTimeAxisLabel { jacobi, slot },
+        TextFont {
+            font_size: bevy::text::FontSize::Px(9.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.58, 0.72, 0.78)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(left),
+            top: px(0),
+            ..default()
+        },
+    )
+}
+
+fn performance_time_axis_at(top: f32, jacobi: bool) -> impl Bundle {
+    let label = if jacobi {
+        "Simulation time"
+    } else {
+        "Benchmark progress"
+    };
     (
         Node {
             position_type: PositionType::Absolute,
@@ -1359,12 +1404,12 @@ fn performance_time_axis_at(top: f32) -> impl Bundle {
             ..default()
         },
         children![
-            axis_text("0", 0.0, 0.0),
-            axis_text("25", 252.0, 0.0),
-            axis_text("50", 512.0, 0.0),
-            axis_text("75", 772.0, 0.0),
-            axis_text_owned(format!("{PERFORMANCE_TEST_DURATION_HOURS:.0}"), 1018.0, 0.0,),
-            axis_text("Detector runtime (h)", 454.0, 11.0),
+            performance_time_axis_text("0", 0.0, jacobi, 0),
+            performance_time_axis_text("--", 252.0, jacobi, 1),
+            performance_time_axis_text("--", 512.0, jacobi, 2),
+            performance_time_axis_text("--", 772.0, jacobi, 3),
+            performance_time_axis_text("--", 1010.0, jacobi, 4),
+            axis_text(label, 454.0, 11.0),
         ],
     )
 }
@@ -1562,7 +1607,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                 BackgroundColor(Color::srgba(0.01, 0.02, 0.04, 0.95)),
                 children![
                     (
-                        Text::new("Rotating-frame Jacobi constants"),
+                        Text::new("Rotating-frame Jacobi relative drift"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(14.0),
                             ..default()
@@ -1645,7 +1690,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                             ..default()
                         },
                     ),
-                    axis_text("C_J", 8.0, 168.0),
+                    axis_text("dC/|C0|", 2.0, 168.0),
                     jacobi_axis_text(0, 2.0, 50.0),
                     jacobi_axis_text(1, 2.0, 174.0),
                     jacobi_axis_text(2, 2.0, 298.0),
@@ -1767,6 +1812,7 @@ pub fn performance_button_system(
     active_method: Res<ActiveGravityMethod>,
     mut state: ResMut<PerformanceComparisonState>,
     mut display_rotation: ResMut<DisplayRotation>,
+    mut simulation_acceleration: ResMut<SimulationAcceleration>,
 ) {
     for (interaction, performance_button, three_d_button, rotation_button, repeat_button) in
         interactions.iter_mut()
@@ -1775,9 +1821,12 @@ pub fn performance_button_system(
             continue;
         }
         if performance_button.is_some() && !state.active {
+            state.return_simulation_acceleration = simulation_acceleration.0;
+            simulation_acceleration.0 = MIN_SIMULATION_ACCELERATION;
             state.start(*active_method);
         } else if three_d_button.is_some() && state.active {
             state.stop();
+            simulation_acceleration.0 = state.return_simulation_acceleration;
         } else if repeat_button.is_some() && state.active && !state.measuring {
             state.restart();
         } else if rotation_button.is_some() {
@@ -1850,6 +1899,7 @@ pub fn performance_method_checkbox_system(
 
 pub fn performance_comparison_system(
     time: Res<Time>,
+    clock: Res<SimulationClock>,
     mut state: ResMut<PerformanceComparisonState>,
     active_method: Res<ActiveGravityMethod>,
     jacobi: Res<JacobiHistory>,
@@ -1859,11 +1909,13 @@ pub fn performance_comparison_system(
         Query<&mut Node, (With<ThreeDViewButton>, Without<PerformanceViewButton>)>,
         Query<&mut Node, With<PerformanceRepeatButton>>,
         Query<(&PerformanceChartSegment, &mut Node, &mut UiTransform)>,
+        Query<&mut Node, With<TrajectoryInversionButton>>,
     )>,
     mut texts: ParamSet<(
         Query<&mut Text, With<PerformanceComparisonStatus>>,
         Query<(&mut Text, &PerformanceComparisonResult)>,
         Query<(&PerformanceJacobiAxisLabel, &mut Text)>,
+        Query<(&PerformanceTimeAxisLabel, &mut Text)>,
     )>,
 ) {
     // A repeat request and an algorithm transition are intentionally handled
@@ -1909,6 +1961,13 @@ pub fn performance_comparison_system(
             Display::None
         };
     }
+    if let Some(mut button) = nodes.p5().iter_mut().next() {
+        button.display = if state.active {
+            Display::None
+        } else {
+            Display::Flex
+        };
+    }
 
     if state.active
         && state.measuring
@@ -1918,12 +1977,20 @@ pub fn performance_comparison_system(
             .copied()
             .unwrap_or(false)
         && *active_method == method_for_phase(state.phase)
+        && clock.elapsed_seconds > 0.0
     {
         let dt = time.delta_secs_f64().max(f64::EPSILON);
         let fps = (1.0 / dt) as f32;
         let phase = state.phase;
         if let Some(history) = state.fps_history.get_mut(phase) {
-            push_performance_sample(history, fps);
+            // Readback/phase hand-off frames are visible as single-frame FPS
+            // spikes even though they are not representative of the method's
+            // steady-state throughput. Keep the raw phase average below, but
+            // plot a short EMA so the comparison remains readable.
+            let plotted_fps = history
+                .back()
+                .map_or(fps, |previous| *previous * 0.82 + fps * 0.18);
+            push_performance_sample(history, plotted_fps);
         }
         // The global Jacobi history may still contain the previous phase's
         // last sample while a new GPU readback is in flight. Do not splice
@@ -1936,17 +2003,18 @@ pub fn performance_comparison_system(
         {
             let series = active_method.performance_index();
             if let Some(history) = state.jacobi_history.get_mut(series) {
-                push_performance_sample(history, sample.jacobi_constant);
+                push_performance_sample(history, *sample);
             }
             state.jacobi_last_request_ids[phase] = jacobi_request_id;
         }
         state.phase_frames = state.phase_frames.saturating_add(1);
         state.phase_elapsed_seconds += time.delta_secs_f64();
-        if state.phase_frames >= PERFORMANCE_PHASE_FRAMES {
+        if clock.elapsed_seconds >= PERFORMANCE_PHASE_SIMULATION_SECONDS {
             let elapsed = state.phase_elapsed_seconds.max(f64::EPSILON);
             let phase = state.phase;
+            let measured_frames = state.phase_frames;
             if let Some(result) = state.frames_per_second.get_mut(phase) {
-                *result = PERFORMANCE_PHASE_FRAMES as f64 / elapsed;
+                *result = measured_frames as f64 / elapsed;
             }
             state.completed_methods[phase] = true;
             if let Some((next_phase, next_method)) = state.next_uncompleted_enabled_method(phase) {
@@ -1963,12 +2031,35 @@ pub fn performance_comparison_system(
 
     if let Some(mut text) = texts.p0().iter_mut().next() {
         *text = Text::new(if state.active && state.measuring {
-            format!(
-                "Measuring {} ({} / {} frames)",
+            let mut status = format!(
+                "Measuring {} ({:.0} / {:.0} simulation seconds)",
                 method_for_phase(state.phase).as_str(),
-                state.phase_frames,
-                PERFORMANCE_PHASE_FRAMES
-            )
+                clock
+                    .elapsed_seconds
+                    .min(PERFORMANCE_PHASE_SIMULATION_SECONDS),
+                PERFORMANCE_PHASE_SIMULATION_SECONDS,
+            );
+            if method_for_phase(state.phase) == ActiveGravityMethod::CurvedArcEq106
+                && let Some(diagnostics) = state.jacobi_history[2]
+                    .back()
+                    .and_then(|sample| sample.eq106_diagnostics)
+            {
+                status.push_str(&format!(
+                    " | seg {} origin=({:.0},{:.0},{:.0}) h/u/v=({:.1},{:.1},{:.1}) cert=[{:.1e},{:.1e},{:.1e},{:.1e}]",
+                    diagnostics.segment_id,
+                    diagnostics.line_origin.x,
+                    diagnostics.line_origin.y,
+                    diagnostics.line_origin.z,
+                    diagnostics.h,
+                    diagnostics.u,
+                    diagnostics.v,
+                    diagnostics.certificates[0],
+                    diagnostics.certificates[1],
+                    diagnostics.certificates[2],
+                    diagnostics.certificates[3],
+                ));
+            }
+            status
         } else if state.active && state.enabled_methods.iter().any(|enabled| *enabled) {
             "Benchmark complete. Select 3D display to return.".to_owned()
         } else if state.active {
@@ -2010,6 +2101,16 @@ pub fn performance_comparison_system(
         }
     }
 
+    let jacobi_times = performance_jacobi_time_bounds(&state).unwrap_or((0.0, 0.0));
+    for (label, mut text) in texts.p3().iter_mut() {
+        **text = if label.jacobi {
+            let fraction = label.slot as f64 / 4.0;
+            format_performance_time(jacobi_times.0 + fraction * (jacobi_times.1 - jacobi_times.0))
+        } else {
+            format!("{}%", label.slot as u32 * 25)
+        };
+    }
+
     update_performance_chart_segments(&state, &mut nodes.p4());
 }
 
@@ -2018,10 +2119,6 @@ fn push_performance_sample<T>(history: &mut std::collections::VecDeque<T>, value
         history.pop_front();
     }
     history.push_back(value);
-}
-
-fn jacobi_series_visual_offset(series: usize) -> f32 {
-    (series as f32 - 2.0) * 4.0
 }
 
 fn update_performance_chart_segments(
@@ -2035,13 +2132,15 @@ fn update_performance_chart_segments(
         .fold(1.0_f32, f32::max);
     let (jacobi_min, jacobi_max) = performance_jacobi_bounds(state).unwrap_or((0.0, 1.0));
     let jacobi_span = (jacobi_max - jacobi_min).max(1.0e-9);
+    let jacobi_time_bounds = performance_jacobi_time_bounds(state).unwrap_or((0.0, 1.0));
+    let jacobi_time_span = (jacobi_time_bounds.1 - jacobi_time_bounds.0).max(f64::EPSILON);
 
     for (segment, mut node, mut transform) in segments.iter_mut() {
         if !performance_chart_series_enabled(state, segment) {
             node.display = Display::None;
             continue;
         }
-        let (y0, y1) = if segment.jacobi {
+        let (x0, x1, y0, y1) = if segment.jacobi {
             let Some(history) = state.jacobi_history.get(segment.series) else {
                 node.display = Display::None;
                 continue;
@@ -2052,12 +2151,23 @@ fn update_performance_chart_segments(
                 node.display = Display::None;
                 continue;
             };
-            let a = ((from - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
-            let b = ((to - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
-            (
-                (1.0 - a) * 220.0 + jacobi_series_visual_offset(segment.series),
-                (1.0 - b) * 220.0 + jacobi_series_visual_offset(segment.series),
-            )
+            let Some(a_drift) = performance_jacobi_relative_drift(history, from) else {
+                node.display = Display::None;
+                continue;
+            };
+            let Some(b_drift) = performance_jacobi_relative_drift(history, to) else {
+                node.display = Display::None;
+                continue;
+            };
+            let a = ((a_drift - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
+            let b = ((b_drift - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
+            let x0 = ((from.simulation_time_seconds - jacobi_time_bounds.0) / jacobi_time_span)
+                .clamp(0.0, 1.0) as f32
+                * PERFORMANCE_CHART_CONTENT_WIDTH;
+            let x1 = ((to.simulation_time_seconds - jacobi_time_bounds.0) / jacobi_time_span)
+                .clamp(0.0, 1.0) as f32
+                * PERFORMANCE_CHART_CONTENT_WIDTH;
+            (x0, x1, (1.0 - a) * 220.0, (1.0 - b) * 220.0)
         } else {
             let Some(history) = state.fps_history.get(segment.series) else {
                 node.display = Display::None;
@@ -2071,28 +2181,19 @@ fn update_performance_chart_segments(
             };
             let y0 = (1.0 - *from / fps_max) * 170.0;
             let y1 = (1.0 - *to / fps_max) * 170.0;
-            (y0, y1)
+            let history_len = history.len();
+            let width = if history_len > 1 {
+                PERFORMANCE_CHART_CONTENT_WIDTH / (history_len - 1) as f32
+            } else {
+                1.0
+            };
+            (
+                segment.index as f32 * width,
+                (segment.index + 1) as f32 * width,
+                y0,
+                y1,
+            )
         };
-        let history_len = if segment.jacobi {
-            state
-                .jacobi_history
-                .get(segment.series)
-                .map_or(0, VecDeque::len)
-        } else {
-            state
-                .fps_history
-                .get(segment.series)
-                .map_or(0, VecDeque::len)
-        };
-        // Each algorithm owns its own sample count, but every series is
-        // stretched to the same detector-runtime axis: 0..100 hours.
-        let width = if history_len > 1 {
-            PERFORMANCE_CHART_CONTENT_WIDTH / (history_len - 1) as f32
-        } else {
-            1.0
-        };
-        let x0 = segment.index as f32 * width;
-        let x1 = (segment.index + 1) as f32 * width;
         let delta = Vec2::new(x1 - x0, y1 - y0);
         let length = delta.length();
         node.display = Display::Flex;
@@ -2104,22 +2205,49 @@ fn update_performance_chart_segments(
 }
 
 fn performance_jacobi_bounds(state: &PerformanceComparisonState) -> Option<(f64, f64)> {
-    let mut values = state
+    let mut values = state.jacobi_history.iter().flat_map(|series| {
+        series
+            .iter()
+            .filter_map(|sample| performance_jacobi_relative_drift(series, sample))
+    });
+    let first = values.next()?.abs();
+    let maximum_magnitude = values.fold(first, |maximum, value| maximum.max(value.abs()));
+    // Jacobi drift is centered on the invariant value zero. A symmetric axis
+    // makes methods directly comparable and prevents the chart from implying
+    // that a one-sided numerical bias is the new baseline.
+    let limit = (maximum_magnitude * 1.08).max(1.0e-6);
+    Some((-limit, limit))
+}
+
+fn performance_jacobi_relative_drift(
+    history: &VecDeque<JacobiSample>,
+    sample: &JacobiSample,
+) -> Option<f64> {
+    let baseline = history.front()?.jacobi_constant;
+    let denominator = baseline.abs().max(1.0e-12);
+    let drift = (sample.jacobi_constant - baseline) / denominator;
+    drift.is_finite().then_some(drift)
+}
+
+fn performance_jacobi_time_bounds(state: &PerformanceComparisonState) -> Option<(f64, f64)> {
+    let mut times = state
         .jacobi_history
         .iter()
-        .flat_map(|series| series.iter().copied())
-        .filter(|value| value.is_finite());
-    let first = values.next()?;
-    let (minimum, maximum) = values.fold((first, first), |(minimum, maximum), value| {
-        (minimum.min(value), maximum.max(value))
+        .flat_map(|series| series.iter().map(|sample| sample.simulation_time_seconds))
+        .filter(|time| time.is_finite());
+    let first = times.next()?;
+    let (minimum, maximum) = times.fold((first, first), |(minimum, maximum), time| {
+        (minimum.min(time), maximum.max(time))
     });
-    let span = maximum - minimum;
-    let padding = if span > f64::EPSILON {
-        0.08 * span
+    Some((minimum, maximum.max(minimum + f64::EPSILON)))
+}
+
+fn format_performance_time(seconds: f64) -> String {
+    if seconds.abs() >= 3600.0 {
+        format!("{:.2} h", seconds / 3600.0)
     } else {
-        (maximum.abs() * 0.02).max(1.0e-9)
-    };
-    Some((minimum - padding, maximum + padding))
+        format!("{seconds:.0} s")
+    }
 }
 
 fn format_axis_value(value: f64) -> String {
@@ -2216,9 +2344,10 @@ pub fn update_gpu_memory_estimate_system(
             + source.fourier_modes.len() as u64 * 16
             + 64 * 8
             + tensor.tensor.coefficients.len() as u64 * 4
-            + 64
-            + 129 * 32
-            + 2 * 8 * 9 * 16;
+            + 112
+            + 15 * 64 * 16
+            + 15 * 129 * 32
+            + 2 * 9 * 9 * 16;
     }
     if let Some(source) = mmfft {
         bytes[3] = source.bytes.len() as u64 + 48 + 32;
@@ -2386,12 +2515,10 @@ pub fn method_toggle_system(
         samples.0.clear();
     }
     simulation_clock.reset_state();
-    // Manual method changes start a new Jacobi trace. During the performance
-    // rotation, preserve the shared source long enough for the next method's
-    // GPU readback to arrive; per-method benchmark histories remain isolated.
-    if !performance.active {
-        jacobi_history.reset();
-    }
+    // Every algorithm starts from a fresh physical-time origin. In particular,
+    // do not let the first benchmark frame copy a same-method sample left over
+    // from before the trajectory reset while the new GPU result is in flight.
+    jacobi_history.reset();
     curved_arc.p0().reset();
     curved_arc.p1().reset();
     curved_arc.p2().reset();
@@ -2405,6 +2532,18 @@ pub fn method_toggle_system(
         c_history.0.clear();
         r_transform.rotation = Quat::IDENTITY;
         r_transform.translation = Vec3::ZERO;
+    }
+}
+
+/// Marks a manual G transition after the large method-toggle system has run.
+/// Keeping this separate avoids increasing that system's Bevy parameter list.
+pub fn preserve_inversion_results_on_manual_method_switch(
+    active_method: Res<ActiveGravityMethod>,
+    performance: Res<PerformanceComparisonState>,
+    mut inversion: ResMut<TrajectoryInversionState>,
+) {
+    if active_method.is_changed() && !performance.active {
+        inversion.preserve_results_on_next_epoch = true;
     }
 }
 pub fn update_hint_on_mode_change(
@@ -2435,10 +2574,12 @@ pub fn update_hint_on_mode_change(
 mod performance_chart_tests {
     use super::{
         PerformanceChartSegment, clear_performance_method_history, format_vram_text,
-        jacobi_series_visual_offset, performance_chart_series_count,
-        performance_chart_series_enabled,
+        performance_chart_series_count, performance_chart_series_enabled,
+        performance_jacobi_relative_drift, performance_jacobi_time_bounds,
     };
-    use crate::components::{ActiveGravityMethod, GpuMemoryEstimate, PerformanceComparisonState};
+    use crate::components::{
+        ActiveGravityMethod, GpuMemoryEstimate, JacobiSample, PerformanceComparisonState,
+    };
     use std::collections::VecDeque;
 
     #[test]
@@ -2451,7 +2592,11 @@ mod performance_chart_tests {
     fn disabling_method_hides_and_clears_all_related_series() {
         let mut state = PerformanceComparisonState::default();
         state.fps_history[1].push_back(60.0);
-        state.jacobi_history[1].push_back(1.0);
+        state.jacobi_history[1].push_back(JacobiSample {
+            simulation_time_seconds: 0.0,
+            jacobi_constant: 1.0,
+            eq106_diagnostics: None,
+        });
         state.frames_per_second[1] = 60.0;
         clear_performance_method_history(&mut state, 1);
         state.enabled_methods[1] = false;
@@ -2472,13 +2617,21 @@ mod performance_chart_tests {
     #[test]
     fn disabling_eq106_clears_only_its_real_jacobi_series() {
         let mut state = PerformanceComparisonState::default();
-        state.jacobi_history[2] = VecDeque::from([1.0]);
-        state.jacobi_history[3] = VecDeque::from([2.0]);
+        let sample = |time, value| JacobiSample {
+            simulation_time_seconds: time,
+            jacobi_constant: value,
+            eq106_diagnostics: None,
+        };
+        state.jacobi_history[2] = VecDeque::from([sample(0.0, 1.0)]);
+        state.jacobi_history[3] = VecDeque::from([sample(0.0, 2.0)]);
         clear_performance_method_history(&mut state, 2);
         state.enabled_methods[2] = false;
 
         assert!(state.jacobi_history[2].is_empty());
-        assert_eq!(state.jacobi_history[3], VecDeque::from([2.0]));
+        assert_eq!(
+            state.jacobi_history[3].front().unwrap().jacobi_constant,
+            2.0
+        );
         assert!(!performance_chart_series_enabled(
             &state,
             &PerformanceChartSegment {
@@ -2505,9 +2658,27 @@ mod performance_chart_tests {
     }
 
     #[test]
-    fn overlapping_jacobi_series_receive_distinct_visual_offsets() {
-        let offsets: Vec<f32> = (0..5).map(jacobi_series_visual_offset).collect();
-        assert_eq!(offsets, [-8.0, -4.0, 0.0, 4.0, 8.0]);
+    fn jacobi_plot_uses_physical_time_and_per_series_relative_drift() {
+        let mut state = PerformanceComparisonState::default();
+        state.jacobi_history[2] = VecDeque::from([
+            JacobiSample {
+                simulation_time_seconds: 5.0,
+                jacobi_constant: 4.0,
+                eq106_diagnostics: None,
+            },
+            JacobiSample {
+                simulation_time_seconds: 25.0,
+                jacobi_constant: 4.04,
+                eq106_diagnostics: None,
+            },
+        ]);
+        assert_eq!(performance_jacobi_time_bounds(&state), Some((5.0, 25.0)));
+        let drift = performance_jacobi_relative_drift(
+            &state.jacobi_history[2],
+            state.jacobi_history[2].back().unwrap(),
+        )
+        .unwrap();
+        assert!((drift - 0.01).abs() < 1.0e-12);
     }
 
     #[test]

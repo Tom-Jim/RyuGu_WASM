@@ -11,9 +11,11 @@ use std::collections::VecDeque;
 
 const PLANNING_WINDOW_POINTS: usize = 128;
 const MIN_SEGMENT_POINTS: usize = 4;
-const EPSILON_TARGET: f64 = 0.25;
+const EPSILON_TARGET: f64 = 0.20;
 const TAYLOR_REMAINDER_TARGET: f64 = 1.0e-3;
-const MAX_TAYLOR_ORDER: u32 = 8;
+// The production GPU evaluator caches the complete two-dimensional basis
+// through P=4, giving J=(P+1)(P+2)/2=15 coefficient spectra per segment.
+const MAX_TAYLOR_ORDER: u32 = 4;
 const CLOSURE_POSITION_TOLERANCE: f32 = 1.0e-3;
 const CLOSURE_VELOCITY_TOLERANCE: f32 = 1.0e-3;
 const CLOSURE_PERIOD_TOLERANCE: f64 = 1.0e-3;
@@ -101,8 +103,8 @@ pub struct CurvedArcResidualSample {
     /// This is the Eq. (118) Taylor series ratio bound, not the Eq. (157) dual
     /// residual. Always populated so the chart has a stable y-range.
     pub epsilon_max: f64,
-    /// Eq. (157) dual-representation residual from the curved-path work
-    /// integral and the independently accumulated GPU potential.
+    /// Optional offline dual-representation residual. Production Eq.106 uses
+    /// the cached-spectrum convergence metric below instead of a second field.
     pub dual_residual: Option<f64>,
     /// Taylor truncation order actually used (1..=MAX_TAYLOR_ORDER).
     pub taylor_order: u32,
@@ -213,7 +215,7 @@ impl CurvedArcResidualHistory {
         self.previous_request_id = Some(sample.snapshot.request_id);
 
         // Eq. (147) supplies P_70 through the curved-path work integral, while
-        // the independently accumulated GPU potential supplies P_spec. Their
+        // the independent Eq. (79)-(83) Fourier-toroidal potential supplies P_spec. Their
         // finite-discretization difference is the Eq. (157) dual residual.
         let residual = (curve_work - origin_curve_work) - (potential - origin);
         residual.is_finite().then_some(residual)
@@ -280,8 +282,9 @@ pub fn build_eq106_source_system(
     mut commands: Commands,
     radial: Option<Res<RadialGravitySource>>,
     existing: Option<Res<Eq106SourceData>>,
+    active_method: Res<ActiveGravityMethod>,
 ) {
-    if existing.is_some() {
+    if existing.is_some() || *active_method != ActiveGravityMethod::CurvedArcEq106 {
         return;
     }
     let Some(radial) = radial else { return };
@@ -585,12 +588,12 @@ pub fn monitor_curved_arc_system(
             history
                 .0
                 .completed_at_or_before(clock.epoch, clock.elapsed_seconds)
-        }) && let Some(dual_residual) = residual_history.dual_residual_for(sample)
-        {
+        }) {
+            let dual_residual = residual_history.dual_residual_for(sample);
             residual_history.push(CurvedArcResidualSample {
                 simulation_time_seconds: sample.snapshot.simulation_time_seconds,
                 epsilon_max,
-                dual_residual: Some(dual_residual),
+                dual_residual,
                 taylor_order,
             });
         }
@@ -793,6 +796,10 @@ fn update_periodicity(
                 planner.stable_closures = planner.stable_closures.saturating_add(1);
             } else {
                 planner.stable_closures = 0;
+                // Periodic reuse is valid only while the closure certificate
+                // remains stable. A changed orbit immediately returns to the
+                // general non-periodic segmented evaluator.
+                planner.mode = CurvedArcMode::NonPeriodic;
             }
             detector.previous_period = Some(period);
             detector.reference = Some(closure);
@@ -862,6 +869,91 @@ mod tests {
         let sharp = evaluate_segment(&sharp, 0, 3, 400.0);
         assert!(sharp.maximum_curvature > gentle.maximum_curvature);
         assert!(sharp.epsilon_max > gentle.epsilon_max);
+    }
+
+    #[test]
+    fn periodic_mode_requires_ten_consecutive_stable_closures() {
+        let mut detector = PeriodicityDetector::default();
+        let mut planner = CurvedArcPlannerState {
+            mode: CurvedArcMode::NonPeriodic,
+            ..default()
+        };
+        let velocity = Vec3::X;
+
+        // Establish the section and the first closure reference.
+        update_periodicity(&mut detector, &mut planner, Vec3::ZERO, velocity, 0.0);
+        for cycle in 1..=11 {
+            update_periodicity(
+                &mut detector,
+                &mut planner,
+                Vec3::new(-1.0, 0.0, 0.0),
+                velocity,
+                cycle as f64 * 10.0 - 0.1,
+            );
+            update_periodicity(
+                &mut detector,
+                &mut planner,
+                Vec3::ZERO,
+                velocity,
+                cycle as f64 * 10.0,
+            );
+            if cycle <= 10 {
+                assert_ne!(planner.mode, CurvedArcMode::Periodic);
+            }
+        }
+        assert_eq!(planner.stable_closures, REQUIRED_STABLE_CLOSURES);
+        assert_eq!(planner.mode, CurvedArcMode::Periodic);
+
+        // A single changed closure invalidates periodic reuse immediately.
+        update_periodicity(
+            &mut detector,
+            &mut planner,
+            Vec3::new(-1.0, 0.0, 0.0),
+            velocity,
+            119.9,
+        );
+        update_periodicity(
+            &mut detector,
+            &mut planner,
+            Vec3::new(0.1, 0.0, 0.0),
+            velocity,
+            120.0,
+        );
+        assert_eq!(planner.stable_closures, 0);
+        assert_eq!(planner.mode, CurvedArcMode::NonPeriodic);
+    }
+
+    #[test]
+    fn eq157_residual_compares_curve_work_with_independent_potential() {
+        let mut history = CurvedArcResidualHistory::default();
+        history.accumulate_curve_work(0.0, 1.0, Vec3::ZERO, Vec3::X, Vec3::X, Vec3::X);
+
+        let sample = |request_id, time, potential| GravityFieldSample {
+            snapshot: GravityRequestSnapshot {
+                request_id,
+                epoch: 0,
+                simulation_time_seconds: time,
+                body_position: Vec3::ZERO,
+                ryugu_transform: Transform::IDENTITY,
+                probe_position: Vec3::ZERO,
+                probe_velocity: Vec3::ZERO,
+            },
+            predictive: false,
+            body_acceleration: Vec3::ZERO,
+            positive_potential: potential,
+            independent_positive_potential: Some(potential),
+            body_acceleration_jacobian: None,
+            eq106_diagnostics: None,
+        };
+
+        assert_eq!(history.dual_residual_for(&sample(1, 0.0, 4.0)), Some(0.0));
+        assert!(
+            history
+                .dual_residual_for(&sample(2, 1.0, 5.0))
+                .is_some_and(|residual| residual.abs() <= f64::EPSILON)
+        );
+        // A repeated GPU request must not be plotted twice.
+        assert_eq!(history.dual_residual_for(&sample(2, 1.0, 5.0)), None);
     }
 
     #[test]

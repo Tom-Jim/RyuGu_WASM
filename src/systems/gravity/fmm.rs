@@ -152,8 +152,9 @@ pub fn build_fmm_source_system(
     mut commands: Commands,
     radial: Option<Res<RadialGravitySource>>,
     existing: Option<Res<FmmSource>>,
+    active_method: Res<ActiveGravityMethod>,
 ) {
-    if existing.is_some() {
+    if existing.is_some() || *active_method != ActiveGravityMethod::Fmm {
         return;
     }
     let Some(radial) = radial else { return };
@@ -381,6 +382,7 @@ fn poll_fmm_readback(channel: Res<FmmReadbackChannel>, mut history: ResMut<FmmGr
             positive_potential: total.w,
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
+            eq106_diagnostics: None,
         });
     }
 }

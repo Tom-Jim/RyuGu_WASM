@@ -1,4 +1,5 @@
 use crate::components::*;
+use crate::systems::curved_arc::Eq106SourceData;
 use crate::systems::inversion::{
     quintic_knot_accelerations, quintic_segment_position_acceleration,
 };
@@ -87,13 +88,20 @@ pub fn capture_trajectory_inversion_system(
     eq106_history: Option<Res<Eq106GpuHistory>>,
     mmfft_history: Option<Res<MmfftCompressedHistory>>,
     fmm_history: Option<Res<FmmGravityHistory>>,
+    eq106_source: Option<Res<Eq106SourceData>>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
     if inversion.capture_epoch != clock.epoch {
         inversion.capture_epoch = clock.epoch;
+        inversion.last_capture_request_id = None;
         inversion.wall_elapsed_seconds = 0.0;
         inversion.raw_samples.clear();
         inversion.knots.clear();
+        inversion.capture_id = None;
+        inversion.capture_source_hash =
+            eq106_source.as_ref().map_or(0, |source| source.source_hash);
+        inversion.certified_sample_streak = 0;
+        inversion.certified_segment_id = None;
         inversion.ready = false;
         inversion.knots_edited = false;
         inversion.inverted = false;
@@ -101,7 +109,24 @@ pub fn capture_trajectory_inversion_system(
         inversion.edit_buffer.clear();
         inversion.error = None;
         inversion.annealing = None;
+        inversion.pending_inversion_methods.clear();
+        inversion.batch_capture_id = None;
         inversion.displayed_density = None;
+        if inversion.preserve_results_on_next_epoch {
+            // G deliberately changes the forward method and therefore the
+            // epoch. Keep completed slots as a fill-in history, while each
+            // row retains its capture/epoch identity for honest comparison.
+            inversion.preserve_results_on_next_epoch = false;
+        } else {
+            // Probe edits, resets, and other physical changes invalidate the
+            // whole comparison set; never mix those captures silently.
+            inversion.results = std::array::from_fn(|_| None);
+        }
+    }
+    if !inversion.ready
+        && let Some(source) = eq106_source.as_ref()
+    {
+        inversion.capture_source_hash = source.source_hash;
     }
     if inversion.ready || clock.elapsed_seconds <= 0.0 {
         return;
@@ -128,6 +153,46 @@ pub fn capture_trajectory_inversion_system(
     let Some(sample) = sample else {
         return;
     };
+    if inversion.last_capture_request_id == Some(sample.snapshot.request_id) {
+        // GPU readback can be visible for several presentation frames. Do not
+        // duplicate one snapshot in the wall-time capture; repeated anchors
+        // make the 16-knot resampling depend on browser scheduling jitter.
+        // Eq.106's 30-sample certification gate precedes the five-second
+        // capture. Counting warm-up frames here created an empty prefix that
+        // resampling filled with repeated copies of the first valid knot.
+        if capture_clock_can_advance(*active_method, inversion.certified_sample_streak) {
+            inversion.wall_elapsed_seconds += time.delta_secs_f64();
+        }
+        return;
+    }
+    inversion.last_capture_request_id = Some(sample.snapshot.request_id);
+    if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+        const REQUIRED_CERTIFIED_CAPTURE_SAMPLES: u32 = 30;
+        let Some(diagnostics) = sample.eq106_diagnostics else {
+            inversion.certified_sample_streak = 0;
+            inversion.certified_segment_id = None;
+            return;
+        };
+        let certified = diagnostics.certificates[0] <= 0.25
+            && diagnostics.certificates[1] <= 0.05
+            && diagnostics.certificates[2] <= 0.25
+            && diagnostics.certificates[3] <= 0.30;
+        if !certified {
+            inversion.certified_sample_streak = 0;
+            inversion.certified_segment_id = None;
+            return;
+        }
+        // Certification belongs to each completed force sample, not to one
+        // planner segment. Adaptive subdivision may legitimately change the
+        // segment id every few samples, especially at accelerated simulation
+        // rates; that must not restart the warm-up.
+        inversion.certified_segment_id = Some(diagnostics.segment_id);
+        inversion.certified_sample_streak =
+            next_certified_sample_streak(inversion.certified_sample_streak, certified);
+        if inversion.certified_sample_streak < REQUIRED_CERTIFIED_CAPTURE_SAMPLES {
+            return;
+        }
+    }
     let baseline_acceleration = sample.snapshot.ryugu_transform.rotation * sample.body_acceleration;
     if !baseline_acceleration.is_finite() {
         return;
@@ -178,8 +243,51 @@ pub fn capture_trajectory_inversion_system(
         });
     }
     inversion.knots = knots;
+    inversion.capture_id = Some(hash_trajectory_capture(&inversion.knots));
     inversion.ready = true;
     inversion.knots_edited = false;
+}
+
+fn capture_clock_can_advance(method: ActiveGravityMethod, certified_sample_streak: u32) -> bool {
+    method != ActiveGravityMethod::CurvedArcEq106 || certified_sample_streak >= 30
+}
+
+fn next_certified_sample_streak(current: u32, certified: bool) -> u32 {
+    if certified {
+        current.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+pub(crate) fn hash_trajectory_capture(knots: &[TrajectoryInversionKnot]) -> u64 {
+    let mut hash = 1469598103934665603_u64;
+    let mut absorb = |bytes: &[u8]| {
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211_u64);
+        }
+    };
+    for knot in knots {
+        for value in [
+            knot.simulation_time_seconds.to_bits(),
+            knot.position.x.to_bits() as u64,
+            knot.position.y.to_bits() as u64,
+            knot.position.z.to_bits() as u64,
+            knot.velocity.x.to_bits() as u64,
+            knot.velocity.y.to_bits() as u64,
+            knot.velocity.z.to_bits() as u64,
+            knot.baseline_acceleration.x.to_bits() as u64,
+            knot.baseline_acceleration.y.to_bits() as u64,
+            knot.baseline_acceleration.z.to_bits() as u64,
+            knot.body_rotation.x.to_bits() as u64,
+            knot.body_rotation.y.to_bits() as u64,
+            knot.body_rotation.z.to_bits() as u64,
+            knot.body_rotation.w.to_bits() as u64,
+        ] {
+            absorb(&value.to_le_bytes());
+        }
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -352,6 +460,50 @@ pub fn render_gizmos_system(
 mod tests {
     use super::*;
 
+    #[test]
+    fn capture_hash_covers_force_and_kinematic_state() {
+        let knot = TrajectoryInversionKnot {
+            position: Vec3::new(1.0, 2.0, 3.0),
+            velocity: Vec3::new(4.0, 5.0, 6.0),
+            simulation_time_seconds: 7.0,
+            baseline_acceleration: Vec3::new(8.0, 9.0, 10.0),
+            body_rotation: Quat::IDENTITY,
+        };
+        let id = hash_trajectory_capture(&[knot]);
+        assert_eq!(id, hash_trajectory_capture(&[knot]));
+        let mut changed = knot;
+        changed.baseline_acceleration.x += 1.0e-6;
+        assert_ne!(id, hash_trajectory_capture(&[changed]));
+    }
+
+    #[test]
+    fn eq106_warm_up_does_not_consume_capture_time() {
+        assert!(!capture_clock_can_advance(
+            ActiveGravityMethod::CurvedArcEq106,
+            29
+        ));
+        assert!(capture_clock_can_advance(
+            ActiveGravityMethod::CurvedArcEq106,
+            30
+        ));
+        assert!(capture_clock_can_advance(
+            ActiveGravityMethod::RadialAnalytic,
+            0
+        ));
+    }
+
+    #[test]
+    fn eq106_certified_samples_accumulate_across_segment_changes() {
+        let mut streak = 0;
+        // Segment identifiers are deliberately absent from this transition:
+        // only the per-sample certificate controls continuity.
+        for _segment_id in [1_u64, 1, 2, 3, 3, 8] {
+            streak = next_certified_sample_streak(streak, true);
+        }
+        assert_eq!(streak, 6);
+        assert_eq!(next_certified_sample_streak(streak, false), 0);
+    }
+
     fn density_voxel(center: Vec3, density: f32) -> InvertedDensityVoxel {
         InvertedDensityVoxel {
             center,
@@ -395,6 +547,12 @@ mod tests {
     fn inverted_section_interpolates_between_neighbouring_voxels() {
         let result = DensityInversionResult {
             method: ActiveGravityMethod::RadialAnalytic,
+            capture_id: 1,
+            source_hash: 2,
+            capture_epoch: 3,
+            rng_seed: 4,
+            initial_objective: 1.0,
+            data_error_scale: 1.0,
             density: 2.0,
             density_scale: 1.0,
             objective: 0.0,
@@ -524,7 +682,14 @@ pub fn render_section_system(
     let grid_half = 550.0_f32;
     let steps = 15_i32;
     let step_size = grid_half * 2.0 / (steps * 2) as f32;
-    let dot_radius = step_size * 0.35;
+    // The forward D-section keeps its larger sample markers. In inversion
+    // view use small translucent samples so the annealer-predicted density
+    // remains visible without covering the section in overlapping spheres.
+    let dot_radius = if inferred.is_some() {
+        step_size * 0.10
+    } else {
+        step_size * 0.35
+    };
     let grid_size = (steps * 2 + 1) as usize;
     let mut section_values = vec![0.0_f32; grid_size * grid_size];
     let mut section_inside = vec![false; grid_size * grid_size];
@@ -575,7 +740,13 @@ pub fn render_section_system(
                 };
             section_inside[grid_index] = true;
             section_values[grid_index] = normalized_density;
-            gizmos.sphere(point, dot_radius, color);
+            let marker_color = if inferred.is_some() {
+                let srgba = color.to_srgba();
+                Color::srgba(srgba.red, srgba.green, srgba.blue, 0.58)
+            } else {
+                color
+            };
+            gizmos.sphere(point, dot_radius, marker_color);
         }
     }
 
@@ -637,7 +808,11 @@ fn draw_section_contours(
             (f32::INFINITY, f32::NEG_INFINITY),
             |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
         );
-    if !minimum.is_finite() || maximum - minimum < 0.02 {
+    // Interpolation of an exactly uniform voxel field still accumulates small
+    // floating-point differences. Use a relative threshold so marching
+    // squares does not magnify numerical dust into dozens of false loops.
+    let density_scale = minimum.abs().max(maximum.abs()).max(1.0);
+    if !minimum.is_finite() || maximum - minimum <= density_scale * 1.0e-4 {
         return;
     }
 

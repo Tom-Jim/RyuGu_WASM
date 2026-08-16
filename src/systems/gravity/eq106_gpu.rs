@@ -1,20 +1,17 @@
 //! GPU-resident Equation (106) engineering evaluator.
 //!
-//! Expensive half-line kernel assembly is performed only when the reference
-//! line changes. Real-time frames reuse the assembled 129-frequency buffer and
-//! dispatch a Bromwich/high-order Taylor translation pass each render frame.
-//! The main WASM thread only polls the asynchronous readback.
+//! Expensive source traversal and transverse Taylor assembly are performed only
+//! when the reference line changes. Real-time frames reuse fifteen cached
+//! fourth-order coefficient spectra and never revisit the source buffer.
 //!
 //! The pass is deliberately documented as an engineering approximation to the
 //! derivation in `docs/mathtidy.md`: it uses fixed quadrature over the
-//! mass-preserving source representation, an independently transformed density
-//! Fourier representation, and the complete planner-selected Eq. (118)
-//! directional Taylor jet. Runtime guards forbid leaving its convergence disk.
+//! mass-preserving source representation and a complete two-dimensional
+//! transverse Taylor jet. Runtime guards shorten and rebuild a segment when its
+//! spectral or truncation certificate is rejected.
 
 use crate::components::*;
-use crate::systems::curved_arc::{
-    CurvedArcPlannerState, CurvedArcResidualHistory, Eq106SourceData,
-};
+use crate::systems::curved_arc::{CurvedArcPlannerState, Eq106SourceData};
 use crate::systems::eq106_operator::Eq106OperatorTensorResource;
 use bevy::prelude::*;
 use bevy::render::{
@@ -22,24 +19,28 @@ use bevy::render::{
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
         Buffer, BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
-        CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
-        ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
+        CachedComputePipelineId, CachedPipelineState, CommandEncoderDescriptor,
+        ComputePassDescriptor, ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
 };
+use bevy::shader::ShaderCacheError;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 const HALF_COUNT: u32 = 64;
 const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
 const QUADRATURE_COUNT: u32 = 64;
+const TAYLOR_MAX_ORDER: u32 = 4;
+const TAYLOR_COEFFICIENT_COUNT: u32 = 15;
 const MAX_BATCH_COUNT: u32 = MAX_SIMULATION_ACCELERATION + 1;
 // Spectrum assembly remains segment-scoped. Evaluate often enough that the
 // CPU leapfrog stays inside the certified local Hessian neighborhood without
 // forcing a synchronous GPU readback on every rendered frame.
 const EVALUATION_CADENCE_FRAMES: u32 = 1;
 const OUTPUT_ROWS_PER_BLOCK: u64 = 9;
-const SPECTRUM_BYTES: u64 = FREQUENCY_COUNT as u64 * 32;
+const SPECTRUM_BYTES: u64 = TAYLOR_COEFFICIENT_COUNT as u64 * FREQUENCY_COUNT as u64 * 32;
+const LINE_SAMPLE_BYTES: u64 = TAYLOR_COEFFICIENT_COUNT as u64 * QUADRATURE_COUNT as u64 * 16;
 const OUTPUT_BYTES: u64 = MAX_BATCH_COUNT as u64 * OUTPUT_ROWS_PER_BLOCK * 16;
 
 #[derive(Resource, Default)]
@@ -51,6 +52,7 @@ struct ExtractedEq106Input {
     sources: Option<Vec<u8>>,
     fourier_modes: Option<Vec<u8>>,
     operator_tensor: Option<Vec<u8>>,
+    psi_operator: Option<Vec<u8>>,
     source_count: u32,
     density_mode_count: u32,
     radius: f32,
@@ -64,20 +66,6 @@ struct ExtractedEq106Input {
 #[derive(Resource, Default)]
 struct Eq106GpuBuffers(Option<Eq106GpuBuffersInner>);
 
-/// Additive potential gauge shared by consecutive local Eq.106 spectral
-/// elements. The GPU correction is tapered to zero before a reference-line
-/// transition, so this is only a defensive C0 alignment for f32 roundoff. It
-/// must never add a force bias: doing that recursively changes the physical
-/// field every time an accelerated batch crosses a segment boundary.
-#[derive(Resource, Default)]
-struct Eq106PotentialGauge {
-    epoch: Option<u64>,
-    line_origin: Option<Vec3>,
-    offset: f32,
-    anchor_potential: Option<f32>,
-    anchor_curve_work: Option<f64>,
-}
-
 struct Eq106GpuBuffersInner {
     uniform: Buffer,
     output: Buffer,
@@ -85,8 +73,10 @@ struct Eq106GpuBuffersInner {
     bind_group: BindGroup,
     line_origin: Vec3,
     line_direction: Vec3,
+    segment_id: u32,
     source_hash: u64,
     spectrum_ready: bool,
+    line_scale: f32,
     render_frame: u32,
     last_submitted: Option<(u64, u64)>,
 }
@@ -95,6 +85,7 @@ struct Eq106GpuBuffersInner {
 struct Eq106ComputePipeline {
     line_samples_id: CachedComputePipelineId,
     assemble_id: CachedComputePipelineId,
+    analytic_id: CachedComputePipelineId,
     evaluate_id: CachedComputePipelineId,
 }
 
@@ -104,7 +95,6 @@ impl Plugin for Eq106GpuComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Eq106GpuReadbackChannel>();
         app.init_resource::<Eq106GpuHistory>();
-        app.init_resource::<Eq106PotentialGauge>();
         app.add_systems(PreUpdate, poll_eq106_readback);
         app.add_systems(Update, clear_eq106_history_on_probe_reset);
 
@@ -112,14 +102,18 @@ impl Plugin for Eq106GpuComputePlugin {
         render_app.init_resource::<ExtractedEq106Input>();
         render_app.init_resource::<Eq106GpuBuffers>();
         render_app.add_systems(ExtractSchedule, extract_eq106_input);
-        render_app.add_systems(Render, dispatch_eq106.in_set(RenderSystems::Render));
+        render_app.add_systems(
+            Render,
+            (initialize_eq106_pipeline, dispatch_eq106)
+                .chain()
+                .in_set(RenderSystems::Render),
+        );
     }
 
     fn finish(&self, app: &mut App) {
         let channel = app.world().resource::<Eq106GpuReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<Eq106ComputePipeline>();
     }
 }
 
@@ -134,6 +128,7 @@ impl FromWorld for Eq106ComputePipeline {
             storage_ro_entry(5),
             storage_rw_entry(6),
             storage_ro_entry(7),
+            storage_ro_entry(8),
         ];
         let layout = BindGroupLayoutDescriptor::new("eq106_complex_bgl", &entries);
         let shader = world
@@ -158,6 +153,15 @@ impl FromWorld for Eq106ComputePipeline {
             entry_point: Some("assemble_spectrum".into()),
             zero_initialize_workgroup_memory: false,
         });
+        let analytic_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("eq106_assemble_analytic_spectrum".into()),
+            layout: vec![layout.clone()],
+            immediate_size: 0,
+            shader: shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("assemble_analytic_spectrum".into()),
+            zero_initialize_workgroup_memory: false,
+        });
         let evaluate_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_evaluate_field".into()),
             layout: vec![layout],
@@ -170,6 +174,7 @@ impl FromWorld for Eq106ComputePipeline {
         Self {
             line_samples_id,
             assemble_id,
+            analytic_id,
             evaluate_id,
         }
     }
@@ -178,21 +183,23 @@ impl FromWorld for Eq106ComputePipeline {
 fn clear_eq106_history_on_probe_reset(
     probe: Res<ProbeInitialConditions>,
     mut history: ResMut<Eq106GpuHistory>,
-    mut gauge: ResMut<Eq106PotentialGauge>,
 ) {
     if probe.is_changed() {
         history.0.clear();
-        *gauge = Eq106PotentialGauge::default();
     }
 }
 
 fn poll_eq106_readback(
     channel: Res<Eq106GpuReadbackChannel>,
     mut history: ResMut<Eq106GpuHistory>,
-    mut gauge: ResMut<Eq106PotentialGauge>,
-    curved_residual: Res<CurvedArcResidualHistory>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
+    if let Ok(mut error) = channel.pipeline_error.try_lock()
+        && let Some(message) = error.take()
+    {
+        runtime_error.raise(message);
+        return;
+    }
     let Ok(mut guard) = channel.data.try_lock() else {
         return;
     };
@@ -221,13 +228,13 @@ fn poll_eq106_readback(
         let origin_row = rows[8];
         if certificate[0] > 0.25
             || certificate[1] > 0.05
-            || (certificate[3] > 0.99 && certificate[2] > 0.25)
+            || certificate[2] > 0.25
+            || certificate[3] > 0.30
         {
-            runtime_error.raise(format!(
-                "Equation (106) GPU batch element {} certification failed (field={:.3e}, imaginary={:.3e}, toroidal={:.3e}, coverage={:.3e}).",
-                block_index + 1,
-                certificate[0], certificate[1], certificate[2], certificate[3]
-            ));
+            // The certificate is a decision signal, not a correction term.
+            // Reject this answer and ask the render world to halve the local
+            // element before rebuilding its cached coefficient spectra.
+            channel.rebuild_requested.store(true, Ordering::Release);
             return;
         }
         let acceleration = Vec3::new(field[0], field[1], field[2]);
@@ -236,25 +243,28 @@ fn poll_eq106_readback(
         let elapsed = potentials[3] as f64;
         let anchor_position = Vec3::new(anchor_row[0], anchor_row[1], anchor_row[2]);
         let line_origin = Vec3::new(origin_row[0], origin_row[1], origin_row[2]);
-        let predicted_body_velocity = Vec3::new(rows[5][0], rows[5][1], rows[5][2]);
+        let local_coordinates = rows[5];
+        // The shader writes one full derivative vector per coordinate
+        // direction: rows[2] = d g / d x, rows[3] = d g / d y, and
+        // rows[4] = d g / d z. Keep those vectors as matrix columns.
         let jacobian = Mat3::from_cols(
-            Vec3::new(rows[2][0], rows[3][0], rows[4][0]),
-            Vec3::new(rows[2][1], rows[3][1], rows[4][1]),
-            Vec3::new(rows[2][2], rows[3][2], rows[4][2]),
+            Vec3::new(rows[2][0], rows[2][1], rows[2][2]),
+            Vec3::new(rows[3][0], rows[3][1], rows[3][2]),
+            Vec3::new(rows[4][0], rows[4][1], rows[4][2]),
         );
         if !acceleration.is_finite()
+            || acceleration.abs().max_element() > 1.0e12
             || !segmented_potential.is_finite()
             || segmented_potential <= 0.0
+            || segmented_potential > 1.0e20
             || !independent_potential.is_finite()
             || independent_potential <= 0.0
             || !anchor_position.is_finite()
             || !line_origin.is_finite()
-            || !predicted_body_velocity.is_finite()
+            || !local_coordinates.iter().all(|value| value.is_finite())
             || !jacobian.is_finite()
         {
-            runtime_error.raise(
-                "Equation (106) GPU returned a non-finite batched field sample or local potential Hessian.",
-            );
+            channel.rebuild_requested.store(true, Ordering::Release);
             return;
         }
 
@@ -274,68 +284,52 @@ fn poll_eq106_readback(
         snapshot.ryugu_transform.rotation = future_rotation;
         snapshot.probe_position =
             snapshot.ryugu_transform.translation + future_rotation * anchor_position;
-        let angular_velocity_body = future_rotation.inverse() * angular_velocity_world;
-        snapshot.probe_velocity = future_rotation
-            * (predicted_body_velocity + angular_velocity_body.cross(anchor_position));
-
-        if gauge.epoch != Some(base_snapshot.epoch) {
-            *gauge = Eq106PotentialGauge {
-                epoch: Some(snapshot.epoch),
-                line_origin: Some(line_origin),
-                offset: 0.0,
-                anchor_potential: None,
-                anchor_curve_work: None,
-            };
-        } else if gauge
-            .line_origin
-            .is_none_or(|previous| previous.distance_squared(line_origin) > 1.0e-6)
-        {
-            // Continue the scalar potential from the last authoritative anchor
-            // using the same curved-path work used by Eq.(157). The endpoint
-            // anchor makes this a first-order accurate overlap continuation;
-            // no acceleration bias is introduced.
-            if let Some(current_work) =
-                curved_residual.curve_work_at(snapshot.simulation_time_seconds)
-            {
-                gauge.offset = gauge
-                    .anchor_potential
-                    .zip(gauge.anchor_curve_work)
-                    .map(|(anchor_potential, anchor_work)| {
-                        (anchor_potential as f64 + current_work - anchor_work) as f32
-                            - segmented_potential
-                    })
-                    .filter(|offset| offset.is_finite())
-                    .unwrap_or(0.0);
-            }
-            gauge.line_origin = Some(line_origin);
+        if block_index > 0 {
+            let angular_velocity_body = future_rotation.inverse() * angular_velocity_world;
+            let base_body_velocity = base_snapshot.ryugu_transform.rotation.inverse()
+                * (base_snapshot.probe_velocity
+                    - angular_velocity_world.cross(
+                        base_snapshot.probe_position - base_snapshot.ryugu_transform.translation,
+                    ));
+            snapshot.probe_velocity = future_rotation
+                * (base_body_velocity + angular_velocity_body.cross(anchor_position));
         }
 
-        let positive_potential = segmented_potential + gauge.offset;
+        // The inverse spectrum is an absolute potential representation. Do
+        // not introduce a per-segment CPU gauge correction into the production
+        // answer; any truncation mismatch is reported by the certificate and
+        // handled by shortening/rebuilding the cached element.
+        let positive_potential = segmented_potential;
         if !positive_potential.is_finite() || positive_potential <= 0.0 {
-            runtime_error
-                .raise("Equation (106) potential gauge alignment produced an invalid value.");
+            runtime_error.raise("Equation (106) cached spectral potential is invalid.");
             return;
-        }
-        if block_index == 0
-            && let Some(curve_work) =
-                curved_residual.curve_work_at(snapshot.simulation_time_seconds)
-        {
-            gauge.anchor_potential = Some(positive_potential);
-            gauge.anchor_curve_work = Some(curve_work);
         }
         history.0.push(GravityFieldSample {
             snapshot,
             predictive: block_index > 0,
             body_acceleration: acceleration,
-            // This segmented potential is generated by the same Eq.106 field
-            // that drives integration. The independent direct potential below
-            // is reserved for the Eq. (157) dual-representation residual.
+            // This potential is reconstructed from the same cached transverse
+            // coefficient spectra as the acceleration driving integration.
             positive_potential,
-            // Eq. (157) must remain an actual dual-representation check.  The
-            // shader evaluates this direct full-space point potential
-            // independently of the segmented spectral potential above.
+            // Independent Eq. (79)-(83) Fourier-toroidal potential: P_spec in
+            // docs/mathtidy.md Eq. (157). It never drives the acceleration.
             independent_positive_potential: Some(independent_potential),
             body_acceleration_jacobian: Some(jacobian),
+            eq106_diagnostics: Some(Eq106SampleDiagnostics {
+                segment_id: local_coordinates[3].round().max(0.0) as u64,
+                line_origin,
+                line_direction: (base_snapshot.ryugu_transform.rotation.inverse()
+                    * (base_snapshot.probe_velocity
+                        - angular_velocity_world.cross(
+                            base_snapshot.probe_position
+                                - base_snapshot.ryugu_transform.translation,
+                        )))
+                .normalize_or_zero(),
+                h: local_coordinates[0],
+                u: local_coordinates[1],
+                v: local_coordinates[2],
+                certificates: certificate,
+            }),
         });
     }
 }
@@ -347,12 +341,15 @@ fn extract_eq106_input(
     active: Extract<Res<ActiveGravityMethod>>,
     clock: Extract<Res<SimulationClock>>,
     fixed_time: Extract<Res<Time<Fixed>>>,
-    simulation_acceleration: Extract<Res<SimulationAcceleration>>,
     planner: Extract<Res<CurvedArcPlannerState>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    extracted.enabled = **active == ActiveGravityMethod::CurvedArcEq106;
+    // Selection alone is insufficient: an uncertified segment must never be
+    // submitted after adaptive splitting leaves the Taylor convergence disk.
+    extracted.enabled = **active == ActiveGravityMethod::CurvedArcEq106
+        && planner.kernel_ready
+        && planner.mode != crate::systems::curved_arc::CurvedArcMode::Error;
     if !extracted.enabled {
         return;
     }
@@ -380,10 +377,11 @@ fn extract_eq106_input(
         probe_position: probe.translation,
         probe_velocity: velocity.0,
     });
-    // Include the endpoint of the final stable interval. Physics blends the
-    // two surrounding local Hessian models at every substep, eliminating the
-    // one-sided field extrapolation that produced Jacobi steps.
-    extracted.batch_count = simulation_acceleration.stable_steps() + 1;
+    // The CPU owns the authoritative orbit integration. Production Eq.106
+    // queries only the current anchor; every CPU substep evaluates the same
+    // cached local spectrum/Jacobian rather than consuming a GPU-predicted
+    // future trajectory as if it were measured state.
+    extracted.batch_count = 1;
     extracted.block_dt = fixed_time.delta_secs() * TIME_SCALE;
     extracted.source_count = source.sources.len() as u32;
     extracted.density_mode_count = source.fourier_modes.len() as u32;
@@ -394,14 +392,14 @@ fn extract_eq106_input(
         .filter(|segment| segment.taylor_order.is_some() && segment.epsilon_max < 1.0)
         .map(|segment| {
             let curvature_limit = if segment.maximum_curvature > f64::MIN_POSITIVE {
-                (8.0 * 0.25 * segment.distance_lower_bound / segment.maximum_curvature).sqrt()
+                (8.0 * 0.20 * segment.distance_lower_bound / segment.maximum_curvature).sqrt()
             } else {
                 f64::INFINITY
             };
             segment.arc_length.max(1.0).min(curvature_limit) as f32
         })
         .unwrap_or(f32::INFINITY);
-    extracted.taylor_order = planner.taylor_order.clamp(1, 8);
+    extracted.taylor_order = planner.taylor_order.clamp(1, TAYLOR_MAX_ORDER);
     let source_hash = source.source_hash;
     if extracted.sources.is_none() || extracted.source_hash != source_hash {
         let mut bytes = Vec::with_capacity(source.sources.len() * 16);
@@ -430,6 +428,20 @@ fn extract_eq106_input(
             .as_ref()
             .map(|resource| resource.tensor.as_le_bytes());
     }
+    if extracted.psi_operator.is_none() {
+        extracted.psi_operator = operator_tensor
+            .as_ref()
+            .map(|resource| resource.psi.as_le_bytes());
+    }
+}
+
+fn initialize_eq106_pipeline(world: &mut World) {
+    let enabled = world.resource::<ExtractedEq106Input>().enabled;
+    if enabled && !world.contains_resource::<Eq106ComputePipeline>() {
+        // Render schedules do not automatically flush ordinary Commands at
+        // every set boundary; initialize directly in this exclusive system.
+        world.init_resource::<Eq106ComputePipeline>();
+    }
 }
 
 fn dispatch_eq106(
@@ -442,9 +454,35 @@ fn dispatch_eq106(
     channel: Res<Eq106GpuReadbackChannel>,
 ) {
     let Some(pipelines) = pipelines else { return };
-    let (Some(line_samples), Some(assemble), Some(evaluate)) = (
+    for (name, id) in [
+        ("line samples", pipelines.line_samples_id),
+        ("sampled spectrum", pipelines.assemble_id),
+        ("analytic Eq.70 spectrum", pipelines.analytic_id),
+        ("inverse spectrum", pipelines.evaluate_id),
+    ] {
+        match cache.get_compute_pipeline_state(id) {
+            // Shader assets are loaded asynchronously. This state is expected
+            // for the first few render frames and is not a compile failure.
+            CachedPipelineState::Err(
+                ShaderCacheError::ShaderNotLoaded(_)
+                | ShaderCacheError::ShaderImportNotYetAvailable,
+            ) => {}
+            CachedPipelineState::Err(error) => {
+                if let Ok(mut slot) = channel.pipeline_error.try_lock()
+                    && slot.is_none()
+                {
+                    *slot = Some(format!(
+                        "Equation (106) {name} GPU pipeline failed: {error}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let (Some(line_samples), Some(assemble), Some(analytic), Some(evaluate)) = (
         cache.get_compute_pipeline(pipelines.line_samples_id),
         cache.get_compute_pipeline(pipelines.assemble_id),
+        cache.get_compute_pipeline(pipelines.analytic_id),
         cache.get_compute_pipeline(pipelines.evaluate_id),
     ) else {
         return;
@@ -462,9 +500,10 @@ fn dispatch_eq106(
         buffers.0 = None;
     }
     if buffers.0.is_none() {
-        let (Some(source_bytes), Some(operator_bytes), Some(mode_bytes)) = (
+        let (Some(source_bytes), Some(operator_bytes), Some(psi_bytes), Some(mode_bytes)) = (
             extracted.sources.as_ref(),
             extracted.operator_tensor.as_ref(),
+            extracted.psi_operator.as_ref(),
             extracted.fourier_modes.as_ref(),
         ) else {
             return;
@@ -495,6 +534,11 @@ fn dispatch_eq106(
             contents: operator_bytes,
             usage: BufferUsages::STORAGE,
         });
+        let psi_operator = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("eq106_complex_psi_operator"),
+            contents: psi_bytes,
+            usage: BufferUsages::STORAGE,
+        });
         let density_modes = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_density_fourier_modes"),
             contents: mode_bytes,
@@ -508,7 +552,7 @@ fn dispatch_eq106(
         });
         let line_samples = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_line_samples"),
-            size: QUADRATURE_COUNT as u64 * 16,
+            size: LINE_SAMPLE_BYTES,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -535,6 +579,7 @@ fn dispatch_eq106(
                 storage_ro_entry(5),
                 storage_rw_entry(6),
                 storage_ro_entry(7),
+                storage_ro_entry(8),
             ],
         );
         let bind_group = render_device.create_bind_group(
@@ -573,6 +618,10 @@ fn dispatch_eq106(
                     binding: 7,
                     resource: density_modes.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 8,
+                    resource: psi_operator.as_entire_binding(),
+                },
             ],
         );
         buffers.0 = Some(Eq106GpuBuffersInner {
@@ -582,8 +631,10 @@ fn dispatch_eq106(
             bind_group,
             line_origin: extracted.probe,
             line_direction: extracted.velocity.normalize_or_zero(),
+            segment_id: 1,
             source_hash: extracted.source_hash,
             spectrum_ready: false,
+            line_scale: 1.0,
             render_frame: 0,
             last_submitted: None,
         });
@@ -606,7 +657,7 @@ fn dispatch_eq106(
     // At 8x the probe advances roughly one old 0.15R segment per presented
     // frame. Size the cached line for two accelerated batches so spectrum
     // assembly is not repeated every frame, while keeping the operator local.
-    let longitudinal_limit = (0.35 * extracted.radius)
+    let mut longitudinal_limit = (0.35 * extracted.radius)
         .max(2.25 * predicted_batch_travel)
         // Keep at least ~18 authoritative 1x frames in one element. This
         // gives the previous sample time to enter the zero-correction overlap
@@ -618,6 +669,15 @@ fn dispatch_eq106(
         // spectral correction is tapered to zero before leaving this disk.
         .min(extracted.certified_line_limit)
         .max(1.0);
+    if channel.rebuild_requested.swap(false, Ordering::AcqRel) {
+        inner.line_scale = (0.5 * inner.line_scale).max(0.125);
+        inner.line_origin = extracted.probe;
+        inner.line_direction = extracted.velocity.normalize_or_zero();
+        inner.segment_id = inner.segment_id.wrapping_add(1).max(1);
+        inner.spectrum_ready = false;
+        inner.last_submitted = None;
+    }
+    longitudinal_limit = (longitudinal_limit * inner.line_scale).max(1.0);
     let transverse_limit = (0.10 * extracted.radius).max(20.0);
     let line_expired = inner.source_hash != extracted.source_hash
         || h < 0.0
@@ -626,8 +686,15 @@ fn dispatch_eq106(
     if line_expired {
         inner.line_origin = extracted.probe;
         inner.line_direction = extracted.velocity.normalize_or_zero();
+        inner.segment_id = inner.segment_id.wrapping_add(1).max(1);
         inner.source_hash = extracted.source_hash;
+        // A fresh reference element gets a fresh curvature budget. A previous
+        // certificate rejection only applies to the element it rejected;
+        // carrying its halved scale into every later element causes needless
+        // rebuilds and collapses the render rate at high simulation speed.
+        inner.line_scale = 1.0;
         inner.spectrum_ready = false;
+        inner.last_submitted = None;
     }
     if inner.line_direction == Vec3::ZERO {
         return;
@@ -658,6 +725,7 @@ fn dispatch_eq106(
         longitudinal_limit,
         extracted.taylor_order,
         extracted.density_mode_count,
+        inner.segment_id,
     );
     render_queue.write_buffer(&inner.uniform, 0, &uniform);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
@@ -677,6 +745,22 @@ fn dispatch_eq106(
             timestamp_writes: None,
         });
         pass.set_pipeline(assemble);
+        pass.set_bind_group(0, &inner.bind_group, &[]);
+        pass.dispatch_workgroups(
+            (TAYLOR_COEFFICIENT_COUNT * FREQUENCY_COUNT).div_ceil(64),
+            1,
+            1,
+        );
+        drop(pass);
+        // Replace the zeroth (on-line) coefficient with Eqs. (47),(68)-(70)
+        // evaluated from the certified complex Psi/Psi_x operator. Higher
+        // coefficients remain the exact local Newton Taylor continuation of
+        // Eq. (118), and vanish at the reference line itself.
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("eq106_analytic_spectrum_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(analytic);
         pass.set_bind_group(0, &inner.bind_group, &[]);
         pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), 1, 1);
         drop(pass);
@@ -748,6 +832,7 @@ fn uniform_bytes(
     longitudinal_limit: f32,
     taylor_order: u32,
     density_mode_count: u32,
+    segment_id: u32,
 ) -> [u8; 112] {
     let mut bytes = [0_u8; 112];
     for (offset, value) in [
@@ -770,10 +855,10 @@ fn uniform_bytes(
         (48, source_count),
         (52, HALF_COUNT),
         (56, QUADRATURE_COUNT),
-        (60, taylor_order.clamp(1, 8)),
+        (60, taylor_order.clamp(1, TAYLOR_MAX_ORDER)),
         (80, batch_count.clamp(1, MAX_BATCH_COUNT)),
         (84, density_mode_count),
-        (88, 0),
+        (88, segment_id),
         (92, 0),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

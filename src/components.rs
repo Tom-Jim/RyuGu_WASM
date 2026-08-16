@@ -142,6 +142,13 @@ pub struct InvertedDensityVoxel {
 #[derive(Clone, Debug)]
 pub struct DensityInversionResult {
     pub method: ActiveGravityMethod,
+    /// Immutable identity of the sixteen trajectory states used by this run.
+    pub capture_id: u64,
+    pub source_hash: u64,
+    pub capture_epoch: u64,
+    pub rng_seed: u64,
+    pub initial_objective: f64,
+    pub data_error_scale: f64,
     pub density: f32,
     pub density_scale: f32,
     pub objective: f64,
@@ -163,6 +170,10 @@ pub struct DensityInversionResult {
 #[derive(Debug)]
 pub struct SimulatedAnnealingJob {
     pub method: ActiveGravityMethod,
+    pub capture_id: u64,
+    pub source_hash: u64,
+    pub capture_epoch: u64,
+    pub rng_seed: u64,
     pub voxels: Vec<InvertedDensityVoxel>,
     pub sensitivities: Vec<Vec3>,
     pub observed_accelerations: Vec<Vec3>,
@@ -196,9 +207,16 @@ pub enum TrajectoryVectorField {
 #[derive(Resource)]
 pub struct TrajectoryInversionState {
     pub capture_epoch: u64,
+    pub last_capture_request_id: Option<u64>,
     pub wall_elapsed_seconds: f64,
     pub raw_samples: Vec<TrajectoryCaptureSample>,
     pub knots: Vec<TrajectoryInversionKnot>,
+    pub capture_id: Option<u64>,
+    pub capture_source_hash: u64,
+    /// Eq.106 capture does not begin until consecutive certified readbacks
+    /// have arrived; adaptive segment boundaries do not break the streak.
+    pub certified_sample_streak: u32,
+    pub certified_segment_id: Option<u64>,
     pub ready: bool,
     /// True after a user edits any captured position or velocity. Captured
     /// knots can use the forward evaluator's acceleration directly; edited
@@ -209,6 +227,15 @@ pub struct TrajectoryInversionState {
     pub edit_buffer: String,
     pub error: Option<String>,
     pub annealing: Option<SimulatedAnnealingJob>,
+    /// A method toggle starts a new physical epoch, but the user explicitly
+    /// wants completed method slots to remain visible as a fill-in history.
+    /// Probe edits, resets, and other non-method changes leave this false so
+    /// the next capture still clears stale results.
+    pub preserve_results_on_next_epoch: bool,
+    /// Remaining methods in one immutable-capture comparison batch. Running
+    /// the batch avoids changing the forward method (and therefore epoch).
+    pub pending_inversion_methods: VecDeque<ActiveGravityMethod>,
+    pub batch_capture_id: Option<u64>,
     pub results: [Option<DensityInversionResult>; 5],
     pub displayed_density: Option<DensityInversionResult>,
 }
@@ -217,9 +244,14 @@ impl Default for TrajectoryInversionState {
     fn default() -> Self {
         Self {
             capture_epoch: 0,
+            last_capture_request_id: None,
             wall_elapsed_seconds: 0.0,
             raw_samples: Vec::with_capacity(384),
             knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
+            capture_id: None,
+            capture_source_hash: 0,
+            certified_sample_streak: 0,
+            certified_segment_id: None,
             ready: false,
             knots_edited: false,
             inverted: false,
@@ -227,6 +259,9 @@ impl Default for TrajectoryInversionState {
             edit_buffer: String::new(),
             error: None,
             annealing: None,
+            preserve_results_on_next_epoch: false,
+            pending_inversion_methods: VecDeque::new(),
+            batch_capture_id: None,
             results: std::array::from_fn(|_| None),
             displayed_density: None,
         }
@@ -237,6 +272,9 @@ impl Default for TrajectoryInversionState {
 pub struct JacobiSample {
     pub simulation_time_seconds: f64,
     pub jacobi_constant: f64,
+    /// Eq.106 segment/certificate state associated with this physical sample.
+    /// Other gravity methods leave this empty.
+    pub eq106_diagnostics: Option<Eq106SampleDiagnostics>,
 }
 
 #[derive(Resource)]
@@ -244,6 +282,8 @@ pub struct JacobiHistory {
     pub samples: VecDeque<JacobiSample>,
     pub elapsed_simulation_seconds: f64,
     pub origin_simulation_seconds: Option<f64>,
+    pub eq106_origin_potential: Option<f64>,
+    pub eq106_origin_curve_work: Option<f64>,
     pub last_request_id: Option<u64>,
     pub last_sample_method: Option<ActiveGravityMethod>,
 }
@@ -254,6 +294,8 @@ impl Default for JacobiHistory {
             samples: VecDeque::with_capacity(JACOBI_HISTORY_CAPACITY),
             elapsed_simulation_seconds: 0.0,
             origin_simulation_seconds: None,
+            eq106_origin_potential: None,
+            eq106_origin_curve_work: None,
             last_request_id: None,
             last_sample_method: None,
         }
@@ -265,6 +307,8 @@ impl JacobiHistory {
         self.samples.clear();
         self.elapsed_simulation_seconds = 0.0;
         self.origin_simulation_seconds = None;
+        self.eq106_origin_potential = None;
+        self.eq106_origin_curve_work = None;
         self.last_request_id = None;
         self.last_sample_method = None;
     }
@@ -423,6 +467,20 @@ pub struct GravityFieldSample {
     /// supplies a symmetric potential Hessian so fixed-update substeps can
     /// evaluate the same conservative local field between GPU readbacks.
     pub body_acceleration_jacobian: Option<Mat3>,
+    /// Runtime evidence needed to correlate Jacobi spikes with Eq.106 segment
+    /// rebuilds and the four independent truncation/spectral certificates.
+    pub eq106_diagnostics: Option<Eq106SampleDiagnostics>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Eq106SampleDiagnostics {
+    pub segment_id: u64,
+    pub line_origin: Vec3,
+    pub line_direction: Vec3,
+    pub h: f32,
+    pub u: f32,
+    pub v: f32,
+    pub certificates: [f32; 4],
 }
 
 #[derive(Default)]
@@ -521,7 +579,12 @@ pub struct Eq106GpuHistory(pub GravitySampleHistory);
 #[derive(Resource, Clone)]
 pub struct Eq106GpuReadbackChannel {
     pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
+    pub pipeline_error: Arc<Mutex<Option<String>>>,
     pub in_flight: Arc<AtomicBool>,
+    /// Set by the main-world certificate check when the cached local spectral
+    /// element must be shortened and rebuilt. The render world consumes it
+    /// before submitting another query for the same simulation snapshot.
+    pub rebuild_requested: Arc<AtomicBool>,
 }
 
 #[derive(Resource, Default)]
@@ -556,7 +619,9 @@ impl Default for Eq106GpuReadbackChannel {
     fn default() -> Self {
         Self {
             data: Arc::new(Mutex::new(None)),
+            pipeline_error: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
+            rebuild_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -683,8 +748,9 @@ pub enum ActiveGravityMethod {
 }
 
 pub const PERFORMANCE_PHASE_FRAMES: u32 = 120;
+pub const PERFORMANCE_PHASE_SIMULATION_SECONDS: f64 =
+    PERFORMANCE_PHASE_FRAMES as f64 * TIME_SCALE as f64 / 60.0;
 pub const PERFORMANCE_HISTORY_CAPACITY: usize = 180;
-pub const PERFORMANCE_TEST_DURATION_HOURS: f64 = 100.0;
 
 /// Quarter-turn rotation applied to the complete browser display frame.
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
@@ -707,10 +773,13 @@ pub struct PerformanceComparisonState {
     pub frames_per_second: [f64; 5],
     pub pending_method: Option<ActiveGravityMethod>,
     pub return_method: ActiveGravityMethod,
+    /// Performance runs are deliberately normalized to 1x; restore the
+    /// user's throughput setting when leaving the comparison view.
+    pub return_simulation_acceleration: u32,
     pub fps_history: [VecDeque<f32>; 5],
     /// Jacobi histories map to Radial, Werner, Eq.106, MMFFT, and FMM.
     /// Each series contains only samples emitted by that algorithm.
-    pub jacobi_history: [VecDeque<f64>; 5],
+    pub jacobi_history: [VecDeque<JacobiSample>; 5],
     pub jacobi_last_request_ids: [Option<u64>; 5],
     /// Algorithms included in the performance rotation. The five entries map
     /// to Radial, Werner, Eq.106, MMFFT, and FMM respectively.
@@ -732,6 +801,7 @@ impl Default for PerformanceComparisonState {
             frames_per_second: [0.0; 5],
             pending_method: None,
             return_method: ActiveGravityMethod::RadialAnalytic,
+            return_simulation_acceleration: MIN_SIMULATION_ACCELERATION,
             fps_history: std::array::from_fn(|_| {
                 VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
             }),

@@ -322,21 +322,17 @@ pub fn physics_system(
                     return;
                 }
             };
-            if use_local_potential_hessian {
-                let start_rotation =
-                    rotation_after(frame_start_rotation, start_time - frame_start_time);
-                let end_rotation =
-                    rotation_after(frame_start_rotation, end_time - frame_start_time);
-                curved_residual.accumulate_curve_work(
-                    start_time,
-                    end_time,
-                    start_rotation.inverse() * (start_world_position - frame_start_translation),
-                    end_rotation.inverse()
-                        * (probe_transform.translation - frame_start_translation),
-                    start_rotation.inverse() * acceleration_start,
-                    end_rotation.inverse() * acceleration_end,
-                );
-            }
+            let start_rotation =
+                rotation_after(frame_start_rotation, start_time - frame_start_time);
+            let end_rotation = rotation_after(frame_start_rotation, end_time - frame_start_time);
+            curved_residual.accumulate_curve_work(
+                start_time,
+                end_time,
+                start_rotation.inverse() * (start_world_position - frame_start_translation),
+                end_rotation.inverse() * (probe_transform.translation - frame_start_translation),
+                start_rotation.inverse() * acceleration_start,
+                end_rotation.inverse() * acceleration_end,
+            );
             probe_velocity.0 += acceleration_end * (0.5 * substep_dt as f32);
         }
 
@@ -386,6 +382,7 @@ mod tests {
             positive_potential: 1.0,
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
+            eq106_diagnostics: None,
         }
     }
 
