@@ -5,74 +5,282 @@
 ![Rust](https://img.shields.io/badge/Rust-Edition_2024-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
-<img src=https://github.com/user-attachments/assets/2ce9f064-98bd-4658-8c0e-999abf0d0297 width="100%" alt="trajectory demonstration" />
+An experimental browser-based simulator for gravitational-field evaluation and spacecraft trajectories around asteroid (162173) Ryugu. The project is written in Rust with Bevy, compiled to WebAssembly, and uses WebGPU for field evaluation.
+
+The repository compares five forward models and contains a research implementation of the near-straight-trajectory formulation called **Equation (106)** in [`mathpub.pdf`](mathpub.pdf). Equation (106) is still an exploratory numerical method: the current implementation is discretized, finite-band, and validated only within the tests and diagnostics described below.
+
+> **Scope:** research prototype and synthetic-data demonstrator. It is not flight software, an orbit-determination product, or evidence of a proven performance advantage over established solvers.
+
+[Open the live WebGPU demo](https://tom-jim.github.io/RyuGu_WASM/)
+
+<img src="https://github.com/user-attachments/assets/2ce9f064-98bd-4658-8c0e-999abf0d0297" width="100%" alt="trajectory demonstration" />
 
 | **Orbital Trajectory** | **ProbeView** |
 | :---: | :---: |
-| <img src="https://github.com/user-attachments/assets/ac05a5ac-e6e2-4f44-b0ca-8a447ba30b7f" width="100%"/> | <img src="https://github.com/user-attachments/assets/f58a18c3-161b-4945-9078-bcfa835c2ed4" width="100%"/> |
+| <img src="https://github.com/user-attachments/assets/ac05a5ac-e6e2-4f44-b0ca-8a447ba30b7f" width="100%" alt="orbital trajectory" /> | <img src="https://github.com/user-attachments/assets/f58a18c3-161b-4945-9078-bcfa835c2ed4" width="100%" alt="probe view" /> |
 | **Change Orbit** | **Change Algorithm** |
-| <img src="https://github.com/user-attachments/assets/7921e222-c7c4-4758-8dfe-82575efdeeb5" width="100%"/> | <img src="https://github.com/user-attachments/assets/6ac1d9aa-2a2f-4744-b8f0-47dd4f11b352" width="100%"/> |
----
+| <img src="https://github.com/user-attachments/assets/7921e222-c7c4-4758-8dfe-82575efdeeb5" width="100%" alt="change orbit" /> | <img src="https://github.com/user-attachments/assets/6ac1d9aa-2a2f-4744-b8f0-47dd4f11b352" width="100%" alt="change gravity algorithm" /> |
 
-Interactive Ryugu gravity and trajectory simulator written in Rust/Bevy, compiled to WebAssembly, and accelerated with WebGPU. It provides five gravity evaluators:
+## What is implemented
 
-- radial analytic GPU quadrature;
-- homogeneous Werner–Scheeres polyhedron;
-- Equation (106) adaptive curved-trajectory evaluation;
-- two-level 3D MMFFT with zero-padded FFT/kernel/IFFT convolution;
-- order-two FMM with P2M, M2M, M2L, L2L, and exact leaf P2P.
-
-The four heterogeneous methods use the mass-normalized density
+The simulator exposes five switchable gravity methods. Four use the same mass-normalized heterogeneous radial profile,
 
 $$
-\rho(r)=C\ln\left(1+\frac r{10\,\mathrm m}\right).
+\rho(r)=C\ln\left(1+\frac{r}{10\,\mathrm m}\right),
 $$
 
-Werner remains a homogeneous reference. This project is intended for numerical experimentation, not flight certification.
+while the Werner–Scheeres model is a homogeneous reference.
 
-## Features
+| UI method | Source preparation | Runtime evaluation | Main qualification |
+|---|---|---|---|
+| **GPU Radial Analytic** | The star-shaped mesh is divided into four equal-volume radial layers per angular cell; layer masses are integrated analytically. | WebGPU evaluates the field with eight-node Gauss–Legendre radial quadrature. | A direct heterogeneous reference. The mass integration is analytic, but the field evaluation is quadrature rather than a closed-form solver. |
+| **GPU Werner Polyhedron** | CPU constructs oriented faces, shared edges, and geometric dyads. | WebGPU evaluates the homogeneous closed-polyhedron formula. | Homogeneous only; unusable boundary or non-manifold edge records are skipped and reported during preprocessing. |
+| **Eq.106 Adaptive Curved-Arc** | A mass-preserving `4 × 8 × 32` source tensor, special-function tables, and trajectory segments are prepared. | WebGPU builds and caches transformed line spectra, then evaluates acceleration, potential, and a local Jacobian. | Experimental hybrid realization of Eq.106; most useful when many samples reuse a geometrically guarded near-straight segment. |
+| **GPU MMFFT + VRAM Compression** | CPU performs a zero-padded Newton-kernel FFT convolution on two grids (`64³` and `16³`). | WebGPU samples the cached potential fields with tricubic interpolation and differentiates the interpolant. | Fast repeated sampling inside the grids; accuracy depends on grid spacing, interpolation, and boundary coverage. |
+| **GPU Fast Multipole Method** | CPU builds a fixed-depth octree and order-two multipole hierarchy. | WebGPU traverses the tree; accepted far cells use multipoles, while non-separated leaves use direct P2P. | Experimental single-target FMM path, not a replacement for a mature multi-target FMM library. |
 
-- Five switchable gravity methods with independent GPU sources and readback histories.
-- Fixed-step leapfrog integration with `1x`–`8x` presentation acceleration.
-- Adaptive Equation (106) segmentation using curvature, distance, and Taylor-remainder bounds.
-- Rotating-frame Jacobi and Equation (157) residual charts.
-- Method-aware density section, orbit trail, probe view, surface normals, and performance comparison.
-- Trajectory-to-density inversion from 16 editable position/velocity controls, a continuous Quintic Hermite track, and simulated annealing over the occupied 3D density voxels.
-- Snapshot-tagged asynchronous WebGPU readback and numerical-error blocking.
+## Mathematical core of Equation (106)
 
-## Requirements
+### 1. Newtonian starting point
 
-- Rust with target `wasm32-unknown-unknown`.
-- [`wasm-pack`](https://rustwasm.github.io/wasm-pack/).
-- [Bun](https://bun.sh/).
-- A WebGPU-capable browser.
+For source point $\mathbf p$, observation point $\mathbf q$, and $R=\lVert\mathbf p-\mathbf q\rVert$, the positive gravitational potential and acceleration convention used by the project is
+
+$$
+U(\mathbf q)=G\iiint_V\frac{\rho(\mathbf p)}{R}\,dV',
+\qquad
+\mathbf g(\mathbf q)=G\iiint_V\rho(\mathbf p)
+\frac{\mathbf p-\mathbf q}{R^3}\,dV'.
+$$
+
+The volume density is represented in source-centered spherical coordinates, so
+
+$$
+dV'=\lambda^2\sin\theta'\,d\lambda\,d\theta'\,d\phi'.
+$$
+
+### 2. Straight-reference-line transform
+
+Around a chosen reference line, write the transverse source–line distance as $a$ and the signed longitudinal source coordinate as $z'$. For $\operatorname{Re}(s)>0$, define
+
+$$
+F(s;a,z')=\int_0^\infty
+\frac{e^{-sh}}{\sqrt{a^2+(h-z')^2}}\,dh.
+$$
+
+The boundary identity
+
+$$
+\frac{\partial F}{\partial z'}=-sF+\frac{1}{R_0},
+\qquad R_0=\sqrt{a^2+z'^2},
+$$
+
+is essential: the $1/R_0$ term is the endpoint contribution from the half-line and must not be discarded.
+
+Introduce
+
+$$
+x=as,\qquad \eta=\frac{z'}a,\qquad \Psi(x,\eta)=F(s;a,z'),
+$$
+
+and the two dimensionless kernels
+
+$$
+K_V=x\Psi-\frac{1}{\sqrt{1+\eta^2}},
+$$
+
+$$
+K_H=x\frac{\partial\Psi}{\partial x}
++\eta x\Psi-\frac{\eta}{\sqrt{1+\eta^2}}.
+$$
+
+Express the source point in the local frame of the reference line as $(r'_\perp,\phi',z')$. With $\Delta\phi=\phi-\phi'$, its transverse separation from the line is
+
+$$
+a^2=\varrho^2+r_\perp'^2-2\varrho r'_\perp\cos\Delta\phi
+$$
+
+and the transformed straight-line acceleration used as the Eq.106 reference coefficient is
+
+$$
+\widetilde{\mathbf g}(s)=G\iiint
+\rho(\lambda,\theta',\phi')\lambda^2\sin\theta'
+\left[
+\mathbf e_\varrho
+\frac{\varrho-r'_\perp\cos\Delta\phi}{a^2}K_H
++\mathbf e_\phi
+\frac{r'_\perp\sin\Delta\phi}{a^2}K_H
++\mathbf e_z\frac{1}{a}K_V
+\right]
+\,d\lambda\,d\theta'\,d\phi'.
+$$
+
+In the mathematical note this expression first appears as Eq.70 and is later carried into the formulation labelled Eq.106. Apparent singular factors at $a\to0$ require the dedicated axis continuation implemented in the shader; arbitrary softening is not part of this derivation.
+
+### 3. Curved-trajectory continuation
+
+For a trajectory written as a reference-line point plus a transverse offset,
+
+$$
+\mathbf q(t)=\bar{\mathbf q}(h(t))+\delta\mathbf q(t),
+$$
+
+the field is locally continued with the translation operator
+
+$$
+\mathbf g(\bar{\mathbf q}+\delta\mathbf q)
+=
+\sum_{n=0}^{A}\frac{1}{n!}
+\left(\delta\mathbf q\cdot\nabla\right)^n
+\mathbf g(\bar{\mathbf q})+\mathbf R_{A+1}.
+$$
+
+The production path uses a bivariate transverse Taylor polynomial through total order **four** (`15` coefficients), not an unlimited or eighth-order expansion. The planner monitors a conservative distance ratio $\varepsilon$ and a geometric-series remainder estimate. A segment must be rebuilt or rejected when its curvature or source proximity exceeds the configured guard.
+
+### 4. How the code realizes the formula
+
+The current shader is a hybrid analytical/numerical realization:
+
+1. A new line segment traverses the discrete source tensor at `64` half-line quadrature nodes.
+2. Direct Newton samples generate the transverse Taylor coefficients.
+3. Those coefficient samples are transformed numerically into `129` signed complex-frequency bins.
+4. The zeroth, reference-line coefficient is overwritten by the analytical Eq.70/Eq.106 kernel evaluated from precomputed $\Psi$ and $\partial_x\Psi$ tables.
+5. A finite-band Bromwich sum reconstructs the field, after which the transverse polynomial supplies the curved-arc correction.
+6. The resulting acceleration, potential, local Jacobian, and diagnostic values are read back asynchronously. CPU physics then advances the trajectory.
+
+Consequently, the implementation should not be described as an exact closed-form evaluation of every curved-trajectory coefficient. Its intended computational opportunity is **segment reuse**: building a new spectrum is expensive, but repeated evaluations on a valid cached segment avoid a fresh source traversal.
+
+## Runtime architecture
+
+```mermaid
+flowchart LR
+    Mesh["Ryugu GLB mesh"] --> Topology["Normalize mesh<br/>weld vertices<br/>build topology"]
+    Topology --> RadialSource["Mass-preserving<br/>radial layers"]
+    Topology --> WernerSource["Werner faces<br/>and shared edges"]
+
+    RadialSource --> RadialGPU["Radial quadrature<br/>WebGPU"]
+    RadialSource --> EqSource["Eq.106<br/>4 × 8 × 32 tensor"]
+    RadialSource --> MMFFTBuild["Two-level FFT grids<br/>CPU preprocessing"]
+    RadialSource --> FMMBuild["Octree + multipoles<br/>CPU preprocessing"]
+
+    EqSource --> EqGPU["Spectrum build/cache<br/>Bromwich evaluation"]
+    MMFFTBuild --> MMFFTGPU["Tricubic field sampling<br/>WebGPU"]
+    FMMBuild --> FMMGPU["Tree traversal<br/>WebGPU"]
+    WernerSource --> WernerGPU["Polyhedron field<br/>WebGPU"]
+
+    Clock["Simulation clock<br/>probe request"] --> Select["Selected gravity method"]
+    RadialGPU --> Select
+    WernerGPU --> Select
+    EqGPU --> Select
+    MMFFTGPU --> Select
+    FMMGPU --> Select
+
+    Select --> Readback["Snapshot-tagged<br/>asynchronous readback"]
+    Readback --> Physics["CPU leapfrog /<br/>velocity-Verlet integration"]
+    Physics --> State["Probe transform<br/>trajectory history"]
+    State --> UI["3D view, charts,<br/>Jacobi and inversion UI"]
+    State --> Clock
+```
+
+The browser has no automatic CPU fallback for the real-time gravity path. If a valid WebGPU evaluator or matching field sample is unavailable, trajectory advancement pauses rather than silently switching algorithms.
+
+## Equation (106) segment pipeline
+
+```mermaid
+flowchart TD
+    History["Recent trajectory history"] --> Planner["Adaptive line/arc planner<br/>curvature + distance guards"]
+    Source["Mass-preserving source tensor"] --> Samples["64 half-line samples<br/>direct Newton Taylor jet"]
+    Planner --> Samples
+    Samples --> Numerical["Numerical Laplace spectra<br/>for transverse coefficients"]
+    Tables["Precomputed Ψ and Ψx tables"] --> Analytic["Analytical Eq.70/Eq.106<br/>reference-line coefficient"]
+    Numerical --> Merge["Cached 129-bin<br/>complex spectrum"]
+    Analytic --> Merge
+    Merge --> Inverse["Finite-band<br/>Bromwich inversion"]
+    Planner --> Offset["Transverse offset<br/>order ≤ 4"]
+    Offset --> Taylor["Bivariate Taylor correction"]
+    Inverse --> Taylor
+    Taylor --> Output["Acceleration + potential<br/>Jacobian + certificates"]
+    Source --> Toroidal["Fourier–toroidal potential<br/>m = 0…16"]
+    Toroidal --> Residual["Eq.157 dual-representation<br/>residual diagnostic"]
+    Output --> Residual
+    Output --> Readback["GPU readback → CPU physics"]
+```
+
+## Diagnostics and density inversion
+
+### Rotating-frame Jacobi diagnostic
+
+For body-frame position $\mathbf r$, velocity $\mathbf v_{\rm rot}$, spin $\boldsymbol\omega$, and positive potential $U$, the displayed quantity is
+
+$$
+C_J=2U+\lVert\boldsymbol\omega\times\mathbf r\rVert^2
+-\lVert\mathbf v_{\rm rot}\rVert^2.
+$$
+
+Its relative drift is a consistency diagnostic for the coupled force, potential, frame transformation, readback, and time integrator. A flat curve does not by itself prove that a gravity model is physically correct; a drift can come from field approximation, stale GPU data, interpolation, or integration error.
+
+### Dual-representation residual
+
+Eq.106 also compares its curve-integrated potential change with a truncated Fourier–toroidal potential representation (`m = 0…16`). This is useful for detecting disagreement between two numerical representations, but the two paths share the same density model. The residual is therefore not an independent physical measurement or a proof of density identifiability.
+
+### Synthetic density inversion
+
+The interactive inversion is deliberately separate from the Eq.106 spectral operator:
+
+- `16` editable position and velocity knots define a continuous quintic-Hermite track;
+- the track is sampled at `241` points;
+- the interior is represented by a `4³` Cartesian grid (`56` occupied voxels for the bundled model);
+- a voxelized Newton sensitivity matrix is precomputed along the track;
+- simulated annealing minimizes trajectory mismatch together with mass, smoothness, radial-symmetry, and weak uniform-prior terms.
+
+The reported `fit` is a synthetic volume-weighted density score against the known reference model. It is not a posterior probability, confidence level, or real-observation accuracy. One external trajectory cannot uniquely recover an arbitrary three-dimensional density field without assumptions and regularization.
+
+## Runtime controls
+
+| Input | Action |
+|---|---|
+| `S` | Toggle overview and probe cameras. |
+| `F` | Toggle computed surface normals. |
+| `D` | Toggle the density section view. |
+| `G` | Cycle through the five gravity methods. |
+| `Invert trajectory` | Run the synthetic inversion after trajectory capture is complete. |
+| Position / velocity rows | Replace one quintic-Hermite control value with `x, y, z`. |
+| `X`, `Y`, `Z`, `Speed` | Change the initial probe state. |
+| Simulation acceleration | Execute `1×`–`8×` complete fixed updates per rendered frame. |
+| Mouse drag / wheel | Orbit and zoom the camera. |
+
+Changing the initial conditions or gravity method resets the trajectory and waits for a field sample associated with the new request.
+
+## Build and run
+
+### Requirements
+
+- Rust with the `wasm32-unknown-unknown` target
+- [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)
+- [Bun](https://bun.sh/)
+- a current WebGPU-capable browser with hardware acceleration
 
 ```sh
 rustup target add wasm32-unknown-unknown
-```
-
-## Quick start
-
-```sh
 bun install
-bun run dev       # debug build and http://localhost:3000
-bun run build     # release WASM in pkg/
-bun run preview   # release build and server
+bun run dev       # debug WASM build, then http://localhost:3000
+bun run build     # release WASM package in pkg/
+bun run preview   # release build, then local server
 bun run serve     # serve an existing build
 ```
 
-Validation:
+The development server supplies the cross-origin isolation headers used by the application. GitHub Pages deployment is defined in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml).
+
+### Validation commands
 
 ```sh
-cargo fmt --all
+cargo fmt --all --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo check --target wasm32-unknown-unknown
 wasm-pack build --target web
-python3 tests/test_gravity_models.py
 ```
 
-Optional Python tooling uses `uv`:
+Optional Python checks and the Wasmtime benchmark use `uv`:
 
 ```sh
 uv sync
@@ -80,349 +288,76 @@ uv run pytest -q
 uv run python scripts/wasmtime_benchmark.py --wasm pkg/ryugu_wasm_bg.wasm
 ```
 
-## Browser and server behavior
+The Rust tests cover density integration, shader parsing, operator tables, transform/inverse consistency, planner guards, radial/Werner/MMFFT/FMM reference cases, physics sampling, Jacobi evaluation, and inversion invariants. Passing unit tests establishes consistency with the tested discretization; it does not establish Eq.106 convergence over every body, trajectory, or parameter range.
 
-The page checks `navigator.gpu` before loading WASM. Development uses `http://localhost`; deployments require HTTPS. The Bun server sends:
+## Repository map
 
-```http
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
+```mermaid
+flowchart TB
+    Root["RyuGu_WASM/"] --> Lib["src/lib.rs<br/>application setup and schedules"]
+    Root --> Components["src/components.rs<br/>shared data and constants"]
+    Root --> Systems["src/systems/"]
+    Systems --> Gravity["gravity/<br/>five field evaluators"]
+    Gravity --> Radial["radial.rs"]
+    Gravity --> Werner["werner.rs"]
+    Gravity --> Eq106["curved_arc.rs<br/>eq106_gpu.rs<br/>eq106_operator.rs<br/>eq106_reference.rs"]
+    Gravity --> MMFFT["mmfft.rs"]
+    Gravity --> FMM["fmm.rs"]
+    Systems --> Simulation["simulation/<br/>physics, inversion, Jacobi"]
+    Systems --> Presentation["presentation/<br/>UI, charts, cameras"]
+    Systems --> Model["model/<br/>mesh normalization and topology"]
+    Systems --> GPUNormals["gpu/normals.rs"]
+
+    Root --> Shaders["assets/shaders/"]
+    Shaders --> EqShader["eq106_complex.wgsl"]
+    Shaders --> OtherShaders["gravity.wgsl<br/>werner_gravity.wgsl<br/>mmfft_compressed.wgsl<br/>fmm_gravity.wgsl"]
+    Root --> Operators["assets/operators/<br/>Eq.106 special-function tables"]
+    Root --> Models["assets/models/<br/>bundled Ryugu and probe meshes"]
+    Root --> Math["mathpub.pdf<br/>mathematical derivation"]
+    Root --> Tests["tests/<br/>Python numerical checks"]
+    Root --> Workflow[".github/workflows/deploy.yml<br/>GitHub Pages deployment"]
 ```
 
-### Enabling WebGPU by browser
+Key implementation entry points:
 
-Use a current browser and enable hardware acceleration.
-
-#### Chrome and Chromium
-
-Check `chrome://gpu`. For unsupported development configurations only, try `chrome://flags/#enable-unsafe-webgpu`.
-
-#### Microsoft Edge
-
-Check `edge://gpu`; Edge uses Chromium's WebGPU backend and flags.
-
-#### Firefox
-
-Use a current release. If necessary for testing, enable `dom.webgpu.enabled` in `about:config`.
-
-#### Safari
-
-Current Safari versions use Metal-backed WebGPU on supported Apple hardware. Older Technology Preview builds may require the WebGPU feature flag.
-
-Adapter smoke test:
-
-```js
-Boolean(navigator.gpu && await navigator.gpu.requestAdapter())
-```
-
-## Why Rust, Bevy, WebAssembly, and WebGPU
-
-| Technology | Role |
+| File | Responsibility |
 |---|---|
-| Rust | Shared native/WASM implementation with strong ownership and type checking. |
-| Bevy | ECS scheduling, fixed updates, render extraction, and GPU resource management. |
-| WebAssembly | Browser delivery without a native installation. |
-| WebGPU | Parallel field evaluation, reductions, and asynchronous readback. |
-
-### Why Rust instead of C++ or Python
-
-Rust fits the current Bevy/WASM/WebGPU pipeline. C++ is equally viable for native scientific libraries; Python remains useful for derivations and validation but is not in the interactive render loop.
-
-## Gravity models
-
-Detailed derivations and convergence conditions are in [`mathpub.pdf`](mathpub.pdf).
-
-### Radial Analytic: Equation
-
-The star-shaped surface mesh is converted to angular cells and four equal-volume radial layers. Each layer stores the exact mean of the logarithmic density, preserving total layer mass. GPU invocations evaluate acceleration and positive potential with the same eight-node radial quadrature.
-
-The model assumes one radial interval per direction.
-
-### Homogeneous Werner polyhedron
-
-Werner uses
-
-$$
-\rho_W=M_{\mathrm{Ryugu}}/V_{\mathrm{mesh}}.
-$$
-
-The GPU evaluates shared-edge logarithmic terms and signed face-solid-angle terms for the closed, outward-oriented mesh. It does not use the heterogeneous radial density.
-
-### Equation (106) adaptive curved trajectory
-
-The trajectory is represented as
-
-$$
-\mathbf q(t)=\overline{\mathbf q}(t)+\delta\mathbf q(t),
-\qquad
-\mathbf g(\overline{\mathbf q}+\delta\mathbf q)
-=\exp(\delta\mathbf q\!\cdot\!\nabla)\mathbf g(\overline{\mathbf q}).
-$$
-
-The GPU uses a mass-preserving `4×8×32` radial/polar/azimuth source quadrature, density modes `m=0..16`, and a 129-frequency Bromwich grid. Curved arcs are planned in the body frame. A segment is accepted only when
-
-$$
-\varepsilon_{\max}=\sup_h\frac{\|\delta\mathbf q(h)\|}{d(h)}<1
-$$
-
-and the geometric Taylor remainder is below tolerance. The curvature bound
-
-$$
-\frac{\kappa\ell^2}{2d_{\min}}<1
-$$
-
-forces shorter segments at higher curvature. Failed segments are bisected; an unresolved minimum segment stops integration instead of extrapolating outside the Taylor disk. Periodic mode requires ten stable closures.
-
-### Density section view
-
-Press `D` to display the selected density:
-
-- radial, Equation (106), MMFFT, and FMM: outward-increasing logarithmic density;
-- Werner: uniform density.
-
-## Trajectory Density Inversion
-
-After five seconds of simulation, the 3D view exposes two editable columns of
-16 uniformly resampled detector states: position on the left and velocity on
-the right. The `Invert trajectory` button uses those states as **Quintic
-Hermite control nodes**, not as only 16 independent gravity observations.
-
-For the default 16 nodes, the 15 Hermite intervals are sampled at 16 points
-per interval, with shared endpoints, giving
-
-$$
-15\times16+1=241
-$$
-
-trajectory positions and inertial-acceleration observations, or 723 scalar
-acceleration components. The displayed magenta inversion trajectory and the
-inverse solver use the same Hermite position/acceleration evaluator. Knot
-accelerations come from non-uniform three-point quadratic differentiation of
-the editable velocity controls, including second-order endpoint stencils.
-
-The asteroid is voxelized into a `4×4×4` Cartesian grid; only cells that
-intersect the radial source are retained (56 cells for the bundled Ryugu
-model). Every retained voxel has an independent positive density. Simulated
-annealing starts from a total-mass-preserving uniform density and minimizes a
-trajectory-data term together with total-mass, neighbor-smoothness, and weak
-uniform-prior terms. Proposals include smooth zero-mass radial modes for fast
-large-scale convergence and mass-conserving exchanges across adjacent voxel
-faces for three-dimensional structure.
-
-The original forward density is never used as the annealing initial state or
-as an inverse observation. It is retained only after optimization for the
-displayed validation metrics:
-
-- Werner is evaluated against its uniform-density reference.
-- Radial, Equation (106), MMFFT, and FMM are evaluated against the
-  volume-averaged outward-increasing logarithmic reference density.
-
-The upper-right inversion panel reports fit (`1 -` volume-weighted relative
-density RMSE), density RMSE, annealing objective improvement, the number of
-Quintic track samples, voxel count, density range, density spread, mass scale,
-objective value, and annealing iterations. A zero objective improvement is
-reported explicitly as remaining at the uniform start; it is not displayed as
-a successful non-uniform recovery.
-
-When inversion is active, the section visualization follows the rotating
-asteroid and shows the recovered density field rather than the forward-model
-field. Dynamic contours are drawn over each section: the exterior outline is
-always present, while interior contours appear for recoverable density levels.
-
-## Comparative scope
-
-| Method | Strength | Main approximation |
-|---|---|---|
-| Werner | Closed homogeneous polyhedron reference. | No heterogeneous density. |
-| Radial | Reusable star-shaped angular/radial source. | Four radial layers and angular discretization. |
-| Equation (106) | Structured curved-trajectory spectral reuse. | Finite source/frequency quadrature and Taylor segmentation. |
-| MMFFT | Two-level 3D zero-padded FFT/kernel/IFFT convolution. | Finite Cartesian mesh spacing and interpolation. |
-| FMM | Hierarchical P2M/M2M/M2L/L2L plus exact leaf P2P. | Order-two source/local expansions. |
-
-Compare methods against a suitable independent reference for the selected density and trajectory. Werner and the other four methods intentionally model different densities.
-
-## GPU execution and readback
-
-```text
-main-world source
-  -> ExtractSchedule
-  -> GPU buffers and body-frame request uniform
-  -> compute dispatch and workgroup reduction
-  -> staging-buffer mapping
-  -> snapshot-tagged gravity history
-  -> fixed-step physics
-```
-
-Readback never blocks the render thread. Snapshot epoch, request ID, time, transform, position, and velocity prevent mixing fields with the wrong simulation state.
-
-## Physics and frame pacing
-
-Physics runs at 60 fixed updates per second. Each displayed update contains 12 leapfrog substeps; `Nx` acceleration advances `N` complete fixed updates without enlarging the integration step.
-
-Radial and Equation (106) histories provide bounded interpolation/prediction. Werner, MMFFT, and FMM hold the newest completed field. Integration pauses during warm-up or after a numerical/certification failure.
-
-## Rotating-frame Jacobi-constant chart
-
-The chart displays
-
-$$
-C_J=2U(\mathbf r_b)
-+\|\boldsymbol\omega_b\times\mathbf r_b\|^2
--\|\mathbf v_b\|^2.
-$$
-
-Every sample uses the CPU-integrated position and velocity. Eq.106 evaluates the matching conservative local potential
-`U_loc = U0 + g0·dx + 1/2 dx^T H dx`, so its displayed force and potential obey `g = grad(U)` within each cached segment. The chart holds 256 samples, reports `dC/|C0|`, and adds an 8% vertical margin around visible extrema.
-
-## Performance comparison
-
-The top-center button opens a five-method workspace. Each enabled method receives a 120-frame measurement window normalized to 1x simulation acceleration; the previous acceleration is restored on exit. Jacobi curves plot per-method relative drift against each sample's actual simulation time, without visual offsets or a synthetic 100-hour axis. Eq.106 samples retain segment id, line origin, local `(h,u,v)`, and all four runtime certificates. Results include the browser, driver, rendering, dispatch, and readback overhead; they are not solver-only or cross-machine benchmarks.
-
-Headless WASM compilation timing:
-
-```sh
-uv run python scripts/wasmtime_benchmark.py --wasm pkg/ryugu_wasm_bg.wasm \
-  --calls 8 --iterations 100000 --json
-```
-
-## Surface topology and normals
-
-After loading the GLTF model, the application normalizes scale, welds vertices at `1e-4`, builds CSR adjacency, and runs a one-shot WebGPU normal pass. Press `F` to display the result.
-
-## Runtime controls
-
-| Input | Action |
-|---|---|
-| `S` | Toggle overview/probe camera. |
-| `F` | Toggle surface normals. |
-| `D` | Toggle density section. |
-| `G` | Cycle the five gravity methods. |
-| `Invert trajectory` | Start density inversion from the 16 displayed position/velocity controls after their five-second capture is complete. |
-| Position / Velocity rows | Click a row, enter `x, y, z`, and press Enter to replace one Hermite control value. |
-| `X`, `Y`, `Z` | Set initial probe position. |
-| `Speed` | Set circular-speed multiplier. |
-| Acceleration | Select `1x`–`8x` complete fixed updates per frame. |
-| Mouse drag / wheel | Orbit / zoom camera. |
-
-Changing initial conditions or gravity method resets the trajectory and waits for a valid field sample.
-
-## Physical constants
-
-| Constant | Value |
-|---|---:|
-| `G` | `6.6743e-11` |
-| `RYUGU_MASS` | `4.5e11 kg` |
-| `CASSINI_MASS` | `2500 kg` |
-| `DENSITY_EPSILON` | `10 m` |
-| `RYUGU_ROTATION_PERIOD_SECS` | `7.63 h` |
-| `TIME_SCALE` | `500` |
-| `PHYSICS_SUBSTEPS` | `12` |
-| `MAX_SIMULATION_ACCELERATION` | `8` |
-| `PROBE_SPEED_FACTOR` | `1.053` |
-
-Default probe state:
-
-```text
-position = (-1000, 1200, 100)
-speed    = 1.053 * sqrt(G * RYUGU_MASS / |position|)
-```
-
-## Scheduling
-
-### Startup
-
-```text
-scene and UI setup -> model load -> source initialization
-```
-
-### Main-world update chain
-
-```text
-model normalization -> topology -> controls/UI -> visualization
-```
-
-GPU results are polled in `PreUpdate`; immutable sources are built in `Update`.
-
-### Fixed update
-
-```text
-physics -> Ryugu rotation -> Jacobi diagnostics
-```
-
-### Render world
-
-```text
-extraction -> compute dispatch -> asynchronous mapping
-```
-
-## Project structure
-
-```text
-Ryugu_wasm/
-├── src/
-│   ├── lib.rs
-│   ├── components.rs
-│   └── systems/
-│       ├── gravity/
-│       ├── gpu/
-│       ├── model/
-│       ├── presentation/
-│       └── simulation/
-├── assets/{models,shaders}/
-├── docs/
-├── scripts/
-├── tests/
-├── index.html
-├── server.ts
-└── Cargo.toml
-```
-
-### File responsibilities
-
-| Path | Responsibility |
-|---|---|
-| `src/components.rs` | Constants, ECS state, gravity sources, and histories. |
-| `src/systems/gravity/` | Radial, Werner, Equation (106), MMFFT, and FMM implementations. |
-| `src/systems/presentation/` | Scene, controls, density section, and charts. |
-| `src/systems/simulation/` | Fixed-step physics, diagnostics, and continuous-trajectory 3D density inversion. |
-| `assets/shaders/` | WebGPU compute shaders. |
-| `tests/` | Independent numerical checks. |
-| `docs/` | Mathematical derivations and convergence conditions. |
-
-## Testing
-
-Rust tests cover density integration, acceleration/potential consistency, Werner and multipole far fields, M2L acceptance, Equation (106) transforms and convergence, interpolation, Jacobi evaluation, buffer layouts, WGSL validation, and the inversion contract: the original density cannot seed annealing, dense Quintic sampling is used instead of cached gravity, and voxel sensitivities remain spatially distinct. Python tests independently check the logarithmic density and convergence guards.
+| [`src/lib.rs`](src/lib.rs) | Bevy plugins, startup systems, update ordering, and WebGPU availability checks. |
+| [`src/systems/gravity/curved_arc.rs`](src/systems/gravity/curved_arc.rs) | Eq.106 source discretization, trajectory planner, Fourier modes, and geometric guards. |
+| [`src/systems/gravity/eq106_gpu.rs`](src/systems/gravity/eq106_gpu.rs) | Eq.106 buffers, render-world dispatch, readback, and history management. |
+| [`assets/shaders/eq106_complex.wgsl`](assets/shaders/eq106_complex.wgsl) | Half-line sampling, complex spectrum assembly, analytical reference coefficient, Bromwich reconstruction, Taylor correction, and diagnostics. |
+| [`src/systems/simulation/physics.rs`](src/systems/simulation/physics.rs) | CPU trajectory integration using snapshot-matched GPU field results. |
+| [`src/systems/simulation/inversion.rs`](src/systems/simulation/inversion.rs) | Quintic track construction and regularized synthetic voxel inversion. |
+| [`mathpub.pdf`](mathpub.pdf) | Full exploratory derivation and stated convergence conditions. |
+
+## Benchmark interpretation
+
+The in-app comparison reports end-to-end rendered frame throughput while each method participates in its normal preprocessing, dispatch, readback, physics, and presentation path. It is useful for interactive regression testing, but it is not a solver-only benchmark and should not be used to claim asymptotic superiority.
+
+A publishable comparison should separately measure:
+
+- preprocessing and cache-build time;
+- warm cached-query latency and throughput;
+- GPU readback and CPU integration overhead;
+- acceleration and potential error against a high-accuracy common reference;
+- Jacobi drift at matched time step and precision;
+- memory use and rebuild frequency as curvature, altitude, and source resolution vary.
+
+The expected Eq.106 advantage, if confirmed, is narrow but testable: a fixed body and density discretization, a long near-straight exterior track, and enough repeated samples per valid segment to amortize spectrum construction. FMM or grid methods may be preferable for arbitrary three-dimensional queries, rapidly changing trajectories, or broad field-volume evaluation.
 
 ## Known limitations
 
-- Radial sources require a star-shaped body.
-- Werner is homogeneous; the other methods use logarithmic density.
-- Equation (106), MMFFT, and FMM use finite discretizations.
-- FMM local expansions are order two; M2L requires the full source-plus-target radius below `0.10×distance`, while non-separated leaves use exact P2P.
-- Density inversion is a regularized, trajectory-constrained reconstruction. A single external track cannot uniquely resolve every unconstrained interior mode; the mass and smoothness terms select a stable 3D solution in the remaining null space.
-- The inversion sensitivity operator uses the voxelized Newton kernel, with MMFFT's finite-grid softening represented in its inverse operator. It is a reconstruction benchmark for comparing the runtime methods, not a calibrated spacecraft-navigation estimator.
-- GPU readback and prediction remain asynchronous numerical approximations.
-- The simulator uses f32 GPU arithmetic and is not an orbit-determination tool.
-- WebGPU is required.
-
-## Mathematical coverage audit
-
-| Document result | Runtime status |
-|---|---|
-| Eq. (79) toroidal identity | Certified segmented Chebyshev table used by the independent potential representation. |
-| Eqs. (81)–(86) density separation | Density Fourier modes `m=0..16` from the mass-preserving `4×8×32` tensor. |
-| Eqs. (89)–(95) NUFFT | Common-frequency Bromwich summation; no explicit general NUFFT matrix. |
-| Eq. (106) straight-line field | Implemented for the discrete density representation on CPU and GPU. |
-| Eqs. (109)–(110) inversion | Finite 129-frequency and half-line quadrature. |
-| Eq. (118) curved translation | Planner-selected directional Taylor jet through order eight. |
-| Eqs. (155)–(158) | Adaptive Taylor guard and dual residual implemented. |
-
-The implementation is a tested, discretized Equation (106) evaluator, not an exact untruncated continuous-density identity.
-
-## Deployment
-
-`.github/workflows/deploy.yml` builds the release WASM package and deploys `index.html`, `assets/`, and `pkg/` to GitHub Pages.
+- The radial source model assumes the body is star-shaped with respect to its chosen center.
+- The Werner solver is homogeneous, whereas the other displayed methods use the logarithmic heterogeneous profile.
+- Eq.106 uses finite source, half-line, frequency, Fourier, and Taylor truncations; the $a\to0$ axis branch and special-function table domain require separate guards.
+- Strongly curved or near-surface trajectories can force frequent Eq.106 segment rebuilds and remove its reuse advantage.
+- The code does not implement the general Type-3/Type-2 NUFFT construction discussed in the mathematical note.
+- MMFFT accuracy is limited by finite grids and interpolation. Its FFT field is built on the CPU and only sampled on the GPU at runtime.
+- The FMM implementation uses a fixed depth, a strict opening criterion, and order-two multipoles; it is an experimental comparison path.
+- GPU arithmetic is primarily `f32`, and GPU readback is asynchronous.
+- The density inversion is regularized and non-unique; it currently uses a voxel Newton sensitivity operator rather than an Eq.106 adjoint.
+- Numerical agreement in this repository does not establish novelty, general convergence, or mission readiness. Those require literature review, independent derivation review, convergence studies, and reproducible external benchmarks.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
