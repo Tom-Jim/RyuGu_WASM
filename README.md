@@ -60,7 +60,7 @@ $$
 
 ### 2. Straight-reference-line transform
 
-Around a chosen reference line, write the transverse source–line distance as $a$ and the signed longitudinal source coordinate as $z'$. For $\operatorname{Re}(s)>0$, define
+Around a chosen reference line, write the transverse source–line distance as $a$ and the signed longitudinal source coordinate as $z'$. For $\mathrm{Re}(s)>0$, define
 
 $$
 F(s;a,z')=\int_0^\infty
@@ -127,11 +127,7 @@ $$
 the field is locally continued with the translation operator
 
 $$
-\mathbf g(\bar{\mathbf q}+\delta\mathbf q)
-=
-\sum_{n=0}^{A}\frac{1}{n!}
-\left(\delta\mathbf q\cdot\nabla\right)^n
-\mathbf g(\bar{\mathbf q})+\mathbf R_{A+1}.
+\mathbf g(\bar{\mathbf q}+\delta\mathbf q)=\sum_{n=0}^{A}\frac{1}{n!}\left(\delta\mathbf q\cdot\nabla\right)^n\mathbf g(\bar{\mathbf q})+\mathbf R_{A+1}.
 $$
 
 The production path uses a bivariate transverse Taylor polynomial through total order **four** (`15` coefficients), not an unlimited or eighth-order expansion. The planner monitors a conservative distance ratio $\varepsilon$ and a geometric-series remainder estimate. A segment must be rebuilt or rejected when its curvature or source proximity exceeds the configured guard.
