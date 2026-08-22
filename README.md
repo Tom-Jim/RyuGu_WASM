@@ -1,7 +1,7 @@
 # Ryugu WASM
 
 [![Live Demo](https://img.shields.io/badge/Live_Demo-WebGPU-success?style=for-the-badge)](https://tom-jim.github.io/RyuGu_WASM/)
-![Bevy](https://img.shields.io/badge/Bevy-0.19.0-purple.svg)
+![Bevy](https://img.shields.io/badge/Bevy-0.19.1-purple.svg)
 ![Rust](https://img.shields.io/badge/Rust-Edition_2024-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
@@ -147,6 +147,45 @@ Consequently, the implementation should not be described as an exact closed-form
 
 ## Runtime architecture
 
+### Software architecture and dependency direction
+
+The Rust code is organized around one-way dependencies. Bevy owns scheduling,
+render extraction, assets, and presentation; numerical backends do not reach
+back into Bevy systems. Both CPU and GPU paths exchange the same snapshot and
+field-sample contract through `src/interface/`.
+
+```mermaid
+flowchart LR
+    Bevy["Bevy adapter\nsrc/bevy/\nECS + RenderApp"] --> Interface["Unified interface\nsrc/interface/\nrequest / response / history"]
+    Interface --> CPU["CPU backends\nsrc/cpu/\nplanning, source prep, integration"]
+    Interface --> GPU["GPU backends\nsrc/gpu/\nrender-world compute plugins"]
+    CPU --> CpuBenchmark["CPU benchmark\nsrc/cpu/benchmark.rs\ndeterministic scalar kernels"]
+    GPU --> GpuTests["GPU tests\nsrc/gpu/tests.rs\nWGSL validation"]
+    GPU --> GpuBenchmark["GPU benchmark metadata\nsrc/gpu/benchmark.rs\ntimestamp stage contract"]
+```
+
+The four top-level layers are intentionally directional:
+
+```text
+src/bevy/      Bevy scheduling, render extraction, scene, UI, and diagnostics
+src/interface/ shared resources, snapshots, histories, and method selection
+src/cpu/       trajectory planning, source preparation, integration, inversion,
+               Eq.106 reference operators, and CPU benchmark entry points
+src/gpu/       WebGPU compute backends, shader validation tests, and timestamp
+               benchmark metadata
+```
+
+There are no compatibility redirect modules in the runtime. Imports point
+directly from Bevy adapters to the shared interface and then to CPU or GPU
+implementations. The Eq.106 dispatch path is split into named preparation,
+trajectory-batch, single-target, and layout stages; no scheduling order, buffer
+contract, or physics fallback behavior changes.
+
+The benchmark entry point is exported from `src/cpu/benchmark.rs` rather than
+the Bevy application entry point. This keeps host/WASM benchmark tooling
+independent from window creation while preserving the public
+`benchmark_gravity_algorithms(iterations)` export.
+
 ```mermaid
 flowchart LR
     Mesh["Ryugu GLB mesh"] --> Topology["Normalize mesh<br/>weld vertices<br/>build topology"]
@@ -291,19 +330,16 @@ The Rust tests cover density integration, shader parsing, operator tables, trans
 ```mermaid
 flowchart TB
     Root["RyuGu_WASM/"] --> Lib["src/lib.rs<br/>application setup and schedules"]
-    Root --> Components["src/components.rs<br/>shared data and constants"]
-    Root --> Systems["src/systems/"]
-    Systems --> Gravity["gravity/<br/>five field evaluators"]
-    Gravity --> Radial["radial.rs"]
-    Gravity --> Werner["werner.rs"]
-    Gravity --> Eq106["curved_arc.rs<br/>eq106_gpu.rs<br/>eq106_operator.rs<br/>eq106_reference.rs"]
-    Gravity --> MMFFT["mmfft.rs"]
-    Gravity --> FMM["fmm.rs"]
-    Systems --> Simulation["simulation/<br/>physics, inversion, Jacobi"]
-    Systems --> Presentation["presentation/<br/>UI, charts, cameras"]
-    Systems --> Model["model/<br/>mesh normalization and topology"]
-    Systems --> GPUNormals["gpu/normals.rs"]
-
+    Root --> Bevy["src/bevy/<br/>scene, UI, charts, scaling"]
+    Root --> Interface["src/interface/<br/>shared data and contracts"]
+    Root --> CPU["src/cpu/<br/>planning, integration, inversion"]
+    Root --> GPU["src/gpu/<br/>WebGPU evaluators and tests"]
+    CPU --> CpuBench["benchmark.rs"]
+    GPU --> GpuTests["tests.rs<br/>WGSL validation"]
+    GPU --> GpuBench["benchmark.rs<br/>timestamp metadata"]
+    CPU --> Eq106Cpu["eq106_reference.rs<br/>eq106_operator.rs<br/>curved_arc.rs"]
+    GPU --> Eq106Gpu["eq106.rs"]
+    GPU --> OtherGpu["radial.rs<br/>werner.rs<br/>mmfft.rs<br/>fmm.rs<br/>normals.rs"]
     Root --> Shaders["assets/shaders/"]
     Shaders --> EqShader["eq106_complex.wgsl"]
     Shaders --> OtherShaders["gravity.wgsl<br/>werner_gravity.wgsl<br/>mmfft_compressed.wgsl<br/>fmm_gravity.wgsl"]
@@ -319,11 +355,13 @@ Key implementation entry points:
 | File | Responsibility |
 |---|---|
 | [`src/lib.rs`](src/lib.rs) | Bevy plugins, startup systems, update ordering, and WebGPU availability checks. |
-| [`src/systems/gravity/curved_arc.rs`](src/systems/gravity/curved_arc.rs) | Eq.106 source discretization, trajectory planner, Fourier modes, and geometric guards. |
-| [`src/systems/gravity/eq106_gpu.rs`](src/systems/gravity/eq106_gpu.rs) | Eq.106 buffers, render-world dispatch, readback, and history management. |
+| [`src/bevy/`](src/bevy/) | Bevy scheduling, scene setup, presentation, UI, and diagnostic charts. |
+| [`src/interface/`](src/interface/) | Shared snapshots, histories, resources, and method-selection helpers. |
+| [`src/cpu/curved_arc.rs`](src/cpu/curved_arc.rs) | Eq.106 source discretization, trajectory planner, Fourier modes, and geometric guards. |
+| [`src/gpu/eq106.rs`](src/gpu/eq106.rs) | Eq.106 buffers, render-world dispatch, readback, and history management. |
 | [`assets/shaders/eq106_complex.wgsl`](assets/shaders/eq106_complex.wgsl) | Half-line sampling, complex spectrum assembly, analytical reference coefficient, Bromwich reconstruction, Taylor correction, and diagnostics. |
-| [`src/systems/simulation/physics.rs`](src/systems/simulation/physics.rs) | CPU trajectory integration using snapshot-matched GPU field results. |
-| [`src/systems/simulation/inversion.rs`](src/systems/simulation/inversion.rs) | Quintic track construction and regularized synthetic voxel inversion. |
+| [`src/cpu/physics.rs`](src/cpu/physics.rs) | CPU trajectory integration using snapshot-matched GPU field results. |
+| [`src/cpu/inversion.rs`](src/cpu/inversion.rs) | Quintic track construction and regularized synthetic voxel inversion. |
 | [`mathpub.pdf`](mathpub.pdf) | Full exploratory derivation and stated convergence conditions. |
 
 ## Benchmark interpretation

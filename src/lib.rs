@@ -1,9 +1,10 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
-mod components;
-mod systems;
-mod topology;
-mod welding;
+#[path = "bevy/mod.rs"]
+mod bevy_app;
+mod cpu;
+mod gpu;
+mod interface;
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -14,36 +15,11 @@ use bevy::render::{
 };
 use bevy::window::PresentMode;
 use bevy::winit::{UpdateMode, WinitSettings};
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
-use bevy_obj::ObjPlugin;
-use bevy_panorbit_camera::PanOrbitCameraPlugin;
-use components::{
-    ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GpuMemoryEstimate,
-    GravityAcceleration, GravityBlendFactor, GravityPotential, GravityRuntimeError, JacobiHistory,
-    PerformanceComparisonState, ProbeInitialConditions, ShowNormals, ShowSection,
-    SimulationAcceleration, SimulationClock, TrajectoryInversionState,
-};
-use std::time::Duration;
-pub use systems::eq106;
-pub use systems::eq106_operator::{PsiOperatorTable, ToroidalOperatorTensor};
-use systems::{
-    compute_pipeline::NormalsComputePlugin,
-    curved_arc::{
-        CurvedArcPlannerState, CurvedArcResidualHistory, PeriodicityDetector,
-        build_eq106_source_system, monitor_curved_arc_system,
-    },
+use bevy_app::{
     energy::{
         record_probe_jacobi_system, setup_eq106_residual_chart, setup_jacobi_chart,
         update_eq106_residual_chart_system, update_jacobi_chart_system,
     },
-    eq106_gpu_pipeline::Eq106GpuComputePlugin,
-    eq106_operator::build_eq106_operator_tensor_system,
-    fmm_pipeline::FmmComputePlugin,
-    gravity_pipeline::{GravityComputePlugin, build_radial_gravity_source_system},
-    inversion::{simulated_annealing_system, start_density_inversion_system},
-    mmfft_pipeline::MmfftCompressedComputePlugin,
-    physics::{physics_system, ryugu_rotation_system},
     render::{
         camera_follow_system, camera_switch_system, capture_trajectory_inversion_system,
         render_gizmos_system, render_section_system, section_alpha_system, setup_scene, setup_ui,
@@ -63,8 +39,36 @@ use systems::{
         trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
         update_hint_on_mode_change, update_ui_scale_system,
     },
-    werner_pipeline::WernerComputePlugin,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
+use bevy_panorbit_camera::PanOrbitCameraPlugin;
+pub use cpu::eq106_operator::{PsiOperatorTable, ToroidalOperatorTensor};
+pub use cpu::eq106_reference as eq106;
+use cpu::{
+    curved_arc::{
+        CurvedArcPlannerState, CurvedArcResidualHistory, build_eq106_source_system,
+        monitor_curved_arc_system,
+    },
+    eq106_operator::build_eq106_operator_tensor_system,
+    inversion::{simulated_annealing_system, start_density_inversion_system},
+    physics::{physics_system, ryugu_rotation_system},
+};
+use gpu::{
+    eq106::Eq106GpuComputePlugin,
+    fmm::FmmComputePlugin,
+    mmfft::MmfftCompressedComputePlugin,
+    normals::NormalsComputePlugin,
+    radial::{GravityComputePlugin, build_radial_gravity_source_system},
+    werner::WernerComputePlugin,
+};
+use interface::components::{
+    ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GpuMemoryEstimate,
+    GravityAcceleration, GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential,
+    GravityRuntimeError, JacobiHistory, PerformanceComparisonState, ProbeInitialConditions,
+    ShowNormals, ShowSection, SimulationAcceleration, SimulationClock, TrajectoryInversionState,
+};
+use std::time::Duration;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -167,13 +171,13 @@ pub fn main() {
         .init_resource::<JacobiHistory>()
         .init_resource::<SimulationClock>()
         .init_resource::<TrajectoryInversionState>()
+        .init_resource::<GravityBenchmarkTrajectory>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
         .init_resource::<DisplayRotation>()
         .init_resource::<PerformanceComparisonState>()
         .init_resource::<CurvedArcPlannerState>()
         .init_resource::<CurvedArcResidualHistory>()
-        .init_resource::<PeriodicityDetector>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::Reactive {
@@ -209,7 +213,6 @@ pub fn main() {
                     ..default()
                 }),
         )
-        .add_plugins(ObjPlugin)
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default());
 
@@ -344,61 +347,4 @@ pub fn main() {
     .run();
 }
 
-/// Deterministic WASM-side microbenchmark entry point used by the Python
-/// `wasmtime` benchmark harness. The browser performance panel measures the
-/// complete Bevy/WebGPU paths; this export measures the corresponding numeric
-/// kernels without requiring a browser DOM or WebGPU imports.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
-pub fn benchmark_gravity_algorithms(iterations: u32) -> f64 {
-    let iterations = iterations.max(1);
-    let mut checksum = 0.0_f64;
-    for index in 0..iterations {
-        let radius = 120.0 + (index % 4096) as f64 * 0.125;
-        let logarithmic_density = (1.0 + radius / components::DENSITY_EPSILON as f64).ln();
-        let radial = logarithmic_density * radius * radius;
-        let edge_log = ((radius + 900.0 + 42.0) / (radius + 900.0 - 42.0)).ln();
-        let werner = edge_log * (radius + 1.0).recip();
-        let displacement = 0.05 * (index as f64 * 0.017).sin();
-        let ratio = displacement / radius;
-        let taylor = ratio + 0.5 * ratio * ratio + 0.375 * ratio * ratio * ratio;
-        checksum += radial + werner + taylor;
-    }
-    std::hint::black_box(checksum)
-}
-
-#[cfg(test)]
-mod shader_tests {
-    use naga::valid::{Capabilities, ValidationFlags, Validator};
-
-    fn validate_wgsl(source: &str) {
-        let module = naga::front::wgsl::parse_str(source).expect("WGSL parsing failed");
-        Validator::new(ValidationFlags::all(), Capabilities::all())
-            .validate(&module)
-            .expect("WGSL validation failed");
-    }
-
-    #[test]
-    fn radial_gravity_shader_is_valid() {
-        validate_wgsl(include_str!("../assets/shaders/gravity.wgsl"));
-    }
-
-    #[test]
-    fn werner_shader_is_valid() {
-        validate_wgsl(include_str!("../assets/shaders/werner_gravity.wgsl"));
-    }
-
-    #[test]
-    fn mmfft_compressed_shader_is_valid() {
-        validate_wgsl(include_str!("../assets/shaders/mmfft_compressed.wgsl"));
-    }
-
-    #[test]
-    fn eq106_complex_shader_is_valid() {
-        validate_wgsl(include_str!("../assets/shaders/eq106_complex.wgsl"));
-    }
-
-    #[test]
-    fn fmm_shader_is_valid() {
-        validate_wgsl(include_str!("../assets/shaders/fmm_gravity.wgsl"));
-    }
-}
+pub use cpu::benchmark::benchmark_gravity_algorithms;
