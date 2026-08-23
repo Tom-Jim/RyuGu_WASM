@@ -171,10 +171,10 @@ impl ComparisonMetric {
             Self::GradientRelativeError => "Gradient error",
             Self::PericenterError => "Pericenter error",
             Self::MinimumAltitude => "Minimum altitude",
-            Self::ModelDiscrimination => "Model separation",
+            Self::ModelDiscrimination => "Reference separation",
             Self::PlanningObjective => "Planning objective",
             Self::SegmentCount => "Segments",
-            Self::SpeedupVsGpuFmm => "Speedup / FMM",
+            Self::SpeedupVsGpuFmm => "Speedup / treecode",
             Self::ColdStartAmortization => "Cold amortization",
         }
     }
@@ -230,6 +230,27 @@ pub enum PlanningExecutionBackend {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct PlanningCandidateScore {
+    pub candidate_index: u32,
+    pub minimum_altitude_m: f32,
+    pub reference_model_separation: f32,
+    pub gradient_information: f32,
+    pub objective: f32,
+}
+
+impl Default for PlanningCandidateScore {
+    fn default() -> Self {
+        Self {
+            candidate_index: 0,
+            minimum_altitude_m: f32::NAN,
+            reference_model_separation: f32::NAN,
+            gradient_information: f32::NAN,
+            objective: f32::NAN,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct PlanningMethodMetrics {
     pub method: ActiveGravityMethod,
     pub backend: PlanningExecutionBackend,
@@ -240,10 +261,10 @@ pub struct PlanningMethodMetrics {
     pub workload: PlanningWorkloadIdentity,
     pub common_preparation_ms: f64,
     pub preprocessing_ms: f64,
-    pub evaluation_ms: f64,
+    pub command_submission_ms: f64,
     pub reduction_ms: f64,
     pub verification_ms: f64,
-    pub readback_ms: f64,
+    pub gpu_completion_map_ms: f64,
     pub warm_evaluation_ms: f64,
     pub total_ms: f64,
     pub relative_gravity_error: f32,
@@ -257,6 +278,10 @@ pub struct PlanningMethodMetrics {
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub density_combinations: u64,
+    pub gpu_request_count: u32,
+    pub minimum_tile_candidates: u32,
+    pub maximum_tile_candidates: u32,
+    pub top_candidates: [PlanningCandidateScore; 5],
 }
 
 pub struct PlanningBatchJob {
@@ -270,6 +295,11 @@ pub struct PlanningBatchJob {
     pub request_id: u64,
     pub density_model: u32,
     pub candidate_start: u32,
+    pub candidate_tile_size: u32,
+    pub minimum_tile_size_used: u32,
+    pub maximum_tile_size_used: u32,
+    pub gpu_request_count: u32,
+    pub last_request_candidate_count: u32,
     pub awaiting_gpu: bool,
     pub warm_repetition: bool,
     pub total_evaluations: u64,
@@ -285,12 +315,16 @@ pub struct PlanningBatchJob {
     pub discrimination_reference_sum: f64,
     pub discrimination_samples: u64,
     pub gradient_information_sum: f64,
+    pub candidate_discrimination_sum: Vec<f64>,
+    pub candidate_reference_sum: Vec<f64>,
+    pub candidate_gradient_sum: Vec<f64>,
+    pub candidate_minimum_altitude_m: Vec<f32>,
     pub common_preparation_ms: f64,
     pub preprocessing_ms: f64,
-    pub evaluation_ms: f64,
+    pub command_submission_ms: f64,
     pub reduction_ms: f64,
     pub verification_ms: f64,
-    pub readback_ms: f64,
+    pub gpu_completion_map_ms: f64,
     pub warm_evaluation_ms: f64,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
@@ -306,6 +340,7 @@ impl PlanningMethodMetrics {
             && self.gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
             && self.pericenter_error_m.is_finite()
             && self.pericenter_error_m <= PLANNING_PERICENTER_ERROR_LIMIT_METERS
+            && self.top_candidates[0].objective.is_finite()
             && self.total_ms.is_finite()
             && self.total_ms > 0.0
     }
@@ -401,13 +436,13 @@ impl PlanningComparisonState {
         Some(if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
             && speedup >= PLANNING_STRONG_SPEEDUP
         {
-            "Eq.106 strong advantage (>=5x GPU FMM)"
+            "Eq.106 strong advantage (>=5x GPU order-2 treecode)"
         } else if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
             && speedup >= PLANNING_USEFUL_SPEEDUP
         {
-            "Eq.106 useful advantage (>=3x GPU FMM)"
+            "Eq.106 useful advantage (>=3x GPU order-2 treecode)"
         } else {
-            "Eq.106 has no effective advantage over GPU FMM"
+            "Eq.106 has no effective advantage over GPU order-2 treecode"
         })
     }
 }

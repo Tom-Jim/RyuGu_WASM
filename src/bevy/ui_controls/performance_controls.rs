@@ -136,16 +136,16 @@ pub fn setup_performance_controls(mut commands: Commands) {
             ),
             performance_method_row(
                 3,
-                "MMFFT + VRAM Compression: -- FPS",
+                "CPU FFT Grid + GPU Interpolation: -- FPS",
                 Color::srgb(1.0, 0.72, 0.2),
             ),
             performance_method_row(
                 4,
-                "Fast Multipole Method: -- FPS",
+                "GPU Order-2 Octree Treecode: -- FPS",
                 Color::srgb(0.25, 0.9, 0.55),
             ),
             (
-                Text::new("Jacobi curves: radial | Werner | Eq.106 | MMFFT compressed | FMM"),
+                Text::new("Jacobi curves: radial | Werner | Eq.106 | FFT grid | treecode"),
                 TextFont {
                     font_size: bevy::text::FontSize::Px(11.0),
                     ..default()
@@ -299,7 +299,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         },
                     ),
                     (
-                        Text::new("MMFFT compressed"),
+                        Text::new("FFT grid + GPU interpolation"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(11.0),
                             ..default()
@@ -313,7 +313,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         },
                     ),
                     (
-                        Text::new("FMM"),
+                        Text::new("Treecode"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(11.0),
                             ..default()
@@ -566,4 +566,3 @@ fn jacobi_axis_text(slot: u8, left: f32, top: f32) -> impl Bundle {
         },
     )
 }
-

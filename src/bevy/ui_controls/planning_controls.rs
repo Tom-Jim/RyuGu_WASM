@@ -93,7 +93,11 @@ pub fn setup_density_inversion_timing_panel(
     mut commands: Commands,
     planning: Res<PlanningComparisonState>,
 ) {
-    let labels = [(2, "Eq.106"), (3, "MMFFT"), (4, "GPU FMM")];
+    let labels = [
+        (2, "Eq.106"),
+        (3, "FFT grid + GPU"),
+        (4, "GPU treecode"),
+    ];
     commands
         .spawn((
             Node {
@@ -380,6 +384,11 @@ pub fn update_planning_results_from_inversion_system(
         request_id: planning.run_id.wrapping_shl(24),
         density_model: 0,
         candidate_start: 0,
+        candidate_tile_size: PLANNING_GPU_TILE_INITIAL_CANDIDATES,
+        minimum_tile_size_used: u32::MAX,
+        maximum_tile_size_used: 0,
+        gpu_request_count: 0,
+        last_request_candidate_count: 0,
         awaiting_gpu: false,
         warm_repetition: false,
         total_evaluations: u64::from(dimensions.0)
@@ -397,12 +406,16 @@ pub fn update_planning_results_from_inversion_system(
         discrimination_reference_sum: 0.0,
         discrimination_samples: 0,
         gradient_information_sum: 0.0,
+        candidate_discrimination_sum: vec![0.0; dimensions.0 as usize],
+        candidate_reference_sum: vec![0.0; dimensions.0 as usize],
+        candidate_gradient_sum: vec![0.0; dimensions.0 as usize],
+        candidate_minimum_altitude_m: vec![f32::INFINITY; dimensions.0 as usize],
         common_preparation_ms,
         preprocessing_ms: 0.0,
-        evaluation_ms: 0.0,
+        command_submission_ms: 0.0,
         reduction_ms: 0.0,
         verification_ms: 0.0,
-        readback_ms: 0.0,
+        gpu_completion_map_ms: 0.0,
         warm_evaluation_ms: 0.0,
         dispatch_count: 0,
         forward_kernel_evaluations: 0,

@@ -13,7 +13,7 @@ pub fn density_inversion_timing_ui_system(
         ),
     >,
 ) {
-    let names = ["Radial", "Werner", "Eq.106 GPU", "MMFFT GPU", "FMM GPU"];
+    let names = ["Radial", "Werner", "Eq.106 GPU", "FFT grid", "Treecode"];
     for (label, mut text) in timing_labels.iter_mut() {
         let marker = if label.0 == active_method.performance_index() {
             "*"
@@ -110,17 +110,20 @@ fn comparison_metric_text(
     let value = match planning.selected_metric {
         ComparisonMetric::GravityRelativeError => {
             format!(
-                "gravity {:.3e} | common {:.2} excluded | cold prep {:.2} + encode {:.2} + reduce {:.2} + readback {:.2} = {:.2} ms | verify {:.2} excluded | warm tile {:.2} | BxKxH {} | dispatch {} | kernels {}",
+                "gravity {:.3e} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + GPU queue/execute/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
                 result.relative_gravity_error,
                 result.common_preparation_ms,
                 result.preprocessing_ms,
-                result.evaluation_ms,
+                result.command_submission_ms,
                 result.reduction_ms,
-                result.readback_ms,
+                result.gpu_completion_map_ms,
                 total,
                 result.verification_ms,
                 result.warm_evaluation_ms,
                 result.density_combinations,
+                result.gpu_request_count,
+                result.minimum_tile_candidates,
+                result.maximum_tile_candidates,
                 result.dispatch_count,
                 result.forward_kernel_evaluations,
             )
@@ -135,10 +138,32 @@ fn comparison_metric_text(
             format!("minimum altitude {:.3} m", result.minimum_altitude_m)
         }
         ComparisonMetric::ModelDiscrimination => {
-            format!("normalized model separation {:.3e}", result.model_discrimination)
+            let best = result.top_candidates[0];
+            format!(
+                "reference-model separation {:.3e} | best candidate #{} {:.3e}",
+                result.model_discrimination, best.candidate_index, best.reference_model_separation
+            )
         }
         ComparisonMetric::PlanningObjective => {
-            format!("verified planning objective {:.3e}", result.planning_objective)
+            let ranked = result
+                .top_candidates
+                .iter()
+                .filter(|score| score.objective.is_finite())
+                .map(|score| {
+                    format!(
+                        "#{} obj {:.3e}, grad {:.3e}, alt {:.1}m",
+                        score.candidate_index,
+                        score.objective,
+                        score.gradient_information,
+                        score.minimum_altitude_m,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "aggregate objective {:.3e} | top candidates {ranked}",
+                result.planning_objective,
+            )
         }
         ComparisonMetric::SegmentCount if index == 2 => {
             format!("{} segments", result.segment_count)
@@ -151,9 +176,9 @@ fn comparison_metric_text(
                 return format!("{marker}{name:<12} N/A");
             };
             format!(
-                "{:.3}x vs GPU FMM | {}",
+                "{:.3}x vs GPU treecode | {}",
                 fmm.total_ms / result.total_ms.max(f64::MIN_POSITIVE),
-                result.method.as_str(),
+                result.method.planning_label(),
             )
         }
         ComparisonMetric::ColdStartAmortization if index == 2 => {
@@ -176,7 +201,8 @@ fn update_planning_comparison_status(
     let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
     let evaluations = u64::from(candidate_count) * u64::from(density_count) * u64::from(sample_count);
     let prefix = format!(
-        "{} | B={} candidates, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        "build v{} | {} | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        env!("CARGO_PKG_VERSION"),
         planning.workload_profile.label(),
         candidate_count,
         density_count,
@@ -196,7 +222,7 @@ fn update_planning_comparison_status(
     );
     if planning.shared_workload().is_none() {
         **text = format!(
-            "{prefix}{}\nMetrics are shown from the completed shared BxKxH validation run. Fair verdict withheld until identical method-specific GPU Eq.106, GPU MMFFT and GPU FMM batches are verified; preprocessing must be included.",
+            "{prefix}{}\nMetrics are shown from the completed shared BxKxH validation run. Fair verdict withheld until identical Eq.106 GPU spectral, CPU FFT-grid + GPU interpolation, and GPU order-2 treecode batches are verified; preprocessing must be included.",
             planning.status,
         );
         color.0 = Color::srgb(1.0, 0.78, 0.25);

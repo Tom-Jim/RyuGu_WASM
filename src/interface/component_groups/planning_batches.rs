@@ -1,9 +1,12 @@
 pub const PLANNING_CANDIDATE_COUNT: u32 = 2_048;
 pub const PLANNING_TRAJECTORY_TUBE_RADIUS_METERS: f32 = 15.0;
-pub const PLANNING_GPU_TILE_CANDIDATES: u32 = 1;
+pub const PLANNING_GPU_TILE_INITIAL_CANDIDATES: u32 = 8;
+pub const PLANNING_GPU_TILE_MIN_CANDIDATES: u32 = 8;
+pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 32;
 pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 8;
-pub const PLANNING_DISPATCH_COOLDOWN_FRAMES: u8 = 2;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 30.0;
+pub const PLANNING_TARGET_REQUEST_MS: f64 = 120.0;
+pub const PLANNING_MAX_REQUEST_MS: f64 = 240.0;
 pub const PLANNING_GPU_UPLOAD_BYTES_PER_FRAME: usize = 1024 * 1024;
 pub const PLANNING_REFERENCE_STRIDE: u32 = 32;
 pub const PLANNING_REFERENCE_CANDIDATE_STRIDE: u32 = 128;
@@ -105,8 +108,10 @@ pub struct PlanningGpuRequest {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlanningGpuTiming {
     pub method_preprocess_ms: f64,
-    pub encode_ms: f64,
-    pub readback_ms: f64,
+    pub command_submission_ms: f64,
+    /// Wall time from queue submission through GPU execution, copy, and map.
+    /// WebGPU timestamp queries are intentionally not used on browser Metal.
+    pub gpu_completion_map_ms: f64,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,

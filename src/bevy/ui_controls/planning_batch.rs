@@ -1,3 +1,5 @@
+use bevy::math::{DMat3, DVec3};
+
 pub fn planning_batch_evaluator_system(
     batch: Res<PlanningCandidateBatch>,
     mut request: ResMut<PlanningGpuRequest>,
@@ -5,7 +7,6 @@ pub fn planning_batch_evaluator_system(
     mut gpu_result: ResMut<PlanningGpuResult>,
     mut planning: ResMut<PlanningComparisonState>,
     mut mmfft_workspace: Local<crate::gpu::mmfft::PlanningMmfftWorkspace>,
-    mut dispatch_cooldown: Local<u8>,
 ) {
     let Some(mut job) = planning.batch_job.take() else {
         return;
@@ -23,8 +24,8 @@ pub fn planning_batch_evaluator_system(
         {
             if job.warm_repetition {
                 job.warm_evaluation_ms = packet.timing.method_preprocess_ms
-                    + packet.timing.encode_ms
-                    + packet.timing.readback_ms;
+                    + packet.timing.command_submission_ms
+                    + packet.timing.gpu_completion_map_ms;
                 finish_planning_method(&job, &batch, packet.backend, &mut planning);
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
@@ -39,10 +40,10 @@ pub fn planning_batch_evaluator_system(
                 advance_planning_method(&mut job);
             } else {
                 reduce_planning_packet(&mut job, &batch, &packet);
-                advance_planning_tile(&mut job);
+                adapt_candidate_tile(&mut job, &packet);
+                advance_planning_tile(&mut job, packet.request.candidate_count);
             }
             job.awaiting_gpu = false;
-            *dispatch_cooldown = PLANNING_DISPATCH_COOLDOWN_FRAMES;
         }
     }
     if job.awaiting_gpu {
@@ -50,16 +51,10 @@ pub fn planning_batch_evaluator_system(
         planning.batch_job = Some(job);
         return;
     }
-    if *dispatch_cooldown > 0 {
-        *dispatch_cooldown -= 1;
-        planning.status = planning_progress_text(&job);
-        planning.batch_job = Some(job);
-        return;
-    }
     if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS) {
         planning.status = format!(
             "{} stress yielded to rendering at {:.0} FPS.",
-            job.method.as_str(),
+            job.method.planning_label(),
             crate::browser_frame_rate().unwrap_or(0.0)
         );
         planning.batch_job = Some(job);
@@ -98,7 +93,7 @@ pub fn planning_batch_evaluator_system(
         let Some(prepared) = prepared else {
             planning.status = format!(
                 "{} planning stopped: payload preparation failed for density model {}.",
-                job.method.as_str(),
+                job.method.planning_label(),
                 job.density_model
             );
             planning.run_requested = false;
@@ -112,14 +107,20 @@ pub fn planning_batch_evaluator_system(
         *payload = prepared;
     }
     job.request_id = job.request_id.wrapping_add(1).max(1);
+    let request_candidate_count = job
+        .candidate_tile_size
+        .min(job.candidate_count - job.candidate_start);
+    job.last_request_candidate_count = request_candidate_count;
+    job.minimum_tile_size_used = job.minimum_tile_size_used.min(request_candidate_count);
+    job.maximum_tile_size_used = job.maximum_tile_size_used.max(request_candidate_count);
+    job.gpu_request_count = job.gpu_request_count.saturating_add(1);
     *request = PlanningGpuRequest {
         request_id: job.request_id,
         batch_id: job.batch_id,
         method: Some(job.method),
         density_model: job.density_model,
         candidate_start: job.candidate_start,
-        candidate_count: PLANNING_GPU_TILE_CANDIDATES
-            .min(job.candidate_count - job.candidate_start),
+        candidate_count: request_candidate_count,
         warm_repetition: job.warm_repetition,
     };
     job.awaiting_gpu = true;
@@ -150,8 +151,8 @@ fn reduce_planning_packet(
         job.gravity_error_sum = f64::NAN;
         job.gradient_error_sum = f64::NAN;
         job.preprocessing_ms += packet.timing.method_preprocess_ms;
-        job.evaluation_ms += packet.timing.encode_ms;
-        job.readback_ms += packet.timing.readback_ms;
+        job.command_submission_ms += packet.timing.command_submission_ms;
+        job.gpu_completion_map_ms += packet.timing.gpu_completion_map_ms;
         job.dispatch_count = job.dispatch_count.saturating_add(packet.timing.dispatch_count);
         job.forward_kernel_evaluations = job
             .forward_kernel_evaluations
@@ -161,52 +162,58 @@ fn reduce_planning_packet(
             .max(packet.timing.spectral_element_count);
         return;
     }
-    for metric in &packet.candidate_metrics {
+    for (local_candidate, metric) in packet.candidate_metrics.iter().enumerate() {
+        let candidate_index = packet.request.candidate_start as usize + local_candidate;
         job.minimum_altitude_m = job.minimum_altitude_m.min(metric[2]);
         job.gradient_information_sum += f64::from(metric[3]);
+        job.candidate_gradient_sum[candidate_index] += f64::from(metric[3]);
+        job.candidate_minimum_altitude_m[candidate_index] =
+            job.candidate_minimum_altitude_m[candidate_index].min(metric[2]);
         if packet.request.density_model > 0 {
             job.discrimination_sum += f64::from(metric[0]);
             job.discrimination_reference_sum += f64::from(metric[1]);
             job.discrimination_samples += 1;
+            job.candidate_discrimination_sum[candidate_index] += f64::from(metric[0]);
+            job.candidate_reference_sum[candidate_index] += f64::from(metric[1]);
         }
     }
     let global_start = packet.request.candidate_start as usize
         * batch.samples_per_candidate as usize;
     let mut accumulated_position_error =
-        vec![Vec3::ZERO; packet.request.candidate_count as usize];
+        vec![DVec3::ZERO; packet.request.candidate_count as usize];
     let mut accumulated_velocity_error =
-        vec![Vec3::ZERO; packet.request.candidate_count as usize];
+        vec![DVec3::ZERO; packet.request.candidate_count as usize];
     let mut previous_verified_time = vec![None; packet.request.candidate_count as usize];
     for (verification_index, local_target) in packet.state_indices.iter().copied().enumerate() {
         let local = local_target as usize;
         let state = batch.states[global_start + local];
         let sample = state.identity[1];
         let verify_pericenter = sample.abs_diff(batch.samples_per_candidate / 2) <= 1;
-        let method_field = Vec3::new(
-            packet.rows[verification_index * 4][0],
-            packet.rows[verification_index * 4][1],
-            packet.rows[verification_index * 4][2],
+        let method_field = DVec3::new(
+            f64::from(packet.rows[verification_index * 4][0]),
+            f64::from(packet.rows[verification_index * 4][1]),
+            f64::from(packet.rows[verification_index * 4][2]),
         );
-        let method_gradient = Mat3::from_cols(
-            Vec3::from_array(
-                packet.rows[verification_index * 4 + 1][..3]
-                    .try_into()
-                    .unwrap(),
+        let method_gradient = DMat3::from_cols(
+            DVec3::new(
+                f64::from(packet.rows[verification_index * 4 + 1][0]),
+                f64::from(packet.rows[verification_index * 4 + 1][1]),
+                f64::from(packet.rows[verification_index * 4 + 1][2]),
             ),
-            Vec3::from_array(
-                packet.rows[verification_index * 4 + 2][..3]
-                    .try_into()
-                    .unwrap(),
+            DVec3::new(
+                f64::from(packet.rows[verification_index * 4 + 2][0]),
+                f64::from(packet.rows[verification_index * 4 + 2][1]),
+                f64::from(packet.rows[verification_index * 4 + 2][2]),
             ),
-            Vec3::from_array(
-                packet.rows[verification_index * 4 + 3][..3]
-                    .try_into()
-                    .unwrap(),
+            DVec3::new(
+                f64::from(packet.rows[verification_index * 4 + 3][0]),
+                f64::from(packet.rows[verification_index * 4 + 3][1]),
+                f64::from(packet.rows[verification_index * 4 + 3][2]),
             ),
         );
         let verification_started = bevy::platform::time::Instant::now();
         let (reference_field, reference_gradient) = direct_planning_reference(
-            state.body_position(),
+            state.body_position().as_dvec3(),
             batch,
             packet.request.density_model,
         );
@@ -219,15 +226,14 @@ fn reduce_planning_packet(
             job.gravity_error_sum = f64::NAN;
             continue;
         }
-        job.gravity_error_sum += f64::from((method_field - reference_field).length_squared());
-        job.gravity_reference_sum += f64::from(reference_field.length_squared());
+        job.gravity_error_sum += (method_field - reference_field).length_squared();
+        job.gravity_reference_sum += reference_field.length_squared();
         job.gravity_samples += 1;
-        job.gradient_error_sum +=
-            f64::from(matrix_norm_squared(method_gradient - reference_gradient));
-        job.gradient_reference_sum += f64::from(matrix_norm_squared(reference_gradient));
+        job.gradient_error_sum += matrix_norm_squared(method_gradient - reference_gradient);
+        job.gradient_reference_sum += matrix_norm_squared(reference_gradient);
         job.gradient_samples += 1;
         let local_candidate = local / batch.samples_per_candidate as usize;
-        let current_time = state.position_time[3];
+        let current_time = f64::from(state.position_time[3]);
         if let Some(previous_time) = previous_verified_time[local_candidate] {
             let delta_time = current_time - previous_time;
             let acceleration_error = method_field - reference_field;
@@ -238,15 +244,15 @@ fn reduce_planning_packet(
         }
         previous_verified_time[local_candidate] = Some(current_time);
         if verify_pericenter {
-            let radial = state.body_position().normalize_or_zero();
+            let radial = state.body_position().as_dvec3().normalize_or_zero();
             job.pericenter_error_m = job
                 .pericenter_error_m
-                .max(accumulated_position_error[local_candidate].dot(radial).abs());
+                .max(accumulated_position_error[local_candidate].dot(radial).abs() as f32);
         }
     }
     job.preprocessing_ms += packet.timing.method_preprocess_ms;
-    job.evaluation_ms += packet.timing.encode_ms;
-    job.readback_ms += packet.timing.readback_ms;
+    job.command_submission_ms += packet.timing.command_submission_ms;
+    job.gpu_completion_map_ms += packet.timing.gpu_completion_map_ms;
     job.dispatch_count = job.dispatch_count.saturating_add(packet.timing.dispatch_count);
     job.forward_kernel_evaluations = job
         .forward_kernel_evaluations
@@ -260,42 +266,66 @@ fn reduce_planning_packet(
 }
 
 fn direct_planning_reference(
-    target: Vec3,
+    target: DVec3,
     batch: &PlanningCandidateBatch,
     density_model: u32,
-) -> (Vec3, Mat3) {
+) -> (DVec3, DMat3) {
     let row_start = density_model as usize * 56;
     let densities = &batch.density_models[row_start..row_start + 56];
-    let mut acceleration = Vec3::ZERO;
-    let mut gradient = Mat3::ZERO;
+    let mut acceleration = DVec3::ZERO;
+    let mut gradient = DMat3::ZERO;
     for source in batch.basis_records.iter() {
-        let position = Vec3::from_array(source.position_volume[..3].try_into().unwrap());
+        let position = DVec3::new(
+            f64::from(source.position_volume[0]),
+            f64::from(source.position_volume[1]),
+            f64::from(source.position_volume[2]),
+        );
         let displacement = position - target;
-        let radius2 = displacement.length_squared().max(1.0e-8);
+        let radius2 = displacement.length_squared().max(1.0e-16);
         let inverse_radius = radius2.sqrt().recip();
         let inverse_radius3 = inverse_radius / radius2;
-        let mass = source.position_volume[3] * densities[source.voxel_index as usize];
-        acceleration += G * mass * displacement * inverse_radius3;
-        let outer = Mat3::from_cols(
+        let mass = f64::from(source.position_volume[3])
+            * f64::from(densities[source.voxel_index as usize]);
+        acceleration += f64::from(G) * mass * displacement * inverse_radius3;
+        let outer = DMat3::from_cols(
             displacement * displacement.x,
             displacement * displacement.y,
             displacement * displacement.z,
         );
-        gradient += G
+        gradient += f64::from(G)
             * mass
-            * (-Mat3::IDENTITY * inverse_radius3
+            * (-DMat3::IDENTITY * inverse_radius3
                 + outer * (3.0 * inverse_radius3 / radius2));
     }
     (acceleration, gradient)
 }
 
-fn matrix_norm_squared(matrix: Mat3) -> f32 {
+fn matrix_norm_squared(matrix: DMat3) -> f64 {
     matrix.x_axis.length_squared() + matrix.y_axis.length_squared() + matrix.z_axis.length_squared()
 }
 
-fn advance_planning_tile(job: &mut PlanningBatchJob) {
-    job.candidate_start += PLANNING_GPU_TILE_CANDIDATES
-        .min(job.candidate_count - job.candidate_start);
+fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) {
+    let request_ms = packet.timing.method_preprocess_ms
+        + packet.timing.command_submission_ms
+        + packet.timing.gpu_completion_map_ms;
+    let frame_rate = crate::browser_frame_rate();
+    let should_shrink = request_ms > PLANNING_MAX_REQUEST_MS
+        || frame_rate.is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS);
+    let can_grow = request_ms < PLANNING_TARGET_REQUEST_MS
+        && frame_rate.is_none_or(|fps| fps >= 45.0);
+    job.candidate_tile_size = if should_shrink {
+        (job.candidate_tile_size / 2).max(PLANNING_GPU_TILE_MIN_CANDIDATES)
+    } else if can_grow {
+        job.candidate_tile_size
+            .saturating_mul(2)
+            .min(PLANNING_GPU_TILE_MAX_CANDIDATES)
+    } else {
+        job.candidate_tile_size
+    };
+}
+
+fn advance_planning_tile(job: &mut PlanningBatchJob, completed_candidates: u32) {
+    job.candidate_start += completed_candidates;
     if job.candidate_start < job.candidate_count {
         return;
     }
@@ -305,8 +335,45 @@ fn advance_planning_tile(job: &mut PlanningBatchJob) {
         return;
     }
     job.density_model = job.density_model_count - 1;
-    job.candidate_start = job.candidate_count - PLANNING_GPU_TILE_CANDIDATES;
+    job.candidate_start = job
+        .candidate_count
+        .saturating_sub(job.candidate_tile_size.min(job.candidate_count));
     job.warm_repetition = true;
+}
+
+fn top_candidate_scores(
+    job: &PlanningBatchJob,
+    accuracy_penalty: f32,
+) -> [PlanningCandidateScore; 5] {
+    let normalization = f64::from(job.density_model_count.max(1))
+        * f64::from(job.samples_per_candidate.max(1));
+    let mut scores = (0..job.candidate_count as usize)
+        .filter_map(|candidate_index| {
+            let reference = job.candidate_reference_sum[candidate_index];
+            let altitude = job.candidate_minimum_altitude_m[candidate_index];
+            if reference <= f64::MIN_POSITIVE || !altitude.is_finite() || altitude <= 0.0 {
+                return None;
+            }
+            let separation =
+                (job.candidate_discrimination_sum[candidate_index] / reference).sqrt() as f32;
+            let gradient_information =
+                (job.candidate_gradient_sum[candidate_index] / normalization).sqrt() as f32;
+            let objective = separation * gradient_information / accuracy_penalty;
+            objective.is_finite().then_some(PlanningCandidateScore {
+                candidate_index: candidate_index as u32,
+                minimum_altitude_m: altitude,
+                reference_model_separation: separation,
+                gradient_information,
+                objective,
+            })
+        })
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| right.objective.total_cmp(&left.objective));
+    let mut top = [PlanningCandidateScore::default(); 5];
+    for (destination, score) in top.iter_mut().zip(scores.into_iter()) {
+        *destination = score;
+    }
+    top
 }
 
 fn finish_planning_method(
@@ -332,8 +399,14 @@ fn finish_planning_method(
         .sqrt() as f32;
     let planning_objective = model_discrimination * gradient_information
         / (1.0 + gravity_error.max(0.0) + gradient_error.max(0.0));
-    let total_ms = job.preprocessing_ms + job.evaluation_ms + job.reduction_ms + job.readback_ms;
-    let warm_per_candidate = job.warm_evaluation_ms / PLANNING_GPU_TILE_CANDIDATES as f64;
+    let accuracy_penalty = 1.0 + gravity_error.max(0.0) + gradient_error.max(0.0);
+    let top_candidates = top_candidate_scores(job, accuracy_penalty);
+    let total_ms = job.preprocessing_ms
+        + job.command_submission_ms
+        + job.reduction_ms
+        + job.gpu_completion_map_ms;
+    let warm_per_candidate =
+        job.warm_evaluation_ms / f64::from(job.last_request_candidate_count.max(1));
     let cold_amortization_candidates =
         (job.preprocessing_ms / warm_per_candidate.max(f64::MIN_POSITIVE)).ceil() as u32;
     let verified = gravity_error.is_finite()
@@ -363,10 +436,10 @@ fn finish_planning_method(
         workload: batch.workload_identity(),
         common_preparation_ms: job.common_preparation_ms,
         preprocessing_ms: job.preprocessing_ms,
-        evaluation_ms: job.evaluation_ms,
+        command_submission_ms: job.command_submission_ms,
         reduction_ms: job.reduction_ms,
         verification_ms: job.verification_ms,
-        readback_ms: job.readback_ms,
+        gpu_completion_map_ms: job.gpu_completion_map_ms,
         warm_evaluation_ms: job.warm_evaluation_ms,
         total_ms,
         relative_gravity_error: gravity_error,
@@ -384,6 +457,10 @@ fn finish_planning_method(
         dispatch_count: job.dispatch_count,
         forward_kernel_evaluations: job.forward_kernel_evaluations,
         density_combinations: job.total_evaluations,
+        gpu_request_count: job.gpu_request_count,
+        minimum_tile_candidates: job.minimum_tile_size_used.min(job.maximum_tile_size_used),
+        maximum_tile_candidates: job.maximum_tile_size_used,
+        top_candidates,
     });
 }
 
@@ -395,6 +472,11 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     };
     job.density_model = 0;
     job.candidate_start = 0;
+    job.candidate_tile_size = PLANNING_GPU_TILE_INITIAL_CANDIDATES;
+    job.minimum_tile_size_used = u32::MAX;
+    job.maximum_tile_size_used = 0;
+    job.gpu_request_count = 0;
+    job.last_request_candidate_count = 0;
     job.awaiting_gpu = false;
     job.warm_repetition = false;
     job.gravity_error_sum = 0.0;
@@ -409,11 +491,15 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.discrimination_reference_sum = 0.0;
     job.discrimination_samples = 0;
     job.gradient_information_sum = 0.0;
+    job.candidate_discrimination_sum.fill(0.0);
+    job.candidate_reference_sum.fill(0.0);
+    job.candidate_gradient_sum.fill(0.0);
+    job.candidate_minimum_altitude_m.fill(f32::INFINITY);
     job.preprocessing_ms = 0.0;
-    job.evaluation_ms = 0.0;
+    job.command_submission_ms = 0.0;
     job.reduction_ms = 0.0;
     job.verification_ms = 0.0;
-    job.readback_ms = 0.0;
+    job.gpu_completion_map_ms = 0.0;
     job.warm_evaluation_ms = 0.0;
     job.dispatch_count = 0;
     job.forward_kernel_evaluations = 0;
@@ -430,13 +516,15 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
         "cold batch"
     };
     format!(
-        "{} {}: {} / {} density combinations, {} model {}, dispatches {}.",
+        "{} {}: {} / {} density combinations, {} model {}, tile {}, GPU requests {}, dispatches {}.",
         job.profile.label(),
-        job.method.as_str(),
+        job.method.planning_label(),
         completed.min(job.total_evaluations),
         job.total_evaluations,
         phase,
         job.density_model + 1,
+        job.candidate_tile_size,
+        job.gpu_request_count,
         job.dispatch_count,
     )
 }

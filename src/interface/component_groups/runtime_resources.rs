@@ -197,10 +197,10 @@ pub enum ActiveGravityMethod {
     /// Eq. (106) adaptive curved-arc mode; it starts non-periodic and promotes
     /// itself to periodic only after the planner sees stable orbit closures.
     CurvedArcEq106,
-    /// Fourth method: tiled MMFFT source evaluation with compressed GPU
-    /// records and a dedicated snapshot-tagged readback channel.
+    /// Fourth method: CPU-preprocessed FFT grids with compressed GPU
+    /// interpolation records and a snapshot-tagged readback channel.
     MmfftCompressed,
-    /// Fifth method: fixed-depth GPU fast multipole evaluation.
+    /// Fifth method: fixed-depth order-two GPU octree treecode evaluation.
     Fmm,
 }
 
@@ -356,8 +356,17 @@ impl ActiveGravityMethod {
             Self::RadialAnalytic => "GPU Radial Analytic",
             Self::HomogeneousWerner => "GPU Werner Polyhedron",
             Self::CurvedArcEq106 => "Eq.106 Adaptive Curved-Arc",
-            Self::MmfftCompressed => "GPU MMFFT + VRAM Compression",
-            Self::Fmm => "GPU Fast Multipole Method",
+            Self::MmfftCompressed => "CPU FFT Grid + GPU Interpolation",
+            Self::Fmm => "GPU Order-2 Octree Treecode",
+        }
+    }
+
+    pub fn planning_label(self) -> &'static str {
+        match self {
+            Self::CurvedArcEq106 => "Eq.106 GPU spectral",
+            Self::MmfftCompressed => "CPU FFT grid + GPU interpolation",
+            Self::Fmm => "GPU order-2 octree treecode",
+            _ => self.as_str(),
         }
     }
 }

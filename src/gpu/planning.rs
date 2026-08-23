@@ -500,7 +500,7 @@ fn dispatch_planning_method(
         );
     }
     render_queue.submit([encoder.finish()]);
-    let encode_ms = encode_started.elapsed().as_secs_f64() * 1.0e3;
+    let command_submission_ms = encode_started.elapsed().as_secs_f64() * 1.0e3;
     buffers.request_id = request.request_id;
     buffers.payload_request_id = extracted.payload.request_id;
     buffers.output_size = output_size;
@@ -526,11 +526,11 @@ fn dispatch_planning_method(
     let item_count = extracted.payload.item_count;
     let state_indices = verification_targets;
     let request_candidate_count = request.candidate_count;
-    let readback_started = bevy::platform::time::Instant::now();
+    let gpu_completion_started = bevy::platform::time::Instant::now();
     mapped
         .slice(..staging_size)
         .map_async(MapMode::Read, move |result| {
-            let readback_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
+            let gpu_completion_map_ms = gpu_completion_started.elapsed().as_secs_f64() * 1.0e3;
             let rows = if result.is_ok() {
                 let view = staging.slice(..staging_size).get_mapped_range();
                 let decoded = bytes_to_f32x4(&view);
@@ -556,8 +556,8 @@ fn dispatch_planning_method(
                     readback_valid: result.is_ok(),
                     timing: PlanningGpuTiming {
                         method_preprocess_ms,
-                        encode_ms,
-                        readback_ms,
+                        command_submission_ms,
+                        gpu_completion_map_ms,
                         dispatch_count: 2,
                         forward_kernel_evaluations: kernel_evaluations,
                         spectral_element_count: 0,

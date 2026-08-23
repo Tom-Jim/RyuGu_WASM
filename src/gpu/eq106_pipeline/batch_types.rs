@@ -19,8 +19,9 @@ use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-        BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor,
-        BufferInitDescriptor, BufferUsages, CachedComputePipelineId, CachedPipelineState,
+        BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding,
+        BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferSize, BufferUsages,
+        CachedComputePipelineId, CachedPipelineState,
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, MapMode,
         PipelineCache, ShaderStages,
     },

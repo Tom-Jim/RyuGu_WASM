@@ -7,6 +7,7 @@ struct PlanningEq106DispatchState {
     staging_size: u64,
     baseline_size: u64,
     metric_size: u64,
+    layout: Option<BindGroupLayout>,
     sources: Option<Buffer>,
     quadrature: Option<Buffer>,
     operator: Option<Buffer>,
@@ -236,21 +237,27 @@ fn dispatch_planning_eq106(
     let baseline = state.baseline.as_ref().expect("planning Eq.106 baseline").clone();
     let metrics = state.metrics.as_ref().expect("planning Eq.106 metrics").clone();
     let staging = state.staging.as_ref().expect("planning Eq.106 staging").clone();
-    let layout = render_device.create_bind_group_layout(
-        "planning_eq106_bgl",
-        &[
-            uniform_entry(0), storage_ro_entry(1), storage_ro_entry(2), storage_rw_entry(3),
-            storage_rw_entry(4), storage_ro_entry(5), storage_rw_entry(6), storage_ro_entry(7),
-            storage_ro_entry(8), storage_ro_entry(9),
-        ],
-    );
+    if state.layout.is_none() {
+        state.layout = Some(render_device.create_bind_group_layout(
+            "planning_eq106_bgl",
+            &[
+                uniform_entry(0), storage_ro_entry(1), storage_ro_entry(2), storage_rw_entry(3),
+                storage_rw_entry(4), storage_ro_entry(5), storage_rw_entry(6), storage_ro_entry(7),
+                storage_ro_entry(8), storage_ro_entry(9),
+            ],
+        ));
+    }
+    let layout = state.layout.as_ref().expect("planning Eq.106 layout").clone();
     let method_preprocess_ms = method_preprocess_started.elapsed().as_secs_f64() * 1.0e3;
     let encode_started = Instant::now();
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("planning_eq106_encoder"),
     });
-    let mut uniforms = Vec::with_capacity(elements.len());
-    let mut bind_groups = Vec::with_capacity(elements.len());
+    let uniform_size = 96_u64;
+    let uniform_alignment = u64::from(render_device.limits().min_uniform_buffer_offset_alignment)
+        .max(1);
+    let uniform_stride = uniform_size.div_ceil(uniform_alignment) * uniform_alignment;
+    let mut uniform_data = vec![0_u8; uniform_stride as usize * elements.len()];
     for (element_index, element) in elements.iter().enumerate() {
         let mut bytes = uniform_bytes(
             element.line_origin,
@@ -268,27 +275,43 @@ fn dispatch_planning_eq106(
             element.target_offset,
         );
         bytes[92..96].copy_from_slice(&(global_state_start as u32).to_le_bytes());
-        let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("planning_eq106_uniform"),
-            contents: &bytes,
-            usage: BufferUsages::UNIFORM,
-        });
-        let bind_group = render_device.create_bind_group(
-            "planning_eq106_bg",
-            &layout,
-            &[
-                BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: sources.as_entire_binding() },
-                BindGroupEntry { binding: 2, resource: quadrature.as_entire_binding() },
-                BindGroupEntry { binding: 3, resource: spectrum.as_entire_binding() },
-                BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
-                BindGroupEntry { binding: 5, resource: operator.as_entire_binding() },
-                BindGroupEntry { binding: 6, resource: line_samples.as_entire_binding() },
-                BindGroupEntry { binding: 7, resource: dummy_modes.as_entire_binding() },
-                BindGroupEntry { binding: 8, resource: psi.as_entire_binding() },
-                BindGroupEntry { binding: 9, resource: shared.positions.as_entire_binding() },
-            ],
-        );
+        let offset = element_index * uniform_stride as usize;
+        uniform_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+    let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("planning_eq106_uniforms"),
+        contents: &uniform_data,
+        usage: BufferUsages::UNIFORM,
+    });
+    let bind_groups = (0..elements.len())
+        .map(|element_index| {
+            render_device.create_bind_group(
+                "planning_eq106_bg",
+                &layout,
+                &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &uniform,
+                            offset: element_index as u64 * uniform_stride,
+                            size: BufferSize::new(uniform_size),
+                        }),
+                    },
+                    BindGroupEntry { binding: 1, resource: sources.as_entire_binding() },
+                    BindGroupEntry { binding: 2, resource: quadrature.as_entire_binding() },
+                    BindGroupEntry { binding: 3, resource: spectrum.as_entire_binding() },
+                    BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
+                    BindGroupEntry { binding: 5, resource: operator.as_entire_binding() },
+                    BindGroupEntry { binding: 6, resource: line_samples.as_entire_binding() },
+                    BindGroupEntry { binding: 7, resource: dummy_modes.as_entire_binding() },
+                    BindGroupEntry { binding: 8, resource: psi.as_entire_binding() },
+                    BindGroupEntry { binding: 9, resource: shared.positions.as_entire_binding() },
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    for (element_index, element) in elements.iter().enumerate() {
+        let bind_group = &bind_groups[element_index];
         for (label, pipeline, groups) in [
             ("planning_eq106_line", line_samples_pipeline, QUADRATURE_COUNT.div_ceil(64)),
             ("planning_eq106_spectrum", assemble_pipeline, (taylor_coefficient_count(element.taylor_order) * FREQUENCY_COUNT).div_ceil(64)),
@@ -299,7 +322,7 @@ fn dispatch_planning_eq106(
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         {
@@ -308,12 +331,10 @@ fn dispatch_planning_eq106(
                 timestamp_writes: None,
             });
             pass.set_pipeline(evaluate_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             let (width, height) = target_dispatch_grid(element.target_count);
             pass.dispatch_workgroups(width, height, 1);
         }
-        uniforms.push(uniform);
-        bind_groups.push(bind_group);
     }
     let (_reduction_uniform, _reduction_bind_group) =
         crate::gpu::planning_reduction::encode_planning_reduction(
@@ -340,7 +361,7 @@ fn dispatch_planning_eq106(
     }
     render_queue.submit([encoder.finish()]);
     state.last_request_id = request.request_id;
-    let encode_ms = encode_started.elapsed().as_secs_f64() * 1.0e3;
+    let command_submission_ms = encode_started.elapsed().as_secs_f64() * 1.0e3;
     let packet_request = request.clone();
     let shared_data = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
@@ -350,9 +371,9 @@ fn dispatch_planning_eq106(
     let source_count = planning.payload.item_count;
     let state_indices = verification_targets;
     let request_candidate_count = request.candidate_count;
-    let readback_started = Instant::now();
+    let gpu_completion_started = Instant::now();
     mapped.slice(..staging_size).map_async(MapMode::Read, move |result| {
-        let readback_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
+        let gpu_completion_map_ms = gpu_completion_started.elapsed().as_secs_f64() * 1.0e3;
         let rows = if result.is_ok() {
             let view = staging.slice(..staging_size).get_mapped_range();
             let full_rows = bytes_to_f32x4(&view);
@@ -388,8 +409,8 @@ fn dispatch_planning_eq106(
                 readback_valid: result.is_ok(),
                 timing: PlanningGpuTiming {
                     method_preprocess_ms,
-                    encode_ms,
-                    readback_ms,
+                    command_submission_ms,
+                    gpu_completion_map_ms,
                     dispatch_count: element_count.saturating_mul(4).saturating_add(1),
                     forward_kernel_evaluations: u64::from(source_count)
                         * u64::from(QUADRATURE_COUNT)
