@@ -1,5 +1,4 @@
 use bevy::prelude::*;
-use rand_chacha::ChaCha8Rng;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -122,7 +121,7 @@ pub struct TrajectoryInversionKnot {
     pub velocity: Vec3,
     pub simulation_time_seconds: f64,
     /// World-frame acceleration returned by the selected forward evaluator at
-    /// the baseline density. Gravity is linear in density, so annealing can
+    /// the baseline density. Gravity is linear in density, so the optimizer can
     /// evaluate density candidates without substituting another field model.
     pub baseline_acceleration: Vec3,
     pub body_rotation: Quat,
@@ -169,10 +168,10 @@ pub struct InvertedDensityVoxel {
     pub center: Vec3,
     pub volume: f32,
     pub density: f32,
-    /// Geometry/total-mass-only annealing prior. This must never contain the
+    /// Geometry/total-mass-only optimization prior. This must never contain the
     /// original density law used later for validation.
     pub baseline_density: f32,
-    /// Original forward-model density used only after annealing to score the
+    /// Original forward-model density used only after optimization to score the
     /// recovered field (uniform Werner, logarithmic for all other methods).
     pub reference_density: f32,
     pub grid: [u8; 3],
@@ -185,7 +184,7 @@ pub struct DensityInversionResult {
     pub capture_id: u64,
     pub source_hash: u64,
     pub capture_epoch: u64,
-    pub rng_seed: u64,
+    pub problem_id: u64,
     pub initial_objective: f64,
     pub data_error_scale: f64,
     pub density: f32,
@@ -198,6 +197,8 @@ pub struct DensityInversionResult {
     pub model_fit: f32,
     /// Relative decrease of the trajectory objective from the uniform start.
     pub objective_improvement: f32,
+    /// CPU time spent assembling and solving this convex QP.
+    pub inversion_time_ms: f64,
     /// Number of acceleration observations sampled along the complete
     /// interpolated Quintic Hermite trajectory.
     pub trajectory_samples: usize,
@@ -207,31 +208,28 @@ pub struct DensityInversionResult {
 }
 
 #[derive(Debug)]
-pub struct SimulatedAnnealingJob {
+pub struct ConvexOptimizationJob {
     pub method: ActiveGravityMethod,
     pub capture_id: u64,
     pub source_hash: u64,
     pub capture_epoch: u64,
-    pub rng_seed: u64,
+    pub problem_id: u64,
     pub voxels: Vec<InvertedDensityVoxel>,
     pub sensitivities: Vec<Vec3>,
     pub observed_accelerations: Vec<Vec3>,
     pub neighbours: Vec<(usize, usize)>,
     pub current_densities: Vec<f32>,
     pub best_densities: Vec<f32>,
-    pub predicted_accelerations: Vec<Vec3>,
-    pub current_mass: f64,
-    pub current_objective: f64,
-    pub best_objective: f64,
     pub initial_objective: f64,
     /// Raw trajectory mismatch of the uniform start. Dividing by this value
     /// prevents the regularizers from overwhelming the very small exterior
     /// gravity signature of an internal mass redistribution.
     pub data_error_scale: f64,
-    pub iteration: u32,
     pub iterations: u32,
-    pub rng: ChaCha8Rng,
     pub voxel_size: f32,
+    /// Wall-clock origin of the complete inversion, including method-specific
+    /// sensitivity construction/readback and the final Clarabel solve.
+    pub started_at: bevy::platform::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,11 +243,22 @@ pub enum TrajectoryVectorField {
 /// changing a probe parameter starts a fresh five-second capture automatically.
 #[derive(Resource)]
 pub struct TrajectoryInversionState {
+    /// Current simulation epoch observed by the capture system. This is
+    /// separate from `capture_epoch` so method changes can retain one frozen
+    /// trajectory without pretending it was sampled again.
+    pub runtime_epoch: u64,
     pub capture_epoch: u64,
     pub last_capture_request_id: Option<u64>,
     pub wall_elapsed_seconds: f64,
     pub raw_samples: Vec<TrajectoryCaptureSample>,
     pub knots: Vec<TrajectoryInversionKnot>,
+    /// Frozen synthetic truth track generated from the logarithmic-density
+    /// radial source. Non-Werner inverse methods reuse this exact track.
+    pub truth_knots: Vec<TrajectoryInversionKnot>,
+    pub truth_capture_id: Option<u64>,
+    /// Long radial truth path used for the common non-Werner display.
+    pub truth_orbit: Vec<Vec3>,
+    pub preserve_truth_track: bool,
     pub capture_id: Option<u64>,
     pub capture_source_hash: u64,
     /// Eq.106 capture does not begin until consecutive certified readbacks
@@ -265,28 +274,28 @@ pub struct TrajectoryInversionState {
     pub selected: Option<(usize, TrajectoryVectorField)>,
     pub edit_buffer: String,
     pub error: Option<String>,
-    pub annealing: Option<SimulatedAnnealingJob>,
-    /// A method toggle starts a new physical epoch, but the user explicitly
-    /// wants completed method slots to remain visible as a fill-in history.
-    /// Probe edits, resets, and other non-method changes leave this false so
-    /// the next capture still clears stale results.
-    pub preserve_results_on_next_epoch: bool,
-    /// Remaining methods in one immutable-capture comparison batch. Running
-    /// the batch avoids changing the forward method (and therefore epoch).
-    pub pending_inversion_methods: VecDeque<ActiveGravityMethod>,
+    pub optimizer: Option<ConvexOptimizationJob>,
     pub batch_capture_id: Option<u64>,
     pub results: [Option<DensityInversionResult>; 5],
+    /// Best fit seen for each method across method switches. Historical only;
+    /// current-trajectory comparisons continue to use `results`.
+    pub best_results: [Option<DensityInversionResult>; 5],
     pub displayed_density: Option<DensityInversionResult>,
 }
 
 impl Default for TrajectoryInversionState {
     fn default() -> Self {
         Self {
+            runtime_epoch: 0,
             capture_epoch: 0,
             last_capture_request_id: None,
             wall_elapsed_seconds: 0.0,
             raw_samples: Vec::with_capacity(384),
             knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
+            truth_knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
+            truth_capture_id: None,
+            truth_orbit: Vec::with_capacity(ORBIT_HISTORY_LEN),
+            preserve_truth_track: false,
             capture_id: None,
             capture_source_hash: 0,
             certified_sample_streak: 0,
@@ -297,11 +306,10 @@ impl Default for TrajectoryInversionState {
             selected: None,
             edit_buffer: String::new(),
             error: None,
-            annealing: None,
-            preserve_results_on_next_epoch: false,
-            pending_inversion_methods: VecDeque::new(),
+            optimizer: None,
             batch_capture_id: None,
             results: std::array::from_fn(|_| None),
+            best_results: std::array::from_fn(|_| None),
             displayed_density: None,
         }
     }
@@ -446,7 +454,6 @@ impl Default for NormalsReadbackChannel {
 #[derive(Resource)]
 pub struct RadialGravitySource {
     pub bytes: Vec<u8>,
-    pub count: u32,
 }
 
 /// Latest GPU-computed gravity acceleration for Cassini (Ryugu body frame).
@@ -495,6 +502,7 @@ pub struct Eq106ReadbackPacket {
     pub partial_sums: Vec<[f32; 4]>,
     pub snapshots: Vec<GravityRequestSnapshot>,
     pub batch_capture_id: Option<u64>,
+    pub sensitivity_column: Option<u32>,
     pub timings: Eq106TimingSample,
 }
 
@@ -644,6 +652,16 @@ pub struct Eq106GpuHistory(pub GravitySampleHistory);
 pub struct Eq106TrajectoryBatchResult {
     pub capture_id: Option<u64>,
     pub samples: Vec<GravityFieldSample>,
+}
+
+#[derive(Resource, Default)]
+pub struct Eq106SensitivityMatrix {
+    pub capture_id: Option<u64>,
+    pub voxel_count: usize,
+    pub sample_count: usize,
+    /// Columns are stored in voxel order; each column contains all frozen
+    /// trajectory acceleration responses for unit voxel density.
+    pub columns: Vec<Vec<Vec3>>,
 }
 
 #[derive(Resource, Clone)]

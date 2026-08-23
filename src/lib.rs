@@ -28,12 +28,11 @@ use bevy_app::{
     ui::{
         clear_runtime_error_on_probe_change, density_inversion_timing_ui_system, fps_update_system,
         method_toggle_system, normal_toggle_system, performance_button_system,
-        performance_comparison_system, performance_method_checkbox_system,
-        preserve_inversion_results_on_manual_method_switch, probe_slider_system,
-        probe_slider_visual_system, runtime_error_overlay_system, runtime_error_reset_system,
-        section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
-        setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
-        setup_runtime_error_overlay, setup_simulation_acceleration_control,
+        performance_comparison_system, performance_method_checkbox_system, probe_slider_system,
+        probe_slider_visual_system, reset_inversion_on_method_change, runtime_error_overlay_system,
+        runtime_error_reset_system, section_toggle_system, setup_density_inversion_timing_panel,
+        setup_fps_ui, setup_performance_chart_segments, setup_performance_controls,
+        setup_probe_controls, setup_runtime_error_overlay, setup_simulation_acceleration_control,
         setup_trajectory_inversion_controls, simulation_acceleration_slider_system,
         simulation_acceleration_slider_visual_system, trajectory_inversion_input_system,
         trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
@@ -47,11 +46,11 @@ pub use cpu::eq106_operator::{PsiOperatorTable, ToroidalOperatorTensor};
 pub use cpu::eq106_reference as eq106;
 use cpu::{
     curved_arc::{
-        CurvedArcPlannerState, CurvedArcResidualHistory, build_eq106_source_system,
+        CurvedArcPlannerState, CurvedArcResidualHistory, build_aggregated_gravity_source_system,
         monitor_curved_arc_system,
     },
     eq106_operator::build_eq106_operator_tensor_system,
-    inversion::{simulated_annealing_system, start_density_inversion_system},
+    inversion::{convex_optimization_system, start_density_inversion_system},
     physics::{physics_system, ryugu_rotation_system},
 };
 use gpu::{
@@ -273,11 +272,11 @@ pub fn main() {
     )
     .add_systems(
         Update,
-        build_eq106_source_system.after(build_radial_gravity_source_system),
+        build_aggregated_gravity_source_system.after(build_radial_gravity_source_system),
     )
     .add_systems(
         Update,
-        build_eq106_operator_tensor_system.after(build_eq106_source_system),
+        build_eq106_operator_tensor_system.after(build_aggregated_gravity_source_system),
     )
     .add_systems(Update, section_toggle_system)
     .add_systems(
@@ -286,7 +285,7 @@ pub fn main() {
             performance_button_system,
             performance_method_checkbox_system,
             method_toggle_system,
-            preserve_inversion_results_on_manual_method_switch,
+            reset_inversion_on_method_change,
         )
             .chain(),
     )
@@ -296,7 +295,7 @@ pub fn main() {
             capture_trajectory_inversion_system,
             trajectory_inversion_input_system,
             start_density_inversion_system,
-            simulated_annealing_system,
+            convex_optimization_system,
             trajectory_inversion_ui_system,
             density_inversion_timing_ui_system,
         )

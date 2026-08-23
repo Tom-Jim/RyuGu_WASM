@@ -1,6 +1,6 @@
 // GPU fast multipole method for the fifth gravity slot.
 //
-// The immutable radial density records are compressed into a six-level linear
+// The common 1024-source aggregation is compressed into a six-level linear
 // octree once. P2M/M2M mass, center-of-mass, and traceless quadrupole moments
 // are stored in breadth-first order. The real-time WGSL pass applies a
 // fixed-depth multipole acceptance criterion in parallel and asynchronously
@@ -150,38 +150,22 @@ impl FromWorld for FmmComputePipeline {
 
 pub fn build_fmm_source_system(
     mut commands: Commands,
-    radial: Option<Res<RadialGravitySource>>,
+    aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     existing: Option<Res<FmmSource>>,
     active_method: Res<ActiveGravityMethod>,
 ) {
     if existing.is_some() || *active_method != ActiveGravityMethod::Fmm {
         return;
     }
-    let Some(radial) = radial else { return };
-    let mut records = Vec::with_capacity(radial.count as usize);
-    let mut radius = 0.0_f64;
-    for chunk in radial.bytes.chunks_exact(32) {
-        let direction = DVec3::new(
-            read_f32(chunk, 0) as f64,
-            read_f32(chunk, 4) as f64,
-            read_f32(chunk, 8) as f64,
-        )
-        .try_normalize()
-        .unwrap_or(DVec3::Z);
-        let solid_angle = (read_f32(chunk, 12) as f64).max(0.0);
-        let inner = (read_f32(chunk, 16) as f64).max(0.0);
-        let outer = (read_f32(chunk, 20) as f64).max(inner);
-        let density = (read_f32(chunk, 24) as f64).max(0.0);
-        if outer <= inner || density <= 0.0 || solid_angle <= 0.0 {
-            continue;
-        }
-        let volume = solid_angle * (outer.powi(3) - inner.powi(3)) / 3.0;
-        let mass = density * volume;
-        let centroid_radius = 0.75 * (outer.powi(4) - inner.powi(4))
-            / (outer.powi(3) - inner.powi(3)).max(f64::MIN_POSITIVE);
-        records.push((direction * centroid_radius, mass));
-        radius = radius.max(outer);
-    }
+    let Some(aggregated) = aggregated else {
+        return;
+    };
+    let records = aggregated
+        .sources
+        .iter()
+        .map(|source| (source.position, source.mass))
+        .collect::<Vec<_>>();
+    let radius = aggregated.radius;
     if records.is_empty() || radius <= 0.0 {
         return;
     }
@@ -332,7 +316,7 @@ pub fn build_fmm_source_system(
         }
     }
     info!(
-        "[fmm] built {} octree nodes and {} retained leaf particles through level {} (P2M/M2M + M2L/L2L + P2P)",
+        "[fmm] built {} octree nodes from {} common sources through level {} (P2M/M2M + M2L/L2L + P2P)",
         offset,
         records.len(),
         MAXIMUM_LEVEL
@@ -344,10 +328,6 @@ pub fn build_fmm_source_system(
         particle_count: records.len() as u32,
         maximum_level: MAXIMUM_LEVEL,
     });
-}
-
-fn read_f32(bytes: &[u8], offset: usize) -> f32 {
-    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4]))
 }
 
 fn clear_fmm_history_on_probe_reset(

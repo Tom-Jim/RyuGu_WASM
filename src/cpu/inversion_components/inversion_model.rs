@@ -2,8 +2,8 @@
 //
 // The unknown is a positive density in every occupied Cartesian voxel, not a
 // global multiplier.  Radial source cells provide a mass/volume-preserving
-// tessellation of the actual Ryugu shape. Their Newtonian sensitivity along
-// the complete Quintic Hermite trajectory is precomputed once; annealing then
+// tessellation of the actual Ryugu shape. Each method's sensitivity along the
+// complete quintic Hermite trajectory is precomputed once; the optimizer then
 // changes individual voxel densities subject to data, total-mass, smoothness,
 // and weak prior terms. Kinematic acceleration comes from the interpolated
 // trajectory itself; captured acceleration from a previously selected method
@@ -14,19 +14,17 @@ use crate::bevy_app::ui::TrajectoryInversionButton;
 use bevy::math::DVec3;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
-use rand_chacha::ChaCha8Rng;
-use rand_core::{Rng, SeedableRng};
 
 // Fifteen Hermite intervals provide 241 acceleration samples (723 scalar
 // components). A 4³ grid leaves the 56 shape-intersecting cells; mass
 // conservation and spatial regularization control the remaining gravity null
 // space without removing three-dimensional voxel freedom.
 const VOXEL_SIDE: usize = 4;
+const EXPECTED_VOXEL_COUNT: usize = 56;
 /// Quintic Hermite is evaluated throughout every knot interval. The sixteen
 /// controls therefore produce 15 * 16 + 1 = 241 trajectory observations.
 const TRAJECTORY_SAMPLES_PER_SEGMENT: usize = 16;
-const ANNEALING_ITERATIONS: u32 = 80_000;
-const ITERATIONS_PER_FRAME: u32 = 1_024;
+const QP_SOLVE_COUNT: u32 = 1;
 const MASS_WEIGHT: f64 = 25.0;
 const SMOOTHNESS_WEIGHT: f64 = 0.02;
 const RADIAL_SYMMETRY_WEIGHT: f64 = 0.15;
@@ -127,7 +125,7 @@ fn build_density_voxels(
         .collect::<Vec<_>>();
 
     // Critical separation: `density` and `baseline_density` are uniform and
-    // are the only values visible to annealing. `reference_density` is the
+    // are the only values visible to optimizer. `reference_density` is the
     // selected model's validation field and is read only after optimization.
     (!voxels.is_empty()).then_some((voxels, voxel_size))
 }
@@ -242,112 +240,130 @@ pub(crate) fn quintic_segment_position_acceleration(
     (position.is_finite() && acceleration.is_finite()).then_some((position, acceleration))
 }
 
+/// Expands the immutable sixteen-knot capture into the exact sample array
+/// shared by every forward method and inverse solve.
+pub(crate) fn sample_frozen_trajectory(
+    knots: &[TrajectoryInversionKnot],
+) -> Option<Vec<TrajectoryInversionKnot>> {
+    let accelerations = quintic_knot_accelerations(knots)?;
+    let mut samples = Vec::with_capacity(
+        (knots.len().saturating_sub(1)) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1,
+    );
+    for segment in 0..knots.len().saturating_sub(1) {
+        let start = knots[segment];
+        let end = knots[segment + 1];
+        let duration = (end.simulation_time_seconds - start.simulation_time_seconds) as f32;
+        let first_sample = usize::from(segment > 0);
+        for sample in first_sample..=TRAJECTORY_SAMPLES_PER_SEGMENT {
+            let u = sample as f32 / TRAJECTORY_SAMPLES_PER_SEGMENT as f32;
+            let (position, acceleration) = quintic_segment_position_acceleration(
+                start,
+                end,
+                accelerations[segment],
+                accelerations[segment + 1],
+                u,
+            )?;
+            samples.push(TrajectoryInversionKnot {
+                position,
+                velocity: start.velocity.lerp(end.velocity, u),
+                simulation_time_seconds: start.simulation_time_seconds
+                    + duration as f64 * u as f64,
+                baseline_acceleration: acceleration,
+                body_rotation: start.body_rotation.slerp(end.body_rotation, u),
+            });
+        }
+    }
+    Some(samples)
+}
+
 fn build_observations_and_sensitivities(
     knots: &[TrajectoryInversionKnot],
     voxels: &[InvertedDensityVoxel],
-    method: ActiveGravityMethod,
-    use_captured_acceleration: bool,
-) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
+) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
     if knots.len() < 2 {
         return None;
     }
     let sample_count = (knots.len() - 1) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1;
     let mut observations = Vec::with_capacity(sample_count);
     let mut sensitivities = Vec::with_capacity(sample_count * voxels.len());
-    let mut predictions = Vec::with_capacity(sample_count);
-    // MMFFT clips its discrete Green kernel at half of the finest 128 m cell.
-    // The other exterior evaluators use the unsoftened Newton kernel. Avoid
-    // inventing method-dependent smoothing scales merely to separate scores.
-    let softening = match method {
-        ActiveGravityMethod::MmfftCompressed => 64.0_f32,
-        _ => 0.0,
-    };
-    let softening_squared = softening.powi(2);
-
     let sensitivity_at = |knot: TrajectoryInversionKnot, voxel: &InvertedDensityVoxel| {
         let displacement = knot.body_rotation * voxel.center - knot.position;
-        displacement
-            * (G * voxel.volume * (displacement.length_squared() + softening_squared).powf(-1.5))
+        displacement * (G * voxel.volume * displacement.length_squared().powf(-1.5))
     };
-
-    // Captured knots already carry the acceleration from the same gravity
-    // snapshot as their position and velocity.  Re-differentiating the
-    // asynchronously sampled velocities amplifies readback jitter and was
-    // the main source of the recent inversion accuracy collapse.  Edited
-    // knots have no trustworthy force sample, so retain the velocity-derived
-    // fallback for that path.
-    let knot_accelerations = if use_captured_acceleration
-        && knots
-            .iter()
-            .all(|knot| knot.baseline_acceleration.is_finite())
-    {
-        knots
-            .iter()
-            .map(|knot| knot.baseline_acceleration)
-            .collect::<Vec<_>>()
-    } else {
-        quintic_knot_accelerations(knots)?
-    };
-
-    for segment in 0..knots.len() - 1 {
-        let start = knots[segment];
-        let end = knots[segment + 1];
-        let duration = (end.simulation_time_seconds - start.simulation_time_seconds) as f32;
-        if !duration.is_finite() || duration <= f32::EPSILON {
-            return None;
+    let samples = sample_frozen_trajectory(knots)?;
+    let observed = interpolate_captured_accelerations(knots, &samples)?;
+    for (sample_knot, observation) in samples.into_iter().zip(observed) {
+        for voxel in voxels {
+            let sensitivity = sensitivity_at(sample_knot, voxel);
+            sensitivities.push(sensitivity);
         }
-        let first_sample = usize::from(segment > 0);
-        for sample in first_sample..=TRAJECTORY_SAMPLES_PER_SEGMENT {
-            let u = sample as f32 / TRAJECTORY_SAMPLES_PER_SEGMENT as f32;
-            let (position, observation) = quintic_segment_position_acceleration(
-                start,
-                end,
-                knot_accelerations[segment],
-                knot_accelerations[segment + 1],
-                u,
-            )?;
-            let sample_knot = TrajectoryInversionKnot {
-                position,
-                velocity: Vec3::ZERO,
-                simulation_time_seconds: start.simulation_time_seconds + duration as f64 * u as f64,
-                baseline_acceleration: Vec3::ZERO,
-                body_rotation: start.body_rotation.slerp(end.body_rotation, u),
-            };
-            let mut prediction = Vec3::ZERO;
-            for voxel in voxels {
-                let sensitivity = sensitivity_at(sample_knot, voxel);
-                prediction += sensitivity * voxel.density;
-                sensitivities.push(sensitivity);
-            }
-            observations.push(observation);
-            predictions.push(prediction);
-        }
+        observations.push(observation);
     }
-    (observations.len() == sample_count).then_some((observations, sensitivities, predictions))
+    (observations.len() == sample_count).then_some((observations, sensitivities))
 }
 
-fn trajectory_data_error(job: &SimulatedAnnealingJob) -> f64 {
-    let mut data_error = 0.0_f64;
-    for (prediction, observed) in job
-        .predicted_accelerations
+fn interpolate_captured_accelerations(
+    knots: &[TrajectoryInversionKnot],
+    samples: &[TrajectoryInversionKnot],
+) -> Option<Vec<Vec3>> {
+    if knots.len() < 2 {
+        return None;
+    }
+    samples
         .iter()
-        .zip(&job.observed_accelerations)
-    {
+        .map(|sample| {
+            let upper = knots
+                .iter()
+                .position(|knot| knot.simulation_time_seconds >= sample.simulation_time_seconds)
+                .unwrap_or(knots.len() - 1);
+            let lower = upper.saturating_sub(1);
+            let a = knots[lower];
+            let b = knots[upper];
+            let span = (b.simulation_time_seconds - a.simulation_time_seconds)
+                .max(f64::EPSILON);
+            let factor = ((sample.simulation_time_seconds - a.simulation_time_seconds) / span)
+                .clamp(0.0, 1.0) as f32;
+            let acceleration = a.baseline_acceleration.lerp(b.baseline_acceleration, factor);
+            acceleration.is_finite().then_some(acceleration)
+        })
+        .collect()
+}
+
+fn trajectory_data_error(job: &ConvexOptimizationJob) -> f64 {
+    density_data_error(job, &job.current_densities)
+}
+
+fn density_data_error(job: &ConvexOptimizationJob, densities: &[f32]) -> f64 {
+    let mut data_error = 0.0_f64;
+    let n = job.voxels.len();
+    for (sample, observed) in job.observed_accelerations.iter().enumerate() {
+        let prediction = (0..n).fold(Vec3::ZERO, |sum, voxel| {
+            sum + job.sensitivities[sample * n + voxel] * densities[voxel]
+        });
         let scale = observed.length_squared().max(1.0e-12);
         data_error += ((prediction - *observed).length_squared() / scale) as f64;
     }
-    data_error /= job.observed_accelerations.len().max(1) as f64;
-    data_error
+    data_error / job.observed_accelerations.len().max(1) as f64
 }
 
-fn objective(job: &SimulatedAnnealingJob) -> f64 {
+fn objective(job: &ConvexOptimizationJob) -> f64 {
+    objective_for_density_slice(job, &job.current_densities)
+}
+
+fn objective_for_density_slice(job: &ConvexOptimizationJob, densities: &[f32]) -> f64 {
     // Exterior gravity differences caused by an internal density rearrangement
     // are orders of magnitude smaller than the total field. Normalize the
     // uniform-start mismatch to one so regularization cannot erase the signal.
-    let data_error = trajectory_data_error(job) / job.data_error_scale.max(1.0e-24);
+    let data_error = density_data_error(job, densities) / job.data_error_scale.max(1.0e-24);
 
-    let mass_error = (job.current_mass / RYUGU_MASS as f64 - 1.0).powi(2);
-    let mean_density = (job.current_mass
+    let mass = job
+        .voxels
+        .iter()
+        .zip(densities)
+        .map(|(voxel, density)| voxel.volume as f64 * *density as f64)
+        .sum::<f64>();
+    let mass_error = (mass / RYUGU_MASS as f64 - 1.0).powi(2);
+    let mean_density = (mass
         / job
             .voxels
             .iter()
@@ -360,8 +376,7 @@ fn objective(job: &SimulatedAnnealingJob) -> f64 {
         job.neighbours
             .iter()
             .map(|&(a, b)| {
-                ((job.current_densities[a] - job.current_densities[b]) as f64 / mean_density)
-                    .powi(2)
+                ((densities[a] - densities[b]) as f64 / mean_density).powi(2)
             })
             .sum::<f64>()
             / job.neighbours.len() as f64
@@ -391,14 +406,12 @@ fn objective(job: &SimulatedAnnealingJob) -> f64 {
         radial_pairs
             .iter()
             .map(|&(a, b)| {
-                ((job.current_densities[a] - job.current_densities[b]) as f64 / mean_density)
-                    .powi(2)
+                ((densities[a] - densities[b]) as f64 / mean_density).powi(2)
             })
             .sum::<f64>()
             / radial_pairs.len() as f64
     };
-    let prior = job
-        .current_densities
+    let prior = densities
         .iter()
         .zip(&job.voxels)
         .map(|(density, voxel)| {
@@ -411,10 +424,6 @@ fn objective(job: &SimulatedAnnealingJob) -> f64 {
         + SMOOTHNESS_WEIGHT * smoothness
         + RADIAL_SYMMETRY_WEIGHT * radial_symmetry
         + PRIOR_WEIGHT * prior
-}
-
-fn next_random(rng: &mut ChaCha8Rng) -> f64 {
-    (rng.next_u64() >> 11) as f64 / (1_u64 << 53) as f64
 }
 
 fn density_model_deviation(voxels: &[InvertedDensityVoxel]) -> f32 {
@@ -434,9 +443,10 @@ fn density_model_deviation(voxels: &[InvertedDensityVoxel]) -> f32 {
 }
 
 fn density_result_from_job(
-    job: &SimulatedAnnealingJob,
+    job: &ConvexOptimizationJob,
     densities: &[f32],
     objective: f64,
+    inversion_time_ms: f64,
 ) -> DensityInversionResult {
     let mut voxels = job.voxels.clone();
     for (voxel, density) in voxels.iter_mut().zip(densities) {
@@ -457,7 +467,7 @@ fn density_result_from_job(
         capture_id: job.capture_id,
         source_hash: job.source_hash,
         capture_epoch: job.capture_epoch,
-        rng_seed: job.rng_seed,
+        problem_id: job.problem_id,
         initial_objective: job.initial_objective,
         data_error_scale: job.data_error_scale,
         density: (inferred_mass / total_volume.max(f64::MIN_POSITIVE)) as f32,
@@ -468,6 +478,7 @@ fn density_result_from_job(
         objective_improvement: ((job.initial_objective - objective)
             / job.initial_objective.max(f64::MIN_POSITIVE))
         .clamp(0.0, 1.0) as f32,
+        inversion_time_ms,
         trajectory_samples: job.observed_accelerations.len(),
         iterations: job.iterations,
         voxel_size: job.voxel_size,
@@ -486,6 +497,7 @@ pub fn start_density_inversion_system(
     >,
     active_method: Res<ActiveGravityMethod>,
     radial_source: Option<Res<RadialGravitySource>>,
+    mut eq106_sensitivity: ResMut<Eq106SensitivityMatrix>,
     mut show_section: ResMut<ShowSection>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
@@ -493,6 +505,15 @@ pub fn start_density_inversion_system(
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed);
     if pressed {
+        if matches!(
+            *active_method,
+            ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::HomogeneousWerner
+        ) {
+            inversion.error = Some(
+                "Radial generates the frozen observations; Werner is forward-only. Neither participates in density inversion.".into(),
+            );
+            return;
+        }
         if !inversion.ready || inversion.knots.len() != TRAJECTORY_INVERSION_SAMPLE_COUNT {
             return;
         }
@@ -500,14 +521,12 @@ pub fn start_density_inversion_system(
             inversion.error = Some("The frozen trajectory capture has no identity.".into());
             return;
         }
-        // One click starts exactly the method selected by G. The frozen
-        // trajectory is reused only for that method; there is no hidden
-        // five-method queue behind this button.
-        inversion.annealing = None;
-        inversion.pending_inversion_methods.clear();
-        inversion.batch_capture_id = None;
-        // Fill one method slot at a time.  Results from other completed
-        // methods belong to their own capture and remain visible in the UI.
+        inversion.optimizer = None;
+        let capture_id = inversion.capture_id.expect("validated above");
+        if inversion.batch_capture_id != Some(capture_id) {
+            inversion.results = std::array::from_fn(|_| None);
+            inversion.batch_capture_id = Some(capture_id);
+        }
         inversion.results[active_method.performance_index()] = None;
         inversion.displayed_density = None;
         inversion.error = None;
@@ -515,92 +534,99 @@ pub fn start_density_inversion_system(
     if !pressed {
         return;
     }
-    if inversion.annealing.is_some() {
+    if inversion.optimizer.is_some() {
         return;
     }
+    let started_at = Instant::now();
     let Some(source) = radial_source else {
         inversion.error = Some("The asteroid volume source is not ready.".into());
         return;
     };
     let Some(capture_id) = inversion.capture_id else {
         inversion.error = Some("The frozen trajectory capture has no identity.".into());
-        inversion.pending_inversion_methods.clear();
         return;
     };
     let method = *active_method;
     let source_hash = inversion.capture_source_hash;
-    let rng_seed = inversion_rng_seed(capture_id, source_hash);
+    let problem_id = inversion_problem_id(capture_id, source_hash);
     let Some((voxels, voxel_size)) = build_density_voxels(&source, method) else {
         inversion.error = Some("The asteroid volume could not be voxelized.".into());
         return;
     };
-    let Some((observed_accelerations, sensitivities, predicted_accelerations)) =
-        build_observations_and_sensitivities(
-            &inversion.knots,
-            &voxels,
-            method,
-            !inversion.knots_edited,
-        )
+    if voxels.len() != EXPECTED_VOXEL_COUNT {
+        inversion.error = Some(format!(
+            "The convex inverse requires a 56-voxel source, but voxelization produced {}.",
+            voxels.len()
+        ));
+        return;
+    }
+    if method == ActiveGravityMethod::CurvedArcEq106
+        && (eq106_sensitivity.capture_id != Some(capture_id)
+            || eq106_sensitivity.voxel_count != voxels.len())
+    {
+        eq106_sensitivity.capture_id = Some(capture_id);
+        eq106_sensitivity.voxel_count = voxels.len();
+        eq106_sensitivity.sample_count = 0;
+        eq106_sensitivity.columns.clear();
+    }
+    let Some((observed_accelerations, mut sensitivities)) =
+        build_observations_and_sensitivities(&inversion.knots, &voxels)
     else {
         inversion.error =
             Some("The 16 states do not define valid acceleration observations.".into());
         return;
     };
+    if method == ActiveGravityMethod::MmfftCompressed {
+        let Some(samples) = sample_frozen_trajectory(&inversion.knots) else {
+            inversion.error = Some("The frozen trajectory cannot be sampled for MMFFT.".into());
+            return;
+        };
+        sensitivities = crate::gpu::mmfft::voxel_basis_sensitivities(&voxels, &samples);
+    }
     let current_densities = voxels.iter().map(|voxel| voxel.density).collect::<Vec<_>>();
-    let current_mass = voxels
-        .iter()
-        .map(|voxel| voxel.density as f64 * voxel.volume as f64)
-        .sum();
-    let mut job = SimulatedAnnealingJob {
+    let mut job = ConvexOptimizationJob {
         method,
         capture_id,
         source_hash,
         capture_epoch: inversion.capture_epoch,
-        rng_seed,
+        problem_id,
         neighbours: build_neighbours(&voxels),
         voxels,
         sensitivities,
         observed_accelerations,
         current_densities: current_densities.clone(),
         best_densities: current_densities,
-        predicted_accelerations,
-        current_mass,
-        current_objective: f64::INFINITY,
-        best_objective: f64::INFINITY,
         initial_objective: f64::INFINITY,
         data_error_scale: 1.0,
-        iteration: 0,
-        iterations: ANNEALING_ITERATIONS,
-        rng: ChaCha8Rng::seed_from_u64(rng_seed),
+        iterations: QP_SOLVE_COUNT,
         voxel_size,
+        started_at,
     };
     job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
-    job.current_objective = objective(&job);
-    job.best_objective = job.current_objective;
-    job.initial_objective = job.current_objective;
-    if !job.current_objective.is_finite() {
+    job.initial_objective = objective(&job);
+    if !job.initial_objective.is_finite() {
         inversion.error = Some("The voxel sensitivity matrix is not finite.".into());
         return;
     }
     inversion.inverted = true;
-    // A visible D-key prior section otherwise wins the render branch and makes
-    // a completed inversion appear identical to the forward density.  Enter
+    // A visible D-key prior section otherwise wins the render branch. Enter
     // inverse view explicitly; D can still be pressed again for comparison.
     show_section.0 = false;
     inversion.displayed_density = Some(density_result_from_job(
         &job,
         &job.best_densities,
-        job.best_objective,
+        job.initial_objective,
+        0.0,
     ));
     inversion.selected = None;
     inversion.edit_buffer.clear();
     inversion.error = None;
-    inversion.annealing = Some(job);
+    inversion.optimizer = Some(job);
 }
 
-fn inversion_rng_seed(capture_id: u64, source_hash: u64) -> u64 {
-    // Identical frozen data and source geometry must traverse exactly the same
-    // proposal sequence. Method-specific forward kernels still make the
-    // objectives and accepted density updates different.
+fn inversion_problem_id(capture_id: u64, source_hash: u64) -> u64 {
+    // Identical frozen data and source geometry identify the same inverse
+    // problem even though method-specific forward operators produce different
+    // sensitivity matrices.
     0x9e37_79b9_7f4a_7c15_u64 ^ capture_id.rotate_left(17) ^ source_hash.rotate_right(11)
 }

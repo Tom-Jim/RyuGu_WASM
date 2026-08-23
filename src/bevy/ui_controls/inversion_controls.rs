@@ -64,7 +64,12 @@ pub fn performance_comparison_system(
         };
     }
     if let Some(mut button) = nodes.p5().iter_mut().next() {
-        button.display = if state.active {
+        button.display = if state.active
+            || matches!(
+                *active_method,
+                ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::HomogeneousWerner
+            )
+        {
             Display::None
         } else {
             Display::Flex
@@ -232,4 +237,3 @@ pub fn performance_comparison_system(
 
     update_performance_chart_segments(&state, &mut nodes.p4());
 }
-

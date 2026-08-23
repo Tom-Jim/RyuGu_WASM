@@ -219,6 +219,7 @@ pub fn physics_system(
     mut clock: ResMut<SimulationClock>,
     mut curved_residual: ResMut<CurvedArcResidualHistory>,
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
+    mut inversion: ResMut<TrajectoryInversionState>,
     time: Res<Time<Fixed>>,
     active_method: Res<ActiveGravityMethod>,
     simulation_acceleration: Res<SimulationAcceleration>,
@@ -370,6 +371,11 @@ pub fn physics_system(
                 end_rotation.inverse() * acceleration_end,
             );
             probe_velocity.0 += acceleration_end * (0.5 * substep_dt as f32);
+            if *active_method == ActiveGravityMethod::RadialAnalytic
+                && inversion.truth_orbit.len() < ORBIT_HISTORY_LEN
+            {
+                inversion.truth_orbit.push(probe_transform.translation);
+            }
             if !benchmark.complete && end_time <= BENCHMARK_DURATION_SECONDS + 1.0e-9 {
                 benchmark.samples.push(GravityBenchmarkSample {
                     simulation_time_seconds: end_time,

@@ -11,7 +11,7 @@
 // spectral or truncation certificate is rejected.
 
 use crate::interface::components::*;
-use crate::cpu::curved_arc::{CurvedArcPlannerState, Eq106SourceData};
+use crate::cpu::curved_arc::{AggregatedGravitySource, CurvedArcPlannerState};
 use crate::cpu::eq106_operator::Eq106OperatorTensorResource;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -25,12 +25,11 @@ use bevy::render::{
         PipelineCache, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
-    settings::WgpuFeatures,
 };
 use bevy::shader::ShaderCacheError;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use wgpu29::{ComputePassTimestampWrites, QuerySet, QuerySetDescriptor, QueryType};
+use wgpu29::{ComputePassTimestampWrites, QuerySet};
 
 const HALF_COUNT: u32 = 64;
 const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
@@ -216,6 +215,7 @@ struct ExtractedEq106Input {
     target_snapshots: Vec<GravityRequestSnapshot>,
     batch_elements: Vec<Eq106BatchElement>,
     batch_capture_id: Option<u64>,
+    sensitivity_column: Option<u32>,
     sources: Option<Vec<u8>>,
     fourier_modes: Option<Vec<u8>>,
     operator_tensor: Option<Vec<u8>>,
@@ -248,6 +248,8 @@ struct Eq106GpuBuffersInner {
     psi_operator: Buffer,
     timing_query_set: Option<QuerySet>,
     timing_resolve: Option<Buffer>,
+    source_count: u32,
+    density_mode_count: u32,
     element_capacity: u32,
     line_origin: Vec3,
     line_direction: Vec3,
@@ -276,6 +278,7 @@ impl Plugin for Eq106GpuComputePlugin {
         app.init_resource::<Eq106GpuReadbackChannel>();
         app.init_resource::<Eq106GpuHistory>();
         app.init_resource::<Eq106TrajectoryBatchResult>();
+        app.init_resource::<Eq106SensitivityMatrix>();
         app.init_resource::<Eq106PerformanceMetrics>();
         app.add_systems(PreUpdate, poll_eq106_readback);
         app.add_systems(Update, clear_eq106_history_on_probe_reset);
@@ -376,6 +379,7 @@ fn poll_eq106_readback(
     channel: Res<Eq106GpuReadbackChannel>,
     mut history: ResMut<Eq106GpuHistory>,
     mut batch_result: ResMut<Eq106TrajectoryBatchResult>,
+    mut sensitivity: ResMut<Eq106SensitivityMatrix>,
     mut performance: ResMut<Eq106PerformanceMetrics>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
@@ -404,7 +408,41 @@ fn poll_eq106_readback(
         }
     };
 
-    if let Some(capture_id) = packet.batch_capture_id {
+    if let (Some(capture_id), Some(column)) =
+        (packet.batch_capture_id, packet.sensitivity_column)
+    {
+        if sensitivity.capture_id != Some(capture_id) {
+            sensitivity.capture_id = Some(capture_id);
+            sensitivity.columns.clear();
+            sensitivity.sample_count = decoded.len();
+        }
+        // `start_density_inversion_system` installs the capture identity before
+        // the first GPU column returns. Initialize the row count from that
+        // first column even when the capture identity already matches.
+        if column == 0 && sensitivity.columns.is_empty() {
+            sensitivity.sample_count = decoded.len();
+        }
+        if sensitivity.sample_count != decoded.len() {
+            runtime_error.raise(format!(
+                "Equation (106) sensitivity column {column} returned {} samples; expected {}.",
+                decoded.len(),
+                sensitivity.sample_count,
+            ));
+            sensitivity.columns.clear();
+            sensitivity.sample_count = 0;
+            return;
+        }
+        if sensitivity.columns.len() == column as usize {
+            sensitivity.columns.push(
+                decoded
+                    .into_iter()
+                    .map(|sample| {
+                        sample.snapshot.ryugu_transform.rotation * sample.body_acceleration
+                    })
+                    .collect(),
+            );
+        }
+    } else if let Some(capture_id) = packet.batch_capture_id {
         batch_result.capture_id = Some(capture_id);
         batch_result.samples = decoded;
     } else if let Some(sample) = decoded.into_iter().next() {

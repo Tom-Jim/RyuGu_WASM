@@ -311,8 +311,15 @@ pub fn trajectory_inversion_input_system(
         (Changed<Interaction>, With<Button>),
     >,
     mut keyboard: MessageReader<KeyboardInput>,
+    active_method: Res<ActiveGravityMethod>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
+    if matches!(
+        *active_method,
+        ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::HomogeneousWerner
+    ) {
+        return;
+    }
     if inversion.ready {
         for (interaction, field) in interactions.iter_mut() {
             if *interaction == Interaction::Pressed {
@@ -329,16 +336,13 @@ pub fn trajectory_inversion_input_system(
                         &inversion.knots,
                     ));
                     inversion.inverted = false;
-                    inversion.annealing = None;
-                    inversion.pending_inversion_methods.clear();
+                    inversion.optimizer = None;
                     inversion.batch_capture_id = None;
                     inversion.results = std::array::from_fn(|_| None);
                     inversion.displayed_density = None;
                 }
                 inversion.selected = Some((field.index, field.vector));
-                // Match ordinary text-field selection behavior: a click
-                // selects the complete vector, so typing immediately replaces
-                // it instead of requiring the user to erase three values.
+                // A click selects the complete vector for immediate replacement.
                 inversion.edit_buffer.clear();
                 inversion.error = None;
             }
@@ -372,8 +376,7 @@ pub fn trajectory_inversion_input_system(
                             crate::bevy_app::render::hash_trajectory_capture(&inversion.knots),
                         );
                         inversion.inverted = false;
-                        inversion.annealing = None;
-                        inversion.pending_inversion_methods.clear();
+                        inversion.optimizer = None;
                         inversion.batch_capture_id = None;
                         inversion.results = std::array::from_fn(|_| None);
                         inversion.displayed_density = None;
@@ -409,14 +412,14 @@ pub fn trajectory_inversion_input_system(
 }
 
 pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
-    let labels = ["Radial", "Werner", "Eq.106", "MMFFT", "FMM"];
+    let labels = [(2, "Eq.106"), (3, "MMFFT"), (4, "FMM")];
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
                 right: px(15),
                 top: px(180),
-                width: px(300),
+                width: px(420),
                 padding: UiRect::all(px(10)),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(4),
@@ -430,14 +433,14 @@ pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new("Density inversion history (G selects the next run)"),
+                Text::new("Density inversion history (best fit; G starts a new run)"),
                 TextFont {
                     font_size: bevy::text::FontSize::Px(13.0),
                     ..default()
                 },
                 TextColor(Color::srgb(0.82, 0.96, 1.0)),
             ));
-            for (index, label) in labels.into_iter().enumerate() {
+            for (method_index, label) in labels {
                 panel.spawn((
                     Text::new(format!("{label:<8}  --")),
                     TextFont {
@@ -445,7 +448,7 @@ pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
                         ..default()
                     },
                     TextColor(Color::srgb(0.55, 0.82, 0.9)),
-                    DensityInversionTimingLabel(index),
+                    DensityInversionTimingLabel(method_index),
                 ));
             }
             panel.spawn((
@@ -467,6 +470,7 @@ pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
 pub fn density_inversion_timing_ui_system(
     inversion: Res<TrajectoryInversionState>,
     active_method: Res<ActiveGravityMethod>,
+    eq106_sensitivity: Res<Eq106SensitivityMatrix>,
     mut timing_labels: Query<(&DensityInversionTimingLabel, &mut Text)>,
     mut status_labels: Query<
         (&mut Text, &mut TextColor),
@@ -483,24 +487,38 @@ pub fn density_inversion_timing_ui_system(
         } else {
             " "
         };
-        **text = match inversion.results[label.0].as_ref() {
+        **text = match inversion.best_results[label.0].as_ref() {
             Some(result) => format!(
-                "{}{: <7} fit {:>7.4}% | RMSE {:>7.4}% | cap {:08x} e{}",
+                "{}{: <7} fit {:>7.4}% | RMSE {:>7.4}% | time {:>8.2} ms",
                 marker,
                 names[label.0],
                 result.model_fit * 100.0,
                 result.model_deviation * 100.0,
-                result.capture_id as u32,
-                result.capture_epoch,
+                result.inversion_time_ms,
             ),
             None => format!("{}{: <7}  --", marker, names[label.0]),
         };
     }
     for (mut text, mut color) in status_labels.iter_mut() {
-        if let Some(job) = inversion.annealing.as_ref() {
-            let progress = 100.0 * job.iteration as f32 / job.iterations as f32;
-            **text = format!("{} annealing: {progress:.1}%", job.method.as_str());
+        if let Some(job) = inversion.optimizer.as_ref() {
+            if job.method == ActiveGravityMethod::CurvedArcEq106
+                && eq106_sensitivity.columns.len() < job.voxels.len()
+            {
+                **text = format!(
+                    "Eq.106 GPU sensitivity: {}/{} voxel columns",
+                    eq106_sensitivity.columns.len(),
+                    job.voxels.len()
+                );
+            } else {
+                **text = format!("{} Clarabel 56x56 QP", job.method.as_str());
+            }
             color.0 = Color::srgb(1.0, 0.78, 0.25);
+        } else if *active_method == ActiveGravityMethod::RadialAnalytic {
+            **text = "Radial forward-only: generating the shared ln-density truth trajectory".into();
+            color.0 = Color::srgb(0.55, 0.82, 0.9);
+        } else if *active_method == ActiveGravityMethod::HomogeneousWerner {
+            **text = "Werner forward-only: density inversion disabled".into();
+            color.0 = Color::srgb(0.55, 0.82, 0.9);
         } else if let Some(result) = inversion.displayed_density.as_ref() {
             let minimum = result
                 .voxels
@@ -527,10 +545,10 @@ pub fn density_inversion_timing_ui_system(
             let convergence = if result.objective_improvement <= 1.0e-6 {
                 "best remained at uniform start"
             } else {
-                "SA improved the trajectory objective"
+                "Clarabel improved the trajectory objective"
             };
             **text = format!(
-                "{}\nfit={:.4}%, density RMSE={:.4}%\n{}; objective gain={:.4}%\ncapture={:016x}, source={:016x}, epoch={}\nseed={:016x}, J0={:.3e}, data scale={:.3e}\n{} Quintic track samples, {} voxels\nmean rho={:.5e}, range={:.4e}..{:.4e}\nsigma/mean={:.3}, mass scale={:.5}\nobjective={:.3e}, {} annealing steps",
+                "{}\nfit={:.4}%, density RMSE={:.4}%\n{}; objective gain={:.4}%\ncapture={:016x}, source={:016x}, epoch={}\nproblem={:016x}, J0={:.3e}, data scale={:.3e}\n{} Quintic track samples, {} voxels\nmean rho={:.5e}, range={:.4e}..{:.4e}\nsigma/mean={:.3}, mass scale={:.5}\nobjective={:.3e}, {} convex QP solve",
                 model,
                 result.model_fit * 100.0,
                 result.model_deviation * 100.0,
@@ -539,7 +557,7 @@ pub fn density_inversion_timing_ui_system(
                 result.capture_id,
                 result.source_hash,
                 result.capture_epoch,
-                result.rng_seed,
+                result.problem_id,
                 result.initial_objective,
                 result.data_error_scale,
                 result.trajectory_samples,
@@ -571,12 +589,18 @@ pub fn density_inversion_timing_ui_system(
 
 pub fn trajectory_inversion_ui_system(
     inversion: Res<TrajectoryInversionState>,
+    active_method: Res<ActiveGravityMethod>,
     mut panels: Query<&mut Node, With<TrajectoryInversionPanel>>,
     mut labels: Query<(&TrajectoryInversionFieldText, &mut Text)>,
     mut fields: Query<(&TrajectoryInversionField, &mut BackgroundColor)>,
 ) {
     for mut panel in panels.iter_mut() {
-        panel.display = if inversion.ready {
+        panel.display = if inversion.ready
+            && !matches!(
+                *active_method,
+                ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::HomogeneousWerner
+            )
+        {
             Display::Flex
         } else {
             Display::None

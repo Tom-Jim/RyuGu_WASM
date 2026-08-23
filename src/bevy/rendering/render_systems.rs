@@ -93,7 +93,7 @@ pub fn render_section_system(
     let steps = 15_i32;
     let step_size = grid_half * 2.0 / (steps * 2) as f32;
     // The forward D-section keeps its larger sample markers. In inversion
-    // view use small translucent samples so the annealer-predicted density
+    // view use small translucent samples so the convex-QP-predicted density
     // remains visible without covering the section in overlapping spheres.
     let dot_radius = if inferred.is_some() {
         step_size * 0.10
@@ -297,7 +297,7 @@ fn marching_squares_segments(
     segments
 }
 
-/// Reconstructs a continuous section from the coarse, independently annealed
+/// Reconstructs a continuous section from the coarse, independently optimized
 /// voxel values. A compact kernel uses only neighbouring cells, so the display
 /// does not invent long-range density gradients; nearest-voxel fallback keeps
 /// every interior mesh sample defined at irregular boundary cells.

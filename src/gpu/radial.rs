@@ -20,8 +20,8 @@ const RADIAL_LAYER_COUNT: u32 = 4;
 struct ExtractedGravityInput {
     probe: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
-    layer_bytes: Option<Vec<u8>>,
-    layer_count: u32,
+    source_bytes: Option<Vec<u8>>,
+    source_count: u32,
 }
 
 #[derive(Resource, Default)]
@@ -32,7 +32,7 @@ struct GravityGpuBuffersInner {
     output: bevy::render::render_resource::Buffer,
     staging: bevy::render::render_resource::Buffer,
     bind_group: BindGroup,
-    layer_count: u32,
+    source_count: u32,
     workgroup_count: u32,
     output_size: u64,
     last_submitted: Option<(u64, u64)>,
@@ -176,7 +176,7 @@ pub fn build_radial_gravity_source_system(
     }
 
     commands.insert_resource(DensityC(density_c));
-    commands.insert_resource(RadialGravitySource { bytes, count });
+    commands.insert_resource(RadialGravitySource { bytes });
 }
 
 fn angular_cell(p0: Vec3, p1: Vec3, p2: Vec3) -> Option<(Vec3, f32, f32)> {
@@ -272,7 +272,7 @@ fn poll_gravity_readback(
 
 fn extract_gravity_input_system(
     mut extracted: ResMut<ExtractedGravityInput>,
-    source: Extract<Option<Res<RadialGravitySource>>>,
+    source: Extract<Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>>,
     clock: Extract<Res<SimulationClock>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
@@ -293,9 +293,20 @@ fn extract_gravity_input_system(
         probe_position: cassini.translation,
         probe_velocity: velocity.0,
     });
-    extracted.layer_count = source.count;
-    if extracted.layer_bytes.is_none() {
-        extracted.layer_bytes = Some(source.bytes.clone());
+    extracted.source_count = source.sources.len() as u32;
+    if extracted.source_bytes.is_none() {
+        let mut bytes = Vec::with_capacity(source.sources.len() * 16);
+        for item in &source.sources {
+            for value in [
+                item.position.x as f32,
+                item.position.y as f32,
+                item.position.z as f32,
+                item.mass as f32,
+            ] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        extracted.source_bytes = Some(bytes);
     }
 }
 
@@ -314,15 +325,15 @@ fn dispatch_gravity_system(
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
         return;
     };
-    if extracted.layer_count == 0 {
+    if extracted.source_count == 0 {
         return;
     }
 
     if buffers.0.is_none() {
-        let Some(layer_bytes) = extracted.layer_bytes.as_ref() else {
+        let Some(source_bytes) = extracted.source_bytes.as_ref() else {
             return;
         };
-        let workgroup_count = extracted.layer_count.div_ceil(WORKGROUP_SIZE);
+        let workgroup_count = extracted.source_count.div_ceil(WORKGROUP_SIZE);
         let output_size = workgroup_count as u64 * 16;
         let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("radial_gravity_uniform"),
@@ -330,9 +341,9 @@ fn dispatch_gravity_system(
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let layers = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("radial_gravity_layers"),
-            contents: layer_bytes,
+        let sources = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("radial_gravity_sources"),
+            contents: source_bytes,
             usage: BufferUsages::STORAGE,
         });
         let output = render_device.create_buffer(&BufferDescriptor {
@@ -361,7 +372,7 @@ fn dispatch_gravity_system(
                 },
                 BindGroupEntry {
                     binding: 1,
-                    resource: layers.as_entire_binding(),
+                    resource: sources.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding: 2,
@@ -374,7 +385,7 @@ fn dispatch_gravity_system(
             output,
             staging,
             bind_group,
-            layer_count: extracted.layer_count,
+            source_count: extracted.source_count,
             workgroup_count,
             output_size,
             last_submitted: None,
@@ -398,7 +409,7 @@ fn dispatch_gravity_system(
     }
     inner.last_submitted = Some(submission_key);
 
-    let uniform_bytes = gravity_uniform_bytes(extracted.probe, inner.layer_count);
+    let uniform_bytes = gravity_uniform_bytes(extracted.probe, inner.source_count);
     render_queue.write_buffer(&inner.uniform, 0, &uniform_bytes);
 
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
@@ -440,12 +451,12 @@ fn dispatch_gravity_system(
         });
 }
 
-fn gravity_uniform_bytes(probe: Vec3, layer_count: u32) -> [u8; 32] {
+fn gravity_uniform_bytes(probe: Vec3, source_count: u32) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     for (offset, value) in [(0, probe.x), (4, probe.y), (8, probe.z), (12, G)] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
-    bytes[16..20].copy_from_slice(&layer_count.to_le_bytes());
+    bytes[16..20].copy_from_slice(&source_count.to_le_bytes());
     bytes
 }
 

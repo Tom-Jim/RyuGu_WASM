@@ -205,9 +205,8 @@ pub fn fps_update_system(
 /// buffer sizes used by its render-world pipeline. WebGPU intentionally has no
 /// portable API for driver-level VRAM usage, so this is labeled as an estimate.
 pub fn update_gpu_memory_estimate_system(
-    radial: Option<Res<RadialGravitySource>>,
+    aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
-    eq106_sources: Option<Res<crate::cpu::curved_arc::Eq106SourceData>>,
     eq106_tensor: Option<Res<Eq106OperatorTensorResource>>,
     eq106_planner: Option<Res<CurvedArcPlannerState>>,
     eq106_performance: Res<Eq106PerformanceMetrics>,
@@ -216,8 +215,9 @@ pub fn update_gpu_memory_estimate_system(
     mut estimate: ResMut<GpuMemoryEstimate>,
 ) {
     let mut bytes = [0_u64; 5];
-    if let Some(source) = radial {
-        bytes[0] = source.bytes.len() as u64 + 32 + 2 * reduction_buffer_bytes(source.count);
+    if let Some(source) = aggregated.as_ref() {
+        let count = source.sources.len() as u32;
+        bytes[0] = count as u64 * 16 + 32 + 2 * reduction_buffer_bytes(count);
     }
     if let Some(topology) = topology {
         let face_count = (topology.triangles.len() / 3) as u64;
@@ -225,15 +225,15 @@ pub fn update_gpu_memory_estimate_system(
         let item_count = edge_count.max(face_count) as u32;
         bytes[1] = edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
     }
-    if let (Some(source), Some(tensor)) = (eq106_sources, eq106_tensor) {
+    if let (Some(source), Some(tensor)) = (aggregated.as_ref(), eq106_tensor) {
         let order = eq106_planner
             .as_ref()
             .map_or(1, |planner| planner.taylor_order.clamp(1, 4));
         let coefficient_count = u64::from((order + 1) * (order + 2) / 2);
         let timing = eq106_performance.latest.unwrap_or_default();
         let target_count = u64::from(timing.target_count.max(1));
-        let element_count = u64::from(timing.spectral_element_count.max(1));
-        let timestamp_bytes = (4 * element_count + 1) * 8;
+        // Timestamp query pools are disabled for browser/Metal stability.
+        let timestamp_bytes = 0_u64;
         bytes[2] = source.sources.len() as u64 * 16
             + source.fourier_modes.len() as u64 * 16
             + 64 * 8
@@ -431,17 +431,47 @@ pub fn method_toggle_system(
     }
 }
 
-/// Marks a manual G transition after the large method-toggle system has run.
-/// Keeping this separate avoids increasing that system's Bevy parameter list.
-pub fn preserve_inversion_results_on_manual_method_switch(
+pub fn reset_inversion_on_method_change(
     active_method: Res<ActiveGravityMethod>,
     performance: Res<PerformanceComparisonState>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    if active_method.is_changed() && !performance.active {
-        inversion.preserve_results_on_next_epoch = true;
+    if !active_method.is_changed() || performance.active {
+        return;
+    }
+    inversion.runtime_epoch = 0;
+    inversion.capture_epoch = 0;
+    inversion.last_capture_request_id = None;
+    inversion.wall_elapsed_seconds = 0.0;
+    inversion.raw_samples.clear();
+    inversion.knots.clear();
+    inversion.capture_id = None;
+    inversion.capture_source_hash = 0;
+    inversion.certified_sample_streak = 0;
+    inversion.certified_segment_id = None;
+    inversion.ready = false;
+    inversion.knots_edited = false;
+    inversion.inverted = false;
+    inversion.selected = None;
+    inversion.edit_buffer.clear();
+    inversion.error = None;
+    inversion.optimizer = None;
+    inversion.batch_capture_id = None;
+    inversion.results = std::array::from_fn(|_| None);
+    inversion.displayed_density = None;
+    inversion.preserve_truth_track =
+        !inversion.truth_knots.is_empty() || !inversion.truth_orbit.is_empty();
+    if *active_method == ActiveGravityMethod::HomogeneousWerner {
+        inversion.knots.clear();
+        inversion.capture_id = None;
+        inversion.ready = false;
+    } else if !inversion.truth_knots.is_empty() {
+        inversion.knots = inversion.truth_knots.clone();
+        inversion.capture_id = inversion.truth_capture_id;
+        inversion.ready = true;
     }
 }
+
 pub fn update_hint_on_mode_change(
     active_method: Res<ActiveGravityMethod>,
     mode: Res<CameraMode>,

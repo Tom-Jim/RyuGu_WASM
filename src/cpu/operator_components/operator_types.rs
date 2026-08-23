@@ -144,7 +144,7 @@ pub fn build_eq106_operator_tensor_system(
     mut commands: Commands,
     existing: Option<Res<Eq106OperatorTensorResource>>,
     attempted: Option<Res<Eq106OperatorBuildAttempted>>,
-    source_data: Option<Res<crate::cpu::curved_arc::Eq106SourceData>>,
+    source_data: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     active_method: Res<ActiveGravityMethod>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {

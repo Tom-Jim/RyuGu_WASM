@@ -35,7 +35,8 @@ while the Werner–Scheeres model is a homogeneous reference.
 |---|---|---|---|
 | **GPU Radial Analytic** | The star-shaped mesh is divided into four equal-volume radial layers per angular cell; layer masses are integrated analytically. | WebGPU evaluates the field with eight-node Gauss–Legendre radial quadrature. | A direct heterogeneous reference. The mass integration is analytic, but the field evaluation is quadrature rather than a closed-form solver. |
 | **GPU Werner Polyhedron** | CPU constructs oriented faces, shared edges, and geometric dyads. | WebGPU evaluates the homogeneous closed-polyhedron formula. | Homogeneous only; unusable boundary or non-manifold edge records are skipped and reported during preprocessing. |
-| **Eq.106 Adaptive Curved-Arc** | A mass-preserving `4 × 8 × 32` source tensor, special-function tables, and trajectory segments are prepared. | WebGPU builds and caches transformed line spectra, then evaluates acceleration, potential, and a local Jacobian. | Experimental hybrid realization of Eq.106; most useful when many samples reuse a geometrically guarded near-straight segment. |
+| **Eq.106 Adaptive Curved-Arc** | The shared `4 × 8 × 32 = 1024` source aggregation, special-function tables, and trajectory segments are prepared. | WebGPU builds and caches transformed line spectra, then evaluates acceleration, potential, and a local Jacobian. | Experimental hybrid realization of Eq.106; most useful when many samples reuse a geometrically guarded near-straight segment. |
+| **Common source discretization** | The original `786432` radial records are mass-preservingly aggregated into the same `1024` point sources. | Radial, MMFFT, and FMM consume this identical source set for method-to-method comparisons. | Werner remains a separate homogeneous closed-polyhedron reference. |
 | **GPU MMFFT + VRAM Compression** | CPU performs a zero-padded Newton-kernel FFT convolution on two grids (`64³` and `16³`). | WebGPU samples the cached potential fields with tricubic interpolation and differentiates the interpolant. | Fast repeated sampling inside the grids; accuracy depends on grid spacing, interpolation, and boundary coverage. |
 | **GPU Fast Multipole Method** | CPU builds a fixed-depth octree and order-two multipole hierarchy. | WebGPU traverses the tree; accepted far cells use multipoles, while non-separated leaves use direct P2P. | Experimental single-target FMM path, not a replacement for a mature multi-target FMM library. |
 
@@ -259,13 +260,20 @@ Eq.106 also compares its curve-integrated potential change with a truncated Four
 
 ### Synthetic density inversion
 
-The interactive inversion is deliberately separate from the Eq.106 spectral operator:
+The interactive inversion freezes one immutable capture before comparing methods:
 
-- `16` editable position and velocity knots define a continuous quintic-Hermite track;
-- the track is sampled at `241` points;
+- `16` editable position, velocity, orientation, and time knots define a continuous quintic-Hermite track sampled at the same `241` points by every method;
+- one `capture_id` identifies that complete sample array, and the UI rejects result rows from a different capture;
+- the synthetic observation vector is generated once from the logarithmic density law `rho(r)=C ln(1+r/epsilon)` through the radial forward history; Radial, Eq.106, MMFFT, and FMM reuse this frozen truth track rather than generating four different observations;
 - the interior is represented by a `4³` Cartesian grid (`56` occupied voxels for the bundled model);
-- a voxelized Newton sensitivity matrix is precomputed along the track;
-- simulated annealing minimizes trajectory mismatch together with mass, smoothness, radial-symmetry, and weak uniform-prior terms.
+- each inverse backend supplies a unit-density response matrix `A` for the same 723-component acceleration vector; forward models never predict density directly, and Clarabel solves for the 56 density variables;
+- Eq.106 builds its 56 unit-density voxel columns with the GPU spectral forward pipeline and caches the readback matrix;
+- MMFFT builds each column with its real CIC deposition, zero-padded FFT convolution, hierarchy selection, and tricubic derivative rather than a softened Newton substitute;
+- Rust assembles the shared `56 × 56` convex QP and Clarabel solves it with exact total-mass equality, density bounds, spatial and radial smoothness, and a weak uniform prior.
+- Radial is the forward-only truth generator for the shared long observation orbit; it is intentionally absent from the inversion button and fit history alongside Werner.
+- Werner remains a forward-only homogeneous polyhedron diagnostic and is intentionally absent from the inversion button and fit history.
+- switching methods clears the current inversion view but retains each method's highest historical fit; an equal fit replaces the saved row only when the complete inversion is faster;
+- each history row reports `fit`, density `RMSE`, and wall-clock inversion time from the button request through method-specific sensitivity construction/readback and the Clarabel solve.
 
 The reported `fit` is a synthetic volume-weighted density score against the known reference model. It is not a posterior probability, confidence level, or real-observation accuracy. One external trajectory cannot uniquely recover an arbitrary three-dimensional density field without assumptions and regularization.
 
@@ -389,7 +397,7 @@ The expected Eq.106 advantage, if confirmed, is narrow but testable: a fixed bod
 - MMFFT accuracy is limited by finite grids and interpolation. Its FFT field is built on the CPU and only sampled on the GPU at runtime.
 - The FMM implementation uses a fixed depth, a strict opening criterion, and order-two multipoles; it is an experimental comparison path.
 - GPU arithmetic is primarily `f32`, and GPU readback is asynchronous.
-- The density inversion is regularized and non-unique; it currently uses a voxel Newton sensitivity operator rather than an Eq.106 adjoint.
+- The density inversion is regularized and non-unique. Eq.106 and MMFFT use method-consistent unit-voxel forward responses, while the shared frozen trajectory and `capture_id` contract prevent cross-capture comparisons.
 - Numerical agreement in this repository does not establish novelty, general convergence, or mission readiness. Those require literature review, independent derivation review, convergence studies, and reproducible external benchmarks.
 
 ## License

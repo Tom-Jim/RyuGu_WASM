@@ -1,6 +1,5 @@
 //! GPU backends and render-world compute adapters.
 
-pub(crate) mod benchmark;
 pub(crate) mod eq106;
 pub(crate) mod fmm;
 pub(crate) mod mmfft;

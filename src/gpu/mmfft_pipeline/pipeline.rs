@@ -265,44 +265,125 @@ fn build_level(records: &[(DVec3, f64)], half_extent: f64, n: usize) -> Vec<[f32
     field
 }
 
+fn cubic_weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [
+        -0.5 * t + t2 - 0.5 * t3,
+        1.0 - 2.5 * t2 + 1.5 * t3,
+        0.5 * t + 2.0 * t2 - 1.5 * t3,
+        -0.5 * t2 + 0.5 * t3,
+    ]
+}
+
+fn cubic_derivatives(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    [
+        -0.5 + 2.0 * t - 1.5 * t2,
+        -5.0 * t + 4.5 * t2,
+        0.5 + 4.0 * t - 4.5 * t2,
+        -t + 1.5 * t2,
+    ]
+}
+
+fn sample_mmfft_grid(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: usize) -> Vec3 {
+    let spacing = 2.0 * half_extent / n as f32;
+    let coordinate = (position + Vec3::splat(half_extent)) / spacing - Vec3::splat(0.5);
+    let base_floor = coordinate.floor().clamp(Vec3::ONE, Vec3::splat((n - 3) as f32));
+    let fraction = (coordinate - base_floor).clamp(Vec3::ZERO, Vec3::ONE);
+    let base = base_floor.as_uvec3() - UVec3::ONE;
+    let wx = cubic_weights(fraction.x);
+    let wy = cubic_weights(fraction.y);
+    let wz = cubic_weights(fraction.z);
+    let dx = cubic_derivatives(fraction.x);
+    let dy = cubic_derivatives(fraction.y);
+    let dz = cubic_derivatives(fraction.z);
+    let mut gradient = Vec3::ZERO;
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                let p = field[grid_index(
+                    base.x as usize + x,
+                    base.y as usize + y,
+                    base.z as usize + z,
+                    n,
+                )][3];
+                gradient += p / spacing
+                    * Vec3::new(
+                        dx[x] * wy[y] * wz[z],
+                        dy[y] * wx[x] * wz[z],
+                        dz[z] * wx[x] * wy[y],
+                    );
+            }
+        }
+    }
+    gradient
+}
+
+/// Builds method-consistent MMFFT unit-density voxel columns using the same
+/// CIC deposition, zero-padded convolution, and tricubic derivative as WGSL.
+pub(crate) fn voxel_basis_sensitivities(
+    voxels: &[InvertedDensityVoxel],
+    samples: &[TrajectoryInversionKnot],
+) -> Vec<Vec3> {
+    let mut columns = Vec::with_capacity(voxels.len());
+    for voxel in voxels {
+        let records = [(voxel.center.as_dvec3(), voxel.volume as f64)];
+        let levels = LEVEL_GRID_SIZES
+            .into_iter()
+            .zip(LEVEL_HALF_EXTENTS)
+            .map(|(n, half)| (build_level(&records, half, n), n, half as f32))
+            .collect::<Vec<_>>();
+        let column = samples
+            .iter()
+            .map(|sample| {
+                let body_position = sample.body_rotation.inverse() * sample.position;
+                let body_acceleration = levels
+                    .iter()
+                    .find_map(|(field, n, half)| {
+                        let margin = 2.0 * *half / *n as f32;
+                        (body_position.abs().max_element() <= *half - margin)
+                            .then(|| sample_mmfft_grid(field, body_position, *half, *n))
+                    })
+                    .unwrap_or_else(|| {
+                        let displacement = voxel.center - body_position;
+                        displacement * (G * voxel.volume / displacement.length().powi(3))
+                    });
+                sample.body_rotation * body_acceleration
+            })
+            .collect::<Vec<_>>();
+        columns.push(column);
+    }
+    let mut row_major = Vec::with_capacity(samples.len() * voxels.len());
+    for sample in 0..samples.len() {
+        for column in &columns {
+            row_major.push(column[sample]);
+        }
+    }
+    row_major
+}
+
 pub fn build_mmfft_compressed_source_system(
     mut commands: Commands,
-    radial: Option<Res<RadialGravitySource>>,
+    aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     existing: Option<Res<MmfftCompressedSource>>,
     active_method: Res<ActiveGravityMethod>,
 ) {
     if existing.is_some() || *active_method != ActiveGravityMethod::MmfftCompressed {
         return;
     }
-    let Some(radial) = radial else { return };
-    if radial.bytes.len() < 32 {
+    let Some(aggregated) = aggregated else {
+        return;
+    };
+    if aggregated.sources.is_empty() {
         return;
     }
 
-    let mut records = Vec::with_capacity(radial.count as usize);
-    let mut total_mass = 0.0_f64;
-    for chunk in radial.bytes.chunks_exact(32) {
-        let direction = DVec3::new(
-            read_f32(chunk, 0) as f64,
-            read_f32(chunk, 4) as f64,
-            read_f32(chunk, 8) as f64,
-        )
-        .normalize_or_zero();
-        let solid_angle = read_f32(chunk, 12).max(0.0);
-        let inner = read_f32(chunk, 16).max(0.0);
-        let outer = read_f32(chunk, 20).max(inner);
-        let density = read_f32(chunk, 24).max(0.0);
-        if outer <= inner || density <= 0.0 || solid_angle <= 0.0 {
-            continue;
-        }
-        let mass =
-            density as f64 * solid_angle as f64 * ((outer as f64).powi(3) - (inner as f64).powi(3))
-                / 3.0;
-        let radius = 0.75 * ((outer as f64).powi(4) - (inner as f64).powi(4))
-            / ((outer as f64).powi(3) - (inner as f64).powi(3)).max(f64::MIN_POSITIVE);
-        records.push((direction * radius, mass));
-        total_mass += mass;
-    }
+    let records = aggregated
+        .sources
+        .iter()
+        .map(|source| (source.position, source.mass))
+        .collect::<Vec<_>>();
     let mut bytes =
         Vec::with_capacity(LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() * 16);
     for (grid_size, half_extent) in LEVEL_GRID_SIZES.into_iter().zip(LEVEL_HALF_EXTENTS) {
@@ -313,8 +394,8 @@ pub fn build_mmfft_compressed_source_system(
         }
     }
     info!(
-        "[mmfft] {} radial records -> nested {:?} grids (zero-padded 3D FFT/IFFT, {} bytes)",
-        radial.count,
+        "[mmfft] {} common sources -> nested {:?} grids (zero-padded 3D FFT/IFFT, {} bytes)",
+        records.len(),
         LEVEL_GRID_SIZES,
         bytes.len()
     );
@@ -323,12 +404,8 @@ pub fn build_mmfft_compressed_source_system(
         grid_sizes: LEVEL_GRID_SIZES.map(|value| value as u32),
         level_count: LEVEL_HALF_EXTENTS.len() as u32,
         half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
-        total_mass: total_mass as f32,
+        total_mass: aggregated.total_mass as f32,
     });
-}
-
-fn read_f32(bytes: &[u8], offset: usize) -> f32 {
-    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
 fn poll_mmfft_readback(

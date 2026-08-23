@@ -63,7 +63,7 @@ pub enum Eq106KernelStatus {
 }
 
 #[derive(Resource, Default)]
-pub struct Eq106SourceData {
+pub struct AggregatedGravitySource {
     pub sources: Vec<Eq106PointSource>,
     /// Eq. (81) density modes packed as `(cylindrical_radius, z, re, im)`;
     /// records are ring-major with modes `0..=16`.
@@ -225,19 +225,17 @@ impl CurvedArcPlannerState {
 const EQ106_AZIMUTH_BINS: usize = 32;
 const EQ106_POLAR_BINS: usize = 8;
 const EQ106_RADIAL_BINS: usize = 4;
-const EQ106_SOURCE_BUDGET: usize = EQ106_AZIMUTH_BINS * EQ106_POLAR_BINS * EQ106_RADIAL_BINS;
+const AGGREGATED_SOURCE_COUNT: usize =
+    EQ106_AZIMUTH_BINS * EQ106_POLAR_BINS * EQ106_RADIAL_BINS;
 
-/// Decodes a bounded, mass-preserving quadrature view of the radial density
-/// records. The full GPU source remains authoritative for the radial method;
-/// this independent view exists solely to certify the complex-frequency
-/// Equation (106) operator before it is allowed to drive physics.
-pub fn build_eq106_source_system(
+/// Aggregates every radial layer into the common mass-preserving point set
+/// consumed by Radial, Eq.106, MMFFT, and FMM.
+pub fn build_aggregated_gravity_source_system(
     mut commands: Commands,
     radial: Option<Res<RadialGravitySource>>,
-    existing: Option<Res<Eq106SourceData>>,
-    active_method: Res<ActiveGravityMethod>,
+    existing: Option<Res<AggregatedGravitySource>>,
 ) {
-    if existing.is_some() || *active_method != ActiveGravityMethod::CurvedArcEq106 {
+    if existing.is_some() {
         return;
     }
     let Some(radial) = radial else { return };
@@ -245,8 +243,8 @@ pub fn build_eq106_source_system(
     if record_count == 0 {
         return;
     }
-    let mut bin_masses = [0.0_f64; EQ106_SOURCE_BUDGET];
-    let mut bin_moments = [DVec3::ZERO; EQ106_SOURCE_BUDGET];
+    let mut bin_masses = [0.0_f64; AGGREGATED_SOURCE_COUNT];
+    let mut bin_moments = [DVec3::ZERO; AGGREGATED_SOURCE_COUNT];
     let mut total_mass = 0.0;
     let mut radius = 0.0_f64;
     for (record_index, chunk) in radial.bytes.chunks_exact(32).enumerate() {
@@ -342,7 +340,12 @@ pub fn build_eq106_source_system(
             }
         }
     }
-    commands.insert_resource(Eq106SourceData {
+    info!(
+        "[gravity] aggregated {} radial records into {} common sources",
+        record_count,
+        sources.len(),
+    );
+    commands.insert_resource(AggregatedGravitySource {
         sources,
         fourier_modes,
         total_mass,
@@ -396,7 +399,7 @@ pub fn monitor_curved_arc_system(
     active_method: Res<ActiveGravityMethod>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
     eq106_history: Option<Res<Eq106GpuHistory>>,
-    source_data: Option<Res<Eq106SourceData>>,
+    source_data: Option<Res<AggregatedGravitySource>>,
     clock: Res<SimulationClock>,
     cassini: Query<&OrbitHistory, With<CassiniMarker>>,
     ryugu: Query<&Transform, With<RyuguMarker>>,

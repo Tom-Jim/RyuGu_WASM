@@ -1,6 +1,6 @@
 fn extract_eq106_input(
     mut extracted: ResMut<ExtractedEq106Input>,
-    source: Extract<Option<Res<Eq106SourceData>>>,
+    source: Extract<Option<Res<AggregatedGravitySource>>>,
     operator_tensor: Extract<Option<Res<Eq106OperatorTensorResource>>>,
     active: Extract<Res<ActiveGravityMethod>>,
     clock: Extract<Res<SimulationClock>>,
@@ -8,6 +8,7 @@ fn extract_eq106_input(
     benchmark: Extract<Res<GravityBenchmarkTrajectory>>,
     inversion: Extract<Res<TrajectoryInversionState>>,
     batch_result: Extract<Res<Eq106TrajectoryBatchResult>>,
+    sensitivity: Extract<Res<Eq106SensitivityMatrix>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
@@ -47,6 +48,7 @@ fn extract_eq106_input(
     extracted.target_snapshots.clear();
     extracted.batch_elements.clear();
     extracted.batch_capture_id = None;
+    extracted.sensitivity_column = None;
     extracted.source_count = source.sources.len() as u32;
     extracted.density_mode_count = source.fourier_modes.len() as u32;
     extracted.radius = source.radius as f32;
@@ -77,7 +79,60 @@ fn extract_eq106_input(
         .then_some(inversion.capture_id)
         .flatten()
         .filter(|capture_id| batch_result.capture_id != Some(*capture_id));
-    if let Some(capture_id) = pending_benchmark_id
+    let pending_sensitivity = inversion.optimizer.as_ref().and_then(|job| {
+        (job.method == ActiveGravityMethod::CurvedArcEq106
+            && sensitivity.capture_id == Some(job.capture_id)
+            && sensitivity.columns.len() < job.voxels.len())
+            .then_some((job.capture_id, sensitivity.columns.len(), job))
+    });
+    if let Some((capture_id, column, job)) = pending_sensitivity {
+        let samples = crate::cpu::inversion::sample_frozen_trajectory(&inversion.knots)
+            .unwrap_or_default();
+        if samples.len() >= 2 {
+            extracted.batch_capture_id = Some(capture_id);
+            extracted.sensitivity_column = Some(column as u32);
+            let mut positions = Vec::with_capacity(samples.len());
+            let mut velocities = Vec::with_capacity(samples.len());
+            for (index, sample) in samples.iter().enumerate() {
+                let rotation = sample.body_rotation;
+                let body_position = rotation.inverse() * sample.position;
+                let body_velocity = rotation.inverse()
+                    * (sample.velocity - angular_velocity_world.cross(sample.position));
+                positions.push(body_position);
+                velocities.push(body_velocity);
+                for value in [body_position.x, body_position.y, body_position.z, 0.0] {
+                    extracted.target_bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                extracted.target_snapshots.push(GravityRequestSnapshot {
+                    request_id: index as u64,
+                    epoch: inversion.capture_epoch,
+                    simulation_time_seconds: sample.simulation_time_seconds,
+                    body_position,
+                    ryugu_transform: Transform::from_rotation(rotation),
+                    probe_position: sample.position,
+                    probe_velocity: sample.velocity,
+                });
+            }
+            extracted.probe = positions[0];
+            extracted.velocity = velocities[0];
+            extracted.snapshot = extracted.target_snapshots.first().cloned();
+            extracted.batch_elements = build_trajectory_batch_elements(
+                &positions,
+                &velocities,
+                extracted.radius,
+                extracted.certified_line_limit,
+            );
+            if let Some(voxel) = job.voxels.get(column) {
+                let mut bytes = Vec::with_capacity(16);
+                for value in [voxel.center.x, voxel.center.y, voxel.center.z, voxel.volume] {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                extracted.sources = Some(bytes);
+                extracted.source_count = 1;
+                extracted.source_hash = capture_id ^ (column as u64 + 1).rotate_left(29);
+            }
+        }
+    } else if let Some(capture_id) = pending_benchmark_id
         && benchmark.samples.len() >= 2
     {
         extracted.batch_capture_id = Some(capture_id);
@@ -171,7 +226,9 @@ fn extract_eq106_input(
     // cached local spectrum/Jacobian rather than consuming a GPU-predicted
     // future trajectory as if it were measured state.
     let source_hash = source.source_hash;
-    if extracted.sources.is_none() || extracted.source_hash != source_hash {
+    if extracted.sensitivity_column.is_none()
+        && (extracted.sources.is_none() || extracted.source_hash != source_hash)
+    {
         let mut bytes = Vec::with_capacity(source.sources.len() * 16);
         for item in &source.sources {
             for value in [
@@ -192,7 +249,9 @@ fn extract_eq106_input(
         }
         extracted.fourier_modes = Some(mode_bytes);
     }
-    extracted.source_hash = source_hash;
+    if extracted.sensitivity_column.is_none() {
+        extracted.source_hash = source_hash;
+    }
     if extracted.operator_tensor.is_none() {
         extracted.operator_tensor = operator_tensor
             .as_ref()
@@ -289,7 +348,8 @@ fn dispatch_eq106_single_target(
     }
     inner.last_submitted = Some(key);
     render_queue.write_buffer(&inner.targets, 0, &extracted.target_bytes);
-    let evaluate_dual_certificate = cfg!(feature = "eq106-dual-certificate")
+    let evaluate_dual_certificate = extracted.sensitivity_column.is_none()
+        && cfg!(feature = "eq106-dual-certificate")
         && inner
             .dual_certificate_frame
             .is_multiple_of(DUAL_CERTIFICATE_CADENCE);
@@ -407,6 +467,7 @@ fn dispatch_eq106_single_target(
     let map_staging = staging.clone();
     let snapshots = extracted.target_snapshots.clone();
     let batch_capture_id = extracted.batch_capture_id;
+    let sensitivity_column = extracted.sensitivity_column;
     let output_size = inner.output_size as usize;
     let target_count = inner.target_count;
     let timestamp_period_ns = render_queue.get_timestamp_period();
@@ -442,6 +503,7 @@ fn dispatch_eq106_single_target(
                         partial_sums: values,
                         snapshots,
                         batch_capture_id,
+                        sensitivity_column,
                         timings,
                     });
                 }
@@ -481,4 +543,3 @@ fn report_eq106_pipeline_errors(
         }
     }
 }
-

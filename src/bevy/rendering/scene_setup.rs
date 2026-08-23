@@ -1,5 +1,5 @@
 use crate::interface::components::*;
-use crate::cpu::curved_arc::Eq106SourceData;
+use crate::cpu::curved_arc::AggregatedGravitySource;
 use crate::cpu::inversion::{
     quintic_knot_accelerations, quintic_segment_position_acceleration,
 };
@@ -85,18 +85,23 @@ pub fn capture_trajectory_inversion_system(
     active_method: Res<ActiveGravityMethod>,
     radial_history: Option<Res<RadialGravityHistory>>,
     werner_history: Option<Res<WernerGravityHistory>>,
-    eq106_history: Option<Res<Eq106GpuHistory>>,
-    mmfft_history: Option<Res<MmfftCompressedHistory>>,
-    fmm_history: Option<Res<FmmGravityHistory>>,
-    eq106_source: Option<Res<Eq106SourceData>>,
+    eq106_source: Option<Res<AggregatedGravitySource>>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    if inversion.capture_epoch != clock.epoch {
+    if inversion.runtime_epoch != clock.epoch {
+        let preserve_truth_track = inversion.preserve_truth_track;
+        inversion.preserve_truth_track = false;
+        inversion.runtime_epoch = clock.epoch;
         inversion.capture_epoch = clock.epoch;
         inversion.last_capture_request_id = None;
         inversion.wall_elapsed_seconds = 0.0;
         inversion.raw_samples.clear();
         inversion.knots.clear();
+        if !preserve_truth_track {
+            inversion.truth_knots.clear();
+            inversion.truth_capture_id = None;
+            inversion.truth_orbit.clear();
+        }
         inversion.capture_id = None;
         inversion.capture_source_hash =
             eq106_source.as_ref().map_or(0, |source| source.source_hash);
@@ -108,19 +113,14 @@ pub fn capture_trajectory_inversion_system(
         inversion.selected = None;
         inversion.edit_buffer.clear();
         inversion.error = None;
-        inversion.annealing = None;
-        inversion.pending_inversion_methods.clear();
+        inversion.optimizer = None;
         inversion.batch_capture_id = None;
         inversion.displayed_density = None;
-        if inversion.preserve_results_on_next_epoch {
-            // G deliberately changes the forward method and therefore the
-            // epoch. Keep completed slots as a fill-in history, while each
-            // row retains its capture/epoch identity for honest comparison.
-            inversion.preserve_results_on_next_epoch = false;
-        } else {
-            // Probe edits, resets, and other physical changes invalidate the
-            // whole comparison set; never mix those captures silently.
-            inversion.results = std::array::from_fn(|_| None);
+        inversion.results = std::array::from_fn(|_| None);
+        if preserve_truth_track && !inversion.truth_knots.is_empty() {
+            inversion.knots = inversion.truth_knots.clone();
+            inversion.capture_id = inversion.truth_capture_id;
+            inversion.ready = true;
         }
     }
     if !inversion.ready
@@ -131,24 +131,16 @@ pub fn capture_trajectory_inversion_system(
     if inversion.ready || clock.elapsed_seconds <= 0.0 {
         return;
     }
-    let sample = match *active_method {
-        ActiveGravityMethod::RadialAnalytic => radial_history
+    // The synthetic inverse observes the same logarithmic-density radial truth
+    // track for every non-Werner method. Werner remains forward-only.
+    let sample = if *active_method == ActiveGravityMethod::HomogeneousWerner {
+        werner_history
             .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch)),
-        ActiveGravityMethod::HomogeneousWerner => werner_history
+            .and_then(|history| history.0.latest_for_epoch(clock.epoch))
+    } else {
+        radial_history
             .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch)),
-        ActiveGravityMethod::CurvedArcEq106 => eq106_history.as_ref().and_then(|history| {
-            history
-                .0
-                .completed_at_or_before(clock.epoch, clock.elapsed_seconds)
-        }),
-        ActiveGravityMethod::MmfftCompressed => mmfft_history
-            .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch)),
-        ActiveGravityMethod::Fmm => fmm_history
-            .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch)),
+            .and_then(|history| history.0.latest_for_epoch(clock.epoch))
     };
     let Some(sample) = sample else {
         return;
@@ -243,6 +235,17 @@ pub fn capture_trajectory_inversion_system(
         });
     }
     inversion.knots = knots;
+    if *active_method != ActiveGravityMethod::HomogeneousWerner
+        && inversion.truth_knots.is_empty()
+    {
+        inversion.truth_knots = inversion.knots.clone();
+        inversion.truth_capture_id = Some(hash_trajectory_capture(&inversion.truth_knots));
+    }
+    if *active_method != ActiveGravityMethod::HomogeneousWerner
+        && !inversion.truth_knots.is_empty()
+    {
+        inversion.knots = inversion.truth_knots.clone();
+    }
     inversion.capture_id = Some(hash_trajectory_capture(&inversion.knots));
     inversion.ready = true;
     inversion.knots_edited = false;
@@ -364,7 +367,17 @@ pub fn render_gizmos_system(
         return;
     };
     for (ct, history) in cassini_query.iter() {
-        let pts: Vec<Vec3> = history.0.iter().copied().collect();
+        let pts: Vec<Vec3> = if *active_method != ActiveGravityMethod::HomogeneousWerner
+            && !inversion.truth_orbit.is_empty()
+        {
+            inversion.truth_orbit.clone()
+        } else if *active_method != ActiveGravityMethod::HomogeneousWerner
+            && !inversion.truth_knots.is_empty()
+        {
+            inversion.truth_knots.iter().map(|knot| knot.position).collect()
+        } else {
+            history.0.iter().copied().collect()
+        };
         let orbit_color = match *active_method {
             ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
             ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
@@ -397,14 +410,24 @@ pub fn render_gizmos_system(
             );
         }
     }
-    if inversion.inverted && inversion.knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT {
-        let Some(accelerations) = quintic_knot_accelerations(&inversion.knots) else {
+    let display_knots: &[TrajectoryInversionKnot] = if *active_method
+        != ActiveGravityMethod::HomogeneousWerner
+        && inversion.truth_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT
+    {
+        &inversion.truth_knots
+    } else if inversion.inverted {
+        &inversion.knots
+    } else {
+        &[]
+    };
+    if display_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT {
+        let Some(accelerations) = quintic_knot_accelerations(display_knots) else {
             return;
         };
         let mut curve = Vec::with_capacity((TRAJECTORY_INVERSION_SAMPLE_COUNT - 1) * 25 + 1);
         for index in 0..TRAJECTORY_INVERSION_SAMPLE_COUNT - 1 {
-            let start = inversion.knots[index];
-            let end = inversion.knots[index + 1];
+            let start = display_knots[index];
+            let end = display_knots[index + 1];
             for substep in 0..25 {
                 if index > 0 && substep == 0 {
                     continue;
@@ -422,7 +445,7 @@ pub fn render_gizmos_system(
             }
         }
         gizmos.linestrip(curve, Color::srgb(1.0, 0.16, 0.72));
-        for (index, knot) in inversion.knots.iter().enumerate() {
+        for (index, knot) in display_knots.iter().enumerate() {
             let hue = index as f32 / TRAJECTORY_INVERSION_SAMPLE_COUNT as f32;
             let color = Color::hsl(hue * 300.0 + 15.0, 0.9, 0.6);
             gizmos.sphere(knot.position, 16.0, color);
@@ -551,7 +574,7 @@ mod tests {
             capture_id: 1,
             source_hash: 2,
             capture_epoch: 3,
-            rng_seed: 4,
+            problem_id: 4,
             initial_objective: 1.0,
             data_error_scale: 1.0,
             density: 2.0,
@@ -560,6 +583,7 @@ mod tests {
             model_deviation: 0.0,
             model_fit: 1.0,
             objective_improvement: 0.0,
+            inversion_time_ms: 0.0,
             trajectory_samples: 17,
             iterations: 1,
             voxel_size: 2.0,
@@ -588,4 +612,3 @@ mod tests {
         assert!(marching_squares_segments(&uniform, &inside, 3, 0.5, true).is_empty());
     }
 }
-

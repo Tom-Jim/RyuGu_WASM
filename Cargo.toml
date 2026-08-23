@@ -19,12 +19,11 @@ required-features = ["regenerate-operators"]
 bevy = { version = "0.19.1", features = ["webgpu","debug"] }
 bevy_panorbit_camera = "0.35"
 bevy_framepace = { version = "0.22.0", default-features = false }
+clarabel = "0.11.1"
 wasm-bindgen = "0.2"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 bytemuck = "1"
 num-complex = "0.4"
-rand_chacha = "0.10"
-rand_core = "0.10"
 rustfft = "6"
 wgpu29 = { package = "wgpu", version = "=29.0.4" }
 

@@ -27,15 +27,14 @@ fn dispatch_eq106(
         .max()
         .unwrap_or(extracted.taylor_order);
     let element_capacity = extracted.batch_elements.len().max(1) as u32;
-    let timing_query_capacity = crate::gpu::benchmark::TIMESTAMP_STAGE_COUNT * element_capacity + 1;
     if buffers.0.as_ref().is_some_and(|inner| {
-        inner.source_hash != extracted.source_hash
+        inner.source_count != extracted.source_count
+            || inner.density_mode_count != extracted.density_mode_count
             || inner.taylor_order != buffer_taylor_order
             || inner.target_count != extracted.target_snapshots.len() as u32
             || inner.element_capacity != element_capacity
     }) {
-        // The source buffer is immutable in the render world. Rebuild the
-        // bind group when the mass-preserving radial source hash changes.
+        // Rebuild only when buffer capacities or binding shapes change.
         buffers.0 = None;
     }
     if buffers.0.is_none() {
@@ -56,7 +55,7 @@ fn dispatch_eq106(
         let sources = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_sources"),
             contents: source_bytes,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let quadrature_bytes = half_line_quadrature_bytes(0.5 * extracted.radius.max(1.0));
         let quadrature = render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -77,7 +76,7 @@ fn dispatch_eq106(
         let density_modes = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_density_fourier_modes"),
             contents: mode_bytes,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let targets = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_targets"),
@@ -99,26 +98,18 @@ fn dispatch_eq106(
         });
         let target_count = extracted.target_snapshots.len().max(1) as u32;
         let output_size = OUTPUT_BYTES * target_count as u64;
-        let timestamps_supported = render_device
-            .features()
-            .contains(WgpuFeatures::TIMESTAMP_QUERY);
-        let timing_query_set = timestamps_supported.then(|| {
-            render_device
-                .wgpu_device()
-                .create_query_set(&QuerySetDescriptor {
-                    label: Some("eq106_timestamps"),
-                    ty: QueryType::Timestamp,
-                    count: timing_query_capacity,
-                })
-        });
-        let timing_resolve = timestamps_supported.then(|| {
-            render_device.create_buffer(&BufferDescriptor {
-                label: Some("eq106_timestamp_resolve"),
-                size: timing_query_capacity as u64 * TIMESTAMP_BYTES,
-                usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        });
+        // Sensitivity construction submits 56 short-lived source variants.
+        // Reusing the compute buffers avoids deferred WebGPU allocations, and
+        // timing queries are intentionally reserved for runtime/benchmark work.
+        // Metal/WebGPU can advertise TIMESTAMP_QUERY while Dawn still cannot
+        // allocate the native sample buffer. A failed query-set allocation
+        // invalidates every following command buffer, so browser builds keep
+        // timestamp instrumentation disabled and use CPU readback timing.
+        // Timestamp query allocation is disabled completely. Do not leave a
+        // lazy create_query_set closure here: Dawn/Metal may reject the native
+        // sample buffer even when the feature bit is advertised.
+        let timing_query_set: Option<QuerySet> = None;
+        let timing_resolve: Option<Buffer> = None;
         let output = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_output"),
             size: output_size,
@@ -127,7 +118,7 @@ fn dispatch_eq106(
         });
         let staging = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_staging"),
-            size: output_size + timing_query_capacity as u64 * TIMESTAMP_BYTES,
+            size: output_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -209,6 +200,8 @@ fn dispatch_eq106(
             psi_operator,
             timing_query_set,
             timing_resolve,
+            source_count: extracted.source_count,
+            density_mode_count: extracted.density_mode_count,
             element_capacity,
             line_origin: extracted.probe,
             line_direction: extracted.velocity.normalize_or_zero(),
@@ -224,6 +217,20 @@ fn dispatch_eq106(
     }
 
     let inner = buffers.0.as_mut().expect("Eq106 GPU buffers initialized");
+    if inner.source_hash != extracted.source_hash {
+        let Some(source_bytes) = extracted.sources.as_ref() else {
+            return;
+        };
+        render_queue.write_buffer(&inner.sources, 0, source_bytes);
+        if extracted.sensitivity_column.is_none()
+            && let Some(mode_bytes) = extracted.fourier_modes.as_ref()
+        {
+            render_queue.write_buffer(&inner.density_modes, 0, mode_bytes);
+        }
+        inner.source_hash = extracted.source_hash;
+        inner.spectrum_ready = false;
+        inner.last_submitted = None;
+    }
     let Some(snapshot) = extracted.snapshot.as_ref() else {
         return;
     };
@@ -420,6 +427,7 @@ fn dispatch_eq106(
         let staging = inner.staging.clone();
         let map_staging = staging.clone();
         let snapshots = extracted.target_snapshots.clone();
+        let sensitivity_column = extracted.sensitivity_column;
         let output_size = inner.output_size as usize;
         let target_count = inner.target_count;
         let element_count = extracted.batch_elements.len() as u32;
@@ -456,6 +464,7 @@ fn dispatch_eq106(
                             partial_sums: values,
                             snapshots,
                             batch_capture_id: Some(capture_id),
+                            sensitivity_column,
                             timings,
                         });
                     }

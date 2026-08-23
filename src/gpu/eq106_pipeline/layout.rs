@@ -89,7 +89,6 @@ fn buffer_entry(binding: u32, ty: BufferBindingType) -> BindGroupLayoutEntry {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -177,6 +176,7 @@ mod tests {
             partial_sums,
             snapshots,
             batch_capture_id: Some(42),
+            sensitivity_column: None,
             timings: default(),
         };
 
