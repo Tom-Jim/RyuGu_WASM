@@ -217,13 +217,30 @@ fn dispatch_eq106(
     }
 
     let inner = buffers.0.as_mut().expect("Eq106 GPU buffers initialized");
+    let Some(snapshot) = extracted.snapshot.as_ref() else {
+        return;
+    };
+    if !extracted.sensitivity_sources.is_empty() {
+        dispatch_eq106_sensitivity_matrix(
+            inner,
+            line_samples,
+            assemble,
+            analytic,
+            evaluate,
+            &render_device,
+            &render_queue,
+            &extracted,
+            &channel,
+            snapshot,
+        );
+        return;
+    }
     if inner.source_hash != extracted.source_hash {
         let Some(source_bytes) = extracted.sources.as_ref() else {
             return;
         };
         render_queue.write_buffer(&inner.sources, 0, source_bytes);
-        if extracted.sensitivity_column.is_none()
-            && let Some(mode_bytes) = extracted.fourier_modes.as_ref()
+        if let Some(mode_bytes) = extracted.fourier_modes.as_ref()
         {
             render_queue.write_buffer(&inner.density_modes, 0, mode_bytes);
         }
@@ -231,9 +248,6 @@ fn dispatch_eq106(
         inner.spectrum_ready = false;
         inner.last_submitted = None;
     }
-    let Some(snapshot) = extracted.snapshot.as_ref() else {
-        return;
-    };
     if let Some(capture_id) = extracted.batch_capture_id
         && !extracted.batch_elements.is_empty()
     {
@@ -290,6 +304,7 @@ fn dispatch_eq106(
                 extracted.density_mode_count,
                 inner.segment_id.wrapping_add(element_index as u32 + 1),
                 evaluate_dual_certificate && element.target_offset == 0,
+                false,
                 element.target_count,
                 element.target_offset,
             );
@@ -427,7 +442,6 @@ fn dispatch_eq106(
         let staging = inner.staging.clone();
         let map_staging = staging.clone();
         let snapshots = extracted.target_snapshots.clone();
-        let sensitivity_column = extracted.sensitivity_column;
         let output_size = inner.output_size as usize;
         let target_count = inner.target_count;
         let element_count = extracted.batch_elements.len() as u32;
@@ -456,6 +470,8 @@ fn dispatch_eq106(
                             cpu_readback_wait_ms,
                             target_count,
                             spectral_element_count: element_count,
+                            dispatch_count: 1,
+                            spectrum_rebuild_count: element_count,
                             ..default()
                         }
                     };
@@ -464,7 +480,9 @@ fn dispatch_eq106(
                             partial_sums: values,
                             snapshots,
                             batch_capture_id: Some(capture_id),
-                            sensitivity_column,
+                            sensitivity_column_count: 0,
+                            sensitivity_source_hash: 0,
+                            sensitivity_configuration_hash: 0,
                             timings,
                         });
                     }

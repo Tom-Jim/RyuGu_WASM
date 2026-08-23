@@ -5,12 +5,13 @@
 // tessellation of the actual Ryugu shape. Each method's sensitivity along the
 // complete quintic Hermite trajectory is precomputed once; the optimizer then
 // changes individual voxel densities subject to data, total-mass, smoothness,
-// and weak prior terms. Kinematic acceleration comes from the interpolated
-// trajectory itself; captured acceleration from a previously selected method
-// and the reference density used for validation are never inverse inputs.
+// and weak prior terms. The observation vector is regenerated at every dense
+// trajectory sample by an f64 reference point-source evaluator; captured
+// acceleration from a previously selected method is never an inverse input.
 
 use crate::interface::components::*;
 use crate::bevy_app::ui::TrajectoryInversionButton;
+use crate::cpu::curved_arc::AggregatedGravitySource;
 use bevy::math::DVec3;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -24,11 +25,15 @@ const EXPECTED_VOXEL_COUNT: usize = 56;
 /// Quintic Hermite is evaluated throughout every knot interval. The sixteen
 /// controls therefore produce 15 * 16 + 1 = 241 trajectory observations.
 const TRAJECTORY_SAMPLES_PER_SEGMENT: usize = 16;
+const HOLDOUT_SAMPLES_PER_SEGMENT: usize = 8;
 const QP_SOLVE_COUNT: u32 = 1;
 const MASS_WEIGHT: f64 = 25.0;
 const SMOOTHNESS_WEIGHT: f64 = 0.02;
 const RADIAL_SYMMETRY_WEIGHT: f64 = 0.15;
 const PRIOR_WEIGHT: f64 = 0.000_1;
+const OBSERVATION_NOISE_FRACTION: f32 = 1.0e-3;
+const OBSERVATION_NOISE_FLOOR: f32 = 1.0e-12;
+const OBSERVATION_NOISE_REALIZATIONS: usize = 3;
 
 #[derive(Clone, Copy, Default)]
 struct VoxelAccumulator {
@@ -203,14 +208,14 @@ pub(crate) fn quintic_knot_accelerations(knots: &[TrajectoryInversionKnot]) -> O
     Some(result)
 }
 
-/// Position and inertial acceleration of one quintic Hermite segment.
+/// Position, inertial velocity, and acceleration of one quintic Hermite segment.
 pub(crate) fn quintic_segment_position_acceleration(
     start: TrajectoryInversionKnot,
     end: TrajectoryInversionKnot,
     start_acceleration: Vec3,
     end_acceleration: Vec3,
     u: f32,
-) -> Option<(Vec3, Vec3)> {
+) -> Option<(Vec3, Vec3, Vec3)> {
     let duration = (end.simulation_time_seconds - start.simulation_time_seconds) as f32;
     if !duration.is_finite() || duration <= f32::EPSILON {
         return None;
@@ -235,9 +240,16 @@ pub(crate) fn quintic_segment_position_acceleration(
         - (start_acceleration - end_acceleration) * (0.5 * h2);
     let u = u.clamp(0.0, 1.0);
     let position = ((((c5 * u + c4) * u + c3) * u + c2) * u + c1) * u + c0;
+    let velocity = (c1
+        + c2 * (2.0 * u)
+        + c3 * (3.0 * u * u)
+        + c4 * (4.0 * u * u * u)
+        + c5 * (5.0 * u * u * u * u))
+        / duration;
     let acceleration =
         (c2 * 2.0 + c3 * (6.0 * u) + c4 * (12.0 * u * u) + c5 * (20.0 * u * u * u)) / h2;
-    (position.is_finite() && acceleration.is_finite()).then_some((position, acceleration))
+    (position.is_finite() && velocity.is_finite() && acceleration.is_finite())
+        .then_some((position, velocity, acceleration))
 }
 
 /// Expands the immutable sixteen-knot capture into the exact sample array
@@ -245,18 +257,28 @@ pub(crate) fn quintic_segment_position_acceleration(
 pub(crate) fn sample_frozen_trajectory(
     knots: &[TrajectoryInversionKnot],
 ) -> Option<Vec<TrajectoryInversionKnot>> {
+    sample_frozen_trajectory_with_subdivisions(knots, TRAJECTORY_SAMPLES_PER_SEGMENT)
+}
+
+pub(crate) fn sample_frozen_trajectory_with_subdivisions(
+    knots: &[TrajectoryInversionKnot],
+    subdivisions: usize,
+) -> Option<Vec<TrajectoryInversionKnot>> {
+    if subdivisions == 0 {
+        return None;
+    }
     let accelerations = quintic_knot_accelerations(knots)?;
     let mut samples = Vec::with_capacity(
-        (knots.len().saturating_sub(1)) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1,
+        (knots.len().saturating_sub(1)) * subdivisions + 1,
     );
     for segment in 0..knots.len().saturating_sub(1) {
         let start = knots[segment];
         let end = knots[segment + 1];
         let duration = (end.simulation_time_seconds - start.simulation_time_seconds) as f32;
         let first_sample = usize::from(segment > 0);
-        for sample in first_sample..=TRAJECTORY_SAMPLES_PER_SEGMENT {
-            let u = sample as f32 / TRAJECTORY_SAMPLES_PER_SEGMENT as f32;
-            let (position, acceleration) = quintic_segment_position_acceleration(
+        for sample in first_sample..=subdivisions {
+            let u = sample as f32 / subdivisions as f32;
+            let (position, velocity, acceleration) = quintic_segment_position_acceleration(
                 start,
                 end,
                 accelerations[segment],
@@ -265,7 +287,7 @@ pub(crate) fn sample_frozen_trajectory(
             )?;
             samples.push(TrajectoryInversionKnot {
                 position,
-                velocity: start.velocity.lerp(end.velocity, u),
+                velocity,
                 simulation_time_seconds: start.simulation_time_seconds
                     + duration as f64 * u as f64,
                 baseline_acceleration: acceleration,
@@ -276,74 +298,40 @@ pub(crate) fn sample_frozen_trajectory(
     Some(samples)
 }
 
-fn build_observations_and_sensitivities(
+fn holdout_frozen_trajectory(
     knots: &[TrajectoryInversionKnot],
-    voxels: &[InvertedDensityVoxel],
-) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
-    if knots.len() < 2 {
-        return None;
-    }
-    let sample_count = (knots.len() - 1) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1;
-    let mut observations = Vec::with_capacity(sample_count);
-    let mut sensitivities = Vec::with_capacity(sample_count * voxels.len());
-    let sensitivity_at = |knot: TrajectoryInversionKnot, voxel: &InvertedDensityVoxel| {
-        let displacement = knot.body_rotation * voxel.center - knot.position;
-        displacement * (G * voxel.volume * displacement.length_squared().powf(-1.5))
-    };
-    let samples = sample_frozen_trajectory(knots)?;
-    let observed = interpolate_captured_accelerations(knots, &samples)?;
-    for (sample_knot, observation) in samples.into_iter().zip(observed) {
-        for voxel in voxels {
-            let sensitivity = sensitivity_at(sample_knot, voxel);
-            sensitivities.push(sensitivity);
+) -> Option<Vec<TrajectoryInversionKnot>> {
+    let accelerations = quintic_knot_accelerations(knots)?;
+    let mut samples = Vec::with_capacity(knots.len().saturating_sub(1) * HOLDOUT_SAMPLES_PER_SEGMENT);
+    for segment in 0..knots.len().saturating_sub(1) {
+        let start = knots[segment];
+        let end = knots[segment + 1];
+        let duration = (end.simulation_time_seconds - start.simulation_time_seconds) as f32;
+        for sample in (1..=HOLDOUT_SAMPLES_PER_SEGMENT * 2).step_by(2) {
+            let u = sample as f32 / (HOLDOUT_SAMPLES_PER_SEGMENT * 2) as f32;
+            let (position, velocity, acceleration) = quintic_segment_position_acceleration(
+                start,
+                end,
+                accelerations[segment],
+                accelerations[segment + 1],
+                u,
+            )?;
+            // Validation follows a distinct nearby arc. The offset is fixed
+            // in the rotating body frame, so all methods still share exactly
+            // the same holdout positions, attitudes, and times.
+            let body_rotation = start.body_rotation.slerp(end.body_rotation, u);
+            let holdout_offset = body_rotation * Vec3::new(24.0, -17.0, 31.0);
+            samples.push(TrajectoryInversionKnot {
+                position: position + holdout_offset,
+                velocity,
+                simulation_time_seconds: start.simulation_time_seconds
+                    + duration as f64 * u as f64,
+                baseline_acceleration: acceleration,
+                body_rotation,
+            });
         }
-        observations.push(observation);
     }
-    (observations.len() == sample_count).then_some((observations, sensitivities))
-}
-
-fn interpolate_captured_accelerations(
-    knots: &[TrajectoryInversionKnot],
-    samples: &[TrajectoryInversionKnot],
-) -> Option<Vec<Vec3>> {
-    if knots.len() < 2 {
-        return None;
-    }
-    samples
-        .iter()
-        .map(|sample| {
-            let upper = knots
-                .iter()
-                .position(|knot| knot.simulation_time_seconds >= sample.simulation_time_seconds)
-                .unwrap_or(knots.len() - 1);
-            let lower = upper.saturating_sub(1);
-            let a = knots[lower];
-            let b = knots[upper];
-            let span = (b.simulation_time_seconds - a.simulation_time_seconds)
-                .max(f64::EPSILON);
-            let factor = ((sample.simulation_time_seconds - a.simulation_time_seconds) / span)
-                .clamp(0.0, 1.0) as f32;
-            let acceleration = a.baseline_acceleration.lerp(b.baseline_acceleration, factor);
-            acceleration.is_finite().then_some(acceleration)
-        })
-        .collect()
-}
-
-fn trajectory_data_error(job: &ConvexOptimizationJob) -> f64 {
-    density_data_error(job, &job.current_densities)
-}
-
-fn density_data_error(job: &ConvexOptimizationJob, densities: &[f32]) -> f64 {
-    let mut data_error = 0.0_f64;
-    let n = job.voxels.len();
-    for (sample, observed) in job.observed_accelerations.iter().enumerate() {
-        let prediction = (0..n).fold(Vec3::ZERO, |sum, voxel| {
-            sum + job.sensitivities[sample * n + voxel] * densities[voxel]
-        });
-        let scale = observed.length_squared().max(1.0e-12);
-        data_error += ((prediction - *observed).length_squared() / scale) as f64;
-    }
-    data_error / job.observed_accelerations.len().max(1) as f64
+    Some(samples)
 }
 
 fn objective(job: &ConvexOptimizationJob) -> f64 {
@@ -478,6 +466,10 @@ fn density_result_from_job(
         objective_improvement: ((job.initial_objective - objective)
             / job.initial_objective.max(f64::MIN_POSITIVE))
         .clamp(0.0, 1.0) as f32,
+        training_rmse: density_data_error(job, densities).sqrt() as f32,
+        holdout_rmse: holdout_data_error(job, densities).sqrt() as f32,
+        observation_noise_fraction: OBSERVATION_NOISE_FRACTION,
+        observation_noise_realizations: OBSERVATION_NOISE_REALIZATIONS,
         inversion_time_ms,
         trajectory_samples: job.observed_accelerations.len(),
         iterations: job.iterations,
@@ -497,7 +489,9 @@ pub fn start_density_inversion_system(
     >,
     active_method: Res<ActiveGravityMethod>,
     radial_source: Option<Res<RadialGravitySource>>,
+    aggregated_source: Option<Res<AggregatedGravitySource>>,
     mut eq106_sensitivity: ResMut<Eq106SensitivityMatrix>,
+    mut eq106_performance: ResMut<Eq106PerformanceMetrics>,
     mut show_section: ResMut<ShowSection>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
@@ -523,8 +517,15 @@ pub fn start_density_inversion_system(
         }
         inversion.optimizer = None;
         let capture_id = inversion.capture_id.expect("validated above");
-        if inversion.batch_capture_id != Some(capture_id) {
+        let source_hash = inversion.capture_source_hash;
+        let source_changed = inversion
+            .best_results
+            .iter()
+            .flatten()
+            .any(|result| result.source_hash != source_hash);
+        if inversion.batch_capture_id != Some(capture_id) || source_changed {
             inversion.results = std::array::from_fn(|_| None);
+            inversion.best_results = std::array::from_fn(|_| None);
             inversion.batch_capture_id = Some(capture_id);
         }
         inversion.results[active_method.performance_index()] = None;
@@ -540,6 +541,10 @@ pub fn start_density_inversion_system(
     let started_at = Instant::now();
     let Some(source) = radial_source else {
         inversion.error = Some("The asteroid volume source is not ready.".into());
+        return;
+    };
+    let Some(reference_source) = aggregated_source else {
+        inversion.error = Some("The aggregated gravity source is not ready.".into());
         return;
     };
     let Some(capture_id) = inversion.capture_id else {
@@ -562,28 +567,78 @@ pub fn start_density_inversion_system(
     }
     if method == ActiveGravityMethod::CurvedArcEq106
         && (eq106_sensitivity.capture_id != Some(capture_id)
+            || eq106_sensitivity.source_hash != source_hash
+            || eq106_sensitivity.configuration_hash
+                != crate::gpu::eq106::eq106_sensitivity_configuration_hash()
             || eq106_sensitivity.voxel_count != voxels.len())
     {
         eq106_sensitivity.capture_id = Some(capture_id);
+        eq106_sensitivity.source_hash = source_hash;
+        eq106_sensitivity.configuration_hash =
+            crate::gpu::eq106::eq106_sensitivity_configuration_hash();
         eq106_sensitivity.voxel_count = voxels.len();
         eq106_sensitivity.sample_count = 0;
         eq106_sensitivity.columns.clear();
     }
-    let Some((observed_accelerations, mut sensitivities)) =
-        build_observations_and_sensitivities(&inversion.knots, &voxels)
-    else {
-        inversion.error =
-            Some("The 16 states do not define valid acceleration observations.".into());
-        return;
-    };
+    let training_count =
+        (inversion.knots.len() - 1) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1;
+    let holdout_count = (inversion.knots.len() - 1) * HOLDOUT_SAMPLES_PER_SEGMENT;
+    let cache_matches = inversion.reference_cache_capture_id == Some(capture_id)
+        && inversion.reference_cache_source_hash == source_hash
+        && inversion.reference_training_observations.len() == training_count
+        && inversion.reference_training_sensitivities.len() == training_count * voxels.len()
+        && inversion.reference_holdout_observations.len() == holdout_count
+        && inversion.reference_holdout_sensitivities.len() == holdout_count * voxels.len();
+    if !cache_matches {
+        let Some((training_observations, training_sensitivities, holdout_observations, holdout_sensitivities)) =
+            training_and_holdout_reference(&inversion.knots, &voxels, &source)
+        else {
+            inversion.error = Some(
+                "The frozen trajectory does not define valid high-resolution reference observations."
+                    .into(),
+            );
+            return;
+        };
+        inversion.reference_cache_capture_id = Some(capture_id);
+        inversion.reference_cache_source_hash = source_hash;
+        inversion.reference_training_observations = training_observations;
+        inversion.reference_training_sensitivities = training_sensitivities;
+        inversion.reference_holdout_observations = holdout_observations;
+        inversion.reference_holdout_sensitivities = holdout_sensitivities;
+    }
+    let observed_accelerations = inversion.reference_training_observations.clone();
+    let mut sensitivities = inversion.reference_training_sensitivities.clone();
+    let holdout_observations = inversion.reference_holdout_observations.clone();
+    let holdout_sensitivities = inversion.reference_holdout_sensitivities.clone();
     if method == ActiveGravityMethod::MmfftCompressed {
         let Some(samples) = sample_frozen_trajectory(&inversion.knots) else {
             inversion.error = Some("The frozen trajectory cannot be sampled for MMFFT.".into());
             return;
         };
         sensitivities = crate::gpu::mmfft::voxel_basis_sensitivities(&voxels, &samples);
+    } else if method == ActiveGravityMethod::Fmm {
+        let Some(samples) = sample_frozen_trajectory(&inversion.knots) else {
+            inversion.error = Some("The frozen trajectory cannot be sampled for FMM.".into());
+            return;
+        };
+        sensitivities = fmm_voxel_basis_sensitivities(&voxels, &samples, &reference_source);
     }
     let current_densities = voxels.iter().map(|voxel| voxel.density).collect::<Vec<_>>();
+    let source_preparation_ms = started_at.elapsed().as_secs_f64() * 1.0e3;
+    if method == ActiveGravityMethod::CurvedArcEq106 {
+        let matrix_cache_hit = eq106_sensitivity.capture_id == Some(capture_id)
+            && eq106_sensitivity.source_hash == source_hash
+            && eq106_sensitivity.configuration_hash
+                == crate::gpu::eq106::eq106_sensitivity_configuration_hash()
+            && eq106_sensitivity.voxel_count == voxels.len()
+            && eq106_sensitivity.sample_count == training_count
+            && eq106_sensitivity.columns.len() == voxels.len();
+        eq106_performance.inversion = Some(Eq106InversionTiming {
+            source_preparation_ms,
+            matrix_cache_hit,
+            ..default()
+        });
+    }
     let mut job = ConvexOptimizationJob {
         method,
         capture_id,
@@ -594,6 +649,8 @@ pub fn start_density_inversion_system(
         voxels,
         sensitivities,
         observed_accelerations,
+        holdout_observations,
+        holdout_sensitivities,
         current_densities: current_densities.clone(),
         best_densities: current_densities,
         initial_objective: f64::INFINITY,
@@ -601,6 +658,7 @@ pub fn start_density_inversion_system(
         iterations: QP_SOLVE_COUNT,
         voxel_size,
         started_at,
+        source_preparation_ms,
     };
     job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
     job.initial_objective = objective(&job);

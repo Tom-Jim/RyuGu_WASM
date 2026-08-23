@@ -39,6 +39,40 @@ impl Default for Eq106GpuReadbackChannel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Eq106TimingSample {
+    pub spectrum_build_ms: Option<f64>,
+    pub target_evaluation_ms: Option<f64>,
+    pub gpu_readback_copy_ms: Option<f64>,
+    pub cpu_readback_wait_ms: f64,
+    pub target_count: u32,
+    pub spectral_element_count: u32,
+    pub dispatch_count: u32,
+    pub spectrum_rebuild_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Eq106InversionTiming {
+    pub source_preparation_ms: f64,
+    pub spectrum_build_ms: Option<f64>,
+    pub target_evaluation_ms: Option<f64>,
+    pub gpu_readback_ms: f64,
+    pub design_matrix_assembly_ms: f64,
+    pub convex_solve_ms: f64,
+    pub verification_ms: f64,
+    pub total_ms: f64,
+    pub dispatch_count: u32,
+    pub spectrum_rebuild_count: u32,
+    pub matrix_cache_hit: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct Eq106PerformanceMetrics {
+    pub latest: Option<Eq106TimingSample>,
+    pub full_inversion_iteration_ms: Option<f64>,
+    pub inversion: Option<Eq106InversionTiming>,
+}
+
 /// Snapshot-aligned history populated by the dedicated compressed readback
 /// channel. Its layout matches the shared gravity sample contract so physics
 /// and Jacobi diagnostics can consume it without special-case math.

@@ -27,6 +27,7 @@ fn uniform_bytes(
     density_mode_count: u32,
     segment_id: u32,
     evaluate_dual_certificate: bool,
+    inversion_mode: bool,
     target_count: u32,
     target_offset: u32,
 ) -> [u8; 96] {
@@ -63,6 +64,7 @@ fn uniform_bytes(
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     bytes[84..88].copy_from_slice(&target_offset.to_le_bytes());
+    bytes[88..92].copy_from_slice(&u32::from(inversion_mode).to_le_bytes());
     bytes
 }
 
@@ -145,6 +147,7 @@ mod tests {
             544,
             9,
             false,
+            false,
             90_166,
             0,
         );
@@ -176,7 +179,9 @@ mod tests {
             partial_sums,
             snapshots,
             batch_capture_id: Some(42),
-            sensitivity_column: None,
+            sensitivity_column_count: 0,
+            sensitivity_source_hash: 0,
+            sensitivity_configuration_hash: 0,
             timings: default(),
         };
 

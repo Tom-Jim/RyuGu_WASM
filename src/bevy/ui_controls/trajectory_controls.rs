@@ -80,6 +80,7 @@ pub fn probe_slider_system(
         transform.translation = next.position;
         velocity.0 = next.velocity();
         history.0.clear();
+        history.0.push_back(next.position);
     }
     if let Some(mut transform) = ryugu_query.iter_mut().next() {
         transform.rotation = Quat::IDENTITY;
@@ -339,6 +340,7 @@ pub fn trajectory_inversion_input_system(
                     inversion.optimizer = None;
                     inversion.batch_capture_id = None;
                     inversion.results = std::array::from_fn(|_| None);
+                    inversion.best_results = std::array::from_fn(|_| None);
                     inversion.displayed_density = None;
                 }
                 inversion.selected = Some((field.index, field.vector));
@@ -379,6 +381,7 @@ pub fn trajectory_inversion_input_system(
                         inversion.optimizer = None;
                         inversion.batch_capture_id = None;
                         inversion.results = std::array::from_fn(|_| None);
+                        inversion.best_results = std::array::from_fn(|_| None);
                         inversion.displayed_density = None;
                         inversion.selected = None;
                         inversion.edit_buffer.clear();
@@ -465,126 +468,6 @@ pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
                 DensityInversionStatusLabel,
             ));
         });
-}
-
-pub fn density_inversion_timing_ui_system(
-    inversion: Res<TrajectoryInversionState>,
-    active_method: Res<ActiveGravityMethod>,
-    eq106_sensitivity: Res<Eq106SensitivityMatrix>,
-    mut timing_labels: Query<(&DensityInversionTimingLabel, &mut Text)>,
-    mut status_labels: Query<
-        (&mut Text, &mut TextColor),
-        (
-            With<DensityInversionStatusLabel>,
-            Without<DensityInversionTimingLabel>,
-        ),
-    >,
-) {
-    let names = ["Radial", "Werner", "Eq.106", "MMFFT", "FMM"];
-    for (label, mut text) in timing_labels.iter_mut() {
-        let marker = if label.0 == active_method.performance_index() {
-            "*"
-        } else {
-            " "
-        };
-        **text = match inversion.best_results[label.0].as_ref() {
-            Some(result) => format!(
-                "{}{: <7} fit {:>7.4}% | RMSE {:>7.4}% | time {:>8.2} ms",
-                marker,
-                names[label.0],
-                result.model_fit * 100.0,
-                result.model_deviation * 100.0,
-                result.inversion_time_ms,
-            ),
-            None => format!("{}{: <7}  --", marker, names[label.0]),
-        };
-    }
-    for (mut text, mut color) in status_labels.iter_mut() {
-        if let Some(job) = inversion.optimizer.as_ref() {
-            if job.method == ActiveGravityMethod::CurvedArcEq106
-                && eq106_sensitivity.columns.len() < job.voxels.len()
-            {
-                **text = format!(
-                    "Eq.106 GPU sensitivity: {}/{} voxel columns",
-                    eq106_sensitivity.columns.len(),
-                    job.voxels.len()
-                );
-            } else {
-                **text = format!("{} Clarabel 56x56 QP", job.method.as_str());
-            }
-            color.0 = Color::srgb(1.0, 0.78, 0.25);
-        } else if *active_method == ActiveGravityMethod::RadialAnalytic {
-            **text = "Radial forward-only: generating the shared ln-density truth trajectory".into();
-            color.0 = Color::srgb(0.55, 0.82, 0.9);
-        } else if *active_method == ActiveGravityMethod::HomogeneousWerner {
-            **text = "Werner forward-only: density inversion disabled".into();
-            color.0 = Color::srgb(0.55, 0.82, 0.9);
-        } else if let Some(result) = inversion.displayed_density.as_ref() {
-            let minimum = result
-                .voxels
-                .iter()
-                .map(|voxel| voxel.density)
-                .fold(f32::INFINITY, f32::min);
-            let maximum = result
-                .voxels
-                .iter()
-                .map(|voxel| voxel.density)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let deviation = (result
-                .voxels
-                .iter()
-                .map(|voxel| (voxel.density - result.density).powi(2))
-                .sum::<f32>()
-                / result.voxels.len().max(1) as f32)
-                .sqrt();
-            let model = if result.method == ActiveGravityMethod::HomogeneousWerner {
-                "uniform start vs uniform Werner reference"
-            } else {
-                "uniform start vs ln density reference"
-            };
-            let convergence = if result.objective_improvement <= 1.0e-6 {
-                "best remained at uniform start"
-            } else {
-                "Clarabel improved the trajectory objective"
-            };
-            **text = format!(
-                "{}\nfit={:.4}%, density RMSE={:.4}%\n{}; objective gain={:.4}%\ncapture={:016x}, source={:016x}, epoch={}\nproblem={:016x}, J0={:.3e}, data scale={:.3e}\n{} Quintic track samples, {} voxels\nmean rho={:.5e}, range={:.4e}..{:.4e}\nsigma/mean={:.3}, mass scale={:.5}\nobjective={:.3e}, {} convex QP solve",
-                model,
-                result.model_fit * 100.0,
-                result.model_deviation * 100.0,
-                convergence,
-                result.objective_improvement * 100.0,
-                result.capture_id,
-                result.source_hash,
-                result.capture_epoch,
-                result.problem_id,
-                result.initial_objective,
-                result.data_error_scale,
-                result.trajectory_samples,
-                result.voxels.len(),
-                result.density,
-                minimum,
-                maximum,
-                deviation / result.density.max(f32::MIN_POSITIVE),
-                result.density_scale,
-                result.objective,
-                result.iterations,
-            );
-            color.0 = Color::srgb(0.45, 1.0, 0.62);
-        } else if let Some(error) = inversion.error.as_deref() {
-            **text = error.to_owned();
-            color.0 = Color::srgb(1.0, 0.4, 0.35);
-        } else if !inversion.ready && inversion.certified_sample_streak > 0 {
-            **text = format!(
-                "Eq.106 certified warm-up: {}/30 consecutive samples",
-                inversion.certified_sample_streak.min(30)
-            );
-            color.0 = Color::srgb(1.0, 0.78, 0.25);
-        } else {
-            **text = "Waiting for inversion".into();
-            color.0 = Color::srgb(0.72, 0.72, 0.76);
-        }
-    }
 }
 
 pub fn trajectory_inversion_ui_system(
@@ -678,40 +561,5 @@ fn performance_method_row(index: usize, label: &str, color: Color) -> impl Bundl
                 TextColor(color),
             ),
         ],
-    )
-}
-
-fn axis_text(label: &'static str, left: f32, top: f32) -> impl Bundle {
-    (
-        Text::new(label),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(9.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.58, 0.72, 0.78)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(left),
-            top: px(top),
-            ..default()
-        },
-    )
-}
-
-fn jacobi_axis_text(slot: u8, left: f32, top: f32) -> impl Bundle {
-    (
-        Text::new("--"),
-        PerformanceJacobiAxisLabel(slot),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(9.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.58, 0.72, 0.78)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(left),
-            top: px(top),
-            ..default()
-        },
     )
 }

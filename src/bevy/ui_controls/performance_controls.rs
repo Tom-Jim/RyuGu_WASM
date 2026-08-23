@@ -532,4 +532,38 @@ pub fn performance_method_checkbox_system(
         }
     }
 }
+fn axis_text(label: &'static str, left: f32, top: f32) -> impl Bundle {
+    (
+        Text::new(label),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(9.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.58, 0.72, 0.78)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(left),
+            top: px(top),
+            ..default()
+        },
+    )
+}
+
+fn jacobi_axis_text(slot: u8, left: f32, top: f32) -> impl Bundle {
+    (
+        Text::new("--"),
+        PerformanceJacobiAxisLabel(slot),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(9.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.58, 0.72, 0.78)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(left),
+            top: px(top),
+            ..default()
+        },
+    )
+}
 

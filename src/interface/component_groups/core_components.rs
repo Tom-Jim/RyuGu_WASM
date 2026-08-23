@@ -161,7 +161,6 @@ impl Default for GravityBenchmarkTrajectory {
         }
     }
 }
-
 #[derive(Clone, Debug)]
 pub struct InvertedDensityVoxel {
     /// Body-fixed centre in metres (the gravity source coordinate system).
@@ -197,16 +196,24 @@ pub struct DensityInversionResult {
     pub model_fit: f32,
     /// Relative decrease of the trajectory objective from the uniform start.
     pub objective_improvement: f32,
+    /// Normalized acceleration residual on the same frozen trajectory used to
+    /// assemble the QP. This is distinct from density model RMSE.
+    pub training_rmse: f32,
+    /// Relative acceleration residual on a deterministic held-out set of
+    /// trajectory states evaluated with the independent reference operator.
+    pub holdout_rmse: f32,
+    /// Relative diagonal observation-noise model used by the QP weighting.
+    pub observation_noise_fraction: f32,
+    pub observation_noise_realizations: usize,
     /// CPU time spent assembling and solving this convex QP.
     pub inversion_time_ms: f64,
-    /// Number of acceleration observations sampled along the complete
-    /// interpolated Quintic Hermite trajectory.
+    /// Number of acceleration observations sampled along the complete dense
+    /// Quintic Hermite trajectory.
     pub trajectory_samples: usize,
     pub iterations: u32,
     pub voxel_size: f32,
     pub voxels: Vec<InvertedDensityVoxel>,
 }
-
 #[derive(Debug)]
 pub struct ConvexOptimizationJob {
     pub method: ActiveGravityMethod,
@@ -217,6 +224,8 @@ pub struct ConvexOptimizationJob {
     pub voxels: Vec<InvertedDensityVoxel>,
     pub sensitivities: Vec<Vec3>,
     pub observed_accelerations: Vec<Vec3>,
+    pub holdout_observations: Vec<Vec3>,
+    pub holdout_sensitivities: Vec<Vec3>,
     pub neighbours: Vec<(usize, usize)>,
     pub current_densities: Vec<f32>,
     pub best_densities: Vec<f32>,
@@ -230,6 +239,7 @@ pub struct ConvexOptimizationJob {
     /// Wall-clock origin of the complete inversion, including method-specific
     /// sensitivity construction/readback and the final Clarabel solve.
     pub started_at: bevy::platform::time::Instant,
+    pub source_preparation_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +286,14 @@ pub struct TrajectoryInversionState {
     pub error: Option<String>,
     pub optimizer: Option<ConvexOptimizationJob>,
     pub batch_capture_id: Option<u64>,
+    /// Method-independent high-resolution truth observations cached for one
+    /// immutable trajectory/source identity and reused across inverse methods.
+    pub reference_cache_capture_id: Option<u64>,
+    pub reference_cache_source_hash: u64,
+    pub reference_training_observations: Vec<Vec3>,
+    pub reference_training_sensitivities: Vec<Vec3>,
+    pub reference_holdout_observations: Vec<Vec3>,
+    pub reference_holdout_sensitivities: Vec<Vec3>,
     pub results: [Option<DensityInversionResult>; 5],
     /// Best fit seen for each method across method switches. Historical only;
     /// current-trajectory comparisons continue to use `results`.
@@ -308,6 +326,12 @@ impl Default for TrajectoryInversionState {
             error: None,
             optimizer: None,
             batch_capture_id: None,
+            reference_cache_capture_id: None,
+            reference_cache_source_hash: 0,
+            reference_training_observations: Vec::new(),
+            reference_training_sensitivities: Vec::new(),
+            reference_holdout_observations: Vec::new(),
+            reference_holdout_sensitivities: Vec::new(),
             results: std::array::from_fn(|_| None),
             best_results: std::array::from_fn(|_| None),
             displayed_density: None,
@@ -502,24 +526,12 @@ pub struct Eq106ReadbackPacket {
     pub partial_sums: Vec<[f32; 4]>,
     pub snapshots: Vec<GravityRequestSnapshot>,
     pub batch_capture_id: Option<u64>,
-    pub sensitivity_column: Option<u32>,
+    /// Number of compact, column-major sensitivity blocks in `partial_sums`.
+    /// Zero denotes the ordinary nine-row runtime/trajectory output layout.
+    pub sensitivity_column_count: u32,
+    pub sensitivity_source_hash: u64,
+    pub sensitivity_configuration_hash: u64,
     pub timings: Eq106TimingSample,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Eq106TimingSample {
-    pub spectrum_build_ms: Option<f64>,
-    pub target_evaluation_ms: Option<f64>,
-    pub gpu_readback_copy_ms: Option<f64>,
-    pub cpu_readback_wait_ms: f64,
-    pub target_count: u32,
-    pub spectral_element_count: u32,
-}
-
-#[derive(Resource, Default)]
-pub struct Eq106PerformanceMetrics {
-    pub latest: Option<Eq106TimingSample>,
-    pub full_inversion_iteration_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -657,6 +669,9 @@ pub struct Eq106TrajectoryBatchResult {
 #[derive(Resource, Default)]
 pub struct Eq106SensitivityMatrix {
     pub capture_id: Option<u64>,
+    pub source_hash: u64,
+    /// Compile-time Eq.106 frequency, quadrature, and Taylor configuration.
+    pub configuration_hash: u64,
     pub voxel_count: usize,
     pub sample_count: usize,
     /// Columns are stored in voxel order; each column contains all frozen

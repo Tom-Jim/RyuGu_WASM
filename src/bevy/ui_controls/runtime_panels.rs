@@ -426,6 +426,7 @@ pub fn method_toggle_system(
         // Reset probe state so the new trajectory starts clean: drop the old
         // history line, undo accumulated spin, and keep Ryugu centered at CoM.
         c_history.0.clear();
+        c_history.0.push_back(probe_initial.position);
         r_transform.rotation = Quat::IDENTITY;
         r_transform.translation = Vec3::ZERO;
     }
@@ -439,6 +440,8 @@ pub fn reset_inversion_on_method_change(
     if !active_method.is_changed() || performance.active {
         return;
     }
+    let preserve_truth_track =
+        !inversion.truth_knots.is_empty() || !inversion.truth_orbit.is_empty();
     inversion.runtime_epoch = 0;
     inversion.capture_epoch = 0;
     inversion.last_capture_request_id = None;
@@ -456,11 +459,7 @@ pub fn reset_inversion_on_method_change(
     inversion.edit_buffer.clear();
     inversion.error = None;
     inversion.optimizer = None;
-    inversion.batch_capture_id = None;
-    inversion.results = std::array::from_fn(|_| None);
-    inversion.displayed_density = None;
-    inversion.preserve_truth_track =
-        !inversion.truth_knots.is_empty() || !inversion.truth_orbit.is_empty();
+    inversion.preserve_truth_track = preserve_truth_track;
     if *active_method == ActiveGravityMethod::HomogeneousWerner {
         inversion.knots.clear();
         inversion.capture_id = None;
@@ -470,6 +469,9 @@ pub fn reset_inversion_on_method_change(
         inversion.capture_id = inversion.truth_capture_id;
         inversion.ready = true;
     }
+    inversion.displayed_density = inversion.results[active_method.performance_index()]
+        .clone()
+        .or_else(|| inversion.best_results[active_method.performance_index()].clone());
 }
 
 pub fn update_hint_on_mode_change(

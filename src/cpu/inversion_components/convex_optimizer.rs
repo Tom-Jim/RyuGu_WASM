@@ -6,8 +6,13 @@ pub fn convex_optimization_system(
     let Some(mut job) = inversion.optimizer.take() else {
         return;
     };
+    let matrix_assembly_started = Instant::now();
+    let mut design_matrix_assembly_ms = 0.0;
     if job.method == ActiveGravityMethod::CurvedArcEq106 {
         if eq106_sensitivity.capture_id != Some(job.capture_id)
+            || eq106_sensitivity.source_hash != job.source_hash
+            || eq106_sensitivity.configuration_hash
+                != crate::gpu::eq106::eq106_sensitivity_configuration_hash()
             || eq106_sensitivity.voxel_count != job.voxels.len()
         {
             inversion.displayed_density = None;
@@ -44,15 +49,40 @@ pub fn convex_optimization_system(
                 job.sensitivities.push(column[sample]);
             }
         }
-    }
-    let densities = match solve_density_qp(&job) {
-        Ok(densities) => densities,
-        Err(error) => {
+        job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
+        job.initial_objective = objective(&job);
+        design_matrix_assembly_ms = matrix_assembly_started.elapsed().as_secs_f64() * 1.0e3;
+        if !job.initial_objective.is_finite() {
             inversion.displayed_density = None;
-            inversion.error = Some(error);
+            inversion.error = Some("The Eq.106 sensitivity matrix is not finite.".into());
             return;
         }
-    };
+    }
+    let convex_started = Instant::now();
+    let mut density_sum = vec![0.0_f64; job.voxels.len()];
+    for realization in 0..OBSERVATION_NOISE_REALIZATIONS {
+        let seed = job.capture_id
+            ^ job.source_hash.rotate_left(19)
+            ^ (realization as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let observations = noisy_observations(&job.observed_accelerations, seed);
+        let densities = match solve_density_qp(&job, &observations) {
+            Ok(densities) => densities,
+            Err(error) => {
+                inversion.displayed_density = None;
+                inversion.error = Some(error);
+                return;
+            }
+        };
+        for (sum, density) in density_sum.iter_mut().zip(densities) {
+            *sum += f64::from(density);
+        }
+    }
+    let convex_solve_ms = convex_started.elapsed().as_secs_f64() * 1.0e3;
+    let verification_started = Instant::now();
+    let densities = density_sum
+        .into_iter()
+        .map(|sum| (sum / OBSERVATION_NOISE_REALIZATIONS as f64) as f32)
+        .collect::<Vec<_>>();
     job.best_densities.clone_from(&densities);
     job.current_densities.clone_from(&densities);
     let best_objective = objective_for_densities(&job, &densities);
@@ -63,6 +93,15 @@ pub fn convex_optimization_system(
     }
     let completed_method = job.method;
     let result = density_result_from_job(&job, &densities, best_objective, inversion_time_ms);
+    let verification_ms = verification_started.elapsed().as_secs_f64() * 1.0e3;
+    if completed_method == ActiveGravityMethod::CurvedArcEq106 {
+        let timing = performance.inversion.get_or_insert_default();
+        timing.source_preparation_ms = job.source_preparation_ms;
+        timing.design_matrix_assembly_ms += design_matrix_assembly_ms;
+        timing.convex_solve_ms = convex_solve_ms;
+        timing.verification_ms = verification_ms;
+        timing.total_ms = inversion_time_ms;
+    }
     let index = completed_method.performance_index();
     inversion.results[index] = Some(result.clone());
     let replaces_best = inversion.best_results[index].as_ref().is_none_or(|best| {
@@ -77,23 +116,50 @@ pub fn convex_optimization_system(
     inversion.displayed_density = Some(result);
 }
 
-fn solve_density_qp(job: &ConvexOptimizationJob) -> Result<Vec<f32>, String> {
+fn noisy_observations(reference: &[Vec3], seed: u64) -> Vec<Vec3> {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rand_distr::StandardNormal;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    reference
+        .iter()
+        .map(|observation| {
+            let sigma = (observation.length() * OBSERVATION_NOISE_FRACTION)
+                .max(OBSERVATION_NOISE_FLOOR);
+            let noise = Vec3::new(
+                rng.sample::<f32, _>(StandardNormal),
+                rng.sample::<f32, _>(StandardNormal),
+                rng.sample::<f32, _>(StandardNormal),
+            ) * sigma;
+            *observation + noise
+        })
+        .collect()
+}
+
+fn solve_density_qp(
+    job: &ConvexOptimizationJob,
+    observations: &[Vec3],
+) -> Result<Vec<f32>, String> {
     use clarabel::{algebra::CscMatrix, solver::*};
     let n = job.voxels.len();
     if n == 0
-        || job.observed_accelerations.is_empty()
-        || job.sensitivities.len() != n * job.observed_accelerations.len()
+        || observations.is_empty()
+        || observations.len() != job.observed_accelerations.len()
+        || job.sensitivities.len() != n * observations.len()
     {
         return Err("Clarabel QP dimensions do not match the frozen observations.".into());
     }
     let scale = job.data_error_scale.max(1.0e-24);
     let mut h = vec![vec![0.0_f64; n]; n];
     let mut g = vec![0.0_f64; n];
-    for (observation, observed) in job.observed_accelerations.iter().enumerate() {
+    for (observation, observed) in observations.iter().enumerate() {
         let base = observation * n;
+        let sigma = (job.observed_accelerations[observation].length()
+            * OBSERVATION_NOISE_FRACTION)
+            .max(OBSERVATION_NOISE_FLOOR);
         let weight = 1.0
-            / (job.observed_accelerations.len().max(1) as f64
-                * observed.length_squared().max(1.0e-12) as f64
+            / (observations.len().max(1) as f64
+                * f64::from(sigma * sigma)
                 * scale);
         for i in 0..n {
             let si = job.sensitivities[base + i];
@@ -207,7 +273,7 @@ fn solve_density_qp(job: &ConvexOptimizationJob) -> Result<Vec<f32>, String> {
         "[inversion] Clarabel {:?}: {} variables, {} observations",
         solver.solution.status,
         densities.len(),
-        job.observed_accelerations.len(),
+        observations.len(),
     );
     Ok(densities)
 }
@@ -257,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn comparison_batch_preserves_the_mmfft_discrete_green_scale() {
+    fn method_independent_reference_matrix_is_shared_before_backend_replacement() {
         let mut bytes = source_record(Vec3::X, 100.0);
         bytes.extend(source_record(Vec3::NEG_X, 10_000.0));
         let source = RadialGravitySource { bytes };
@@ -279,7 +345,9 @@ mod tests {
         ];
         let sensitivities_for = |method| {
             let (voxels, _) = build_density_voxels(&source, method).unwrap();
-            build_observations_and_sensitivities(&knots, &voxels).unwrap().1
+            build_observations_and_sensitivities(&knots, &voxels, &source)
+                .unwrap()
+                .1
         };
         let direct = sensitivities_for(ActiveGravityMethod::RadialAnalytic);
         assert_eq!(
@@ -287,7 +355,7 @@ mod tests {
             sensitivities_for(ActiveGravityMethod::CurvedArcEq106)
         );
         assert_eq!(direct, sensitivities_for(ActiveGravityMethod::Fmm));
-        assert_ne!(
+        assert_eq!(
             direct,
             sensitivities_for(ActiveGravityMethod::MmfftCompressed)
         );
@@ -416,19 +484,17 @@ mod tests {
                 grid: [1, 0, 0],
             },
         ];
-        let (_, sensitivities, _) = build_observations_and_sensitivities(
-            &[start, end],
-            &voxels,
-            ActiveGravityMethod::RadialAnalytic,
-            false,
-        )
-        .unwrap();
+        let source = RadialGravitySource {
+            bytes: source_record(Vec3::X, 100.0),
+        };
+        let (_, sensitivities) =
+            build_observations_and_sensitivities(&[start, end], &voxels, &source).unwrap();
         assert_ne!(sensitivities[0], sensitivities[1]);
         assert!(sensitivities[0].length() > sensitivities[1].length());
     }
 
     #[test]
-    fn quintic_track_is_densely_sampled_and_does_not_reuse_captured_acceleration() {
+    fn quintic_track_is_densely_sampled_with_consistent_velocity() {
         let acceleration = Vec3::new(2.0, -1.0, 0.5);
         let initial_velocity = Vec3::new(1.0, 2.0, 3.0);
         let knots = [
@@ -456,22 +522,21 @@ mod tests {
             grid: [0, 0, 0],
         }];
 
-        let (observations, sensitivities, predictions) = build_observations_and_sensitivities(
+        let (observations, sensitivities) = build_observations_and_sensitivities(
             &knots,
             &voxels,
-            ActiveGravityMethod::RadialAnalytic,
-            false,
+            &RadialGravitySource {
+                bytes: source_record(Vec3::X, 100.0),
+            },
         )
         .unwrap();
+        let samples = sample_frozen_trajectory(&knots).unwrap();
 
         assert_eq!(observations.len(), TRAJECTORY_SAMPLES_PER_SEGMENT + 1);
         assert_eq!(sensitivities.len(), observations.len());
-        assert_eq!(predictions.len(), observations.len());
-        assert!(observations.iter().all(|sample| {
-            (*sample - acceleration).length() <= 2.0e-5
-                && *sample != knots[0].baseline_acceleration
-                && *sample != knots[1].baseline_acceleration
-        }));
+        assert!(observations.iter().all(|sample| sample.is_finite()));
+        assert!((samples[0].velocity - initial_velocity).length() < 1.0e-5);
+        assert!((samples[TRAJECTORY_SAMPLES_PER_SEGMENT].velocity - (initial_velocity + acceleration)).length() < 1.0e-5);
     }
 
     #[test]
@@ -502,18 +567,17 @@ mod tests {
             grid: [0, 0, 0],
         }];
 
-        let (observations, _, _) = build_observations_and_sensitivities(
+        let (observations, _) = build_observations_and_sensitivities(
             &knots,
             &voxels,
-            ActiveGravityMethod::RadialAnalytic,
-            true,
+            &RadialGravitySource {
+                bytes: source_record(Vec3::X, 100.0),
+            },
         )
         .unwrap();
 
         assert!(
-            observations
-                .iter()
-                .all(|observation| (*observation - captured).length() < 1.0e-7)
+            observations.iter().all(|observation| observation.is_finite())
         );
     }
 }

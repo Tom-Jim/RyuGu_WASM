@@ -25,6 +25,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 bytemuck = "1"
 num-complex = "0.4"
 rustfft = "6"
+rand = { version = "0.10", default-features = false, features = ["std_rng"] }
+rand_distr = "0.6"
 wgpu29 = { package = "wgpu", version = "=29.0.4" }
 
 [dev-dependencies]

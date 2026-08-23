@@ -51,7 +51,7 @@ pub fn setup_scene(
         TargetSize(6.7),
         Transform::from_translation(probe_initial.position),
         Velocity(probe_initial.velocity()),
-        OrbitHistory(std::collections::VecDeque::with_capacity(ORBIT_HISTORY_LEN)),
+        OrbitHistory(std::collections::VecDeque::from([PROBE_R0])),
         CassiniMarker,
     ));
 }
@@ -114,13 +114,19 @@ pub fn capture_trajectory_inversion_system(
         inversion.edit_buffer.clear();
         inversion.error = None;
         inversion.optimizer = None;
-        inversion.batch_capture_id = None;
-        inversion.displayed_density = None;
-        inversion.results = std::array::from_fn(|_| None);
+        if !preserve_truth_track {
+            inversion.batch_capture_id = None;
+            inversion.displayed_density = None;
+            inversion.results = std::array::from_fn(|_| None);
+            inversion.best_results = std::array::from_fn(|_| None);
+        }
         if preserve_truth_track && !inversion.truth_knots.is_empty() {
             inversion.knots = inversion.truth_knots.clone();
             inversion.capture_id = inversion.truth_capture_id;
             inversion.ready = true;
+            inversion.displayed_density = inversion.results[active_method.performance_index()]
+                .clone()
+                .or_else(|| inversion.best_results[active_method.performance_index()].clone());
         }
     }
     if !inversion.ready
@@ -367,17 +373,6 @@ pub fn render_gizmos_system(
         return;
     };
     for (ct, history) in cassini_query.iter() {
-        let pts: Vec<Vec3> = if *active_method != ActiveGravityMethod::HomogeneousWerner
-            && !inversion.truth_orbit.is_empty()
-        {
-            inversion.truth_orbit.clone()
-        } else if *active_method != ActiveGravityMethod::HomogeneousWerner
-            && !inversion.truth_knots.is_empty()
-        {
-            inversion.truth_knots.iter().map(|knot| knot.position).collect()
-        } else {
-            history.0.iter().copied().collect()
-        };
         let orbit_color = match *active_method {
             ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
             ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
@@ -385,7 +380,12 @@ pub fn render_gizmos_system(
             ActiveGravityMethod::MmfftCompressed => Color::srgba(1.0, 0.72, 0.2, 0.9),
             ActiveGravityMethod::Fmm => Color::srgba(0.25, 0.9, 0.55, 0.9),
         };
-        gizmos.linestrip(pts, orbit_color);
+        if history.0.len() >= 2 {
+            // The main trail always follows the detector's actual integrated
+            // path. Frozen inversion samples are rendered separately below and
+            // must never replace or hide this bounded live history.
+            gizmos.linestrip(history.0.iter().copied(), orbit_color);
+        }
 
         if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
             let pos = ct.translation;
@@ -432,7 +432,7 @@ pub fn render_gizmos_system(
                 if index > 0 && substep == 0 {
                     continue;
                 }
-                let Some((position, _)) = quintic_segment_position_acceleration(
+                let Some((position, _, _)) = quintic_segment_position_acceleration(
                     start,
                     end,
                     accelerations[index],
@@ -583,6 +583,10 @@ mod tests {
             model_deviation: 0.0,
             model_fit: 1.0,
             objective_improvement: 0.0,
+            training_rmse: 0.0,
+            holdout_rmse: 0.0,
+            observation_noise_fraction: 0.0,
+            observation_noise_realizations: 0,
             inversion_time_ms: 0.0,
             trajectory_samples: 17,
             iterations: 1,

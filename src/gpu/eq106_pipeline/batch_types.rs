@@ -43,6 +43,12 @@ const TAYLOR_REMAINDER_TARGET: f32 = 1.0e-3;
 const TIMESTAMP_BYTES: u64 = 8;
 const TARGET_DISPATCH_WIDTH: u32 = 65_535;
 
+pub(crate) const fn eq106_sensitivity_configuration_hash() -> u64 {
+    (FREQUENCY_COUNT as u64) << 32
+        ^ (TAYLOR_MAX_ORDER as u64) << 16
+        ^ QUADRATURE_COUNT as u64
+}
+
 fn taylor_coefficient_count(order: u32) -> u32 {
     let order = order.clamp(1, TAYLOR_MAX_ORDER);
     ((order + 1) * (order + 2) / 2).min(MAX_TAYLOR_COEFFICIENT_COUNT)
@@ -109,6 +115,8 @@ fn decode_gpu_timings(
         cpu_readback_wait_ms,
         target_count,
         spectral_element_count,
+        dispatch_count: 1,
+        spectrum_rebuild_count: spectral_element_count,
     }
 }
 
@@ -215,7 +223,8 @@ struct ExtractedEq106Input {
     target_snapshots: Vec<GravityRequestSnapshot>,
     batch_elements: Vec<Eq106BatchElement>,
     batch_capture_id: Option<u64>,
-    sensitivity_column: Option<u32>,
+    sensitivity_sources: Vec<[u8; 16]>,
+    sensitivity_source_hash: u64,
     sources: Option<Vec<u8>>,
     fourier_modes: Option<Vec<u8>>,
     operator_tensor: Option<Vec<u8>>,
@@ -396,6 +405,64 @@ fn poll_eq106_readback(
     performance.latest = Some(packet.timings);
     let angular_velocity_world =
         RYUGU_SPIN_AXIS.normalize() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
+    if packet.sensitivity_column_count > 0 {
+        let Some(capture_id) = packet.batch_capture_id else {
+            runtime_error.raise("Equation (106) sensitivity readback has no capture identity.");
+            return;
+        };
+        let column_count = packet.sensitivity_column_count as usize;
+        let sample_count = packet.snapshots.len();
+        if sensitivity.capture_id != Some(capture_id)
+            || sensitivity.source_hash != packet.sensitivity_source_hash
+            || sensitivity.configuration_hash != packet.sensitivity_configuration_hash
+        {
+            return;
+        }
+        if packet.partial_sums.len() != column_count * sample_count {
+            runtime_error.raise(format!(
+                "Equation (106) sensitivity batch returned {} vectors; expected {} x {}.",
+                packet.partial_sums.len(),
+                column_count,
+                sample_count,
+            ));
+            return;
+        }
+        let assembled_at = Instant::now();
+        let columns = packet
+            .partial_sums
+            .chunks_exact(sample_count)
+            .map(|column| {
+                column
+                    .iter()
+                    .zip(&packet.snapshots)
+                    .map(|(field, snapshot)| {
+                        snapshot.ryugu_transform.rotation
+                            * Vec3::new(field[0], field[1], field[2])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if columns
+            .iter()
+            .flatten()
+            .any(|acceleration| !acceleration.is_finite())
+        {
+            runtime_error.raise("Equation (106) sensitivity matrix contains non-finite values.");
+            return;
+        }
+        sensitivity.capture_id = Some(capture_id);
+        sensitivity.sample_count = sample_count;
+        sensitivity.voxel_count = column_count;
+        sensitivity.columns = columns;
+        let inversion = performance.inversion.get_or_insert_default();
+        inversion.gpu_readback_ms = packet.timings.cpu_readback_wait_ms;
+        inversion.design_matrix_assembly_ms = assembled_at.elapsed().as_secs_f64() * 1.0e3;
+        inversion.dispatch_count = packet.timings.dispatch_count;
+        inversion.spectrum_rebuild_count = packet.timings.spectrum_rebuild_count;
+        inversion.spectrum_build_ms = packet.timings.spectrum_build_ms;
+        inversion.target_evaluation_ms = packet.timings.target_evaluation_ms;
+        return;
+    }
     let decoded = match decode_eq106_packet(&packet, angular_velocity_world) {
         Ok(decoded) => decoded,
         Err(Eq106DecodeError::Incomplete) => {
@@ -408,41 +475,7 @@ fn poll_eq106_readback(
         }
     };
 
-    if let (Some(capture_id), Some(column)) =
-        (packet.batch_capture_id, packet.sensitivity_column)
-    {
-        if sensitivity.capture_id != Some(capture_id) {
-            sensitivity.capture_id = Some(capture_id);
-            sensitivity.columns.clear();
-            sensitivity.sample_count = decoded.len();
-        }
-        // `start_density_inversion_system` installs the capture identity before
-        // the first GPU column returns. Initialize the row count from that
-        // first column even when the capture identity already matches.
-        if column == 0 && sensitivity.columns.is_empty() {
-            sensitivity.sample_count = decoded.len();
-        }
-        if sensitivity.sample_count != decoded.len() {
-            runtime_error.raise(format!(
-                "Equation (106) sensitivity column {column} returned {} samples; expected {}.",
-                decoded.len(),
-                sensitivity.sample_count,
-            ));
-            sensitivity.columns.clear();
-            sensitivity.sample_count = 0;
-            return;
-        }
-        if sensitivity.columns.len() == column as usize {
-            sensitivity.columns.push(
-                decoded
-                    .into_iter()
-                    .map(|sample| {
-                        sample.snapshot.ryugu_transform.rotation * sample.body_acceleration
-                    })
-                    .collect(),
-            );
-        }
-    } else if let Some(capture_id) = packet.batch_capture_id {
+    if let Some(capture_id) = packet.batch_capture_id {
         batch_result.capture_id = Some(capture_id);
         batch_result.samples = decoded;
     } else if let Some(sample) = decoded.into_iter().next() {

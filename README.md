@@ -162,7 +162,7 @@ flowchart LR
     Interface --> GPU["GPU backends\nsrc/gpu/\nrender-world compute plugins"]
     CPU --> CpuBenchmark["CPU benchmark\nsrc/cpu/benchmark.rs\ndeterministic scalar kernels"]
     GPU --> GpuTests["GPU tests\nsrc/gpu/tests.rs\nWGSL validation"]
-    GPU --> GpuBenchmark["GPU benchmark metadata\nsrc/gpu/benchmark.rs\ntimestamp stage contract"]
+    GPU --> GpuBenchmark["GPU performance metrics\nshared interface resources\nportable timing fields"]
 ```
 
 The four top-level layers are intentionally directional:
@@ -172,15 +172,15 @@ src/bevy/      Bevy scheduling, render extraction, scene, UI, and diagnostics
 src/interface/ shared resources, snapshots, histories, and method selection
 src/cpu/       trajectory planning, source preparation, integration, inversion,
                Eq.106 reference operators, and CPU benchmark entry points
-src/gpu/       WebGPU compute backends, shader validation tests, and timestamp
-               benchmark metadata
+src/gpu/       WebGPU compute backends, shader validation tests, and portable
+               performance metric collection
 ```
 
 There are no compatibility redirect modules in the runtime. Imports point
 directly from Bevy adapters to the shared interface and then to CPU or GPU
 implementations. The Eq.106 dispatch path is split into named preparation,
-trajectory-batch, single-target, and layout stages; no scheduling order, buffer
-contract, or physics fallback behavior changes.
+trajectory-batch, sensitivity-matrix, single-target, and layout stages; no
+scheduling order, buffer contract, or physics fallback behavior changes.
 
 The benchmark entry point is exported from `src/cpu/benchmark.rs` rather than
 the Bevy application entry point. This keeps host/WASM benchmark tooling
@@ -264,16 +264,22 @@ The interactive inversion freezes one immutable capture before comparing methods
 
 - `16` editable position, velocity, orientation, and time knots define a continuous quintic-Hermite track sampled at the same `241` points by every method;
 - one `capture_id` identifies that complete sample array, and the UI rejects result rows from a different capture;
-- the synthetic observation vector is generated once from the logarithmic density law `rho(r)=C ln(1+r/epsilon)` through the radial forward history; Radial, Eq.106, MMFFT, and FMM reuse this frozen truth track rather than generating four different observations;
+- the synthetic observation vector is generated at all 241 training states from all `786432` logarithmic-density radial records by an independent `f64` order-two tree with a strict `0.025` opening tolerance; the result is cached by `capture_id` and source hash, so every inverse backend receives identical observations without repeating the high-resolution build;
+- the Quintic Hermite sampler evaluates position, its analytic time derivative, and acceleration from the same polynomial; editing a knot changes the capture identity and regenerates both the matrix geometry and observations;
+- validation uses a separate body-frame-offset holdout arc that is never included in the QP; its predictions use unit-density bases assembled from the original radial records rather than voxel-centroid kernels;
 - the interior is represented by a `4³` Cartesian grid (`56` occupied voxels for the bundled model);
 - each inverse backend supplies a unit-density response matrix `A` for the same 723-component acceleration vector; forward models never predict density directly, and Clarabel solves for the 56 density variables;
-- Eq.106 builds its 56 unit-density voxel columns with the GPU spectral forward pipeline and caches the readback matrix;
+- Eq.106 builds all 56 unit-density voxel columns in one GPU command encoder, submits once, and reads one compact acceleration-only matrix back once; Jacobian, residual, dual-certificate, and timestamp-query output is disabled for this inversion-only path;
+- the Eq.106 matrix cache identity combines the frozen `capture_id`, source geometry hash, voxel/sample dimensions, and a frequency/quadrature/Taylor configuration signature; a density update reuses the geometry operator instead of rebuilding it;
 - MMFFT builds each column with its real CIC deposition, zero-padded FFT convolution, hierarchy selection, and tricubic derivative rather than a softened Newton substitute;
+- FMM builds each unit-density column from a distributed voxel source tree and evaluates it with the FMM multipole acceptance path rather than the generic voxel-centroid Newton matrix;
 - Rust assembles the shared `56 × 56` convex QP and Clarabel solves it with exact total-mass equality, density bounds, spatial and radial smoothness, and a weak uniform prior.
+- the data term uses an explicit diagonal covariance (`0.1%` relative acceleration noise with an absolute floor) instead of implicit per-sample normalization; three reproducible seeded Gaussian realizations are solved and their density estimates are averaged, while holdout observations remain noiseless;
 - Radial is the forward-only truth generator for the shared long observation orbit; it is intentionally absent from the inversion button and fit history alongside Werner.
 - Werner remains a forward-only homogeneous polyhedron diagnostic and is intentionally absent from the inversion button and fit history.
-- switching methods clears the current inversion view but retains each method's highest historical fit; an equal fit replaces the saved row only when the complete inversion is faster;
-- each history row reports `fit`, density `RMSE`, and wall-clock inversion time from the button request through method-specific sensitivity construction/readback and the Clarabel solve.
+- switching methods retains every method's current and best result for the same frozen truth track, and restores the selected method's density view; editing the trajectory or changing the physical source invalidates the complete comparison history;
+- each history row separates density fit from the training and independent holdout field residuals, and reports wall-clock inversion time from the button request through method-specific sensitivity construction/readback and the Clarabel solve.
+- the Eq.106 status line separates source preparation, CPU spectrum/evaluation command encoding, asynchronous GPU batch completion plus mapped readback, design-matrix assembly, Clarabel solve, verification, total time, dispatch count, spectrum rebuild count, and cache hit/miss. A cache hit explicitly reports that GPU stages were skipped. Browser timestamp queries remain disabled on Dawn/Metal because query-set allocation can fail even when the feature bit is advertised.
 
 The reported `fit` is a synthetic volume-weighted density score against the known reference model. It is not a posterior probability, confidence level, or real-observation accuracy. One external trajectory cannot uniquely recover an arbitrary three-dimensional density field without assumptions and regularization.
 

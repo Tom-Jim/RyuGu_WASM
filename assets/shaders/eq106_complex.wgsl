@@ -23,7 +23,7 @@ struct Eq106Params {
     target_count: u32,
     line_limit: f32,
     target_offset: u32,
-    _padding1: u32,
+    inversion_mode: u32,
     _padding2: u32,
 };
 
@@ -696,13 +696,16 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
     for (var frequency_index = 0u; frequency_index < frequency_count; frequency_index += 1u) {
         let signed_index = i32(frequency_index) - i32(params.half_count);
         let omega = f32(signed_index) * params.omega_step;
-        let spectral_derivative = complex_mul(vec2<f32>(params.sigma, omega), phase);
         let denominator = max(params.sigma * params.sigma + omega * omega, 1.0e-20);
         edge_sum += (phase.x * params.sigma + phase.y * omega) / denominator;
-        edge_derivative_sum += (
-            spectral_derivative.x * params.sigma
-            + spectral_derivative.y * omega
-        ) / denominator;
+        var spectral_derivative = vec2<f32>(0.0);
+        if params.inversion_mode == 0u {
+            spectral_derivative = complex_mul(vec2<f32>(params.sigma, omega), phase);
+            edge_derivative_sum += (
+                spectral_derivative.x * params.sigma
+                + spectral_derivative.y * omega
+            ) / denominator;
+        }
 
         for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
             let sample = spectrum[coefficient * frequency_count + frequency_index];
@@ -715,14 +718,16 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 z.x,
                 complex_mul(sample.potential, phase).x,
             );
-            coefficient_imaginary[coefficient] += vec3<f32>(x.y, y.y, z.y);
-            coefficient_derivative_h[coefficient] += vec3<f32>(
-                complex_mul(sample.acceleration_x, spectral_derivative).x,
-                complex_mul(sample.acceleration_y, spectral_derivative).x,
-                complex_mul(sample.acceleration_z, spectral_derivative).x,
-            );
-            if abs(signed_index) == i32(params.half_count) {
-                coefficient_tail[coefficient] += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+            if params.inversion_mode == 0u {
+                coefficient_imaginary[coefficient] += vec3<f32>(x.y, y.y, z.y);
+                coefficient_derivative_h[coefficient] += vec3<f32>(
+                    complex_mul(sample.acceleration_x, spectral_derivative).x,
+                    complex_mul(sample.acceleration_y, spectral_derivative).x,
+                    complex_mul(sample.acceleration_z, spectral_derivative).x,
+                );
+                if abs(signed_index) == i32(params.half_count) {
+                    coefficient_tail[coefficient] += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+                }
             }
         }
         phase = complex_mul(phase, phase_step);
@@ -746,27 +751,34 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // spectrum as the acceleration. This avoids accumulating a second
         // finite-band integration of the longitudinal field over h.
         let reconstructed_potential = raw.w / edge_response;
-        let raw_derivative_h = coefficient_derivative_h[coefficient] * inversion_scale;
-        let reconstructed_derivative_h = (
-            raw_derivative_h * edge_response
-            - raw.xyz * edge_response_derivative
-        ) / (edge_response * edge_response);
         let value = monomial(u, v, a, b);
         field += vec4<f32>(reconstructed, reconstructed_potential) * value;
-        imaginary_field += coefficient_imaginary[coefficient]
-            * inversion_scale / edge_response * value;
-        tail_field += coefficient_tail[coefficient]
-            * inversion_scale / edge_response * abs(value);
-        derivative_h += reconstructed_derivative_h * value;
-        if a > 0u {
-            derivative_u += reconstructed.xyz * f32(a) * monomial(u, v, a - 1u, b);
+        if params.inversion_mode == 0u {
+            let raw_derivative_h = coefficient_derivative_h[coefficient] * inversion_scale;
+            let reconstructed_derivative_h = (
+                raw_derivative_h * edge_response
+                - raw.xyz * edge_response_derivative
+            ) / (edge_response * edge_response);
+            imaginary_field += coefficient_imaginary[coefficient]
+                * inversion_scale / edge_response * value;
+            tail_field += coefficient_tail[coefficient]
+                * inversion_scale / edge_response * abs(value);
+            derivative_h += reconstructed_derivative_h * value;
+            if a > 0u {
+                derivative_u += reconstructed.xyz * f32(a) * monomial(u, v, a - 1u, b);
+            }
+            if b > 0u {
+                derivative_v += reconstructed.xyz * f32(b) * monomial(u, v, a, b - 1u);
+            }
+            if degree == active_order {
+                last_order_field += reconstructed.xyz * value;
+            }
         }
-        if b > 0u {
-            derivative_v += reconstructed.xyz * f32(b) * monomial(u, v, a, b - 1u);
-        }
-        if degree == active_order {
-            last_order_field += reconstructed.xyz * value;
-        }
+    }
+
+    if params.inversion_mode != 0u {
+        output[target_index] = field;
+        return;
     }
 
     let derivative_x = derivative_h * tangent.x + derivative_u * normal.x + derivative_v * binormal.x;

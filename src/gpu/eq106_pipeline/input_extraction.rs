@@ -48,7 +48,8 @@ fn extract_eq106_input(
     extracted.target_snapshots.clear();
     extracted.batch_elements.clear();
     extracted.batch_capture_id = None;
-    extracted.sensitivity_column = None;
+    extracted.sensitivity_sources.clear();
+    extracted.sensitivity_source_hash = 0;
     extracted.source_count = source.sources.len() as u32;
     extracted.density_mode_count = source.fourier_modes.len() as u32;
     extracted.radius = source.radius as f32;
@@ -82,15 +83,17 @@ fn extract_eq106_input(
     let pending_sensitivity = inversion.optimizer.as_ref().and_then(|job| {
         (job.method == ActiveGravityMethod::CurvedArcEq106
             && sensitivity.capture_id == Some(job.capture_id)
-            && sensitivity.columns.len() < job.voxels.len())
-            .then_some((job.capture_id, sensitivity.columns.len(), job))
+            && sensitivity.source_hash == job.source_hash
+            && sensitivity.configuration_hash == eq106_sensitivity_configuration_hash()
+            && sensitivity.columns.is_empty())
+            .then_some((job.capture_id, job))
     });
-    if let Some((capture_id, column, job)) = pending_sensitivity {
+    if let Some((capture_id, job)) = pending_sensitivity {
         let samples = crate::cpu::inversion::sample_frozen_trajectory(&inversion.knots)
             .unwrap_or_default();
         if samples.len() >= 2 {
             extracted.batch_capture_id = Some(capture_id);
-            extracted.sensitivity_column = Some(column as u32);
+            extracted.sensitivity_source_hash = job.source_hash;
             let mut positions = Vec::with_capacity(samples.len());
             let mut velocities = Vec::with_capacity(samples.len());
             for (index, sample) in samples.iter().enumerate() {
@@ -122,14 +125,20 @@ fn extract_eq106_input(
                 extracted.radius,
                 extracted.certified_line_limit,
             );
-            if let Some(voxel) = job.voxels.get(column) {
-                let mut bytes = Vec::with_capacity(16);
+            extracted.sensitivity_sources.reserve(job.voxels.len());
+            for voxel in &job.voxels {
+                let mut bytes = [0_u8; 16];
+                let mut offset = 0;
                 for value in [voxel.center.x, voxel.center.y, voxel.center.z, voxel.volume] {
-                    bytes.extend_from_slice(&value.to_le_bytes());
+                    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                    offset += 4;
                 }
-                extracted.sources = Some(bytes);
+                extracted.sensitivity_sources.push(bytes);
+            }
+            if let Some(first) = extracted.sensitivity_sources.first() {
+                extracted.sources = Some(first.to_vec());
                 extracted.source_count = 1;
-                extracted.source_hash = capture_id ^ (column as u64 + 1).rotate_left(29);
+                extracted.source_hash = capture_id ^ job.source_hash.rotate_left(29);
             }
         }
     } else if let Some(capture_id) = pending_benchmark_id
@@ -226,7 +235,7 @@ fn extract_eq106_input(
     // cached local spectrum/Jacobian rather than consuming a GPU-predicted
     // future trajectory as if it were measured state.
     let source_hash = source.source_hash;
-    if extracted.sensitivity_column.is_none()
+    if extracted.sensitivity_sources.is_empty()
         && (extracted.sources.is_none() || extracted.source_hash != source_hash)
     {
         let mut bytes = Vec::with_capacity(source.sources.len() * 16);
@@ -241,6 +250,8 @@ fn extract_eq106_input(
             }
         }
         extracted.sources = Some(bytes);
+    }
+    if extracted.fourier_modes.is_none() {
         let mut mode_bytes = Vec::with_capacity(source.fourier_modes.len() * 16);
         for record in &source.fourier_modes {
             for value in record {
@@ -249,7 +260,7 @@ fn extract_eq106_input(
         }
         extracted.fourier_modes = Some(mode_bytes);
     }
-    if extracted.sensitivity_column.is_none() {
+    if extracted.sensitivity_sources.is_empty() {
         extracted.source_hash = source_hash;
     }
     if extracted.operator_tensor.is_none() {
@@ -348,7 +359,7 @@ fn dispatch_eq106_single_target(
     }
     inner.last_submitted = Some(key);
     render_queue.write_buffer(&inner.targets, 0, &extracted.target_bytes);
-    let evaluate_dual_certificate = extracted.sensitivity_column.is_none()
+    let evaluate_dual_certificate = extracted.sensitivity_sources.is_empty()
         && cfg!(feature = "eq106-dual-certificate")
         && inner
             .dual_certificate_frame
@@ -365,6 +376,7 @@ fn dispatch_eq106_single_target(
         extracted.density_mode_count,
         inner.segment_id,
         evaluate_dual_certificate,
+        false,
         inner.target_count,
         0,
     );
@@ -467,7 +479,6 @@ fn dispatch_eq106_single_target(
     let map_staging = staging.clone();
     let snapshots = extracted.target_snapshots.clone();
     let batch_capture_id = extracted.batch_capture_id;
-    let sensitivity_column = extracted.sensitivity_column;
     let output_size = inner.output_size as usize;
     let target_count = inner.target_count;
     let timestamp_period_ns = render_queue.get_timestamp_period();
@@ -503,7 +514,9 @@ fn dispatch_eq106_single_target(
                         partial_sums: values,
                         snapshots,
                         batch_capture_id,
-                        sensitivity_column,
+                        sensitivity_column_count: 0,
+                        sensitivity_source_hash: 0,
+                        sensitivity_configuration_hash: 0,
                         timings,
                     });
                 }
