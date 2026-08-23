@@ -111,6 +111,18 @@ use wasm_bindgen::prelude::*;
         return elapsed > 0 ? 1000 * ryuguFrameIntervalCount / elapsed : 0;
     }
 
+    export function browser_recent_frame_ms() {
+        if (ryuguFrameIntervalCount === 0) return 0;
+        const sampleCount = Math.min(8, ryuguFrameIntervalCount);
+        let longest = 0;
+        for (let offset = 1; offset <= sampleCount; offset += 1) {
+            const index = (ryuguFrameIntervalCursor - offset + ryuguFrameIntervals.length)
+                % ryuguFrameIntervals.length;
+            longest = Math.max(longest, ryuguFrameIntervals[index]);
+        }
+        return longest;
+    }
+
     export function has_webgpu() {
         return typeof navigator !== "undefined" && navigator.gpu !== undefined;
     }
@@ -141,6 +153,9 @@ extern "C" {
     #[wasm_bindgen(js_name = browser_actual_fps)]
     fn browser_actual_fps_js() -> f64;
 
+    #[wasm_bindgen(js_name = browser_recent_frame_ms)]
+    fn browser_recent_frame_ms_js() -> f64;
+
     #[wasm_bindgen(js_name = has_webgpu)]
     fn browser_has_webgpu() -> bool;
 
@@ -156,8 +171,19 @@ pub(crate) fn browser_frame_rate() -> Option<f64> {
     (fps.is_finite() && fps > 0.0).then_some(fps)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn browser_recent_frame_ms() -> Option<f64> {
+    let milliseconds = browser_recent_frame_ms_js();
+    (milliseconds.is_finite() && milliseconds > 0.0).then_some(milliseconds)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn browser_frame_rate() -> Option<f64> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn browser_recent_frame_ms() -> Option<f64> {
     None
 }
 

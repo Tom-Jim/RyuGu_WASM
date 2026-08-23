@@ -103,15 +103,19 @@ fn comparison_metric_text(
     {
         return format!("{marker}{name:<12} N/A (different workload)");
     }
-    if !result.gpu_batch_verified {
-        return format!("{marker}{name:<12} N/A (GPU verification failed)");
-    }
+    let verification = if result.gpu_batch_verified {
+        ""
+    } else {
+        "UNVERIFIED | "
+    };
     let total = result.total_ms;
     let value = match planning.selected_metric {
         ComparisonMetric::GravityRelativeError => {
             format!(
-                "gravity {:.3e} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + GPU queue/execute/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
+                "{verification}gravity {:.3e} | valid {}/{} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
                 result.relative_gravity_error,
+                result.valid_candidate_count,
+                result.workload.candidate_count,
                 result.common_preparation_ms,
                 result.preprocessing_ms,
                 result.command_submission_ms,
@@ -129,18 +133,18 @@ fn comparison_metric_text(
             )
         }
         ComparisonMetric::GradientRelativeError => {
-            format!("gradient relative error {:.3e}", result.gradient_relative_error)
+            format!("{verification}gradient relative error {:.3e}", result.gradient_relative_error)
         }
         ComparisonMetric::PericenterError => {
-            format!("pericenter error {:.4} m", result.pericenter_error_m)
+            format!("{verification}pericenter error {:.4} m", result.pericenter_error_m)
         }
         ComparisonMetric::MinimumAltitude => {
-            format!("minimum altitude {:.3} m", result.minimum_altitude_m)
+            format!("{verification}minimum altitude {:.3} m", result.minimum_altitude_m)
         }
         ComparisonMetric::ModelDiscrimination => {
             let best = result.top_candidates[0];
             format!(
-                "reference-model separation {:.3e} | best candidate #{} {:.3e}",
+                "{verification}reference-model separation {:.3e} | best candidate #{} {:.3e}",
                 result.model_discrimination, best.candidate_index, best.reference_model_separation
             )
         }
@@ -161,33 +165,70 @@ fn comparison_metric_text(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "aggregate objective {:.3e} | top candidates {ranked}",
+                "{verification}aggregate objective {:.3e} | top candidates {ranked}",
                 result.planning_objective,
             )
         }
         ComparisonMetric::SegmentCount if index == 2 => {
-            format!("{} segments", result.segment_count)
+            format!("{verification}{} segments", result.segment_count)
         }
         ComparisonMetric::SpeedupVsGpuFmm => {
-            if planning.shared_workload().is_none() {
-                return format!("{marker}{name:<12} N/A (GPU fairness pending)");
+            if planning.completed_workload().is_none() {
+                return format!("{marker}{name:<12} N/A (methods incomplete)");
             }
-            let Some(fmm) = planning.results[4] else {
+            let (Some(eq106), Some(mmfft), Some(fmm)) =
+                (planning.results[2], planning.results[3], planning.results[4])
+            else {
                 return format!("{marker}{name:<12} N/A");
             };
-            format!(
-                "{:.3}x vs GPU treecode | {}",
-                fmm.total_ms / result.total_ms.max(f64::MIN_POSITIVE),
-                result.method.planning_label(),
-            )
+            if index == 2 {
+                let relation = |label: &str, baseline_ms: f64| {
+                    if baseline_ms <= eq106.total_ms {
+                        format!(
+                            "{label} {:.2} ms ({:.1}x faster than Eq.106)",
+                            baseline_ms,
+                            eq106.total_ms / baseline_ms.max(f64::MIN_POSITIVE)
+                        )
+                    } else {
+                        format!(
+                            "{label} {:.2} ms (Eq.106 {:.1}x faster)",
+                            baseline_ms,
+                            baseline_ms / eq106.total_ms.max(f64::MIN_POSITIVE)
+                        )
+                    }
+                };
+                format!(
+                    "{verification}Eq.106 {:.2} ms | {} | {} | requests {}/{}/{} | dispatch {}/{}/{}",
+                    eq106.total_ms,
+                    relation("FFT", mmfft.total_ms),
+                    relation("tree", fmm.total_ms),
+                    eq106.gpu_request_count,
+                    mmfft.gpu_request_count,
+                    fmm.gpu_request_count,
+                    eq106.dispatch_count,
+                    mmfft.dispatch_count,
+                    fmm.dispatch_count,
+                )
+            } else {
+                format!(
+                    "{verification}completed | {:.2} ms | requests {} | dispatch {} | {}",
+                    result.total_ms,
+                    result.gpu_request_count,
+                    result.dispatch_count,
+                    result.method.planning_label(),
+                )
+            }
         }
-        ComparisonMetric::ColdStartAmortization if index == 2 => {
-            if planning.shared_workload().is_none() || result.warm_evaluation_ms <= 0.0 {
+        ComparisonMetric::ColdStartAmortization => {
+            if result.warm_evaluation_ms <= 0.0 {
                 return format!("{marker}{name:<12} N/A (cold/warm GPU timing pending)");
             }
-            format!("{} candidates", result.cold_amortization_candidates)
+            format!(
+                "{verification}{} candidate-equivalents (diagnostic, run B={})",
+                result.cold_amortization_candidates, result.workload.candidate_count
+            )
         }
-        ComparisonMetric::SegmentCount | ComparisonMetric::ColdStartAmortization => "N/A".into(),
+        ComparisonMetric::SegmentCount => "not applicable (no Eq.106 spectral segments)".into(),
         ComparisonMetric::DensityFit | ComparisonMetric::InversionTime => unreachable!(),
     };
     format!("{marker}{name:<12} {value}")
@@ -201,8 +242,9 @@ fn update_planning_comparison_status(
     let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
     let evaluations = u64::from(candidate_count) * u64::from(density_count) * u64::from(sample_count);
     let prefix = format!(
-        "build v{} | {} | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        "build v{} ({}) | {} | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
         env!("CARGO_PKG_VERSION"),
+        option_env!("RYUGU_GIT_SHA").unwrap_or("unknown"),
         planning.workload_profile.label(),
         candidate_count,
         density_count,
@@ -220,7 +262,7 @@ fn update_planning_comparison_status(
         NEAR_SYNC_TRANSVERSE_LIMIT_METERS,
         NEAR_SYNC_RELATIVE_REMAINDER_TARGET,
     );
-    if planning.shared_workload().is_none() {
+    if planning.completed_workload().is_none() {
         **text = format!(
             "{prefix}{}\nMetrics are shown from the completed shared BxKxH validation run. Fair verdict withheld until identical Eq.106 GPU spectral, CPU FFT-grid + GPU interpolation, and GPU order-2 treecode batches are verified; preprocessing must be included.",
             planning.status,
@@ -228,15 +270,18 @@ fn update_planning_comparison_status(
         color.0 = Color::srgb(1.0, 0.78, 0.25);
         return;
     }
+    let verdict = planning
+        .fair_verdict()
+        .unwrap_or_else(|| "Fair verdict withheld: incomplete planning results".into());
     **text = format!(
-        "{prefix}gravity <= 1e-3 | gradient <= 1e-2 | pericenter <= 1 m | Eq.106 segments <= 10 (hard 16) | cold amortization <= 256\n{}",
-        planning
-            .fair_verdict()
-            .unwrap_or("Fair verdict withheld: incomplete planning results"),
+        "{prefix}gravity <= 1e-3 | gradient <= 1e-2 | pericenter <= 1 m | Eq.106 segments <= 10 (hard 16) | complete candidate coverage\n{}",
+        verdict,
     );
     color.0 = if planning
         .fair_verdict()
-        .is_some_and(|verdict| verdict.contains("advantage"))
+        .is_some_and(|verdict| {
+            verdict.starts_with("Eq.106 strong") || verdict.starts_with("Eq.106 useful")
+        })
     {
         Color::srgb(0.45, 1.0, 0.62)
     } else {

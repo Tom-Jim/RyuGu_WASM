@@ -24,16 +24,16 @@ pub(crate) fn planning_verification_targets(
     request: &PlanningGpuRequest,
     batch: &PlanningCandidateBatch,
 ) -> Vec<u32> {
-    if !request
-        .density_model
-        .is_multiple_of(PLANNING_REFERENCE_MODEL_STRIDE)
-    {
+    let model_stride = PLANNING_REFERENCE_MODEL_STRIDE.min((batch.density_model_count / 4).max(1));
+    if !request.density_model.is_multiple_of(model_stride) {
         return Vec::new();
     }
+    let candidate_stride =
+        PLANNING_REFERENCE_CANDIDATE_STRIDE.min((batch.candidate_count / 8).max(1));
     let mut targets = Vec::new();
     for local_candidate in 0..request.candidate_count {
         let candidate = request.candidate_start + local_candidate;
-        if !candidate.is_multiple_of(PLANNING_REFERENCE_CANDIDATE_STRIDE) {
+        if !candidate.is_multiple_of(candidate_stride) {
             continue;
         }
         for sample in 0..batch.samples_per_candidate {

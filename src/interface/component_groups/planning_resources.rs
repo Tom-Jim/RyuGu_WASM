@@ -22,7 +22,6 @@ pub const PLANNING_EQ106_TARGET_SEGMENTS: u32 = 10;
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
 pub const PLANNING_USEFUL_SPEEDUP: f64 = 3.0;
 pub const PLANNING_STRONG_SPEEDUP: f64 = 5.0;
-pub const PLANNING_MAX_COLD_AMORTIZATION_CANDIDATES: u32 = 256;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
 pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
 
@@ -119,14 +118,14 @@ pub enum PlanningWorkloadProfile {
 impl PlanningWorkloadProfile {
     pub fn dimensions(self) -> (u32, u32, u32) {
         match self {
-            Self::First => (PLANNING_CANDIDATE_COUNT, 16, 241),
+            Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),
             Self::Stress => (PLANNING_CANDIDATE_COUNT, 32, 512),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::First => "First 2048x16x241",
+            Self::First => "First 32x4x241",
             Self::Stress => "Stress 2048x32x512",
         }
     }
@@ -174,7 +173,7 @@ impl ComparisonMetric {
             Self::ModelDiscrimination => "Reference separation",
             Self::PlanningObjective => "Planning objective",
             Self::SegmentCount => "Segments",
-            Self::SpeedupVsGpuFmm => "Speedup / treecode",
+            Self::SpeedupVsGpuFmm => "Speedup / baselines",
             Self::ColdStartAmortization => "Cold amortization",
         }
     }
@@ -274,6 +273,7 @@ pub struct PlanningMethodMetrics {
     pub model_discrimination: f32,
     pub planning_objective: f32,
     pub segment_count: u32,
+    pub valid_candidate_count: u32,
     pub cold_amortization_candidates: u32,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
@@ -319,6 +319,7 @@ pub struct PlanningBatchJob {
     pub candidate_reference_sum: Vec<f64>,
     pub candidate_gradient_sum: Vec<f64>,
     pub candidate_minimum_altitude_m: Vec<f32>,
+    pub candidate_valid: Vec<bool>,
     pub common_preparation_ms: f64,
     pub preprocessing_ms: f64,
     pub command_submission_ms: f64,
@@ -341,6 +342,7 @@ impl PlanningMethodMetrics {
             && self.pericenter_error_m.is_finite()
             && self.pericenter_error_m <= PLANNING_PERICENTER_ERROR_LIMIT_METERS
             && self.top_candidates[0].objective.is_finite()
+            && self.valid_candidate_count > 0
             && self.total_ms.is_finite()
             && self.total_ms > 0.0
     }
@@ -390,14 +392,14 @@ impl Default for PlanningComparisonState {
             run_requested: false,
             run_id: 0,
             reference_duration_seconds: 0.0,
-            status: "First uses normal density inversion. Select Stress to start planning.".into(),
+            status: "Choose a planning metric to run First, or use inversion metrics with the inversion button.".into(),
             batch_job: None,
         }
     }
 }
 
 impl PlanningComparisonState {
-    pub fn shared_workload(&self) -> Option<PlanningWorkloadIdentity> {
+    pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
         let eq106 = self.results[ActiveGravityMethod::CurvedArcEq106.performance_index()]?;
         let mmfft = self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?;
         let fmm = self.results[ActiveGravityMethod::Fmm.performance_index()]?;
@@ -412,37 +414,85 @@ impl PlanningComparisonState {
             && eq106.workload.is_complete()
             && eq106.backend == PlanningExecutionBackend::GpuEq106
             && mmfft.backend == PlanningExecutionBackend::GpuMmfft
-            && fmm.backend == PlanningExecutionBackend::GpuFmm
-            && eq106.gpu_batch_verified
-            && mmfft.gpu_batch_verified
-            && fmm.gpu_batch_verified)
+            && fmm.backend == PlanningExecutionBackend::GpuFmm)
             .then_some(eq106.workload)
     }
 
-    pub fn fair_verdict(&self) -> Option<&'static str> {
-        self.shared_workload()?;
+    pub fn fair_verdict(&self) -> Option<String> {
+        self.completed_workload()?;
         let eq106 = self.results[2]?;
         let mmfft = self.results[3]?;
         let fmm = self.results[4]?;
-        if ![eq106, mmfft, fmm]
-            .into_iter()
-            .all(PlanningMethodMetrics::accuracy_eligible)
-            || eq106.segment_count > PLANNING_EQ106_MAX_SEGMENTS
-            || eq106.cold_amortization_candidates > PLANNING_MAX_COLD_AMORTIZATION_CANDIDATES
-        {
-            return Some("no eligible winner: accuracy, segment, or amortization limit failed");
+        let mut failures = Vec::new();
+        for (name, result) in [("Eq.106", eq106), ("FFT-grid", mmfft), ("treecode", fmm)] {
+            let failure_count = failures.len();
+            if !result.gpu_batch_verified {
+                failures.push(format!("{name} GPU verification failed"));
+            }
+            if !result.relative_gravity_error.is_finite()
+                || result.relative_gravity_error > PLANNING_GRAVITY_ERROR_LIMIT
+            {
+                failures.push(format!(
+                    "{name} gravity {:.3e} > {:.1e}",
+                    result.relative_gravity_error, PLANNING_GRAVITY_ERROR_LIMIT
+                ));
+            }
+            if !result.gradient_relative_error.is_finite()
+                || result.gradient_relative_error > PLANNING_GRADIENT_ERROR_LIMIT
+            {
+                failures.push(format!(
+                    "{name} gradient {:.3e} > {:.1e}",
+                    result.gradient_relative_error, PLANNING_GRADIENT_ERROR_LIMIT
+                ));
+            }
+            if !result.pericenter_error_m.is_finite()
+                || result.pericenter_error_m > PLANNING_PERICENTER_ERROR_LIMIT_METERS
+            {
+                failures.push(format!(
+                    "{name} pericenter {:.3e}m > {:.1}m",
+                    result.pericenter_error_m, PLANNING_PERICENTER_ERROR_LIMIT_METERS
+                ));
+            }
+            if !result.accuracy_eligible() && failures.len() == failure_count {
+                failures.push(format!("{name} has incomplete score or timing data"));
+            }
         }
-        let speedup = fmm.total_ms / eq106.total_ms;
+        if eq106.segment_count > PLANNING_EQ106_MAX_SEGMENTS {
+            failures.push(format!(
+                "Eq.106 segments {} > {}",
+                eq106.segment_count, PLANNING_EQ106_MAX_SEGMENTS
+            ));
+        }
+        if eq106.valid_candidate_count == 0
+            || eq106.valid_candidate_count != mmfft.valid_candidate_count
+            || eq106.valid_candidate_count != fmm.valid_candidate_count
+        {
+            failures.push(format!(
+                "valid candidates differ: Eq.106 {}, FFT-grid {}, treecode {}",
+                eq106.valid_candidate_count,
+                mmfft.valid_candidate_count,
+                fmm.valid_candidate_count
+            ));
+        }
+        if !failures.is_empty() {
+            return Some(format!("no eligible winner: {}", failures.join("; ")));
+        }
+        let speedup_vs_fft = mmfft.total_ms / eq106.total_ms;
+        let speedup_vs_tree = fmm.total_ms / eq106.total_ms;
+        let minimum_speedup = speedup_vs_fft.min(speedup_vs_tree);
         Some(if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
-            && speedup >= PLANNING_STRONG_SPEEDUP
+            && minimum_speedup >= PLANNING_STRONG_SPEEDUP
         {
-            "Eq.106 strong advantage (>=5x GPU order-2 treecode)"
+            "Eq.106 strong advantage (>=5x both fixed baselines)".into()
         } else if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
-            && speedup >= PLANNING_USEFUL_SPEEDUP
+            && minimum_speedup >= PLANNING_USEFUL_SPEEDUP
         {
-            "Eq.106 useful advantage (>=3x GPU order-2 treecode)"
+            "Eq.106 useful advantage (>=3x both fixed baselines)".into()
         } else {
-            "Eq.106 has no effective advantage over GPU order-2 treecode"
+            format!(
+                "Eq.106 has no effective advantage: {:.3}x vs FFT-grid, {:.3}x vs treecode",
+                speedup_vs_fft, speedup_vs_tree
+            )
         })
     }
 }

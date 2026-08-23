@@ -99,6 +99,7 @@ fn extract_eq106_input(
             extracted.sensitivity_basis_hash = job.basis_sources.hash;
             let mut positions = Vec::with_capacity(samples.len());
             let mut velocities = Vec::with_capacity(samples.len());
+            let mut times = Vec::with_capacity(samples.len());
             for (index, sample) in samples.iter().enumerate() {
                 let rotation = sample.body_rotation;
                 let body_position = rotation.inverse() * sample.position;
@@ -106,6 +107,7 @@ fn extract_eq106_input(
                     * (sample.velocity - angular_velocity_world.cross(sample.position));
                 positions.push(body_position);
                 velocities.push(body_velocity);
+                times.push(sample.simulation_time_seconds as f32);
                 for value in [body_position.x, body_position.y, body_position.z, 0.0] {
                     extracted.target_bytes.extend_from_slice(&value.to_le_bytes());
                 }
@@ -125,6 +127,7 @@ fn extract_eq106_input(
             extracted.batch_elements = build_trajectory_batch_elements(
                 &positions,
                 &velocities,
+                &times,
                 extracted.radius,
                 extracted.certified_line_limit,
             );
@@ -163,12 +166,14 @@ fn extract_eq106_input(
         extracted.batch_capture_id = Some(capture_id);
         let mut batch_positions = Vec::with_capacity(benchmark.samples.len());
         let mut batch_velocities = Vec::with_capacity(benchmark.samples.len());
+        let mut batch_times = Vec::with_capacity(benchmark.samples.len());
         for (index, sample) in benchmark.samples.iter().enumerate() {
             let body_position = sample.body_rotation.inverse() * sample.position;
             let body_velocity = sample.body_rotation.inverse()
                 * (sample.velocity - angular_velocity_world.cross(sample.position));
             batch_positions.push(body_position);
             batch_velocities.push(body_velocity);
+            batch_times.push(sample.simulation_time_seconds as f32);
             for value in [body_position.x, body_position.y, body_position.z, 0.0] {
                 extracted
                     .target_bytes
@@ -190,6 +195,7 @@ fn extract_eq106_input(
         extracted.batch_elements = build_trajectory_batch_elements(
             &batch_positions,
             &batch_velocities,
+            &batch_times,
             extracted.radius,
             extracted.certified_line_limit,
         );
@@ -199,6 +205,7 @@ fn extract_eq106_input(
         extracted.batch_capture_id = Some(capture_id);
         let mut batch_positions = Vec::with_capacity(inversion.raw_samples.len());
         let mut batch_velocities = Vec::with_capacity(inversion.raw_samples.len());
+        let mut batch_times = Vec::with_capacity(inversion.raw_samples.len());
         for (index, sample) in inversion.raw_samples.iter().enumerate() {
             let rotation = sample.knot.body_rotation;
             let body_position = rotation.inverse() * sample.knot.position;
@@ -206,6 +213,7 @@ fn extract_eq106_input(
                 * (sample.knot.velocity - angular_velocity_world.cross(sample.knot.position));
             batch_positions.push(body_position);
             batch_velocities.push(body_velocity);
+            batch_times.push(sample.knot.simulation_time_seconds as f32);
             for value in [body_position.x, body_position.y, body_position.z, 0.0] {
                 extracted
                     .target_bytes
@@ -230,6 +238,7 @@ fn extract_eq106_input(
         extracted.batch_elements = build_trajectory_batch_elements(
             &batch_positions,
             &batch_velocities,
+            &batch_times,
             extracted.radius,
             extracted.certified_line_limit,
         );

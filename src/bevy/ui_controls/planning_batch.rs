@@ -1,4 +1,4 @@
-use bevy::math::{DMat3, DVec3};
+use bevy::math::{DMat3, DQuat, DVec3};
 
 pub fn planning_batch_evaluator_system(
     batch: Res<PlanningCandidateBatch>,
@@ -51,11 +51,12 @@ pub fn planning_batch_evaluator_system(
         planning.batch_job = Some(job);
         return;
     }
-    if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS) {
+    if rendering_needs_priority() {
         planning.status = format!(
-            "{} stress yielded to rendering at {:.0} FPS.",
+            "{} stress yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
             job.method.planning_label(),
-            crate::browser_frame_rate().unwrap_or(0.0)
+            crate::browser_frame_rate().unwrap_or(0.0),
+            crate::browser_recent_frame_ms().unwrap_or(0.0),
         );
         planning.batch_job = Some(job);
         return;
@@ -146,7 +147,6 @@ fn reduce_planning_packet(
             .candidate_metrics
             .iter()
             .any(|row| row.iter().any(|value| !value.is_finite()))
-        || packet.candidate_metrics.iter().any(|row| row[0] < 0.0)
     {
         job.gravity_error_sum = f64::NAN;
         job.gradient_error_sum = f64::NAN;
@@ -164,6 +164,10 @@ fn reduce_planning_packet(
     }
     for (local_candidate, metric) in packet.candidate_metrics.iter().enumerate() {
         let candidate_index = packet.request.candidate_start as usize + local_candidate;
+        if metric[0] < 0.0 {
+            job.candidate_valid[candidate_index] = false;
+            continue;
+        }
         job.minimum_altitude_m = job.minimum_altitude_m.min(metric[2]);
         job.gradient_information_sum += f64::from(metric[3]);
         job.candidate_gradient_sum[candidate_index] += f64::from(metric[3]);
@@ -236,7 +240,13 @@ fn reduce_planning_packet(
         let current_time = f64::from(state.position_time[3]);
         if let Some(previous_time) = previous_verified_time[local_candidate] {
             let delta_time = current_time - previous_time;
-            let acceleration_error = method_field - reference_field;
+            let rotation = DQuat::from_xyzw(
+                f64::from(state.body_rotation[0]),
+                f64::from(state.body_rotation[1]),
+                f64::from(state.body_rotation[2]),
+                f64::from(state.body_rotation[3]),
+            );
+            let acceleration_error = rotation * (method_field - reference_field);
             accumulated_position_error[local_candidate] +=
                 accumulated_velocity_error[local_candidate] * delta_time
                     + 0.5 * acceleration_error * delta_time * delta_time;
@@ -244,7 +254,13 @@ fn reduce_planning_packet(
         }
         previous_verified_time[local_candidate] = Some(current_time);
         if verify_pericenter {
-            let radial = state.body_position().as_dvec3().normalize_or_zero();
+            let rotation = DQuat::from_xyzw(
+                f64::from(state.body_rotation[0]),
+                f64::from(state.body_rotation[1]),
+                f64::from(state.body_rotation[2]),
+                f64::from(state.body_rotation[3]),
+            );
+            let radial = (rotation * state.body_position().as_dvec3()).normalize_or_zero();
             job.pericenter_error_m = job
                 .pericenter_error_m
                 .max(accumulated_position_error[local_candidate].dot(radial).abs() as f32);
@@ -309,19 +325,39 @@ fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) 
         + packet.timing.command_submission_ms
         + packet.timing.gpu_completion_map_ms;
     let frame_rate = crate::browser_frame_rate();
+    let recent_frame_ms = crate::browser_recent_frame_ms();
     let should_shrink = request_ms > PLANNING_MAX_REQUEST_MS
-        || frame_rate.is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS);
+        || frame_rate.is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
+        || recent_frame_ms.is_some_and(|milliseconds| {
+            milliseconds > PLANNING_MAX_RECENT_FRAME_MS
+        });
     let can_grow = request_ms < PLANNING_TARGET_REQUEST_MS
-        && frame_rate.is_none_or(|fps| fps >= 45.0);
+        && frame_rate.is_none_or(|fps| fps >= 59.0)
+        && recent_frame_ms.is_none_or(|milliseconds| milliseconds <= 17.2);
+    let (minimum, maximum) = if job.method == ActiveGravityMethod::CurvedArcEq106 {
+        (
+            PLANNING_GPU_TILE_MIN_CANDIDATES,
+            PLANNING_GPU_TILE_MAX_CANDIDATES,
+        )
+    } else {
+        (
+            PLANNING_GENERIC_TILE_MIN_CANDIDATES,
+            PLANNING_GENERIC_TILE_MAX_CANDIDATES,
+        )
+    };
     job.candidate_tile_size = if should_shrink {
-        (job.candidate_tile_size / 2).max(PLANNING_GPU_TILE_MIN_CANDIDATES)
+        (job.candidate_tile_size / 2).max(minimum)
     } else if can_grow {
-        job.candidate_tile_size
-            .saturating_mul(2)
-            .min(PLANNING_GPU_TILE_MAX_CANDIDATES)
+        job.candidate_tile_size.saturating_mul(2).min(maximum)
     } else {
         job.candidate_tile_size
     };
+}
+
+fn rendering_needs_priority() -> bool {
+    crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
+        || crate::browser_recent_frame_ms()
+            .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS)
 }
 
 fn advance_planning_tile(job: &mut PlanningBatchJob, completed_candidates: u32) {
@@ -349,6 +385,9 @@ fn top_candidate_scores(
         * f64::from(job.samples_per_candidate.max(1));
     let mut scores = (0..job.candidate_count as usize)
         .filter_map(|candidate_index| {
+            if !job.candidate_valid[candidate_index] {
+                return None;
+            }
             let reference = job.candidate_reference_sum[candidate_index];
             let altitude = job.candidate_minimum_altitude_m[candidate_index];
             if reference <= f64::MIN_POSITIVE || !altitude.is_finite() || altitude <= 0.0 {
@@ -453,6 +492,7 @@ fn finish_planning_method(
         } else {
             0
         },
+        valid_candidate_count: job.candidate_valid.iter().filter(|valid| **valid).count() as u32,
         cold_amortization_candidates,
         dispatch_count: job.dispatch_count,
         forward_kernel_evaluations: job.forward_kernel_evaluations,
@@ -472,7 +512,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     };
     job.density_model = 0;
     job.candidate_start = 0;
-    job.candidate_tile_size = PLANNING_GPU_TILE_INITIAL_CANDIDATES;
+    job.candidate_tile_size = PLANNING_GENERIC_TILE_INITIAL_CANDIDATES;
     job.minimum_tile_size_used = u32::MAX;
     job.maximum_tile_size_used = 0;
     job.gpu_request_count = 0;
@@ -495,6 +535,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.candidate_reference_sum.fill(0.0);
     job.candidate_gradient_sum.fill(0.0);
     job.candidate_minimum_altitude_m.fill(f32::INFINITY);
+    job.candidate_valid.fill(true);
     job.preprocessing_ms = 0.0;
     job.command_submission_ms = 0.0;
     job.reduction_ms = 0.0;

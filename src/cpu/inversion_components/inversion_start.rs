@@ -8,6 +8,7 @@ pub fn start_density_inversion_system(
         ),
     >,
     active_method: Res<ActiveGravityMethod>,
+    planning: Res<PlanningComparisonState>,
     radial_source: Option<Res<RadialGravitySource>>,
     aggregated_source: Option<Res<AggregatedGravitySource>>,
     mut sensitivity_caches: ResMut<DensitySensitivityCaches>,
@@ -19,6 +20,9 @@ pub fn start_density_inversion_system(
     let pressed = interactions
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed);
+    if !planning.selected_metric.is_inversion() {
+        return;
+    }
     if !validate_inversion_request(pressed, *active_method, &mut inversion) {
         return;
     }

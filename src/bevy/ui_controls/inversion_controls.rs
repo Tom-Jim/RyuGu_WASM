@@ -2,6 +2,7 @@ pub fn performance_comparison_system(
     time: Res<Time>,
     clock: Res<SimulationClock>,
     eq106_performance: Res<Eq106PerformanceMetrics>,
+    planning: Res<PlanningComparisonState>,
     mut state: ResMut<PerformanceComparisonState>,
     active_method: Res<ActiveGravityMethod>,
     jacobi: Res<JacobiHistory>,
@@ -65,6 +66,7 @@ pub fn performance_comparison_system(
     }
     if let Some(mut button) = nodes.p5().iter_mut().next() {
         button.display = if state.active
+            || !planning.selected_metric.is_inversion()
             || matches!(
                 *active_method,
                 ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::HomogeneousWerner

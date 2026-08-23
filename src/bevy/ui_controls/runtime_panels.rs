@@ -277,7 +277,7 @@ fn format_vram_text(method: ActiveGravityMethod, memory: GpuMemoryEstimate) -> S
         .collect::<Vec<_>>()
         .join(" | ");
     format!(
-        "VRAM estimate: {} {} ({active_share:.1}% of total)\n{}",
+        "Active runtime VRAM: {} {} ({active_share:.1}% of total)\n{}",
         labels[active_index],
         format_bytes(active_bytes),
         details
@@ -620,7 +620,7 @@ mod performance_chart_tests {
             bytes: [1024, 2048, 3 * 1024, 4 * 1024, 5 * 1024],
         };
         let text = format_vram_text(ActiveGravityMethod::Fmm, memory);
-        assert!(text.starts_with("VRAM estimate: FMM 5.0 KB"));
+        assert!(text.starts_with("Active runtime VRAM: FMM 5.0 KB"));
         assert!(text.contains("R 1.0 KB"));
         assert!(text.contains("106 3.0 KB"));
     }

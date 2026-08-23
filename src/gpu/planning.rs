@@ -88,7 +88,7 @@ impl Plugin for PlanningGpuComputePlugin {
             dispatch_planning_method
                 .after(PlanningGpuSystems::PrepareSharedInput)
                 .in_set(PlanningGpuSystems::Dispatch)
-                .in_set(RenderSystems::Render),
+                .in_set(RenderSystems::Cleanup),
         );
     }
 
@@ -598,7 +598,11 @@ fn mmfft_planning_uniform(
     batch: &PlanningCandidateBatch,
     payload: &PlanningMethodPayload,
 ) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(64);
+    // WGSL uniform layout gives the trailing vec3 a 16-byte alignment, so the
+    // Params structure occupies 80 bytes even though its scalar payload ends
+    // at byte 64. Keep the shader offsets unchanged and provide the required
+    // tail padding explicitly.
+    let mut bytes = Vec::with_capacity(80);
     for value in [
         request.candidate_start * batch.samples_per_candidate,
         request.candidate_count * batch.samples_per_candidate,
@@ -623,6 +627,7 @@ fn mmfft_planning_uniform(
     ] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+    bytes.resize(80, 0);
     bytes
 }
 

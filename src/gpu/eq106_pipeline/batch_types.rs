@@ -142,10 +142,14 @@ fn select_batch_taylor_order(epsilon: f32) -> Option<u32> {
 fn build_trajectory_batch_elements(
     positions: &[Vec3],
     velocities: &[Vec3],
+    times: &[f32],
     source_radius: f32,
     certified_line_limit: f32,
 ) -> Vec<Eq106BatchElement> {
-    if positions.is_empty() || positions.len() != velocities.len() {
+    if positions.is_empty()
+        || positions.len() != velocities.len()
+        || positions.len() != times.len()
+    {
         return Vec::new();
     }
     let maximum_line_limit = certified_line_limit
@@ -171,6 +175,13 @@ fn build_trajectory_batch_elements(
         let mut best_order = 1_u32;
         let mut end = start;
         while end < positions.len() {
+            let elapsed = times[end] - times[start];
+            if !elapsed.is_finite()
+                || elapsed < 0.0
+                || elapsed > NEAR_SYNC_SEGMENT_MAX_SECONDS
+            {
+                break;
+            }
             let position = positions[end];
             let relative = position - origin;
             let h = relative.dot(direction);
@@ -312,7 +323,7 @@ impl Plugin for Eq106GpuComputePlugin {
                 .after(initialize_eq106_pipeline)
                 .after(crate::gpu::planning::PlanningGpuSystems::PrepareSharedInput)
                 .in_set(crate::gpu::planning::PlanningGpuSystems::Dispatch)
-                .in_set(RenderSystems::Render),
+                .in_set(RenderSystems::Cleanup),
         );
     }
 

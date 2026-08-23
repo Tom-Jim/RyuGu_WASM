@@ -38,7 +38,8 @@ impl PlanningBatchBuilder {
     ) -> Option<Self> {
         let started = bevy::platform::time::Instant::now();
         let (candidate_count, density_model_count, samples_per_candidate) = profile.dimensions();
-        if candidate_count != PLANNING_CANDIDATE_COUNT || voxels.len() != 56 {
+        if candidate_count == 0 || candidate_count > PLANNING_CANDIDATE_COUNT || voxels.len() != 56
+        {
             return None;
         }
         let basis = build_voxel_basis_sources(voxels, source)?;
@@ -110,6 +111,7 @@ impl PlanningBatchBuilder {
         while self.next_candidate < end {
             if append_tube_candidate_states(
                 self.next_candidate,
+                self.candidate_count,
                 &self.reference_samples,
                 &mut self.states,
                 &mut self.gpu_position_bytes,
@@ -177,6 +179,7 @@ impl PlanningBatchBuilder {
 
 fn append_tube_candidate_states(
     candidate: u32,
+    candidate_count: u32,
     reference: &[TrajectoryInversionKnot],
     states: &mut Vec<PlanningCandidateState>,
     gpu_position_bytes: &mut Vec<u8>,
@@ -186,7 +189,8 @@ fn append_tube_candidate_states(
         return None;
     }
     let mut world_positions = Vec::with_capacity(sample_count as usize);
-    let (radius, phase, harmonic, phase_rate) = candidate_tube_parameters(candidate);
+    let (radius, phase, harmonic, phase_rate) =
+        candidate_tube_parameters(candidate, candidate_count);
     for sample in 0..sample_count {
         let reference_state = reference[sample as usize];
         let tangent = reference_state.velocity.normalize_or_zero();
@@ -253,9 +257,9 @@ fn append_tube_candidate_states(
     Some(())
 }
 
-fn candidate_tube_parameters(candidate: u32) -> (f32, f32, f32, f32) {
+fn candidate_tube_parameters(candidate: u32, candidate_count: u32) -> (f32, f32, f32, f32) {
     let golden = 0.618_033_95_f32;
-    let radial_fraction = ((candidate as f32 + 0.5) / PLANNING_CANDIDATE_COUNT as f32).sqrt();
+    let radial_fraction = ((candidate as f32 + 0.5) / candidate_count.max(1) as f32).sqrt();
     let radius = PLANNING_TRAJECTORY_TUBE_RADIUS_METERS * radial_fraction;
     let phase = std::f32::consts::TAU * ((candidate as f32 * golden).fract());
     let harmonic = 1.0 + (candidate % 5) as f32;

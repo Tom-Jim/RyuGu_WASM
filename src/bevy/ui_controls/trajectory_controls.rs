@@ -157,7 +157,7 @@ pub fn setup_fps_ui(mut commands: Commands) {
         FpsTextMarker,
     ));
     commands.spawn((
-        Text::new("VRAM estimate: --"),
+        Text::new("Active runtime VRAM: --"),
         TextFont {
             font_size: bevy::text::FontSize::Px(11.0),
             ..default()

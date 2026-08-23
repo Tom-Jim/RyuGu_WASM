@@ -216,6 +216,29 @@ pub fn planning_comparison_control_system(
         (*interaction == Interaction::Pressed).then_some(button.0)
     }) {
         planning.selected_metric = metric;
+        if metric.is_inversion() {
+            planning.run_requested = false;
+            planning.batch_job = None;
+            planning.results = std::array::from_fn(|_| None);
+            planning.reference_duration_seconds = 0.0;
+            *request = PlanningGpuRequest::default();
+            *payload = PlanningMethodPayload::default();
+            gpu_result.0 = None;
+            planning.status =
+                "Density inversion is selected; use Invert trajectory to solve it.".into();
+        } else if planning.completed_workload().is_none() && planning.batch_job.is_none() {
+            planning.run_requested = true;
+            planning.run_id = planning.run_id.wrapping_add(1);
+            planning.results = std::array::from_fn(|_| None);
+            planning.reference_duration_seconds = 0.0;
+            *request = PlanningGpuRequest::default();
+            *payload = PlanningMethodPayload::default();
+            gpu_result.0 = None;
+            planning.status = format!(
+                "{} planning workload queued for the frozen capture.",
+                planning.workload_profile.label()
+            );
+        }
     }
     if let Some(profile) = workload_interactions
         .iter()
@@ -230,16 +253,18 @@ pub fn planning_comparison_control_system(
         *request = PlanningGpuRequest::default();
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
-        planning.run_requested = profile == PlanningWorkloadProfile::Stress;
+        planning.run_requested = !planning.selected_metric.is_inversion();
         if planning.run_requested {
             planning.run_id = planning.run_id.wrapping_add(1);
-            planning.status =
-                "Stress selected: the isolated planning workload is queued for the frozen capture."
-                    .into();
+            planning.status = format!(
+                "{} selected: the planning workload is queued for the frozen capture.",
+                profile.label()
+            );
         } else {
-            planning.status =
-                "First selected: normal density inversion is active; planning stress is idle."
-                    .into();
+            planning.status = format!(
+                "{} selected for planning metrics; choose a non-inversion metric to run it.",
+                profile.label()
+            );
         }
     }
     for (button, mut color) in button_sets.p0().iter_mut() {
@@ -266,10 +291,7 @@ pub fn update_planning_results_from_inversion_system(
     mut planning: ResMut<PlanningComparisonState>,
     mut batch_builder: Local<Option<crate::cpu::planning::PlanningBatchBuilder>>,
 ) {
-    if planning.workload_profile != PlanningWorkloadProfile::Stress
-        || !planning.run_requested
-        || planning.batch_job.is_some()
-    {
+    if !planning.run_requested || planning.batch_job.is_some() {
         return;
     }
     let Some(capture_id) = inversion.capture_id else {
@@ -327,16 +349,22 @@ pub fn update_planning_results_from_inversion_system(
         };
         *batch_builder = Some(builder);
         planning.status = format!(
-            "Stress candidate preparation: 0 / {} trajectories.",
+            "{} candidate preparation: 0 / {} trajectories.",
+            planning.workload_profile.label(),
             dimensions.0
         );
         return;
     }
     let builder = batch_builder.as_mut().expect("matched planning builder");
-    if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS) {
+    if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
+        || crate::browser_recent_frame_ms()
+            .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS)
+    {
         planning.status = format!(
-            "Stress candidate preparation yielded to rendering at {:.0} FPS: {} / {} trajectories.",
+            "{} candidate preparation yielded to rendering at {:.1} FPS / {:.1} ms recent frame: {} / {} curves.",
+            planning.workload_profile.label(),
             crate::browser_frame_rate().unwrap_or(0.0),
+            crate::browser_recent_frame_ms().unwrap_or(0.0),
             builder.completed_candidates(),
             dimensions.0
         );
@@ -350,7 +378,8 @@ pub fn update_planning_results_from_inversion_system(
     }
     if !builder.is_complete() {
         planning.status = format!(
-            "Stress candidate preparation: {} / {} trajectories.",
+            "{} candidate preparation: {} / {} trajectories.",
+            planning.workload_profile.label(),
             builder.completed_candidates(),
             dimensions.0
         );
@@ -410,6 +439,7 @@ pub fn update_planning_results_from_inversion_system(
         candidate_reference_sum: vec![0.0; dimensions.0 as usize],
         candidate_gradient_sum: vec![0.0; dimensions.0 as usize],
         candidate_minimum_altitude_m: vec![f32::INFINITY; dimensions.0 as usize],
+        candidate_valid: vec![true; dimensions.0 as usize],
         common_preparation_ms,
         preprocessing_ms: 0.0,
         command_submission_ms: 0.0,
@@ -454,7 +484,7 @@ pub fn setup_probe_crash_overlay(mut commands: Commands) {
         ))
         .with_children(|parent| {
             parent.spawn((
-                Text::new("探测器撞毁\n正在重置场景…"),
+                Text::new("PROBE IMPACT\nResetting flight scene..."),
                 TextFont {
                     font_size: bevy::text::FontSize::Px(32.0),
                     ..default()
@@ -504,7 +534,7 @@ pub fn probe_crash_overlay_system(
     if crash.active {
         let remaining = (ProbeCrashState::DISPLAY_SECONDS - crash.elapsed_seconds).max(0.0);
         for mut text in messages.iter_mut() {
-            **text = format!("探测器撞毁\n{remaining:.1} s 后重置场景");
+            **text = format!("PROBE IMPACT\nResetting flight scene in {remaining:.1} s");
         }
         crash.elapsed_seconds += time.delta_secs();
     }
@@ -547,7 +577,6 @@ pub fn reset_after_probe_crash_scene_system(
 pub fn reset_after_probe_crash_state_system(
     mut reset_request: ResMut<ProbeCrashResetRequest>,
     mut active_method: ResMut<ActiveGravityMethod>,
-    mut planning: ResMut<PlanningComparisonState>,
     mut performance: ResMut<PerformanceComparisonState>,
     mut inversion: ResMut<TrajectoryInversionState>,
     mut probe_initial: ResMut<ProbeInitialConditions>,
@@ -572,7 +601,6 @@ pub fn reset_after_probe_crash_state_system(
     }
     *reset_request = ProbeCrashResetRequest(false);
     *active_method = ActiveGravityMethod::RadialAnalytic;
-    *planning = PlanningComparisonState::default();
     *performance = PerformanceComparisonState::default();
     *inversion = TrajectoryInversionState::default();
     *probe_initial = ProbeInitialConditions::default();

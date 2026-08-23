@@ -1,6 +1,17 @@
 #[derive(Resource, Default)]
 struct PlanningEq106DispatchState {
     last_request_id: u64,
+    active_request_id: u64,
+    next_stage: usize,
+    active_started: Option<Instant>,
+    active_method_preprocess_ms: f64,
+    active_command_submission_ms: f64,
+    active_elements: Vec<Eq106BatchElement>,
+    active_invalid_candidates: Vec<u32>,
+    active_maximum_elements_per_candidate: u32,
+    active_verification_targets: Vec<u32>,
+    active_uniform: Option<Buffer>,
+    active_bind_groups: Vec<BindGroup>,
     batch_id: u64,
     payload_request_id: u64,
     output_size: u64,
@@ -19,7 +30,24 @@ struct PlanningEq106DispatchState {
     baseline: Option<Buffer>,
     metrics: Option<Buffer>,
     staging: Option<Buffer>,
-    element_tiles: std::collections::HashMap<(u32, u32), (Vec<Eq106BatchElement>, u32)>,
+    element_tiles:
+        std::collections::HashMap<(u32, u32), (Vec<Eq106BatchElement>, u32, Vec<u32>)>,
+}
+
+impl PlanningEq106DispatchState {
+    fn clear_active(&mut self) {
+        self.active_request_id = 0;
+        self.next_stage = 0;
+        self.active_started = None;
+        self.active_method_preprocess_ms = 0.0;
+        self.active_command_submission_ms = 0.0;
+        self.active_elements.clear();
+        self.active_invalid_candidates.clear();
+        self.active_maximum_elements_per_candidate = 0;
+        self.active_verification_targets.clear();
+        self.active_uniform = None;
+        self.active_bind_groups.clear();
+    }
 }
 
 fn dispatch_planning_eq106(
@@ -34,13 +62,23 @@ fn dispatch_planning_eq106(
     mut state: ResMut<PlanningEq106DispatchState>,
 ) {
     let request = &planning.request;
-    if request.method != Some(ActiveGravityMethod::CurvedArcEq106)
-        || planning.payload.method != request.method
-        || planning.payload.density_model != request.density_model
-        || state.last_request_id == request.request_id
+    let request_matches = request.method == Some(ActiveGravityMethod::CurvedArcEq106)
+        && planning.payload.method == request.method
+        && planning.payload.density_model == request.density_model;
+    if state.active_request_id != 0
+        && (!request_matches || state.active_request_id != request.request_id)
     {
+        state.clear_active();
+        let in_flight = Arc::clone(&channel.in_flight);
+        render_queue.on_submitted_work_done(move || {
+            in_flight.store(false, Ordering::Release);
+        });
         return;
     }
+    if !request_matches || state.last_request_id == request.request_id {
+        return;
+    }
+    let starting_request = state.active_request_id != request.request_id;
     let Some(batch) = planning
         .batch
         .as_ref()
@@ -74,12 +112,19 @@ fn dispatch_planning_eq106(
     {
         return;
     }
-    if channel
-        .in_flight
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
+    if starting_request {
+        if channel
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        state.active_request_id = request.request_id;
+        state.next_stage = 0;
+        state.active_started = Some(Instant::now());
+        state.active_method_preprocess_ms = 0.0;
+        state.active_command_submission_ms = 0.0;
     }
     let method_preprocess_started = Instant::now();
     let samples_per_candidate = batch.samples_per_candidate as usize;
@@ -89,13 +134,18 @@ fn dispatch_planning_eq106(
         state.element_tiles.clear();
     }
     let tile_key = (request.candidate_start, request.candidate_count);
-    let (elements, maximum_elements_per_candidate) = if let Some(cached) =
-        state.element_tiles.get(&tile_key)
-    {
+    let (elements, maximum_elements_per_candidate, invalid_candidates) = if !starting_request {
+        (
+            state.active_elements.clone(),
+            state.active_maximum_elements_per_candidate,
+            state.active_invalid_candidates.clone(),
+        )
+    } else if let Some(cached) = state.element_tiles.get(&tile_key) {
         cached.clone()
     } else {
         let mut elements = Vec::new();
         let mut maximum_elements_per_candidate = 0_u32;
+        let mut invalid_candidates = Vec::new();
         for local_candidate in 0..request.candidate_count as usize {
             let start = global_state_start + local_candidate * samples_per_candidate;
             let end = start + samples_per_candidate;
@@ -107,13 +157,28 @@ fn dispatch_planning_eq106(
                 .iter()
                 .map(|state| state.body_velocity())
                 .collect::<Vec<_>>();
+            let times = batch.states[start..end]
+                .iter()
+                .map(|state| state.position_time[3])
+                .collect::<Vec<_>>();
             let local_offset = local_candidate as u32 * batch.samples_per_candidate;
             let mut candidate_elements = build_trajectory_batch_elements(
                 &positions,
                 &velocities,
+                &times,
                 planning.source_radius,
                 4.0 * planning.source_radius,
             );
+            let mut expected_offset = 0_u32;
+            let complete = candidate_elements.iter().all(|element| {
+                let contiguous = element.target_offset == expected_offset;
+                expected_offset = expected_offset.saturating_add(element.target_count);
+                contiguous
+            }) && expected_offset == batch.samples_per_candidate;
+            if !complete {
+                invalid_candidates.push(local_candidate as u32);
+                continue;
+            }
             maximum_elements_per_candidate =
                 maximum_elements_per_candidate.max(candidate_elements.len() as u32);
             for element in &mut candidate_elements {
@@ -123,13 +188,24 @@ fn dispatch_planning_eq106(
         }
         state.element_tiles.insert(
             tile_key,
-            (elements.clone(), maximum_elements_per_candidate),
+            (
+                elements.clone(),
+                maximum_elements_per_candidate,
+                invalid_candidates.clone(),
+            ),
         );
-        (elements, maximum_elements_per_candidate)
+        (
+            elements,
+            maximum_elements_per_candidate,
+            invalid_candidates,
+        )
     };
-    if elements.is_empty() {
-        channel.in_flight.store(false, Ordering::Release);
-        return;
+    if starting_request {
+        state.active_elements.clone_from(&elements);
+        state
+            .active_invalid_candidates
+            .clone_from(&invalid_candidates);
+        state.active_maximum_elements_per_candidate = maximum_elements_per_candidate;
     }
     let common_changed = state.batch_id != batch.batch_id
         || state.quadrature.is_none()
@@ -185,8 +261,19 @@ fn dispatch_planning_eq106(
         }));
     }
     let output_size = target_count as u64 * OUTPUT_BYTES;
-    let verification_targets =
-        crate::gpu::planning_reduction::planning_verification_targets(request, batch);
+    let verification_targets = if starting_request {
+        let targets = crate::gpu::planning_reduction::planning_verification_targets(request, batch)
+            .into_iter()
+            .filter(|target| {
+                let candidate = *target / batch.samples_per_candidate;
+                !invalid_candidates.contains(&candidate)
+            })
+            .collect::<Vec<_>>();
+        state.active_verification_targets.clone_from(&targets);
+        targets
+    } else {
+        state.active_verification_targets.clone()
+    };
     let metric_size = u64::from(request.candidate_count) * 16;
     let staging_size = metric_size + verification_targets.len() as u64 * 5 * 16;
     if state.output_size != output_size || state.output.is_none() {
@@ -194,7 +281,7 @@ fn dispatch_planning_eq106(
         state.output = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_output"),
             size: output_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
     }
@@ -248,96 +335,123 @@ fn dispatch_planning_eq106(
         ));
     }
     let layout = state.layout.as_ref().expect("planning Eq.106 layout").clone();
-    let method_preprocess_ms = method_preprocess_started.elapsed().as_secs_f64() * 1.0e3;
+    state.active_method_preprocess_ms +=
+        method_preprocess_started.elapsed().as_secs_f64() * 1.0e3;
+    if starting_request {
+        let uniform_size = 96_u64;
+        let uniform_alignment =
+            u64::from(render_device.limits().min_uniform_buffer_offset_alignment).max(1);
+        let uniform_stride = uniform_size.div_ceil(uniform_alignment) * uniform_alignment;
+        let mut uniform_data = vec![0_u8; uniform_stride as usize * elements.len().max(1)];
+        for (element_index, element) in elements.iter().enumerate() {
+            let mut bytes = uniform_bytes(
+                element.line_origin,
+                element.line_origin,
+                element.line_direction,
+                planning.payload.item_count,
+                planning.source_radius,
+                element.line_limit,
+                element.taylor_order,
+                0,
+                element_index as u32 + 1,
+                false,
+                false,
+                element.target_count,
+                element.target_offset,
+            );
+            bytes[92..96].copy_from_slice(&(global_state_start as u32).to_le_bytes());
+            let offset = element_index * uniform_stride as usize;
+            uniform_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("planning_eq106_uniforms"),
+            contents: &uniform_data,
+            usage: BufferUsages::UNIFORM,
+        });
+        state.active_bind_groups = (0..elements.len())
+            .map(|element_index| {
+                render_device.create_bind_group(
+                    "planning_eq106_bg",
+                    &layout,
+                    &[
+                        BindGroupEntry {
+                            binding: 0,
+                            resource: BindingResource::Buffer(BufferBinding {
+                                buffer: &uniform,
+                                offset: element_index as u64 * uniform_stride,
+                                size: BufferSize::new(uniform_size),
+                            }),
+                        },
+                        BindGroupEntry { binding: 1, resource: sources.as_entire_binding() },
+                        BindGroupEntry { binding: 2, resource: quadrature.as_entire_binding() },
+                        BindGroupEntry { binding: 3, resource: spectrum.as_entire_binding() },
+                        BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
+                        BindGroupEntry { binding: 5, resource: operator.as_entire_binding() },
+                        BindGroupEntry { binding: 6, resource: line_samples.as_entire_binding() },
+                        BindGroupEntry { binding: 7, resource: dummy_modes.as_entire_binding() },
+                        BindGroupEntry { binding: 8, resource: psi.as_entire_binding() },
+                        BindGroupEntry { binding: 9, resource: shared.positions.as_entire_binding() },
+                    ],
+                )
+            })
+            .collect();
+        state.active_uniform = Some(uniform);
+    }
+    let stage_budget = planning_eq106_stage_budget();
+    if stage_budget == 0 {
+        return;
+    }
+    let total_stages = elements.len() * 4;
+    let stage_end = (state.next_stage + stage_budget).min(total_stages);
+    let final_submission = stage_end == total_stages;
+    let _uniform = state.active_uniform.as_ref();
+    let bind_groups = state.active_bind_groups.clone();
     let encode_started = Instant::now();
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("planning_eq106_encoder"),
+        label: Some("planning_eq106_paced_encoder"),
     });
-    let uniform_size = 96_u64;
-    let uniform_alignment = u64::from(render_device.limits().min_uniform_buffer_offset_alignment)
-        .max(1);
-    let uniform_stride = uniform_size.div_ceil(uniform_alignment) * uniform_alignment;
-    let mut uniform_data = vec![0_u8; uniform_stride as usize * elements.len()];
-    for (element_index, element) in elements.iter().enumerate() {
-        let mut bytes = uniform_bytes(
-            element.line_origin,
-            element.line_origin,
-            element.line_direction,
-            planning.payload.item_count,
-            planning.source_radius,
-            element.line_limit,
-            element.taylor_order,
-            0,
-            element_index as u32 + 1,
-            false,
-            false,
-            element.target_count,
-            element.target_offset,
-        );
-        bytes[92..96].copy_from_slice(&(global_state_start as u32).to_le_bytes());
-        let offset = element_index * uniform_stride as usize;
-        uniform_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    if state.next_stage == 0 {
+        encoder.clear_buffer(&output, 0, None);
     }
-    let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("planning_eq106_uniforms"),
-        contents: &uniform_data,
-        usage: BufferUsages::UNIFORM,
-    });
-    let bind_groups = (0..elements.len())
-        .map(|element_index| {
-            render_device.create_bind_group(
-                "planning_eq106_bg",
-                &layout,
-                &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: BindingResource::Buffer(BufferBinding {
-                            buffer: &uniform,
-                            offset: element_index as u64 * uniform_stride,
-                            size: BufferSize::new(uniform_size),
-                        }),
-                    },
-                    BindGroupEntry { binding: 1, resource: sources.as_entire_binding() },
-                    BindGroupEntry { binding: 2, resource: quadrature.as_entire_binding() },
-                    BindGroupEntry { binding: 3, resource: spectrum.as_entire_binding() },
-                    BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
-                    BindGroupEntry { binding: 5, resource: operator.as_entire_binding() },
-                    BindGroupEntry { binding: 6, resource: line_samples.as_entire_binding() },
-                    BindGroupEntry { binding: 7, resource: dummy_modes.as_entire_binding() },
-                    BindGroupEntry { binding: 8, resource: psi.as_entire_binding() },
-                    BindGroupEntry { binding: 9, resource: shared.positions.as_entire_binding() },
-                ],
-            )
-        })
-        .collect::<Vec<_>>();
-    for (element_index, element) in elements.iter().enumerate() {
+    for flat_stage in state.next_stage..stage_end {
+        let element_index = flat_stage / 4;
+        let stage = flat_stage % 4;
+        let element = &elements[element_index];
         let bind_group = &bind_groups[element_index];
-        for (label, pipeline, groups) in [
-            ("planning_eq106_line", line_samples_pipeline, QUADRATURE_COUNT.div_ceil(64)),
-            ("planning_eq106_spectrum", assemble_pipeline, (taylor_coefficient_count(element.taylor_order) * FREQUENCY_COUNT).div_ceil(64)),
-            ("planning_eq106_analytic", analytic_pipeline, FREQUENCY_COUNT.div_ceil(64)),
-        ] {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some(label),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups(groups, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("planning_eq106_evaluate"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(evaluate_pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            let (width, height) = target_dispatch_grid(element.target_count);
-            pass.dispatch_workgroups(width, height, 1);
-        }
+        let (label, pipeline, width, height) = match stage {
+            0 => (
+                "planning_eq106_line",
+                line_samples_pipeline,
+                QUADRATURE_COUNT.div_ceil(64),
+                1,
+            ),
+            1 => (
+                "planning_eq106_spectrum",
+                assemble_pipeline,
+                (taylor_coefficient_count(element.taylor_order) * FREQUENCY_COUNT).div_ceil(64),
+                1,
+            ),
+            2 => (
+                "planning_eq106_analytic",
+                analytic_pipeline,
+                FREQUENCY_COUNT.div_ceil(64),
+                1,
+            ),
+            _ => {
+                let (width, height) = target_dispatch_grid(element.target_count);
+                ("planning_eq106_evaluate", evaluate_pipeline, width, height)
+            }
+        };
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(width, height, 1);
     }
-    let (_reduction_uniform, _reduction_bind_group) =
-        crate::gpu::planning_reduction::encode_planning_reduction(
+    let reduction_resources = final_submission.then(|| {
+        let resources = crate::gpu::planning_reduction::encode_planning_reduction(
             &render_device,
             &mut encoder,
             reduction_pipeline,
@@ -349,19 +463,29 @@ fn dispatch_planning_eq106(
             &baseline,
             &metrics,
         );
-    encoder.copy_buffer_to_buffer(&metrics, 0, &staging, 0, metric_size);
-    for (compact_index, target_index) in verification_targets.iter().copied().enumerate() {
-        encoder.copy_buffer_to_buffer(
-            &output,
-            u64::from(target_index) * OUTPUT_BYTES,
-            &staging,
-            metric_size + compact_index as u64 * 5 * 16,
-            5 * 16,
-        );
-    }
+        encoder.copy_buffer_to_buffer(&metrics, 0, &staging, 0, metric_size);
+        for (compact_index, target_index) in verification_targets.iter().copied().enumerate() {
+            encoder.copy_buffer_to_buffer(
+                &output,
+                u64::from(target_index) * OUTPUT_BYTES,
+                &staging,
+                metric_size + compact_index as u64 * 5 * 16,
+                5 * 16,
+            );
+        }
+        resources
+    });
     render_queue.submit([encoder.finish()]);
+    state.active_command_submission_ms += encode_started.elapsed().as_secs_f64() * 1.0e3;
+    state.next_stage = stage_end;
+    if !final_submission {
+        return;
+    }
+    drop(reduction_resources);
     state.last_request_id = request.request_id;
-    let command_submission_ms = encode_started.elapsed().as_secs_f64() * 1.0e3;
+    let method_preprocess_ms = state.active_method_preprocess_ms;
+    let command_submission_ms = state.active_command_submission_ms;
+    let request_wall_started = state.active_started.unwrap_or_else(Instant::now);
     let packet_request = request.clone();
     let shared_data = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
@@ -371,39 +495,80 @@ fn dispatch_planning_eq106(
     let source_count = planning.payload.item_count;
     let state_indices = verification_targets;
     let request_candidate_count = request.candidate_count;
-    let gpu_completion_started = Instant::now();
+    let samples_per_candidate = batch.samples_per_candidate;
+    let invalid_candidates_for_readback = invalid_candidates;
+    state.clear_active();
     mapped.slice(..staging_size).map_async(MapMode::Read, move |result| {
-        let gpu_completion_map_ms = gpu_completion_started.elapsed().as_secs_f64() * 1.0e3;
+        let request_wall_ms = request_wall_started.elapsed().as_secs_f64() * 1.0e3;
+        let gpu_completion_map_ms =
+            (request_wall_ms - method_preprocess_ms - command_submission_ms).max(0.0);
         let rows = if result.is_ok() {
             let view = staging.slice(..staging_size).get_mapped_range();
             let full_rows = bytes_to_f32x4(&view);
-            let candidate_metrics = full_rows[..request_candidate_count as usize].to_vec();
-            let mut rows = Vec::with_capacity(state_indices.len() * 4);
-            for target_rows in full_rows[request_candidate_count as usize..]
+            let mut candidate_metrics = full_rows[..request_candidate_count as usize].to_vec();
+            let mut rejected_candidates = vec![false; request_candidate_count as usize];
+            for (candidate, metric) in candidate_metrics.iter_mut().enumerate() {
+                if metric[0] < 0.0 || metric.iter().copied().any(|value| !value.is_finite()) {
+                    *metric = [-1.0, 0.0, 0.0, 0.0];
+                    rejected_candidates[candidate] = true;
+                }
+            }
+            for candidate in &invalid_candidates_for_readback {
+                if let Some(metric) = candidate_metrics.get_mut(*candidate as usize) {
+                    *metric = [-1.0, 0.0, 0.0, 0.0];
+                    rejected_candidates[*candidate as usize] = true;
+                }
+            }
+            let compact_rows = &full_rows[request_candidate_count as usize..];
+            for (target_index, target_rows) in state_indices.iter().copied().zip(
+                compact_rows
                 .chunks_exact(5)
-                .take(state_indices.len())
-            {
+                .take(state_indices.len()),
+            ) {
                 let certificate = target_rows[1];
-                let valid = certificate[0] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
+                let finite = [target_rows[0], target_rows[2], target_rows[3], target_rows[4]]
+                    .into_iter()
+                    .flatten()
+                    .all(f32::is_finite);
+                let valid = finite
+                    && certificate.iter().copied().all(f32::is_finite)
+                    && certificate[0] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
                     && certificate[1] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
                     && certificate[2] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
                     && certificate[3] <= 0.30;
-                if valid {
+                if !valid {
+                    let candidate = target_index / samples_per_candidate;
+                    if let Some(rejected) = rejected_candidates.get_mut(candidate as usize) {
+                        *rejected = true;
+                    }
+                    if let Some(metric) = candidate_metrics.get_mut(candidate as usize) {
+                        *metric = [-1.0, 0.0, 0.0, 0.0];
+                    }
+                }
+            }
+            let mut filtered_indices = Vec::with_capacity(state_indices.len());
+            let mut rows = Vec::with_capacity(state_indices.len() * 4);
+            for (target_index, target_rows) in state_indices.iter().copied().zip(
+                compact_rows
+                    .chunks_exact(5)
+                    .take(state_indices.len()),
+            ) {
+                let candidate = target_index / samples_per_candidate;
+                if !rejected_candidates[candidate as usize] {
+                    filtered_indices.push(target_index);
                     rows.extend([target_rows[0], target_rows[2], target_rows[3], target_rows[4]]);
-                } else {
-                    rows.extend([[f32::NAN; 4]; 4]);
                 }
             }
             drop(view);
             staging.unmap();
-            (rows, candidate_metrics)
+            (rows, candidate_metrics, filtered_indices)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         if let Ok(mut guard) = shared_data.lock() {
             *guard = Some(PlanningGpuPacket {
                 request: packet_request,
-                state_indices,
+                state_indices: rows.2,
                 rows: rows.0,
                 candidate_metrics: rows.1,
                 readback_valid: result.is_ok(),
@@ -425,4 +590,16 @@ fn dispatch_planning_eq106(
         }
         in_flight.store(false, Ordering::Release);
     });
+}
+
+fn planning_eq106_stage_budget() -> usize {
+    let average_fps = crate::browser_frame_rate();
+    let recent_frame_ms = crate::browser_recent_frame_ms();
+    let frame_over_budget = average_fps.is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
+        || recent_frame_ms
+            .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS);
+    if frame_over_budget {
+        return 0;
+    }
+    1
 }
