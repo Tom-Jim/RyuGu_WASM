@@ -223,8 +223,10 @@ struct ExtractedEq106Input {
     target_snapshots: Vec<GravityRequestSnapshot>,
     batch_elements: Vec<Eq106BatchElement>,
     batch_capture_id: Option<u64>,
-    sensitivity_sources: Vec<[u8; 16]>,
+    sensitivity_sources: Vec<Vec<u8>>,
+    sensitivity_source_counts: Vec<u32>,
     sensitivity_source_hash: u64,
+    sensitivity_basis_hash: u64,
     sources: Option<Vec<u8>>,
     fourier_modes: Option<Vec<u8>>,
     operator_tensor: Option<Vec<u8>>,
@@ -414,6 +416,7 @@ fn poll_eq106_readback(
         let sample_count = packet.snapshots.len();
         if sensitivity.capture_id != Some(capture_id)
             || sensitivity.source_hash != packet.sensitivity_source_hash
+            || sensitivity.basis_hash != packet.sensitivity_basis_hash
             || sensitivity.configuration_hash != packet.sensitivity_configuration_hash
         {
             return;

@@ -236,44 +236,25 @@ fn evaluate_reference_basis(
 }
 
 pub(crate) fn fmm_voxel_basis_sensitivities(
-    voxels: &[InvertedDensityVoxel],
+    basis: &VoxelBasisSources,
     samples: &[TrajectoryInversionKnot],
-    source: &AggregatedGravitySource,
 ) -> Vec<Vec3> {
-    let mut groups = vec![Vec::<(DVec3, f64)>::new(); voxels.len()];
-    for point in &source.sources {
-        let index = voxels
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| {
-                left.center
-                    .as_dvec3()
-                    .distance_squared(point.position)
-                    .total_cmp(&right.center.as_dvec3().distance_squared(point.position))
-            })
-            .map(|(index, _)| index);
-        if let Some(index) = index {
-            groups[index].push((point.position, point.mass));
-        }
-    }
-    let trees = groups
-        .into_iter()
-        .zip(voxels)
-        .map(|(mut points, voxel)| {
-            let total_mass = points.iter().map(|(_, mass)| *mass).sum::<f64>();
-            if total_mass > f64::MIN_POSITIVE {
-                let scale = voxel.volume as f64 / total_mass;
-                for (_, mass) in &mut points {
-                    *mass *= scale;
-                }
-            } else {
-                points.push((voxel.center.as_dvec3(), voxel.volume as f64));
-            }
-            build_fmm_node(points, 0, FMM_METHOD_MAX_DEPTH)
+    let trees = basis
+        .columns
+        .iter()
+        .map(|column| {
+            build_fmm_node(
+                column
+                    .iter()
+                    .map(|source| (source.position, source.volume))
+                    .collect(),
+                0,
+                FMM_METHOD_MAX_DEPTH,
+            )
         })
         .collect::<Vec<_>>();
 
-    let mut result = Vec::with_capacity(samples.len() * voxels.len());
+    let mut result = Vec::with_capacity(samples.len() * basis.columns.len());
     for sample in samples {
         for tree in &trees {
             let body_position = sample.body_rotation.inverse() * sample.position;

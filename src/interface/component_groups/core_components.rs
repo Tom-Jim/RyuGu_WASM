@@ -207,6 +207,7 @@ pub struct DensityInversionResult {
     pub observation_noise_realizations: usize,
     /// CPU time spent assembling and solving this convex QP.
     pub inversion_time_ms: f64,
+    pub timing: InversionTimingBreakdown,
     /// Number of acceleration observations sampled along the complete dense
     /// Quintic Hermite trajectory.
     pub trajectory_samples: usize,
@@ -222,6 +223,8 @@ pub struct ConvexOptimizationJob {
     pub capture_epoch: u64,
     pub problem_id: u64,
     pub voxels: Vec<InvertedDensityVoxel>,
+    pub basis_sources: VoxelBasisSources,
+    pub frozen_samples: Vec<TrajectoryInversionKnot>,
     pub sensitivities: Vec<Vec3>,
     pub observed_accelerations: Vec<Vec3>,
     pub holdout_observations: Vec<Vec3>,
@@ -240,6 +243,7 @@ pub struct ConvexOptimizationJob {
     /// sensitivity construction/readback and the final Clarabel solve.
     pub started_at: bevy::platform::time::Instant,
     pub source_preparation_ms: f64,
+    pub timing: InversionTimingBreakdown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,6 +534,7 @@ pub struct Eq106ReadbackPacket {
     /// Zero denotes the ordinary nine-row runtime/trajectory output layout.
     pub sensitivity_column_count: u32,
     pub sensitivity_source_hash: u64,
+    pub sensitivity_basis_hash: u64,
     pub sensitivity_configuration_hash: u64,
     pub timings: Eq106TimingSample,
 }
@@ -670,6 +675,7 @@ pub struct Eq106TrajectoryBatchResult {
 pub struct Eq106SensitivityMatrix {
     pub capture_id: Option<u64>,
     pub source_hash: u64,
+    pub basis_hash: u64,
     /// Compile-time Eq.106 frequency, quadrature, and Taylor configuration.
     pub configuration_hash: u64,
     pub voxel_count: usize,

@@ -62,10 +62,11 @@ use gpu::{
     werner::WernerComputePlugin,
 };
 use interface::components::{
-    ActiveGravityMethod, CameraMode, DensityC, DisplayRotation, GpuMemoryEstimate,
-    GravityAcceleration, GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential,
-    GravityRuntimeError, JacobiHistory, PerformanceComparisonState, ProbeInitialConditions,
-    ShowNormals, ShowSection, SimulationAcceleration, SimulationClock, TrajectoryInversionState,
+    ActiveGravityMethod, CameraMode, DensityC, DensitySensitivityCaches, DisplayRotation,
+    GpuMemoryEstimate, GravityAcceleration, GravityBenchmarkTrajectory, GravityBlendFactor,
+    GravityPotential, GravityRuntimeError, JacobiHistory, PerformanceComparisonState,
+    ProbeInitialConditions, ShowNormals, ShowSection, SimulationAcceleration, SimulationClock,
+    TrajectoryInversionState,
 };
 use std::time::Duration;
 
@@ -170,6 +171,7 @@ pub fn main() {
         .init_resource::<JacobiHistory>()
         .init_resource::<SimulationClock>()
         .init_resource::<TrajectoryInversionState>()
+        .init_resource::<DensitySensitivityCaches>()
         .init_resource::<GravityBenchmarkTrajectory>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()

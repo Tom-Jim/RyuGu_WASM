@@ -12,23 +12,38 @@ pub fn density_inversion_timing_ui_system(
         ),
     >,
 ) {
-    let names = ["Radial", "Werner", "Eq.106", "MMFFT", "FMM"];
+    let names = ["Radial", "Werner", "Eq.106 GPU", "MMFFT CPU", "Treecode CPU"];
     for (label, mut text) in timing_labels.iter_mut() {
         let marker = if label.0 == active_method.performance_index() {
             "*"
         } else {
             " "
         };
-        **text = match inversion.best_results[label.0].as_ref() {
-            Some(result) => format!(
-                "{}{: <7} density fit {:>7.4}% | holdout {:>7.4}% | time {:>8.2} ms",
+        **text = match inversion.results[label.0].as_ref() {
+            Some(result) => {
+                let best_fit = inversion.best_results[label.0]
+                    .as_ref()
+                    .map_or(result.model_fit, |best| best.model_fit);
+                let cache = if result.timing.matrix_cache_hit {
+                    "warm"
+                } else {
+                    "cold"
+                };
+                format!(
+                "{}{: <12} current {:>7.4}% | best {:>7.4}% | truth {:>7.2} ms | matrix {:>7.2} ms {} | QP {:>7.2} ms | verify {:>6.2} ms | total {:>8.2} ms",
                 marker,
                 names[label.0],
                 result.model_fit * 100.0,
-                result.holdout_rmse * 100.0,
+                best_fit * 100.0,
+                result.timing.truth_prepare_ms,
+                result.timing.matrix_build_ms,
+                cache,
+                result.timing.convex_solve_ms,
+                result.timing.verification_ms,
                 result.inversion_time_ms,
-            ),
-            None => format!("{}{: <7}  --", marker, names[label.0]),
+            )
+            }
+            None => format!("{}{: <12}  --", marker, names[label.0]),
         };
     }
     for (mut text, mut color) in status_labels.iter_mut() {
@@ -59,13 +74,18 @@ fn update_density_inversion_status(
                 .inversion
                 .map_or(0.0, |timing| timing.source_preparation_ms);
             **text = format!(
-                "Eq.106 batched GPU matrix: {}/{} columns | source {:.2} ms | one dispatch/readback pending",
+                "Eq.106 batched GPU matrix: {}/{} columns | common truth {:.2} ms | one dispatch/readback pending",
                 sensitivity.columns.len(),
                 job.voxels.len(),
                 source_ms,
             );
         } else {
-            **text = format!("{} Clarabel 56x56 QP", job.method.as_str());
+            let method = if job.method == ActiveGravityMethod::Fmm {
+                "CPU quadrupole treecode"
+            } else {
+                job.method.as_str()
+            };
+            **text = format!("{} Clarabel 56x56 QP", method);
         }
         color.0 = Color::srgb(1.0, 0.78, 0.25);
         return;
@@ -86,7 +106,7 @@ fn update_density_inversion_status(
     {
         if timing.matrix_cache_hit {
             **text = format!(
-                "Eq.106 ms source {:.2} | matrix cache hit: GPU stages skipped | matrix {:.2} | Clarabel {:.2} | verify {:.2} | total {:.2} | dispatch 0",
+                "Eq.106 ms common truth {:.2} (excluded) | matrix cache hit: GPU stages skipped | matrix {:.2} | Clarabel {:.2} | verify {:.2} | total {:.2} | dispatch 0",
                 timing.source_preparation_ms,
                 timing.design_matrix_assembly_ms,
                 timing.convex_solve_ms,
@@ -95,7 +115,7 @@ fn update_density_inversion_status(
             );
         } else {
             **text = format!(
-                "Eq.106 ms source {:.2} | CPU encode spectrum {:.2} / evaluate {:.2} | GPU batch+map {:.2} | matrix {:.2} | Clarabel {:.2} | verify {:.2} | total {:.2} | dispatch {} | rebuild {} | cache miss",
+                "Eq.106 ms common truth {:.2} (excluded) | CPU encode spectrum {:.2} / evaluate {:.2} | GPU batch+map {:.2} | matrix {:.2} | Clarabel {:.2} | verify {:.2} | total {:.2} | dispatch {} | rebuild {} | cache miss",
                 timing.source_preparation_ms,
                 timing.spectrum_build_ms.unwrap_or(0.0),
                 timing.target_evaluation_ms.unwrap_or(0.0),

@@ -2,6 +2,43 @@
 #[derive(Resource, Default)]
 pub struct FmmGravityHistory(pub GravitySampleHistory);
 
+#[derive(Clone, Copy, Debug)]
+pub struct VoxelBasisSource {
+    pub position: bevy::math::DVec3,
+    /// Unit-density source volume in cubic metres.
+    pub volume: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VoxelBasisSources {
+    /// One distributed source column for every inversion voxel.
+    pub columns: Vec<Vec<VoxelBasisSource>>,
+    pub hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InversionTimingBreakdown {
+    /// Common high-resolution truth construction, excluded from method time.
+    pub truth_prepare_ms: f64,
+    pub matrix_build_ms: f64,
+    pub matrix_cache_hit: bool,
+    pub convex_solve_ms: f64,
+    pub verification_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DensitySensitivityCache {
+    pub capture_id: Option<u64>,
+    pub source_hash: u64,
+    pub basis_hash: u64,
+    pub sample_count: usize,
+    pub values: Vec<Vec3>,
+}
+
+#[derive(Resource, Default)]
+pub struct DensitySensitivityCaches(pub [DensitySensitivityCache; 5]);
+
 #[derive(Resource)]
 pub struct FmmSource {
     pub bytes: Vec<u8>,

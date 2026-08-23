@@ -15,7 +15,11 @@ fn dispatch_eq106_sensitivity_matrix(
     };
     let column_count = extracted.sensitivity_sources.len();
     let target_count = extracted.target_snapshots.len();
-    if column_count == 0 || target_count == 0 || extracted.batch_elements.is_empty() {
+    if column_count == 0
+        || extracted.sensitivity_source_counts.len() != column_count
+        || target_count == 0
+        || extracted.batch_elements.is_empty()
+    {
         return;
     }
     let key = (
@@ -64,7 +68,7 @@ fn dispatch_eq106_sensitivity_matrix(
                 element.line_origin,
                 element.line_origin,
                 element.line_direction,
-                1,
+                extracted.sensitivity_source_counts[column],
                 extracted.radius,
                 element.line_limit,
                 element.taylor_order,
@@ -206,6 +210,7 @@ fn dispatch_eq106_sensitivity_matrix(
     let snapshots = extracted.target_snapshots.clone();
     let element_count = extracted.batch_elements.len() as u32;
     let sensitivity_source_hash = extracted.sensitivity_source_hash;
+    let sensitivity_basis_hash = extracted.sensitivity_basis_hash;
     let sensitivity_configuration_hash = eq106_sensitivity_configuration_hash();
     let readback_started = Instant::now();
     mapped_staging
@@ -222,6 +227,7 @@ fn dispatch_eq106_sensitivity_matrix(
                         batch_capture_id: Some(capture_id),
                         sensitivity_column_count: column_count as u32,
                         sensitivity_source_hash,
+                        sensitivity_basis_hash,
                         sensitivity_configuration_hash,
                         timings: Eq106TimingSample {
                             spectrum_build_ms: Some(spectrum_encoding_ms),

@@ -588,6 +588,7 @@ mod tests {
             observation_noise_fraction: 0.0,
             observation_noise_realizations: 0,
             inversion_time_ms: 0.0,
+            timing: default(),
             trajectory_samples: 17,
             iterations: 1,
             voxel_size: 2.0,

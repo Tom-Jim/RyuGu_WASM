@@ -482,6 +482,7 @@ fn dispatch_eq106(
                             batch_capture_id: Some(capture_id),
                             sensitivity_column_count: 0,
                             sensitivity_source_hash: 0,
+                            sensitivity_basis_hash: 0,
                             sensitivity_configuration_hash: 0,
                             timings,
                         });

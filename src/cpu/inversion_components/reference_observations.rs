@@ -31,16 +31,19 @@ fn reference_observations_and_sensitivities(
 
 fn training_and_holdout_reference(
     knots: &[TrajectoryInversionKnot],
+    training_samples: &[TrajectoryInversionKnot],
     voxels: &[InvertedDensityVoxel],
     radial_source: &RadialGravitySource,
 ) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
-    let training_samples = sample_frozen_trajectory(knots)?;
+    if training_samples.is_empty() {
+        return None;
+    }
     let holdout_samples = holdout_frozen_trajectory(knots)?;
     let tree = high_resolution_reference_tree(radial_source)?;
     let basis_trees = high_resolution_reference_basis_trees(voxels, radial_source)?;
     Some((
-        reference_observations(&training_samples, &tree)?,
-        evaluate_reference_basis(&basis_trees, &training_samples),
+        reference_observations(training_samples, &tree)?,
+        evaluate_reference_basis(&basis_trees, training_samples),
         reference_observations(&holdout_samples, &tree)?,
         evaluate_reference_basis(&basis_trees, &holdout_samples),
     ))

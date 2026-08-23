@@ -181,6 +181,7 @@ mod tests {
             batch_capture_id: Some(42),
             sensitivity_column_count: 0,
             sensitivity_source_hash: 0,
+            sensitivity_basis_hash: 0,
             sensitivity_configuration_hash: 0,
             timings: default(),
         };

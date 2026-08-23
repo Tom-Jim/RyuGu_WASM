@@ -49,7 +49,9 @@ fn extract_eq106_input(
     extracted.batch_elements.clear();
     extracted.batch_capture_id = None;
     extracted.sensitivity_sources.clear();
+    extracted.sensitivity_source_counts.clear();
     extracted.sensitivity_source_hash = 0;
+    extracted.sensitivity_basis_hash = 0;
     extracted.source_count = source.sources.len() as u32;
     extracted.density_mode_count = source.fourier_modes.len() as u32;
     extracted.radius = source.radius as f32;
@@ -84,16 +86,17 @@ fn extract_eq106_input(
         (job.method == ActiveGravityMethod::CurvedArcEq106
             && sensitivity.capture_id == Some(job.capture_id)
             && sensitivity.source_hash == job.source_hash
+            && sensitivity.basis_hash == job.basis_sources.hash
             && sensitivity.configuration_hash == eq106_sensitivity_configuration_hash()
             && sensitivity.columns.is_empty())
             .then_some((job.capture_id, job))
     });
     if let Some((capture_id, job)) = pending_sensitivity {
-        let samples = crate::cpu::inversion::sample_frozen_trajectory(&inversion.knots)
-            .unwrap_or_default();
+        let samples = &job.frozen_samples;
         if samples.len() >= 2 {
             extracted.batch_capture_id = Some(capture_id);
             extracted.sensitivity_source_hash = job.source_hash;
+            extracted.sensitivity_basis_hash = job.basis_sources.hash;
             let mut positions = Vec::with_capacity(samples.len());
             let mut velocities = Vec::with_capacity(samples.len());
             for (index, sample) in samples.iter().enumerate() {
@@ -125,20 +128,33 @@ fn extract_eq106_input(
                 extracted.radius,
                 extracted.certified_line_limit,
             );
-            extracted.sensitivity_sources.reserve(job.voxels.len());
-            for voxel in &job.voxels {
-                let mut bytes = [0_u8; 16];
-                let mut offset = 0;
-                for value in [voxel.center.x, voxel.center.y, voxel.center.z, voxel.volume] {
-                    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-                    offset += 4;
+            extracted
+                .sensitivity_sources
+                .reserve(job.basis_sources.columns.len());
+            extracted
+                .sensitivity_source_counts
+                .reserve(job.basis_sources.columns.len());
+            for column in &job.basis_sources.columns {
+                let mut bytes = Vec::with_capacity(column.len() * 16);
+                for source in column {
+                    for value in [
+                        source.position.x as f32,
+                        source.position.y as f32,
+                        source.position.z as f32,
+                        source.volume as f32,
+                    ] {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
                 }
                 extracted.sensitivity_sources.push(bytes);
+                extracted.sensitivity_source_counts.push(column.len() as u32);
             }
             if let Some(first) = extracted.sensitivity_sources.first() {
-                extracted.sources = Some(first.to_vec());
-                extracted.source_count = 1;
-                extracted.source_hash = capture_id ^ job.source_hash.rotate_left(29);
+                extracted.sources = Some(first.clone());
+                extracted.source_count = extracted.sensitivity_source_counts[0];
+                extracted.source_hash = capture_id
+                    ^ job.source_hash.rotate_left(29)
+                    ^ job.basis_sources.hash.rotate_right(7);
             }
         }
     } else if let Some(capture_id) = pending_benchmark_id
@@ -516,6 +532,7 @@ fn dispatch_eq106_single_target(
                         batch_capture_id,
                         sensitivity_column_count: 0,
                         sensitivity_source_hash: 0,
+                        sensitivity_basis_hash: 0,
                         sensitivity_configuration_hash: 0,
                         timings,
                     });

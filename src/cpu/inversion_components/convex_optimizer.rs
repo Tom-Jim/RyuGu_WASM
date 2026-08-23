@@ -11,6 +11,7 @@ pub fn convex_optimization_system(
     if job.method == ActiveGravityMethod::CurvedArcEq106 {
         if eq106_sensitivity.capture_id != Some(job.capture_id)
             || eq106_sensitivity.source_hash != job.source_hash
+            || eq106_sensitivity.basis_hash != job.basis_sources.hash
             || eq106_sensitivity.configuration_hash
                 != crate::gpu::eq106::eq106_sensitivity_configuration_hash()
             || eq106_sensitivity.voxel_count != job.voxels.len()
@@ -52,6 +53,9 @@ pub fn convex_optimization_system(
         job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
         job.initial_objective = objective(&job);
         design_matrix_assembly_ms = matrix_assembly_started.elapsed().as_secs_f64() * 1.0e3;
+        if !job.timing.matrix_cache_hit {
+            job.timing.matrix_build_ms = job.started_at.elapsed().as_secs_f64() * 1.0e3;
+        }
         if !job.initial_objective.is_finite() {
             inversion.displayed_density = None;
             inversion.error = Some("The Eq.106 sensitivity matrix is not finite.".into());
@@ -86,14 +90,17 @@ pub fn convex_optimization_system(
     job.best_densities.clone_from(&densities);
     job.current_densities.clone_from(&densities);
     let best_objective = objective_for_densities(&job, &densities);
-    let inversion_time_ms = job.started_at.elapsed().as_secs_f64() * 1.0e3;
-    performance.full_inversion_iteration_ms = Some(inversion_time_ms);
     for (voxel, density) in job.voxels.iter_mut().zip(&densities) {
         voxel.density = *density;
     }
     let completed_method = job.method;
-    let result = density_result_from_job(&job, &densities, best_objective, inversion_time_ms);
     let verification_ms = verification_started.elapsed().as_secs_f64() * 1.0e3;
+    job.timing.convex_solve_ms = convex_solve_ms;
+    job.timing.verification_ms = verification_ms;
+    let inversion_time_ms = job.started_at.elapsed().as_secs_f64() * 1.0e3;
+    job.timing.total_ms = inversion_time_ms;
+    performance.full_inversion_iteration_ms = Some(inversion_time_ms);
+    let result = density_result_from_job(&job, &densities, best_objective, inversion_time_ms);
     if completed_method == ActiveGravityMethod::CurvedArcEq106 {
         let timing = performance.inversion.get_or_insert_default();
         timing.source_preparation_ms = job.source_preparation_ms;

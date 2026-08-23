@@ -323,12 +323,15 @@ fn sample_mmfft_grid(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: us
 /// Builds method-consistent MMFFT unit-density voxel columns using the same
 /// CIC deposition, zero-padded convolution, and tricubic derivative as WGSL.
 pub(crate) fn voxel_basis_sensitivities(
-    voxels: &[InvertedDensityVoxel],
+    basis: &VoxelBasisSources,
     samples: &[TrajectoryInversionKnot],
 ) -> Vec<Vec3> {
-    let mut columns = Vec::with_capacity(voxels.len());
-    for voxel in voxels {
-        let records = [(voxel.center.as_dvec3(), voxel.volume as f64)];
+    let mut columns = Vec::with_capacity(basis.columns.len());
+    for sources in &basis.columns {
+        let records = sources
+            .iter()
+            .map(|source| (source.position, source.volume))
+            .collect::<Vec<_>>();
         let levels = LEVEL_GRID_SIZES
             .into_iter()
             .zip(LEVEL_HALF_EXTENTS)
@@ -346,15 +349,19 @@ pub(crate) fn voxel_basis_sensitivities(
                             .then(|| sample_mmfft_grid(field, body_position, *half, *n))
                     })
                     .unwrap_or_else(|| {
-                        let displacement = voxel.center - body_position;
-                        displacement * (G * voxel.volume / displacement.length().powi(3))
+                        sources.iter().fold(Vec3::ZERO, |sum, source| {
+                            let displacement = source.position.as_vec3() - body_position;
+                            sum + displacement
+                                * (G * source.volume as f32
+                                    / displacement.length_squared().max(1.0e-12).powf(1.5))
+                        })
                     });
                 sample.body_rotation * body_acceleration
             })
             .collect::<Vec<_>>();
         columns.push(column);
     }
-    let mut row_major = Vec::with_capacity(samples.len() * voxels.len());
+    let mut row_major = Vec::with_capacity(samples.len() * basis.columns.len());
     for sample in 0..samples.len() {
         for column in &columns {
             row_major.push(column[sample]);
