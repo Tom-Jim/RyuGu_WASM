@@ -12,6 +12,7 @@ const MIME: Record<string, string> = {
   ".png":  "image/png",
   ".jpg":  "image/jpeg",
   ".css":  "text/css",
+  ".wgsl": "text/plain; charset=utf-8",
 };
 
 Bun.serve({
@@ -35,6 +36,7 @@ Bun.serve({
         // Required for SharedArrayBuffer / WASM threads (if needed)
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cache-Control": "no-store",
       },
     });
   },

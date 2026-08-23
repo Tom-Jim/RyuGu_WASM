@@ -200,6 +200,9 @@ pub fn planning_comparison_control_system(
         (Changed<Interaction>, With<Button>),
     >,
     mut planning: ResMut<PlanningComparisonState>,
+    mut request: ResMut<PlanningGpuRequest>,
+    mut payload: ResMut<PlanningMethodPayload>,
+    mut gpu_result: ResMut<PlanningGpuResult>,
     mut button_sets: ParamSet<(
         Query<(&ComparisonMetricButton, &mut BackgroundColor)>,
         Query<(&PlanningWorkloadButton, &mut BackgroundColor)>,
@@ -219,12 +222,21 @@ pub fn planning_comparison_control_system(
         planning.workload_profile = profile;
         planning.results = std::array::from_fn(|_| None);
         planning.batch_job = None;
-        planning.run_requested = true;
-        planning.run_id = planning.run_id.wrapping_add(1);
-        planning.status = format!(
-            "{} selected and queued. Existing frozen method results will start the batch automatically.",
-            profile.label()
-        );
+        planning.reference_duration_seconds = 0.0;
+        *request = PlanningGpuRequest::default();
+        *payload = PlanningMethodPayload::default();
+        gpu_result.0 = None;
+        planning.run_requested = profile == PlanningWorkloadProfile::Stress;
+        if planning.run_requested {
+            planning.run_id = planning.run_id.wrapping_add(1);
+            planning.status =
+                "Stress selected: the isolated planning workload is queued for the frozen capture."
+                    .into();
+        } else {
+            planning.status =
+                "First selected: normal density inversion is active; planning stress is idle."
+                    .into();
+        }
     }
     for (button, mut color) in button_sets.p0().iter_mut() {
         color.0 = if button.0 == planning.selected_metric {
@@ -243,79 +255,158 @@ pub fn planning_comparison_control_system(
 }
 
 pub fn update_planning_results_from_inversion_system(
+    mut commands: Commands,
     inversion: Res<TrajectoryInversionState>,
+    radial: Option<Res<RadialGravitySource>>,
+    aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     mut planning: ResMut<PlanningComparisonState>,
+    mut batch_builder: Local<Option<crate::cpu::planning::PlanningBatchBuilder>>,
 ) {
-    if !planning.run_requested || planning.batch_job.is_some() {
+    if planning.workload_profile != PlanningWorkloadProfile::Stress
+        || !planning.run_requested
+        || planning.batch_job.is_some()
+    {
         return;
     }
-    let methods = [
-        ActiveGravityMethod::CurvedArcEq106,
-        ActiveGravityMethod::MmfftCompressed,
-        ActiveGravityMethod::Fmm,
-    ];
-    let Some(reference) = methods
-        .iter()
-        .filter_map(|method| inversion.results[method.performance_index()].as_ref())
-        .next()
-    else {
+    let Some(capture_id) = inversion.capture_id else {
         planning.status = format!(
-            "{} planning queued: complete a frozen-track inversion first.",
+            "{} planning queued: freeze a reference trajectory first.",
             planning.workload_profile.label()
         );
         return;
     };
-    let completed = methods
-        .iter()
-        .filter(|method| inversion.results[method.performance_index()].is_some())
-        .count();
-    if completed < methods.len() {
-        planning.status = format!(
-            "{} planning queued: {}/3 frozen-track inversions complete.",
-            planning.workload_profile.label(),
-            completed
-        );
-        return;
-    }
-    let same_frozen_problem = methods.iter().all(|method| {
-        inversion.results[method.performance_index()]
-            .as_ref()
-            .is_some_and(|result| {
-                result.capture_id == reference.capture_id
-                    && result.source_hash == reference.source_hash
-                    && result.capture_epoch == reference.capture_epoch
-            })
-    });
-    if !same_frozen_problem {
-        planning.status = format!(
-            "{} planning blocked: the three inversions do not share one capture_id, source hash and epoch.",
-            planning.workload_profile.label()
-        );
+    let source_hash = inversion.capture_source_hash;
+    if source_hash == 0 {
+        planning.status = "Planning queued: the frozen capture identity is incomplete.".into();
         return;
     }
     let dimensions = planning.workload_profile.dimensions();
+    let builder_matches = batch_builder.as_ref().is_some_and(|builder| {
+        builder.matches(
+            planning.workload_profile,
+            planning.run_id,
+            capture_id,
+            source_hash,
+        )
+    });
+    if !builder_matches {
+        let Some(radial) = radial else {
+            planning.status = "Planning queued: the common radial volume source is not ready.".into();
+            return;
+        };
+        let Some(aggregated) = aggregated else {
+            planning.status = "Planning queued: the common 1024-source geometry is not ready.".into();
+            return;
+        };
+        let Some((voxels, _)) = crate::cpu::inversion::build_density_voxels(
+            &radial,
+            ActiveGravityMethod::CurvedArcEq106,
+        ) else {
+            planning.status =
+                "Planning batch could not build the independent 56-region truth geometry.".into();
+            return;
+        };
+        let Some(builder) = crate::cpu::planning::PlanningBatchBuilder::new(
+            planning.workload_profile,
+            planning.run_id,
+            capture_id,
+            inversion.capture_epoch,
+            source_hash,
+            &inversion.knots,
+            &voxels,
+            &aggregated,
+        ) else {
+            planning.status =
+                "Planning batch initialization failed its equal-mass or source checks.".into();
+            planning.run_requested = false;
+            return;
+        };
+        *batch_builder = Some(builder);
+        planning.status = format!(
+            "Stress candidate preparation: 0 / {} trajectories.",
+            dimensions.0
+        );
+        return;
+    }
+    let builder = batch_builder.as_mut().expect("matched planning builder");
+    if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS) {
+        planning.status = format!(
+            "Stress candidate preparation yielded to rendering at {:.0} FPS: {} / {} trajectories.",
+            crate::browser_frame_rate().unwrap_or(0.0),
+            builder.completed_candidates(),
+            dimensions.0
+        );
+        return;
+    }
+    if !builder.advance(PLANNING_BUILD_CANDIDATES_PER_FRAME) {
+        planning.status = "Planning candidate generation left the certified 15 m tube.".into();
+        planning.run_requested = false;
+        *batch_builder = None;
+        return;
+    }
+    if !builder.is_complete() {
+        planning.status = format!(
+            "Stress candidate preparation: {} / {} trajectories.",
+            builder.completed_candidates(),
+            dimensions.0
+        );
+        return;
+    }
+    let Some((batch, common_preparation_ms)) = batch_builder.take().and_then(|builder| builder.finish())
+    else {
+        planning.status = "Planning candidate batch could not be finalized.".into();
+        planning.run_requested = false;
+        return;
+    };
+    planning.reference_duration_seconds = inversion
+        .knots
+        .first()
+        .zip(inversion.knots.last())
+        .map_or(0.0, |(first, last)| {
+            (last.simulation_time_seconds - first.simulation_time_seconds) as f32
+        });
+    let batch_id = batch.batch_id;
+    commands.insert_resource(batch);
+    commands.insert_resource(PlanningGpuRequest::default());
+    commands.insert_resource(PlanningMethodPayload::default());
     planning.batch_job = Some(PlanningBatchJob {
         run_id: planning.run_id,
         profile: planning.workload_profile,
         method: ActiveGravityMethod::CurvedArcEq106,
-        capture_id: reference.capture_id,
-        source_hash: reference.source_hash,
-        voxels: reference.voxels.clone(),
+        batch_id,
         candidate_count: dimensions.0,
         density_model_count: dimensions.1,
         samples_per_candidate: dimensions.2,
-        cursor: 0,
+        request_id: planning.run_id.wrapping_shl(24),
+        density_model: 0,
+        candidate_start: 0,
+        awaiting_gpu: false,
+        warm_repetition: false,
         total_evaluations: u64::from(dimensions.0)
             * u64::from(dimensions.1)
             * u64::from(dimensions.2),
         gravity_error_sum: 0.0,
+        gravity_reference_sum: 0.0,
+        gravity_samples: 0,
         gradient_error_sum: 0.0,
+        gradient_reference_sum: 0.0,
         gradient_samples: 0,
         pericenter_error_m: 0.0,
-        candidate_min_radius: f32::INFINITY,
-        preprocessing_ms: reference.timing.truth_prepare_ms + reference.timing.matrix_build_ms,
+        minimum_altitude_m: f32::INFINITY,
+        discrimination_sum: 0.0,
+        discrimination_reference_sum: 0.0,
+        discrimination_samples: 0,
+        gradient_information_sum: 0.0,
+        common_preparation_ms,
+        preprocessing_ms: 0.0,
         evaluation_ms: 0.0,
-        baseline_gravity_error: reference.holdout_rmse,
+        reduction_ms: 0.0,
+        verification_ms: 0.0,
+        readback_ms: 0.0,
+        warm_evaluation_ms: 0.0,
+        dispatch_count: 0,
+        forward_kernel_evaluations: 0,
+        spectral_element_count: 0,
     });
     planning.status = format!(
         "{} batch planning started: 0/{} evaluations, Eq.106.",

@@ -9,11 +9,10 @@ pub const NEAR_SYNC_SEMIMAJOR_AXIS_METERS: f32 = 831.624;
 pub const NEAR_SYNC_PERICENTER_RADIUS_METERS: f32 = 564.765;
 pub const NEAR_SYNC_APOCENTER_RADIUS_METERS: f32 = 1_098.483;
 pub const NEAR_SYNC_ECCENTRICITY: f32 = 0.320_889;
-pub const NEAR_SYNC_LOCAL_WINDOW_SECONDS: f32 = 1_800.0;
 pub const NEAR_SYNC_SEGMENT_MAX_SECONDS: f32 = 300.0;
 pub const NEAR_SYNC_TAYLOR_ORDER: u32 = 4;
-pub const NEAR_SYNC_TRUST_RADIUS_METERS: f32 = 10.0;
-pub const NEAR_SYNC_TRANSVERSE_LIMIT_METERS: f32 = 20.0;
+pub const NEAR_SYNC_TRUST_RADIUS_METERS: f32 = PLANNING_TRAJECTORY_TUBE_RADIUS_METERS;
+pub const NEAR_SYNC_TRANSVERSE_LIMIT_METERS: f32 = PLANNING_TRAJECTORY_TUBE_RADIUS_METERS;
 pub const NEAR_SYNC_RELATIVE_REMAINDER_TARGET: f32 = 1.0e-3;
 
 pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
@@ -120,15 +119,15 @@ pub enum PlanningWorkloadProfile {
 impl PlanningWorkloadProfile {
     pub fn dimensions(self) -> (u32, u32, u32) {
         match self {
-            Self::First => (256, 16, 241),
-            Self::Stress => (1_024, 32, 512),
+            Self::First => (PLANNING_CANDIDATE_COUNT, 16, 241),
+            Self::Stress => (PLANNING_CANDIDATE_COUNT, 32, 512),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::First => "First 256x16x241",
-            Self::Stress => "Stress 1024x32x512",
+            Self::First => "First 2048x16x241",
+            Self::Stress => "Stress 2048x32x512",
         }
     }
 }
@@ -141,18 +140,24 @@ pub enum ComparisonMetric {
     GravityRelativeError,
     GradientRelativeError,
     PericenterError,
+    MinimumAltitude,
+    ModelDiscrimination,
+    PlanningObjective,
     SegmentCount,
     SpeedupVsGpuFmm,
     ColdStartAmortization,
 }
 
 impl ComparisonMetric {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 11] = [
         Self::DensityFit,
         Self::InversionTime,
         Self::GravityRelativeError,
         Self::GradientRelativeError,
         Self::PericenterError,
+        Self::MinimumAltitude,
+        Self::ModelDiscrimination,
+        Self::PlanningObjective,
         Self::SegmentCount,
         Self::SpeedupVsGpuFmm,
         Self::ColdStartAmortization,
@@ -165,6 +170,9 @@ impl ComparisonMetric {
             Self::GravityRelativeError => "Gravity error",
             Self::GradientRelativeError => "Gradient error",
             Self::PericenterError => "Pericenter error",
+            Self::MinimumAltitude => "Minimum altitude",
+            Self::ModelDiscrimination => "Model separation",
+            Self::PlanningObjective => "Planning objective",
             Self::SegmentCount => "Segments",
             Self::SpeedupVsGpuFmm => "Speedup / FMM",
             Self::ColdStartAmortization => "Cold amortization",
@@ -179,7 +187,10 @@ impl ComparisonMetric {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanningWorkloadIdentity {
     pub reference_capture_id: u64,
-    pub reference_ellipse_hash: u64,
+    pub reference_capture_epoch: u64,
+    pub source_hash: u64,
+    pub basis_hash: u64,
+    pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,
     pub sample_hash: u64,
@@ -200,7 +211,9 @@ impl PlanningWorkloadIdentity {
 
     pub fn is_complete(self) -> bool {
         self.reference_capture_id != 0
-            && self.reference_ellipse_hash != 0
+            && self.source_hash != 0
+            && self.basis_hash != 0
+            && self.reference_arc_hash != 0
             && self.candidate_hash != 0
             && self.density_model_hash != 0
             && self.sample_hash != 0
@@ -211,7 +224,6 @@ impl PlanningWorkloadIdentity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanningExecutionBackend {
-    SharedCpuValidation,
     GpuEq106,
     GpuMmfft,
     GpuFmm,
@@ -226,36 +238,63 @@ pub struct PlanningMethodMetrics {
     /// GPU fairness verdict.
     pub gpu_batch_verified: bool,
     pub workload: PlanningWorkloadIdentity,
+    pub common_preparation_ms: f64,
     pub preprocessing_ms: f64,
     pub evaluation_ms: f64,
+    pub reduction_ms: f64,
+    pub verification_ms: f64,
+    pub readback_ms: f64,
+    pub warm_evaluation_ms: f64,
     pub total_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
     pub pericenter_error_m: f32,
+    pub minimum_altitude_m: f32,
+    pub model_discrimination: f32,
+    pub planning_objective: f32,
     pub segment_count: u32,
     pub cold_amortization_candidates: u32,
+    pub dispatch_count: u32,
+    pub forward_kernel_evaluations: u64,
+    pub density_combinations: u64,
 }
 
 pub struct PlanningBatchJob {
     pub run_id: u64,
     pub profile: PlanningWorkloadProfile,
     pub method: ActiveGravityMethod,
-    pub capture_id: u64,
-    pub source_hash: u64,
-    pub voxels: Vec<InvertedDensityVoxel>,
+    pub batch_id: u64,
     pub candidate_count: u32,
     pub density_model_count: u32,
     pub samples_per_candidate: u32,
-    pub cursor: u64,
+    pub request_id: u64,
+    pub density_model: u32,
+    pub candidate_start: u32,
+    pub awaiting_gpu: bool,
+    pub warm_repetition: bool,
     pub total_evaluations: u64,
     pub gravity_error_sum: f64,
+    pub gravity_reference_sum: f64,
+    pub gravity_samples: u64,
     pub gradient_error_sum: f64,
+    pub gradient_reference_sum: f64,
     pub gradient_samples: u64,
     pub pericenter_error_m: f32,
-    pub candidate_min_radius: f32,
+    pub minimum_altitude_m: f32,
+    pub discrimination_sum: f64,
+    pub discrimination_reference_sum: f64,
+    pub discrimination_samples: u64,
+    pub gradient_information_sum: f64,
+    pub common_preparation_ms: f64,
     pub preprocessing_ms: f64,
     pub evaluation_ms: f64,
-    pub baseline_gravity_error: f32,
+    pub reduction_ms: f64,
+    pub verification_ms: f64,
+    pub readback_ms: f64,
+    pub warm_evaluation_ms: f64,
+    pub dispatch_count: u32,
+    pub forward_kernel_evaluations: u64,
+    pub spectral_element_count: u32,
 }
 
 impl PlanningMethodMetrics {
@@ -279,6 +318,7 @@ pub struct PlanningComparisonState {
     pub results: [Option<PlanningMethodMetrics>; 5],
     pub run_requested: bool,
     pub run_id: u64,
+    pub reference_duration_seconds: f32,
     pub status: String,
     pub batch_job: Option<PlanningBatchJob>,
 }
@@ -314,7 +354,8 @@ impl Default for PlanningComparisonState {
             results: std::array::from_fn(|_| None),
             run_requested: false,
             run_id: 0,
-            status: "Select a workload, then press Invert trajectory to collect planning results.".into(),
+            reference_duration_seconds: 0.0,
+            status: "First uses normal density inversion. Select Stress to start planning.".into(),
             batch_job: None,
         }
     }

@@ -15,19 +15,10 @@ pub fn start_density_inversion_system(
     mut eq106_performance: ResMut<Eq106PerformanceMetrics>,
     mut show_section: ResMut<ShowSection>,
     mut inversion: ResMut<TrajectoryInversionState>,
-    mut planning: ResMut<PlanningComparisonState>,
 ) {
     let pressed = interactions
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed);
-    if pressed {
-        planning.run_requested = true;
-        planning.run_id = planning.run_id.wrapping_add(1);
-        planning.status = format!(
-            "{} planning run queued for the frozen capture.",
-            planning.workload_profile.label()
-        );
-    }
     if !validate_inversion_request(pressed, *active_method, &mut inversion) {
         return;
     }

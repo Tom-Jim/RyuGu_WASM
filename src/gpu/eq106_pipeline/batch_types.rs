@@ -297,11 +297,20 @@ impl Plugin for Eq106GpuComputePlugin {
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedEq106Input>();
         render_app.init_resource::<Eq106GpuBuffers>();
+        render_app.init_resource::<PlanningEq106DispatchState>();
         render_app.add_systems(ExtractSchedule, extract_eq106_input);
         render_app.add_systems(
             Render,
             (initialize_eq106_pipeline, dispatch_eq106)
                 .chain()
+                .in_set(RenderSystems::Render),
+        );
+        render_app.add_systems(
+            Render,
+            dispatch_planning_eq106
+                .after(initialize_eq106_pipeline)
+                .after(crate::gpu::planning::PlanningGpuSystems::PrepareSharedInput)
+                .in_set(crate::gpu::planning::PlanningGpuSystems::Dispatch)
                 .in_set(RenderSystems::Render),
         );
     }

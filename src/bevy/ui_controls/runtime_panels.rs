@@ -189,10 +189,12 @@ pub fn fps_update_system(
     mut query: Query<&mut Text, With<FpsTextMarker>>,
     mut vram_query: Query<&mut Text, (With<VramTextMarker>, Without<FpsTextMarker>)>,
 ) {
-    let fps = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|d| d.smoothed())
-        .unwrap_or(0.0);
+    let fps = crate::browser_frame_rate().unwrap_or_else(|| {
+        diagnostics
+            .get(&FrameTimeDiagnosticsPlugin::FPS)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0)
+    });
     if let Some(mut text) = query.iter_mut().next() {
         *text = Text::new(format!("FPS: {fps:.0}"));
     }

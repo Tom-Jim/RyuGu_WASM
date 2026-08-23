@@ -292,7 +292,12 @@ fn extract_eq106_input(
 }
 
 fn initialize_eq106_pipeline(world: &mut World) {
-    let enabled = world.resource::<ExtractedEq106Input>().enabled;
+    let enabled = world.resource::<ExtractedEq106Input>().enabled
+        || world
+            .get_resource::<crate::gpu::planning::ExtractedPlanningInput>()
+            .is_some_and(|planning| {
+                planning.request.method == Some(ActiveGravityMethod::CurvedArcEq106)
+            });
     if enabled && !world.contains_resource::<Eq106ComputePipeline>() {
         // Render schedules do not automatically flush ordinary Commands at
         // every set boundary; initialize directly in this exclusive system.

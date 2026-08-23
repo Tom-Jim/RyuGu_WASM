@@ -87,7 +87,7 @@ pub fn performance_comparison_system(
         && clock.elapsed_seconds > 0.0
     {
         let dt = time.delta_secs_f64().max(f64::EPSILON);
-        let fps = (1.0 / dt) as f32;
+        let fps = crate::browser_frame_rate().unwrap_or(1.0 / dt) as f32;
         let phase = state.phase;
         if let Some(history) = state.fps_history.get_mut(phase) {
             // Readback/phase hand-off frames are visible as single-frame FPS

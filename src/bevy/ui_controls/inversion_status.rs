@@ -13,7 +13,7 @@ pub fn density_inversion_timing_ui_system(
         ),
     >,
 ) {
-    let names = ["Radial", "Werner", "Eq.106 GPU", "MMFFT CPU", "Treecode CPU"];
+    let names = ["Radial", "Werner", "Eq.106 GPU", "MMFFT GPU", "FMM GPU"];
     for (label, mut text) in timing_labels.iter_mut() {
         let marker = if label.0 == active_method.performance_index() {
             "*"
@@ -83,10 +83,10 @@ fn comparison_metric_text(
         if let Some(job) = planning.batch_job.as_ref()
             && job.method.performance_index() == index
         {
-            let target_count =
-                u64::from(job.candidate_count) * u64::from(job.samples_per_candidate);
-            let completed = job.cursor * u64::from(job.density_model_count);
-            let percent = 100.0 * job.cursor as f64 / target_count.max(1) as f64;
+            let completed = (u64::from(job.density_model) * u64::from(job.candidate_count)
+                + u64::from(job.candidate_start))
+                * u64::from(job.samples_per_candidate);
+            let percent = 100.0 * completed as f64 / job.total_evaluations.max(1) as f64;
             return format!(
                 "{marker}{name:<12} running {:>6.2}% | {completed}/{} BxKxH evaluations",
                 percent, job.total_evaluations,
@@ -103,15 +103,26 @@ fn comparison_metric_text(
     {
         return format!("{marker}{name:<12} N/A (different workload)");
     }
-    let total = result.preprocessing_ms + result.evaluation_ms;
+    if !result.gpu_batch_verified {
+        return format!("{marker}{name:<12} N/A (GPU verification failed)");
+    }
+    let total = result.total_ms;
     let value = match planning.selected_metric {
         ComparisonMetric::GravityRelativeError => {
             format!(
-                "gravity relative error {:.3e} | prep {:.2} + eval {:.2} = {:.2} ms",
+                "gravity {:.3e} | common {:.2} excluded | cold prep {:.2} + encode {:.2} + reduce {:.2} + readback {:.2} = {:.2} ms | verify {:.2} excluded | warm tile {:.2} | BxKxH {} | dispatch {} | kernels {}",
                 result.relative_gravity_error,
+                result.common_preparation_ms,
                 result.preprocessing_ms,
                 result.evaluation_ms,
+                result.reduction_ms,
+                result.readback_ms,
                 total,
+                result.verification_ms,
+                result.warm_evaluation_ms,
+                result.density_combinations,
+                result.dispatch_count,
+                result.forward_kernel_evaluations,
             )
         }
         ComparisonMetric::GradientRelativeError => {
@@ -120,10 +131,22 @@ fn comparison_metric_text(
         ComparisonMetric::PericenterError => {
             format!("pericenter error {:.4} m", result.pericenter_error_m)
         }
+        ComparisonMetric::MinimumAltitude => {
+            format!("minimum altitude {:.3} m", result.minimum_altitude_m)
+        }
+        ComparisonMetric::ModelDiscrimination => {
+            format!("normalized model separation {:.3e}", result.model_discrimination)
+        }
+        ComparisonMetric::PlanningObjective => {
+            format!("verified planning objective {:.3e}", result.planning_objective)
+        }
         ComparisonMetric::SegmentCount if index == 2 => {
             format!("{} segments", result.segment_count)
         }
         ComparisonMetric::SpeedupVsGpuFmm => {
+            if planning.shared_workload().is_none() {
+                return format!("{marker}{name:<12} N/A (GPU fairness pending)");
+            }
             let Some(fmm) = planning.results[4] else {
                 return format!("{marker}{name:<12} N/A");
             };
@@ -134,6 +157,9 @@ fn comparison_metric_text(
             )
         }
         ComparisonMetric::ColdStartAmortization if index == 2 => {
+            if planning.shared_workload().is_none() || result.warm_evaluation_ms <= 0.0 {
+                return format!("{marker}{name:<12} N/A (cold/warm GPU timing pending)");
+            }
             format!("{} candidates", result.cold_amortization_candidates)
         }
         ComparisonMetric::SegmentCount | ComparisonMetric::ColdStartAmortization => "N/A".into(),
@@ -150,7 +176,7 @@ fn update_planning_comparison_status(
     let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
     let evaluations = u64::from(candidate_count) * u64::from(density_count) * u64::from(sample_count);
     let prefix = format!(
-        "{} | B={} candidates, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nwindow +/-{:.0}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        "{} | B={} candidates, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
         planning.workload_profile.label(),
         candidate_count,
         density_count,
@@ -161,7 +187,7 @@ fn update_planning_comparison_status(
         NEAR_SYNC_ECCENTRICITY,
         NEAR_SYNC_PERICENTER_RADIUS_METERS,
         NEAR_SYNC_APOCENTER_RADIUS_METERS,
-        NEAR_SYNC_LOCAL_WINDOW_SECONDS * 0.5,
+        planning.reference_duration_seconds,
         NEAR_SYNC_SEGMENT_MAX_SECONDS,
         NEAR_SYNC_TAYLOR_ORDER,
         NEAR_SYNC_TRUST_RADIUS_METERS,

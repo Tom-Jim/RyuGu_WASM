@@ -24,7 +24,7 @@ struct Eq106Params {
     line_limit: f32,
     target_offset: u32,
     inversion_mode: u32,
-    _padding2: u32,
+    input_base: u32,
 };
 
 struct SpectrumSample {
@@ -652,7 +652,7 @@ fn evaluate_field(
         return;
     }
     let target_index = params.target_offset + local_target_index;
-    let target_record = targets[target_index];
+    let target_record = targets[params.input_base + target_index];
     let probe_pos = target_record.xyz;
     let elapsed = target_record.w;
     let basis = transverse_basis(params.line_direction);

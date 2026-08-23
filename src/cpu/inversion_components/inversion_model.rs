@@ -46,7 +46,7 @@ fn read_f32(bytes: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4]))
 }
 
-fn build_density_voxels(
+pub(crate) fn build_density_voxels(
     source: &RadialGravitySource,
     method: ActiveGravityMethod,
 ) -> Option<(Vec<InvertedDensityVoxel>, f32)> {
@@ -294,6 +294,53 @@ pub(crate) fn sample_frozen_trajectory_with_subdivisions(
                 body_rotation: start.body_rotation.slerp(end.body_rotation, u),
             });
         }
+    }
+    Some(samples)
+}
+
+pub(crate) fn sample_frozen_trajectory_at_count(
+    knots: &[TrajectoryInversionKnot],
+    sample_count: usize,
+) -> Option<Vec<TrajectoryInversionKnot>> {
+    if knots.len() < 2 || sample_count < 2 {
+        return None;
+    }
+    let accelerations = quintic_knot_accelerations(knots)?;
+    let start_time = knots.first()?.simulation_time_seconds;
+    let end_time = knots.last()?.simulation_time_seconds;
+    let duration = end_time - start_time;
+    if !duration.is_finite() || duration <= f64::EPSILON {
+        return None;
+    }
+    let mut segment = 0_usize;
+    let mut samples = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let fraction = sample as f64 / sample_count.saturating_sub(1) as f64;
+        let time = start_time + duration * fraction;
+        while segment + 2 < knots.len() && time > knots[segment + 1].simulation_time_seconds {
+            segment += 1;
+        }
+        let start = knots[segment];
+        let end = knots[segment + 1];
+        let segment_duration = end.simulation_time_seconds - start.simulation_time_seconds;
+        if !segment_duration.is_finite() || segment_duration <= f64::EPSILON {
+            return None;
+        }
+        let u = ((time - start.simulation_time_seconds) / segment_duration).clamp(0.0, 1.0) as f32;
+        let (position, velocity, acceleration) = quintic_segment_position_acceleration(
+            start,
+            end,
+            accelerations[segment],
+            accelerations[segment + 1],
+            u,
+        )?;
+        samples.push(TrajectoryInversionKnot {
+            position,
+            velocity,
+            simulation_time_seconds: time,
+            baseline_acceleration: acceleration,
+            body_rotation: start.body_rotation.slerp(end.body_rotation, u),
+        });
     }
     Some(samples)
 }

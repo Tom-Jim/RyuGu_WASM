@@ -33,3 +33,18 @@ fn eq106_complex_shader_is_valid() {
 fn fmm_shader_is_valid() {
     validate_wgsl(include_str!("../../assets/shaders/fmm_gravity.wgsl"));
 }
+
+#[test]
+fn planning_fmm_shader_is_valid() {
+    validate_wgsl(include_str!("../../assets/shaders/planning_fmm.wgsl"));
+}
+
+#[test]
+fn planning_mmfft_shader_is_valid() {
+    validate_wgsl(include_str!("../../assets/shaders/planning_mmfft.wgsl"));
+}
+
+#[test]
+fn planning_reduction_shader_is_valid() {
+    validate_wgsl(include_str!("../../assets/shaders/planning_metrics.wgsl"));
+}

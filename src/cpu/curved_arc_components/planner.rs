@@ -2,7 +2,7 @@ use crate::interface::components::*;
 use crate::cpu::eq106_reference::Eq106PointSource;
 #[cfg(test)]
 use crate::cpu::eq106_reference::{
-    self, Eq106Certificate, Eq106Error, Eq106FrequencyGrid, Eq106ReferenceLine,
+    self as eq106, Eq106Certificate, Eq106Error, Eq106FrequencyGrid, Eq106ReferenceLine,
     Eq106TransformSample,
 };
 use bevy::math::DVec3;

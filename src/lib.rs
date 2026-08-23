@@ -63,6 +63,7 @@ use gpu::{
     fmm::FmmComputePlugin,
     mmfft::MmfftCompressedComputePlugin,
     normals::NormalsComputePlugin,
+    planning::PlanningGpuComputePlugin,
     radial::{GravityComputePlugin, build_radial_gravity_source_system},
     werner::WernerComputePlugin,
 };
@@ -82,6 +83,34 @@ use wasm_bindgen::prelude::*;
 // model is allowed to run when the GPU evaluator is unavailable.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = r#"
+    const ryuguFrameIntervals = new Float64Array(60);
+    let ryuguFrameIntervalCount = 0;
+    let ryuguFrameIntervalCursor = 0;
+    let ryuguLastAnimationFrame = 0;
+
+    function record_ryugu_animation_frame(timestamp) {
+        if (ryuguLastAnimationFrame > 0) {
+            ryuguFrameIntervals[ryuguFrameIntervalCursor] = timestamp - ryuguLastAnimationFrame;
+            ryuguFrameIntervalCursor = (ryuguFrameIntervalCursor + 1) % ryuguFrameIntervals.length;
+            ryuguFrameIntervalCount = Math.min(ryuguFrameIntervalCount + 1, ryuguFrameIntervals.length);
+        }
+        ryuguLastAnimationFrame = timestamp;
+        requestAnimationFrame(record_ryugu_animation_frame);
+    }
+
+    if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(record_ryugu_animation_frame);
+    }
+
+    export function browser_actual_fps() {
+        if (ryuguFrameIntervalCount === 0) return 0;
+        let elapsed = 0;
+        for (let index = 0; index < ryuguFrameIntervalCount; index += 1) {
+            elapsed += ryuguFrameIntervals[index];
+        }
+        return elapsed > 0 ? 1000 * ryuguFrameIntervalCount / elapsed : 0;
+    }
+
     export function has_webgpu() {
         return typeof navigator !== "undefined" && navigator.gpu !== undefined;
     }
@@ -109,6 +138,9 @@ use wasm_bindgen::prelude::*;
     }
 "#)]
 extern "C" {
+    #[wasm_bindgen(js_name = browser_actual_fps)]
+    fn browser_actual_fps_js() -> f64;
+
     #[wasm_bindgen(js_name = has_webgpu)]
     fn browser_has_webgpu() -> bool;
 
@@ -116,6 +148,17 @@ extern "C" {
 
     #[wasm_bindgen(js_name = set_display_rotation)]
     fn browser_set_display_rotation(quarter_turn: u8);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn browser_frame_rate() -> Option<f64> {
+    let fps = browser_actual_fps_js();
+    (fps.is_finite() && fps > 0.0).then_some(fps)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn browser_frame_rate() -> Option<f64> {
+    None
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -236,6 +279,7 @@ pub fn main() {
     }
 
     if has_webgpu {
+        app.add_plugins(PlanningGpuComputePlugin);
         app.add_plugins(NormalsComputePlugin);
         app.add_plugins(GravityComputePlugin);
         app.add_plugins(WernerComputePlugin);

@@ -1,4 +1,4 @@
-fn build_voxel_basis_sources(
+pub(crate) fn build_voxel_basis_sources(
     voxels: &[InvertedDensityVoxel],
     source: &AggregatedGravitySource,
 ) -> Option<VoxelBasisSources> {

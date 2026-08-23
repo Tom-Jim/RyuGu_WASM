@@ -7,3 +7,4 @@ pub mod eq106_operator;
 pub mod eq106_reference;
 pub(crate) mod inversion;
 pub(crate) mod physics;
+pub(crate) mod planning;
