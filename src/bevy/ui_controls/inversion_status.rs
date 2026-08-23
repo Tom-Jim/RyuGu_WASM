@@ -3,6 +3,7 @@ pub fn density_inversion_timing_ui_system(
     active_method: Res<ActiveGravityMethod>,
     eq106_sensitivity: Res<Eq106SensitivityMatrix>,
     eq106_performance: Res<Eq106PerformanceMetrics>,
+    planning: Res<PlanningComparisonState>,
     mut timing_labels: Query<(&DensityInversionTimingLabel, &mut Text)>,
     mut status_labels: Query<
         (&mut Text, &mut TextColor),
@@ -19,43 +20,176 @@ pub fn density_inversion_timing_ui_system(
         } else {
             " "
         };
-        **text = match inversion.results[label.0].as_ref() {
-            Some(result) => {
-                let best_fit = inversion.best_results[label.0]
+        **text = comparison_metric_text(
+            marker,
+            names[label.0],
+            label.0,
+            &inversion,
+            &planning,
+        );
+    }
+    for (mut text, mut color) in status_labels.iter_mut() {
+        if planning.selected_metric.is_inversion() {
+            update_density_inversion_status(
+                &inversion,
+                *active_method,
+                &eq106_sensitivity,
+                &eq106_performance,
+                &mut text,
+                &mut color,
+            );
+        } else {
+            update_planning_comparison_status(&planning, &mut text, &mut color);
+        }
+    }
+}
+
+fn comparison_metric_text(
+    marker: &str,
+    name: &str,
+    index: usize,
+    inversion: &TrajectoryInversionState,
+    planning: &PlanningComparisonState,
+) -> String {
+    if planning.selected_metric.is_inversion() {
+        let Some(result) = inversion.results[index].as_ref() else {
+            return format!("{marker}{name:<12} N/A");
+        };
+        return match planning.selected_metric {
+            ComparisonMetric::DensityFit => {
+                let best_fit = inversion.best_results[index]
                     .as_ref()
                     .map_or(result.model_fit, |best| best.model_fit);
-                let cache = if result.timing.matrix_cache_hit {
-                    "warm"
-                } else {
-                    "cold"
-                };
                 format!(
-                "{}{: <12} current {:>7.4}% | best {:>7.4}% | truth {:>7.2} ms | matrix {:>7.2} ms {} | QP {:>7.2} ms | verify {:>6.2} ms | total {:>8.2} ms",
-                marker,
-                names[label.0],
-                result.model_fit * 100.0,
-                best_fit * 100.0,
+                    "{marker}{name:<12} current {:>7.4}% | best {:>7.4}%",
+                    result.model_fit * 100.0,
+                    best_fit * 100.0,
+                )
+            }
+            ComparisonMetric::InversionTime => format!(
+                "{marker}{name:<12} truth {:>7.2} ms | matrix {:>7.2} ms {} | QP {:>7.2} ms | verify {:>6.2} ms | total {:>8.2} ms",
                 result.timing.truth_prepare_ms,
                 result.timing.matrix_build_ms,
-                cache,
+                if result.timing.matrix_cache_hit { "warm" } else { "cold" },
                 result.timing.convex_solve_ms,
                 result.timing.verification_ms,
                 result.inversion_time_ms,
-            )
-            }
-            None => format!("{}{: <12}  --", marker, names[label.0]),
+            ),
+            _ => unreachable!(),
         };
     }
-    for (mut text, mut color) in status_labels.iter_mut() {
-        update_density_inversion_status(
-            &inversion,
-            *active_method,
-            &eq106_sensitivity,
-            &eq106_performance,
-            &mut text,
-            &mut color,
-        );
+
+    let Some(result) = planning.results[index] else {
+        if let Some(job) = planning.batch_job.as_ref()
+            && job.method.performance_index() == index
+        {
+            let target_count =
+                u64::from(job.candidate_count) * u64::from(job.samples_per_candidate);
+            let completed = job.cursor * u64::from(job.density_model_count);
+            let percent = 100.0 * job.cursor as f64 / target_count.max(1) as f64;
+            return format!(
+                "{marker}{name:<12} running {:>6.2}% | {completed}/{} BxKxH evaluations",
+                percent, job.total_evaluations,
+            );
+        }
+        if planning.run_requested {
+            return format!("{marker}{name:<12} pending shared workload");
+        }
+        return format!("{marker}{name:<12} N/A");
+    };
+    let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
+    if (result.workload.candidate_count, result.workload.density_model_count, result.workload.samples_per_candidate)
+        != (candidate_count, density_count, sample_count)
+    {
+        return format!("{marker}{name:<12} N/A (different workload)");
     }
+    let total = result.preprocessing_ms + result.evaluation_ms;
+    let value = match planning.selected_metric {
+        ComparisonMetric::GravityRelativeError => {
+            format!(
+                "gravity relative error {:.3e} | prep {:.2} + eval {:.2} = {:.2} ms",
+                result.relative_gravity_error,
+                result.preprocessing_ms,
+                result.evaluation_ms,
+                total,
+            )
+        }
+        ComparisonMetric::GradientRelativeError => {
+            format!("gradient relative error {:.3e}", result.gradient_relative_error)
+        }
+        ComparisonMetric::PericenterError => {
+            format!("pericenter error {:.4} m", result.pericenter_error_m)
+        }
+        ComparisonMetric::SegmentCount if index == 2 => {
+            format!("{} segments", result.segment_count)
+        }
+        ComparisonMetric::SpeedupVsGpuFmm => {
+            let Some(fmm) = planning.results[4] else {
+                return format!("{marker}{name:<12} N/A");
+            };
+            format!(
+                "{:.3}x vs GPU FMM | {}",
+                fmm.total_ms / result.total_ms.max(f64::MIN_POSITIVE),
+                result.method.as_str(),
+            )
+        }
+        ComparisonMetric::ColdStartAmortization if index == 2 => {
+            format!("{} candidates", result.cold_amortization_candidates)
+        }
+        ComparisonMetric::SegmentCount | ComparisonMetric::ColdStartAmortization => "N/A".into(),
+        ComparisonMetric::DensityFit | ComparisonMetric::InversionTime => unreachable!(),
+    };
+    format!("{marker}{name:<12} {value}")
+}
+
+fn update_planning_comparison_status(
+    planning: &PlanningComparisonState,
+    text: &mut Text,
+    color: &mut TextColor,
+) {
+    let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
+    let evaluations = u64::from(candidate_count) * u64::from(density_count) * u64::from(sample_count);
+    let prefix = format!(
+        "{} | B={} candidates, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nwindow +/-{:.0}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        planning.workload_profile.label(),
+        candidate_count,
+        density_count,
+        sample_count,
+        evaluations,
+        NEAR_SYNC_ORBIT_PERIOD_SECONDS / 3600.0,
+        NEAR_SYNC_SEMIMAJOR_AXIS_METERS,
+        NEAR_SYNC_ECCENTRICITY,
+        NEAR_SYNC_PERICENTER_RADIUS_METERS,
+        NEAR_SYNC_APOCENTER_RADIUS_METERS,
+        NEAR_SYNC_LOCAL_WINDOW_SECONDS * 0.5,
+        NEAR_SYNC_SEGMENT_MAX_SECONDS,
+        NEAR_SYNC_TAYLOR_ORDER,
+        NEAR_SYNC_TRUST_RADIUS_METERS,
+        NEAR_SYNC_TRANSVERSE_LIMIT_METERS,
+        NEAR_SYNC_RELATIVE_REMAINDER_TARGET,
+    );
+    if planning.shared_workload().is_none() {
+        **text = format!(
+            "{prefix}{}\nMetrics are shown from the completed shared BxKxH validation run. Fair verdict withheld until identical method-specific GPU Eq.106, GPU MMFFT and GPU FMM batches are verified; preprocessing must be included.",
+            planning.status,
+        );
+        color.0 = Color::srgb(1.0, 0.78, 0.25);
+        return;
+    }
+    **text = format!(
+        "{prefix}gravity <= 1e-3 | gradient <= 1e-2 | pericenter <= 1 m | Eq.106 segments <= 10 (hard 16) | cold amortization <= 256\n{}",
+        planning
+            .fair_verdict()
+            .unwrap_or("Fair verdict withheld: incomplete planning results"),
+    );
+    color.0 = if planning
+        .fair_verdict()
+        .is_some_and(|verdict| verdict.contains("advantage"))
+    {
+        Color::srgb(0.45, 1.0, 0.62)
+    } else {
+        Color::srgb(1.0, 0.78, 0.25)
+    };
 }
 
 fn update_density_inversion_status(

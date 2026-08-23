@@ -28,15 +28,20 @@ use bevy_app::{
     ui::{
         clear_runtime_error_on_probe_change, density_inversion_timing_ui_system, fps_update_system,
         method_toggle_system, normal_toggle_system, performance_button_system,
-        performance_comparison_system, performance_method_checkbox_system, probe_slider_system,
-        probe_slider_visual_system, reset_inversion_on_method_change, runtime_error_overlay_system,
-        runtime_error_reset_system, section_toggle_system, setup_density_inversion_timing_panel,
-        setup_fps_ui, setup_performance_chart_segments, setup_performance_controls,
-        setup_probe_controls, setup_runtime_error_overlay, setup_simulation_acceleration_control,
-        setup_trajectory_inversion_controls, simulation_acceleration_slider_system,
-        simulation_acceleration_slider_visual_system, trajectory_inversion_input_system,
-        trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
-        update_hint_on_mode_change, update_ui_scale_system,
+        performance_comparison_system, performance_method_checkbox_system,
+        planning_batch_evaluator_system, planning_comparison_control_system,
+        probe_collision_system, probe_crash_overlay_system, probe_orbit_preset_style_system,
+        probe_orbit_preset_system, probe_slider_system, probe_slider_visual_system,
+        reset_after_probe_crash_scene_system, reset_after_probe_crash_state_system,
+        reset_inversion_on_method_change, runtime_error_overlay_system, runtime_error_reset_system,
+        section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
+        setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
+        setup_probe_crash_overlay, setup_runtime_error_overlay,
+        setup_simulation_acceleration_control, setup_trajectory_inversion_controls,
+        simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
+        trajectory_inversion_input_system, trajectory_inversion_ui_system,
+        update_gpu_memory_estimate_system, update_hint_on_mode_change,
+        update_planning_results_from_inversion_system, update_ui_scale_system,
     },
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,8 +70,8 @@ use interface::components::{
     ActiveGravityMethod, CameraMode, DensityC, DensitySensitivityCaches, DisplayRotation,
     GpuMemoryEstimate, GravityAcceleration, GravityBenchmarkTrajectory, GravityBlendFactor,
     GravityPotential, GravityRuntimeError, JacobiHistory, PerformanceComparisonState,
-    ProbeInitialConditions, ShowNormals, ShowSection, SimulationAcceleration, SimulationClock,
-    TrajectoryInversionState,
+    PlanningComparisonState, ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions,
+    ShowNormals, ShowSection, SimulationAcceleration, SimulationClock, TrajectoryInversionState,
 };
 use std::time::Duration;
 
@@ -175,6 +180,9 @@ pub fn main() {
         .init_resource::<GravityBenchmarkTrajectory>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
+        .init_resource::<PlanningComparisonState>()
+        .init_resource::<ProbeCrashState>()
+        .init_resource::<ProbeCrashResetRequest>()
         .init_resource::<DisplayRotation>()
         .init_resource::<PerformanceComparisonState>()
         .init_resource::<CurvedArcPlannerState>()
@@ -246,6 +254,7 @@ pub fn main() {
             setup_ui,
             setup_fps_ui,
             setup_runtime_error_overlay,
+            setup_probe_crash_overlay,
             setup_probe_controls,
             setup_simulation_acceleration_control,
             setup_jacobi_chart,
@@ -299,6 +308,9 @@ pub fn main() {
             start_density_inversion_system,
             convex_optimization_system,
             trajectory_inversion_ui_system,
+            planning_comparison_control_system,
+            update_planning_results_from_inversion_system,
+            planning_batch_evaluator_system,
             density_inversion_timing_ui_system,
         )
             .chain(),
@@ -306,10 +318,21 @@ pub fn main() {
     .add_systems(
         Update,
         (
+            probe_orbit_preset_system,
             probe_slider_system,
             runtime_error_reset_system,
             clear_runtime_error_on_probe_change,
             probe_slider_visual_system,
+            probe_orbit_preset_style_system,
+        )
+            .chain(),
+    )
+    .add_systems(
+        Update,
+        (
+            probe_crash_overlay_system,
+            reset_after_probe_crash_scene_system,
+            reset_after_probe_crash_state_system,
         )
             .chain(),
     )
@@ -340,6 +363,7 @@ pub fn main() {
         (
             monitor_curved_arc_system,
             physics_system,
+            probe_collision_system,
             ryugu_rotation_system,
             record_probe_jacobi_system,
         )

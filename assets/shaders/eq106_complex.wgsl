@@ -47,6 +47,15 @@ struct SpectrumSample {
 @group(0) @binding(8) var<storage, read> psi_operator: array<f32>;
 @group(0) @binding(9) var<storage, read> targets: array<vec4<f32>>;
 
+var<workgroup> evaluation_phase: array<vec2<f32>, 129>;
+var<workgroup> evaluation_spectral_derivative: array<vec2<f32>, 129>;
+var<workgroup> evaluation_omega: array<f32, 129>;
+var<workgroup> evaluation_sum: array<vec4<f32>, 64>;
+var<workgroup> evaluation_derivative: array<vec4<f32>, 64>;
+var<workgroup> evaluation_imaginary: array<vec4<f32>, 64>;
+var<workgroup> evaluation_tail: array<vec4<f32>, 64>;
+var<workgroup> evaluation_edge: array<vec2<f32>, 64>;
+
 const PI: f32 = 3.141592653589793;
 const TAYLOR_MAX_ORDER: u32 = 4u;
 const OUTPUT_ROWS_PER_BLOCK: u32 = 9u;
@@ -632,9 +641,13 @@ fn fourier_toroidal_potential(position: vec3<f32>) -> f32 {
     return params.g_const * potential / PI;
 }
 
-@compute @workgroup_size(1, 1, 1)
-fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let local_target_index = global_id.y * TARGET_DISPATCH_WIDTH + global_id.x;
+@compute @workgroup_size(64, 1, 1)
+fn evaluate_field(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let lane = local_id.x;
+    let local_target_index = workgroup_id.y * TARGET_DISPATCH_WIDTH + workgroup_id.x;
     if local_target_index >= params.target_count {
         return;
     }
@@ -667,115 +680,154 @@ fn evaluate_field(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var tail_field = vec3<f32>(0.0);
 
     var independent_potential = 0.0;
-    if params.evaluate_dual_certificate != 0u && target_index == 0u {
+    if lane == 0u && params.evaluate_dual_certificate != 0u && target_index == 0u {
         independent_potential = fourier_toroidal_potential(probe_pos);
     }
 
-    var coefficient_sum: array<vec4<f32>, 15>;
-    var coefficient_derivative_h: array<vec3<f32>, 15>;
-    var coefficient_imaginary: array<vec3<f32>, 15>;
-    var coefficient_tail: array<vec3<f32>, 15>;
-    for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
-        coefficient_sum[coefficient] = vec4<f32>(0.0);
-        coefficient_derivative_h[coefficient] = vec3<f32>(0.0);
-        coefficient_imaginary[coefficient] = vec3<f32>(0.0);
-        coefficient_tail[coefficient] = vec3<f32>(0.0);
-    }
-
     // Frequencies are equally spaced. Seed the negative endpoint once and
-    // rotate by exp(i*delta_omega*h) instead of evaluating trig functions for
-    // every frequency and every Taylor coefficient.
-    let first_angle = -f32(params.half_count) * params.omega_step * h;
-    let growth = exp(params.sigma * h);
-    var phase = growth * vec2<f32>(cos(first_angle), sin(first_angle));
-    let phase_step_angle = params.omega_step * h;
-    let phase_step = vec2<f32>(cos(phase_step_angle), sin(phase_step_angle));
-    var edge_sum = 0.0;
-    var edge_derivative_sum = 0.0;
+    // rotate by exp(i*delta_omega*h). Lane zero constructs the recurrence once;
+    // all lanes then share it while reducing the frequency dimension.
+    if lane == 0u {
+        let first_angle = -f32(params.half_count) * params.omega_step * h;
+        let growth = exp(params.sigma * h);
+        var phase = growth * vec2<f32>(cos(first_angle), sin(first_angle));
+        let phase_step_angle = params.omega_step * h;
+        let phase_step = vec2<f32>(cos(phase_step_angle), sin(phase_step_angle));
+        for (var frequency_index = 0u; frequency_index < frequency_count; frequency_index += 1u) {
+            let signed_index = i32(frequency_index) - i32(params.half_count);
+            let omega = f32(signed_index) * params.omega_step;
+            evaluation_phase[frequency_index] = phase;
+            evaluation_omega[frequency_index] = omega;
+            evaluation_spectral_derivative[frequency_index] = complex_mul(
+                vec2<f32>(params.sigma, omega),
+                phase,
+            );
+            phase = complex_mul(phase, phase_step);
+        }
+    }
+    workgroupBarrier();
 
-    for (var frequency_index = 0u; frequency_index < frequency_count; frequency_index += 1u) {
-        let signed_index = i32(frequency_index) - i32(params.half_count);
-        let omega = f32(signed_index) * params.omega_step;
+    var local_edge = vec2<f32>(0.0);
+    for (var frequency_index = lane; frequency_index < frequency_count; frequency_index += 64u) {
+        let omega = evaluation_omega[frequency_index];
         let denominator = max(params.sigma * params.sigma + omega * omega, 1.0e-20);
-        edge_sum += (phase.x * params.sigma + phase.y * omega) / denominator;
-        var spectral_derivative = vec2<f32>(0.0);
+        let phase = evaluation_phase[frequency_index];
+        local_edge.x += (phase.x * params.sigma + phase.y * omega) / denominator;
         if params.inversion_mode == 0u {
-            spectral_derivative = complex_mul(vec2<f32>(params.sigma, omega), phase);
-            edge_derivative_sum += (
+            let spectral_derivative = evaluation_spectral_derivative[frequency_index];
+            local_edge.y += (
                 spectral_derivative.x * params.sigma
                 + spectral_derivative.y * omega
             ) / denominator;
         }
+    }
+    evaluation_edge[lane] = local_edge;
+    workgroupBarrier();
+    var edge_stride = 32u;
+    loop {
+        if edge_stride == 0u { break; }
+        if lane < edge_stride {
+            evaluation_edge[lane] += evaluation_edge[lane + edge_stride];
+        }
+        workgroupBarrier();
+        edge_stride = edge_stride >> 1u;
+    }
 
-        for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
+    let raw_edge_response = evaluation_edge[0].x * inversion_scale;
+    let edge_response = max(abs(raw_edge_response), 0.25);
+    var edge_response_derivative = 0.0;
+    if abs(raw_edge_response) > 0.25 {
+        let response_sign = select(-1.0, 1.0, raw_edge_response >= 0.0);
+        edge_response_derivative = response_sign * evaluation_edge[0].y * inversion_scale;
+    }
+
+    for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
+        var local_sum = vec4<f32>(0.0);
+        var local_derivative = vec3<f32>(0.0);
+        var local_imaginary = vec3<f32>(0.0);
+        var local_tail = vec3<f32>(0.0);
+        for (var frequency_index = lane; frequency_index < frequency_count; frequency_index += 64u) {
+            let signed_index = i32(frequency_index) - i32(params.half_count);
+            let phase = evaluation_phase[frequency_index];
             let sample = spectrum[coefficient * frequency_count + frequency_index];
             let x = complex_mul(sample.acceleration_x, phase);
             let y = complex_mul(sample.acceleration_y, phase);
             let z = complex_mul(sample.acceleration_z, phase);
-            coefficient_sum[coefficient] += vec4<f32>(
+            local_sum += vec4<f32>(
                 x.x,
                 y.x,
                 z.x,
                 complex_mul(sample.potential, phase).x,
             );
             if params.inversion_mode == 0u {
-                coefficient_imaginary[coefficient] += vec3<f32>(x.y, y.y, z.y);
-                coefficient_derivative_h[coefficient] += vec3<f32>(
+                let spectral_derivative = evaluation_spectral_derivative[frequency_index];
+                local_imaginary += vec3<f32>(x.y, y.y, z.y);
+                local_derivative += vec3<f32>(
                     complex_mul(sample.acceleration_x, spectral_derivative).x,
                     complex_mul(sample.acceleration_y, spectral_derivative).x,
                     complex_mul(sample.acceleration_z, spectral_derivative).x,
                 );
                 if abs(signed_index) == i32(params.half_count) {
-                    coefficient_tail[coefficient] += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+                    local_tail += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
                 }
             }
         }
-        phase = complex_mul(phase, phase_step);
-    }
+        evaluation_sum[lane] = local_sum;
+        evaluation_derivative[lane] = vec4<f32>(local_derivative, 0.0);
+        evaluation_imaginary[lane] = vec4<f32>(local_imaginary, 0.0);
+        evaluation_tail[lane] = vec4<f32>(local_tail, 0.0);
+        workgroupBarrier();
 
-    let raw_edge_response = edge_sum * inversion_scale;
-    let edge_response = max(abs(raw_edge_response), 0.25);
-    var edge_response_derivative = 0.0;
-    if abs(raw_edge_response) > 0.25 {
-        let response_sign = select(-1.0, 1.0, raw_edge_response >= 0.0);
-        edge_response_derivative = response_sign * edge_derivative_sum * inversion_scale;
-    }
+        var stride = 32u;
+        loop {
+            if stride == 0u { break; }
+            if lane < stride {
+                evaluation_sum[lane] += evaluation_sum[lane + stride];
+                evaluation_derivative[lane] += evaluation_derivative[lane + stride];
+                evaluation_imaginary[lane] += evaluation_imaginary[lane + stride];
+                evaluation_tail[lane] += evaluation_tail[lane + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
 
-    for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
-        let a = coefficient_a(coefficient);
-        let b = coefficient_b(coefficient);
-        let degree = a + b;
-        let raw = coefficient_sum[coefficient] * inversion_scale;
-        let reconstructed = raw.xyz / edge_response;
-        // Potential is inverted directly from the same cached coefficient
-        // spectrum as the acceleration. This avoids accumulating a second
-        // finite-band integration of the longitudinal field over h.
-        let reconstructed_potential = raw.w / edge_response;
-        let value = monomial(u, v, a, b);
-        field += vec4<f32>(reconstructed, reconstructed_potential) * value;
-        if params.inversion_mode == 0u {
-            let raw_derivative_h = coefficient_derivative_h[coefficient] * inversion_scale;
-            let reconstructed_derivative_h = (
-                raw_derivative_h * edge_response
-                - raw.xyz * edge_response_derivative
-            ) / (edge_response * edge_response);
-            imaginary_field += coefficient_imaginary[coefficient]
-                * inversion_scale / edge_response * value;
-            tail_field += coefficient_tail[coefficient]
-                * inversion_scale / edge_response * abs(value);
-            derivative_h += reconstructed_derivative_h * value;
-            if a > 0u {
-                derivative_u += reconstructed.xyz * f32(a) * monomial(u, v, a - 1u, b);
-            }
-            if b > 0u {
-                derivative_v += reconstructed.xyz * f32(b) * monomial(u, v, a, b - 1u);
-            }
-            if degree == active_order {
-                last_order_field += reconstructed.xyz * value;
+        if lane == 0u {
+            let a = coefficient_a(coefficient);
+            let b = coefficient_b(coefficient);
+            let degree = a + b;
+            let raw = evaluation_sum[0] * inversion_scale;
+            let reconstructed = raw.xyz / edge_response;
+            let reconstructed_potential = raw.w / edge_response;
+            let value = monomial(u, v, a, b);
+            field += vec4<f32>(reconstructed, reconstructed_potential) * value;
+            if params.inversion_mode == 0u {
+                let raw_derivative_h = evaluation_derivative[0].xyz * inversion_scale;
+                let reconstructed_derivative_h = (
+                    raw_derivative_h * edge_response
+                    - raw.xyz * edge_response_derivative
+                ) / (edge_response * edge_response);
+                imaginary_field += evaluation_imaginary[0].xyz
+                    * inversion_scale / edge_response * value;
+                tail_field += evaluation_tail[0].xyz
+                    * inversion_scale / edge_response * abs(value);
+                derivative_h += reconstructed_derivative_h * value;
+                if a > 0u {
+                    derivative_u += reconstructed.xyz * f32(a) * monomial(u, v, a - 1u, b);
+                }
+                if b > 0u {
+                    derivative_v += reconstructed.xyz * f32(b) * monomial(u, v, a, b - 1u);
+                }
+                if degree == active_order {
+                    last_order_field += reconstructed.xyz * value;
+                }
             }
         }
+        workgroupBarrier();
     }
 
+    if lane != 0u {
+        return;
+    }
     if params.inversion_mode != 0u {
         output[target_index] = field;
         return;

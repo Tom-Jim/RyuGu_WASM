@@ -467,6 +467,8 @@ pub fn reset_inversion_on_method_change(
     } else if !inversion.truth_knots.is_empty() {
         inversion.knots = inversion.truth_knots.clone();
         inversion.capture_id = inversion.truth_capture_id;
+        inversion.capture_epoch = inversion.truth_capture_epoch;
+        inversion.capture_source_hash = inversion.truth_source_hash;
         inversion.ready = true;
     }
     inversion.displayed_density = inversion.results[active_method.performance_index()]

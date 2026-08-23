@@ -51,7 +51,7 @@ pub fn setup_scene(
         TargetSize(6.7),
         Transform::from_translation(probe_initial.position),
         Velocity(probe_initial.velocity()),
-        OrbitHistory(std::collections::VecDeque::from([PROBE_R0])),
+        OrbitHistory(std::collections::VecDeque::from([probe_initial.position])),
         CassiniMarker,
     ));
 }
@@ -100,6 +100,8 @@ pub fn capture_trajectory_inversion_system(
         if !preserve_truth_track {
             inversion.truth_knots.clear();
             inversion.truth_capture_id = None;
+            inversion.truth_capture_epoch = 0;
+            inversion.truth_source_hash = 0;
             inversion.truth_orbit.clear();
         }
         inversion.capture_id = None;
@@ -123,6 +125,8 @@ pub fn capture_trajectory_inversion_system(
         if preserve_truth_track && !inversion.truth_knots.is_empty() {
             inversion.knots = inversion.truth_knots.clone();
             inversion.capture_id = inversion.truth_capture_id;
+            inversion.capture_epoch = inversion.truth_capture_epoch;
+            inversion.capture_source_hash = inversion.truth_source_hash;
             inversion.ready = true;
             inversion.displayed_density = inversion.results[active_method.performance_index()]
                 .clone()
@@ -246,6 +250,8 @@ pub fn capture_trajectory_inversion_system(
     {
         inversion.truth_knots = inversion.knots.clone();
         inversion.truth_capture_id = Some(hash_trajectory_capture(&inversion.truth_knots));
+        inversion.truth_capture_epoch = inversion.capture_epoch;
+        inversion.truth_source_hash = inversion.capture_source_hash;
     }
     if *active_method != ActiveGravityMethod::HomogeneousWerner
         && !inversion.truth_knots.is_empty()

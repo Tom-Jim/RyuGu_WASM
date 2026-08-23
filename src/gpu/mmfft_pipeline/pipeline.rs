@@ -113,158 +113,6 @@ impl FromWorld for MmfftComputePipeline {
     }
 }
 
-#[cfg(test)]
-fn fft_1d(values: &mut [Complex64], inverse: bool) {
-    let mut planner = FftPlanner::<f64>::new();
-    let transform = if inverse {
-        planner.plan_fft_inverse(values.len())
-    } else {
-        planner.plan_fft_forward(values.len())
-    };
-    process_fft_line(values, transform.as_ref(), inverse);
-}
-
-fn fft_3d(values: &mut [Complex64], n: usize, inverse: bool) {
-    let mut planner = FftPlanner::<f64>::new();
-    let transform = if inverse {
-        planner.plan_fft_inverse(n)
-    } else {
-        planner.plan_fft_forward(n)
-    };
-    let mut line = vec![Complex64::default(); n];
-    for z in 0..n {
-        for y in 0..n {
-            for x in 0..n {
-                line[x] = values[(z * n + y) * n + x];
-            }
-            process_fft_line(&mut line, transform.as_ref(), inverse);
-            for x in 0..n {
-                values[(z * n + y) * n + x] = line[x];
-            }
-        }
-    }
-    for z in 0..n {
-        for x in 0..n {
-            for y in 0..n {
-                line[y] = values[(z * n + y) * n + x];
-            }
-            process_fft_line(&mut line, transform.as_ref(), inverse);
-            for y in 0..n {
-                values[(z * n + y) * n + x] = line[y];
-            }
-        }
-    }
-    for y in 0..n {
-        for x in 0..n {
-            for z in 0..n {
-                line[z] = values[(z * n + y) * n + x];
-            }
-            process_fft_line(&mut line, transform.as_ref(), inverse);
-            for z in 0..n {
-                values[(z * n + y) * n + x] = line[z];
-            }
-        }
-    }
-}
-
-fn process_fft_line(values: &mut [Complex64], transform: &dyn Fft<f64>, inverse: bool) {
-    transform.process(values);
-    if inverse {
-        let scale = (values.len() as f64).recip();
-        for value in values {
-            *value *= scale;
-        }
-    }
-}
-
-fn grid_index(x: usize, y: usize, z: usize, side: usize) -> usize {
-    (z * side + y) * side + x
-}
-
-/// Full zero-padded 3-D FFT/IFFT convolution for one hierarchy level.
-fn build_level(records: &[(DVec3, f64)], half_extent: f64, n: usize) -> Vec<[f32; 4]> {
-    let p = 2 * n;
-    let spacing = 2.0 * half_extent / n as f64;
-    let mut density = vec![Complex64::default(); p * p * p];
-    // Cloud-in-cell deposition is conservative and avoids nearest-cell phase
-    // jumps when the irregular radial quadrature is mapped to the FFT mesh.
-    for &(position, mass) in records {
-        let grid = (position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
-        let base = grid.floor();
-        let fraction = grid - base;
-        for dz in 0..=1 {
-            for dy in 0..=1 {
-                for dx in 0..=1 {
-                    let ix = base.x as isize + dx;
-                    let iy = base.y as isize + dy;
-                    let iz = base.z as isize + dz;
-                    if ix < 0
-                        || iy < 0
-                        || iz < 0
-                        || ix >= n as isize
-                        || iy >= n as isize
-                        || iz >= n as isize
-                    {
-                        continue;
-                    }
-                    let weight = if dx == 0 {
-                        1.0 - fraction.x
-                    } else {
-                        fraction.x
-                    } * if dy == 0 {
-                        1.0 - fraction.y
-                    } else {
-                        fraction.y
-                    } * if dz == 0 {
-                        1.0 - fraction.z
-                    } else {
-                        fraction.z
-                    };
-                    density[grid_index(ix as usize, iy as usize, iz as usize, p)].re +=
-                        mass * weight;
-                }
-            }
-        }
-    }
-    fft_3d(&mut density, p, false);
-    let mass_spectrum = density;
-    let mut field = vec![[0.0_f32; 4]; n * n * n];
-    // Convolve the Newton potential. The runtime differentiates the same
-    // trilinear interpolant analytically, so acceleration and potential remain
-    // a discrete conservative pair without three redundant inverse FFTs.
-    let mut kernel = vec![Complex64::default(); p * p * p];
-    for z in 0..p {
-        for y in 0..p {
-            for x in 0..p {
-                let signed = |index: usize| {
-                    if index < n {
-                        index as isize
-                    } else {
-                        index as isize - p as isize
-                    }
-                };
-                let displacement =
-                    DVec3::new(signed(x) as f64, signed(y) as f64, signed(z) as f64) * spacing;
-                kernel[grid_index(x, y, z, p)].re = 1.0 / displacement.length().max(0.5 * spacing);
-            }
-        }
-    }
-    fft_3d(&mut kernel, p, false);
-    for (value, mass) in kernel.iter_mut().zip(&mass_spectrum) {
-        *value = *value * *mass;
-    }
-    fft_3d(&mut kernel, p, true);
-    for z in 0..n {
-        for y in 0..n {
-            for x in 0..n {
-                field[grid_index(x, y, z, n)][3] =
-                    (G as f64 * kernel[grid_index(x, y, z, p)].re) as f32;
-            }
-        }
-    }
-    field
-}
-
 fn cubic_weights(t: f32) -> [f32; 4] {
     let t2 = t * t;
     let t3 = t2 * t;
@@ -288,6 +136,7 @@ fn cubic_derivatives(t: f32) -> [f32; 4] {
 
 fn sample_mmfft_grid(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: usize) -> Vec3 {
     let spacing = 2.0 * half_extent / n as f32;
+    let inverse_spacing = spacing.recip();
     let coordinate = (position + Vec3::splat(half_extent)) / spacing - Vec3::splat(0.5);
     let base_floor = coordinate.floor().clamp(Vec3::ONE, Vec3::splat((n - 3) as f32));
     let fraction = (coordinate - base_floor).clamp(Vec3::ZERO, Vec3::ONE);
@@ -308,7 +157,7 @@ fn sample_mmfft_grid(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: us
                     base.z as usize + z,
                     n,
                 )][3];
-                gradient += p / spacing
+                gradient += p * inverse_spacing
                     * Vec3::new(
                         dx[x] * wy[y] * wz[z],
                         dy[y] * wx[x] * wz[z],
@@ -326,45 +175,70 @@ pub(crate) fn voxel_basis_sensitivities(
     basis: &VoxelBasisSources,
     samples: &[TrajectoryInversionKnot],
 ) -> Vec<Vec3> {
-    let mut columns = Vec::with_capacity(basis.columns.len());
-    for sources in &basis.columns {
+    let body_positions = samples
+        .iter()
+        .map(|sample| sample.body_rotation.inverse() * sample.position)
+        .collect::<Vec<_>>();
+    let sample_levels = body_positions
+        .iter()
+        .map(|position| {
+            LEVEL_GRID_SIZES
+                .into_iter()
+                .zip(LEVEL_HALF_EXTENTS)
+                .position(|(n, half)| {
+                    let margin = 2.0 * half as f32 / n as f32;
+                    position.abs().max_element() <= half as f32 - margin
+                })
+        })
+        .collect::<Vec<_>>();
+    let used_levels = std::array::from_fn::<_, 2, _>(|level| {
+        sample_levels.iter().any(|sample| *sample == Some(level))
+    });
+    let mut workspaces = LEVEL_GRID_SIZES
+        .into_iter()
+        .zip(LEVEL_HALF_EXTENTS)
+        .enumerate()
+        .map(|(level, (n, half))| used_levels[level].then(|| MmfftLevelWorkspace::new(n, half)))
+        .collect::<Vec<_>>();
+    let column_count = basis.columns.len();
+    let mut row_major = vec![Vec3::ZERO; samples.len() * column_count];
+    for (column_index, sources) in basis.columns.iter().enumerate() {
         let records = sources
             .iter()
             .map(|source| (source.position, source.volume))
             .collect::<Vec<_>>();
-        let levels = LEVEL_GRID_SIZES
-            .into_iter()
-            .zip(LEVEL_HALF_EXTENTS)
-            .map(|(n, half)| (build_level(&records, half, n), n, half as f32))
-            .collect::<Vec<_>>();
-        let column = samples
-            .iter()
-            .map(|sample| {
-                let body_position = sample.body_rotation.inverse() * sample.position;
-                let body_acceleration = levels
-                    .iter()
-                    .find_map(|(field, n, half)| {
-                        let margin = 2.0 * *half / *n as f32;
-                        (body_position.abs().max_element() <= *half - margin)
-                            .then(|| sample_mmfft_grid(field, body_position, *half, *n))
-                    })
-                    .unwrap_or_else(|| {
-                        sources.iter().fold(Vec3::ZERO, |sum, source| {
-                            let displacement = source.position.as_vec3() - body_position;
-                            sum + displacement
-                                * (G * source.volume as f32
-                                    / displacement.length_squared().max(1.0e-12).powf(1.5))
-                        })
-                    });
-                sample.body_rotation * body_acceleration
-            })
-            .collect::<Vec<_>>();
-        columns.push(column);
-    }
-    let mut row_major = Vec::with_capacity(samples.len() * basis.columns.len());
-    for sample in 0..samples.len() {
-        for column in &columns {
-            row_major.push(column[sample]);
+        for (level, workspace) in workspaces.iter_mut().enumerate() {
+            let Some(workspace) = workspace.as_mut() else {
+                continue;
+            };
+            let n = workspace.n;
+            let half_extent = workspace.half_extent as f32;
+            let field = workspace.build(&records);
+            for (sample_index, sample) in samples.iter().enumerate() {
+                if sample_levels[sample_index] == Some(level) {
+                    let acceleration = sample_mmfft_grid(
+                        field,
+                        body_positions[sample_index],
+                        half_extent,
+                        n,
+                    );
+                    row_major[sample_index * column_count + column_index] =
+                        sample.body_rotation * acceleration;
+                }
+            }
+        }
+        for (sample_index, sample) in samples.iter().enumerate() {
+            if sample_levels[sample_index].is_some() {
+                continue;
+            }
+            let body_acceleration = sources.iter().fold(Vec3::ZERO, |sum, source| {
+                let displacement = source.position.as_vec3() - body_positions[sample_index];
+                let distance_squared = displacement.length_squared().max(1.0e-12);
+                sum + displacement
+                    * (G * source.volume as f32 / (distance_squared * distance_squared.sqrt()))
+            });
+            row_major[sample_index * column_count + column_index] =
+                sample.body_rotation * body_acceleration;
         }
     }
     row_major
@@ -391,11 +265,16 @@ pub fn build_mmfft_compressed_source_system(
         .iter()
         .map(|source| (source.position, source.mass))
         .collect::<Vec<_>>();
+    let mut workspaces = LEVEL_GRID_SIZES
+        .into_iter()
+        .zip(LEVEL_HALF_EXTENTS)
+        .map(|(n, half)| MmfftLevelWorkspace::new(n, half))
+        .collect::<Vec<_>>();
     let mut bytes =
         Vec::with_capacity(LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() * 16);
-    for (grid_size, half_extent) in LEVEL_GRID_SIZES.into_iter().zip(LEVEL_HALF_EXTENTS) {
-        for sample in build_level(&records, half_extent, grid_size) {
-            for value in sample {
+    for workspace in &mut workspaces {
+        for sample in workspace.build(&records) {
+            for value in *sample {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }

@@ -51,13 +51,13 @@ fn compensated_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return two_sum(high.x, low);
 }
 
-fn edge_contribution(index: u32) -> vec4<f32> {
+fn edge_contribution(index: u32, probe_pos: vec3<f32>) -> vec4<f32> {
     let edge = edges[index];
-    let r0 = edge.p0.xyz - params.probe_pos;
-    let r1 = edge.p1.xyz - params.probe_pos;
+    let r0 = edge.p0.xyz - probe_pos;
+    let r1 = edge.p1.xyz - probe_pos;
     let length0 = length(r0);
     let length1 = length(r1);
-    let edge_length = length(edge.p1.xyz - edge.p0.xyz);
+    let edge_length = edge.p0.w;
     let sum_length = length0 + length1;
     let denominator = max(sum_length - edge_length, 1.0e-6 * max(sum_length, 1.0));
     let logarithm = log(max((sum_length + edge_length) / denominator, 1.0));
@@ -69,11 +69,11 @@ fn edge_contribution(index: u32) -> vec4<f32> {
     return vec4<f32>(tensor_r * logarithm, dot(r0, tensor_r) * logarithm);
 }
 
-fn face_contribution(index: u32) -> vec4<f32> {
+fn face_contribution(index: u32, probe_pos: vec3<f32>) -> vec4<f32> {
     let face = faces[index];
-    let r0 = face.p0.xyz - params.probe_pos;
-    let r1 = face.p1.xyz - params.probe_pos;
-    let r2 = face.p2.xyz - params.probe_pos;
+    let r0 = face.p0.xyz - probe_pos;
+    let r1 = face.p1.xyz - probe_pos;
+    let r2 = face.p2.xyz - probe_pos;
     let length0 = length(r0);
     let length1 = length(r1);
     let length2 = length(r2);
@@ -101,11 +101,12 @@ fn main(
     let lane = local_id.x;
     var edge_sum = vec4<f32>(0.0);
     var face_sum = vec4<f32>(0.0);
+    let probe_pos = params.probe_pos;
     if index < params.edge_count {
-        edge_sum = edge_contribution(index);
+        edge_sum = edge_contribution(index, probe_pos);
     }
     if index < params.face_count {
-        face_sum = face_contribution(index);
+        face_sum = face_contribution(index, probe_pos);
     }
     // ∇U for the conventional positive gravitational potential:
     // -Gρ Σ(E r L) + Gρ Σ(F r ω).

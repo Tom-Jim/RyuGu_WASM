@@ -1,0 +1,372 @@
+pub const PROBE_R0: Vec3 = Vec3::new(-616.535, 0.0, -65.459);
+pub const PROBE_SPEED_FACTOR: f32 = 1.07;
+pub const PROBE_ORBIT_NORMAL: Vec3 = Vec3::new(0.037_806, -0.933_691, -0.356_079);
+
+pub const NEAR_SYNC_POSITION: Vec3 = Vec3::new(-1097.269, 51.622, 0.0);
+pub const NEAR_SYNC_SPEED_FACTOR: f32 = 0.824_08;
+pub const NEAR_SYNC_ORBIT_PERIOD_SECONDS: f64 = 27_495.468;
+pub const NEAR_SYNC_SEMIMAJOR_AXIS_METERS: f32 = 831.624;
+pub const NEAR_SYNC_PERICENTER_RADIUS_METERS: f32 = 564.765;
+pub const NEAR_SYNC_APOCENTER_RADIUS_METERS: f32 = 1_098.483;
+pub const NEAR_SYNC_ECCENTRICITY: f32 = 0.320_889;
+pub const NEAR_SYNC_LOCAL_WINDOW_SECONDS: f32 = 1_800.0;
+pub const NEAR_SYNC_SEGMENT_MAX_SECONDS: f32 = 300.0;
+pub const NEAR_SYNC_TAYLOR_ORDER: u32 = 4;
+pub const NEAR_SYNC_TRUST_RADIUS_METERS: f32 = 10.0;
+pub const NEAR_SYNC_TRANSVERSE_LIMIT_METERS: f32 = 20.0;
+pub const NEAR_SYNC_RELATIVE_REMAINDER_TARGET: f32 = 1.0e-3;
+
+pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
+pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
+pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
+pub const PLANNING_EQ106_TARGET_SEGMENTS: u32 = 10;
+pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
+pub const PLANNING_USEFUL_SPEEDUP: f64 = 3.0;
+pub const PLANNING_STRONG_SPEEDUP: f64 = 5.0;
+pub const PLANNING_MAX_COLD_AMORTIZATION_CANDIDATES: u32 = 256;
+pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
+pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
+
+pub fn probe_initial_velocity_for_normal(
+    position: Vec3,
+    speed_factor: f32,
+    orbit_normal: Vec3,
+) -> Vec3 {
+    let radius = position.length();
+    if !radius.is_finite() || radius <= f32::EPSILON {
+        return Vec3::ZERO;
+    }
+    let radial = position / radius;
+    let tangent = orbit_normal
+        .normalize_or_zero()
+        .cross(radial)
+        .normalize_or_zero();
+    let speed = speed_factor.clamp(0.0, 2.0) * (G * RYUGU_MASS / radius).sqrt();
+    tangent * speed
+}
+
+pub fn probe_initial_velocity(position: Vec3, speed_factor: f32) -> Vec3 {
+    probe_initial_velocity_for_normal(position, speed_factor, PROBE_ORBIT_NORMAL)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProbeOrbitPreset {
+    #[default]
+    CurrentBenchmark,
+    NearSynchronousPlanning,
+    Custom,
+}
+
+impl ProbeOrbitPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CurrentBenchmark => "Current orbit",
+            Self::NearSynchronousPlanning => "Near-sync ellipse",
+            Self::Custom => "Custom",
+        }
+    }
+
+    pub fn conditions(self) -> ProbeInitialConditions {
+        match self {
+            Self::CurrentBenchmark | Self::Custom => ProbeInitialConditions::default(),
+            Self::NearSynchronousPlanning => ProbeInitialConditions {
+                position: NEAR_SYNC_POSITION,
+                speed_factor: NEAR_SYNC_SPEED_FACTOR,
+                orbit_normal: RYUGU_SPIN_AXIS,
+                preset: self,
+            },
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct ProbeInitialConditions {
+    pub position: Vec3,
+    pub speed_factor: f32,
+    pub orbit_normal: Vec3,
+    pub preset: ProbeOrbitPreset,
+}
+
+impl Default for ProbeInitialConditions {
+    fn default() -> Self {
+        Self {
+            position: PROBE_R0,
+            speed_factor: PROBE_SPEED_FACTOR,
+            orbit_normal: PROBE_ORBIT_NORMAL,
+            preset: ProbeOrbitPreset::CurrentBenchmark,
+        }
+    }
+}
+
+impl ProbeInitialConditions {
+    pub fn velocity(self) -> Vec3 {
+        if self.preset == ProbeOrbitPreset::CurrentBenchmark
+            && self.orbit_normal == PROBE_ORBIT_NORMAL
+        {
+            probe_initial_velocity(self.position, self.speed_factor)
+        } else {
+            probe_initial_velocity_for_normal(self.position, self.speed_factor, self.orbit_normal)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanningWorkloadProfile {
+    #[default]
+    First,
+    Stress,
+}
+
+impl PlanningWorkloadProfile {
+    pub fn dimensions(self) -> (u32, u32, u32) {
+        match self {
+            Self::First => (256, 16, 241),
+            Self::Stress => (1_024, 32, 512),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::First => "First 256x16x241",
+            Self::Stress => "Stress 1024x32x512",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComparisonMetric {
+    #[default]
+    DensityFit,
+    InversionTime,
+    GravityRelativeError,
+    GradientRelativeError,
+    PericenterError,
+    SegmentCount,
+    SpeedupVsGpuFmm,
+    ColdStartAmortization,
+}
+
+impl ComparisonMetric {
+    pub const ALL: [Self; 8] = [
+        Self::DensityFit,
+        Self::InversionTime,
+        Self::GravityRelativeError,
+        Self::GradientRelativeError,
+        Self::PericenterError,
+        Self::SegmentCount,
+        Self::SpeedupVsGpuFmm,
+        Self::ColdStartAmortization,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DensityFit => "Density fit",
+            Self::InversionTime => "Inversion time",
+            Self::GravityRelativeError => "Gravity error",
+            Self::GradientRelativeError => "Gradient error",
+            Self::PericenterError => "Pericenter error",
+            Self::SegmentCount => "Segments",
+            Self::SpeedupVsGpuFmm => "Speedup / FMM",
+            Self::ColdStartAmortization => "Cold amortization",
+        }
+    }
+
+    pub fn is_inversion(self) -> bool {
+        matches!(self, Self::DensityFit | Self::InversionTime)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanningWorkloadIdentity {
+    pub reference_capture_id: u64,
+    pub reference_ellipse_hash: u64,
+    pub candidate_hash: u64,
+    pub density_model_hash: u64,
+    pub sample_hash: u64,
+    pub tolerance_hash: u64,
+    pub candidate_count: u32,
+    pub density_model_count: u32,
+    pub samples_per_candidate: u32,
+    pub outputs: u8,
+}
+
+impl PlanningWorkloadIdentity {
+    pub const GRAVITY: u8 = 1;
+    pub const GRADIENT: u8 = 2;
+    pub const MINIMUM_ALTITUDE: u8 = 4;
+    pub const OBJECTIVE: u8 = 8;
+    pub const REQUIRED_OUTPUTS: u8 =
+        Self::GRAVITY | Self::GRADIENT | Self::MINIMUM_ALTITUDE | Self::OBJECTIVE;
+
+    pub fn is_complete(self) -> bool {
+        self.reference_capture_id != 0
+            && self.reference_ellipse_hash != 0
+            && self.candidate_hash != 0
+            && self.density_model_hash != 0
+            && self.sample_hash != 0
+            && self.tolerance_hash != 0
+            && self.outputs & Self::REQUIRED_OUTPUTS == Self::REQUIRED_OUTPUTS
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanningExecutionBackend {
+    SharedCpuValidation,
+    GpuEq106,
+    GpuMmfft,
+    GpuFmm,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlanningMethodMetrics {
+    pub method: ActiveGravityMethod,
+    pub backend: PlanningExecutionBackend,
+    /// True only when this row came from the named method's GPU batch path.
+    /// Shared validation runs may populate diagnostics, but cannot unlock a
+    /// GPU fairness verdict.
+    pub gpu_batch_verified: bool,
+    pub workload: PlanningWorkloadIdentity,
+    pub preprocessing_ms: f64,
+    pub evaluation_ms: f64,
+    pub total_ms: f64,
+    pub relative_gravity_error: f32,
+    pub gradient_relative_error: f32,
+    pub pericenter_error_m: f32,
+    pub segment_count: u32,
+    pub cold_amortization_candidates: u32,
+}
+
+pub struct PlanningBatchJob {
+    pub run_id: u64,
+    pub profile: PlanningWorkloadProfile,
+    pub method: ActiveGravityMethod,
+    pub capture_id: u64,
+    pub source_hash: u64,
+    pub voxels: Vec<InvertedDensityVoxel>,
+    pub candidate_count: u32,
+    pub density_model_count: u32,
+    pub samples_per_candidate: u32,
+    pub cursor: u64,
+    pub total_evaluations: u64,
+    pub gravity_error_sum: f64,
+    pub gradient_error_sum: f64,
+    pub gradient_samples: u64,
+    pub pericenter_error_m: f32,
+    pub candidate_min_radius: f32,
+    pub preprocessing_ms: f64,
+    pub evaluation_ms: f64,
+    pub baseline_gravity_error: f32,
+}
+
+impl PlanningMethodMetrics {
+    pub fn accuracy_eligible(self) -> bool {
+        self.workload.is_complete()
+            && self.relative_gravity_error.is_finite()
+            && self.relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gradient_relative_error.is_finite()
+            && self.gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
+            && self.pericenter_error_m.is_finite()
+            && self.pericenter_error_m <= PLANNING_PERICENTER_ERROR_LIMIT_METERS
+            && self.total_ms.is_finite()
+            && self.total_ms > 0.0
+    }
+}
+
+#[derive(Resource)]
+pub struct PlanningComparisonState {
+    pub selected_metric: ComparisonMetric,
+    pub workload_profile: PlanningWorkloadProfile,
+    pub results: [Option<PlanningMethodMetrics>; 5],
+    pub run_requested: bool,
+    pub run_id: u64,
+    pub status: String,
+    pub batch_job: Option<PlanningBatchJob>,
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct ProbeCrashState {
+    pub active: bool,
+    pub elapsed_seconds: f32,
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct ProbeCrashResetRequest(pub bool);
+
+impl ProbeCrashState {
+    pub const DISPLAY_SECONDS: f32 = 3.0;
+
+    pub fn trigger(&mut self) {
+        self.active = true;
+        self.elapsed_seconds = 0.0;
+    }
+
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.elapsed_seconds = 0.0;
+    }
+}
+
+impl Default for PlanningComparisonState {
+    fn default() -> Self {
+        Self {
+            selected_metric: ComparisonMetric::DensityFit,
+            workload_profile: PlanningWorkloadProfile::First,
+            results: std::array::from_fn(|_| None),
+            run_requested: false,
+            run_id: 0,
+            status: "Select a workload, then press Invert trajectory to collect planning results.".into(),
+            batch_job: None,
+        }
+    }
+}
+
+impl PlanningComparisonState {
+    pub fn shared_workload(&self) -> Option<PlanningWorkloadIdentity> {
+        let eq106 = self.results[ActiveGravityMethod::CurvedArcEq106.performance_index()]?;
+        let mmfft = self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?;
+        let fmm = self.results[ActiveGravityMethod::Fmm.performance_index()]?;
+        let dimensions = self.workload_profile.dimensions();
+        (eq106.workload == mmfft.workload
+            && eq106.workload == fmm.workload
+            && (
+                eq106.workload.candidate_count,
+                eq106.workload.density_model_count,
+                eq106.workload.samples_per_candidate,
+            ) == dimensions
+            && eq106.workload.is_complete()
+            && eq106.backend == PlanningExecutionBackend::GpuEq106
+            && mmfft.backend == PlanningExecutionBackend::GpuMmfft
+            && fmm.backend == PlanningExecutionBackend::GpuFmm
+            && eq106.gpu_batch_verified
+            && mmfft.gpu_batch_verified
+            && fmm.gpu_batch_verified)
+            .then_some(eq106.workload)
+    }
+
+    pub fn fair_verdict(&self) -> Option<&'static str> {
+        self.shared_workload()?;
+        let eq106 = self.results[2]?;
+        let mmfft = self.results[3]?;
+        let fmm = self.results[4]?;
+        if ![eq106, mmfft, fmm]
+            .into_iter()
+            .all(PlanningMethodMetrics::accuracy_eligible)
+            || eq106.segment_count > PLANNING_EQ106_MAX_SEGMENTS
+            || eq106.cold_amortization_candidates > PLANNING_MAX_COLD_AMORTIZATION_CANDIDATES
+        {
+            return Some("no eligible winner: accuracy, segment, or amortization limit failed");
+        }
+        let speedup = fmm.total_ms / eq106.total_ms;
+        Some(if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
+            && speedup >= PLANNING_STRONG_SPEEDUP
+        {
+            "Eq.106 strong advantage (>=5x GPU FMM)"
+        } else if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
+            && speedup >= PLANNING_USEFUL_SPEEDUP
+        {
+            "Eq.106 useful advantage (>=3x GPU FMM)"
+        } else {
+            "Eq.106 has no effective advantage over GPU FMM"
+        })
+    }
+}

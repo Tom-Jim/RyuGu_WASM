@@ -22,17 +22,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let p   = positions[i].xyz;
     var acc = vec3<f32>(0.0);
+    let last = end - 1u;
 
-    for (var k = start; k < end - 1u; k = k + 1u) {
+    for (var k = start; k < last; k += 1u) {
         let a = positions[nbr_idx[k]].xyz;
         let b = positions[nbr_idx[k + 1u]].xyz;
         acc += cross(a - p, b - p);
     }
-    let a_last  = positions[nbr_idx[end - 1u]].xyz;
+    let a_last  = positions[nbr_idx[last]].xyz;
     let b_first = positions[nbr_idx[start]].xyz;
     acc += cross(a_last - p, b_first - p);
 
     let len = length(acc);
-    let n   = select(vec3<f32>(0.0, 1.0, 0.0), acc / len, len > 1e-6);
+    let n = select(vec3<f32>(0.0, 1.0, 0.0), acc / len, len > 1e-6);
     normals[i] = Normal(n, 0.0);
 }

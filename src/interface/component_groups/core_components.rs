@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 pub const G: f32 = 6.6743e-11;
@@ -35,10 +34,6 @@ pub const RYUGU_SPIN_AXIS: Vec3 = Vec3::new(-0.043, -0.914, 0.405);
 
 pub const DENSITY_EPSILON: f32 = 10.0;
 pub const SECTION_CLIP_RADIUS: f32 = 450.0;
-pub const PROBE_R0: Vec3 = Vec3::new(-616.535, 0.0, -65.459);
-pub const PROBE_SPEED_FACTOR: f32 = 1.07;
-pub const PROBE_ORBIT_NORMAL: Vec3 = Vec3::new(0.037_806, -0.933_691, -0.356_079);
-
 /// Shared outward-increasing logarithmic density law used by the radial,
 /// Equation (106), MMFFT, and FMM modes:
 /// `rho(r) = C ln(1 + r / epsilon)`.
@@ -46,48 +41,6 @@ pub fn logarithmic_radial_density(radius: f32, density_c: f32) -> f32 {
     density_c * (1.0 + radius.max(0.0) / DENSITY_EPSILON).ln()
 }
 
-pub fn probe_initial_velocity(position: Vec3, speed_factor: f32) -> Vec3 {
-    let radius = position.length();
-    if !radius.is_finite() || radius <= f32::EPSILON {
-        return Vec3::ZERO;
-    }
-
-    let radial = position / radius;
-    let tangent = PROBE_ORBIT_NORMAL
-        .normalize_or_zero()
-        .cross(radial)
-        .normalize_or_zero();
-    let speed = speed_factor.clamp(0.0, 2.0) * (G * RYUGU_MASS / radius).sqrt();
-    tangent * speed
-}
-
-pub static PROBE_V_INIT: LazyLock<Vec3> =
-    LazyLock::new(|| probe_initial_velocity(PROBE_R0, PROBE_SPEED_FACTOR));
-
-#[derive(Resource, Clone, Copy, PartialEq)]
-pub struct ProbeInitialConditions {
-    pub position: Vec3,
-    pub speed_factor: f32,
-}
-
-impl Default for ProbeInitialConditions {
-    fn default() -> Self {
-        Self {
-            position: PROBE_R0,
-            speed_factor: PROBE_SPEED_FACTOR,
-        }
-    }
-}
-
-impl ProbeInitialConditions {
-    pub fn velocity(self) -> Vec3 {
-        if self.position == PROBE_R0 && self.speed_factor == PROBE_SPEED_FACTOR {
-            *PROBE_V_INIT
-        } else {
-            probe_initial_velocity(self.position, self.speed_factor)
-        }
-    }
-}
 #[derive(Component)]
 pub struct TargetSize(pub f32);
 #[derive(Component)]
@@ -270,6 +223,11 @@ pub struct TrajectoryInversionState {
     /// radial source. Non-Werner inverse methods reuse this exact track.
     pub truth_knots: Vec<TrajectoryInversionKnot>,
     pub truth_capture_id: Option<u64>,
+    pub truth_capture_epoch: u64,
+    /// Source identity paired with `truth_capture_id`. Method switches must
+    /// restore both values or the next inversion looks like a different
+    /// physical problem and invalidates the accumulated comparison results.
+    pub truth_source_hash: u64,
     /// Long radial truth path used for the common non-Werner display.
     pub truth_orbit: Vec<Vec3>,
     pub preserve_truth_track: bool,
@@ -316,6 +274,8 @@ impl Default for TrajectoryInversionState {
             knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
             truth_knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
             truth_capture_id: None,
+            truth_capture_epoch: 0,
+            truth_source_hash: 0,
             truth_orbit: Vec::with_capacity(ORBIT_HISTORY_LEN),
             preserve_truth_track: false,
             capture_id: None,

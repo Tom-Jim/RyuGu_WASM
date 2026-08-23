@@ -273,6 +273,7 @@ The interactive inversion freezes one immutable capture before comparing methods
 - Eq.106 builds all 56 unit-density voxel columns in one GPU command encoder, submits once, and reads one compact acceleration-only matrix back once; Jacobian, residual, dual-certificate, and timestamp-query output is disabled for this inversion-only path;
 - the Eq.106 matrix cache identity combines the frozen `capture_id`, source geometry hash, shared basis hash, voxel/sample dimensions, and a frequency/quadrature/Taylor configuration signature; a density update reuses the geometry operator instead of rebuilding it;
 - MMFFT builds each column with its real CIC deposition, zero-padded FFT convolution, hierarchy selection, and tricubic derivative rather than a softened Newton substitute;
+- one cold MMFFT matrix build now creates each level's Newton kernel spectrum once, reuses cached forward/inverse RustFFT plans and scratch storage, performs the convolution in a reusable `Complex64` density buffer, and skips hierarchy levels unused by the frozen target array. The numerical precision and `64³`/`16³` grids are unchanged;
 - the third inversion row is explicitly a CPU `f64` quadrupole treecode using the shared distributed basis. It is not labelled as the runtime GPU FMM, whose current pipeline remains a separate single-target WebGPU evaluator;
 - MMFFT and treecode matrices are cached by `capture_id`, source hash, shared basis hash, and sample count, matching the Eq.106 warm-reuse semantics;
 - Rust assembles the shared `56 × 56` convex QP and Clarabel solves it with exact total-mass equality, density bounds, spatial and radial smoothness, and a weak uniform prior.
@@ -282,9 +283,27 @@ The interactive inversion freezes one immutable capture before comparing methods
 - switching methods retains every method's current and best result for the same frozen truth track, and restores the selected method's density view; editing the trajectory or changing the physical source invalidates the complete comparison history;
 - each history row shows the latest run beside the retained best fit, and reports common truth preparation separately from cold/warm matrix time, Clarabel time, verification, and method total. Common truth construction is excluded from method total, so the first selected algorithm no longer pays the shared-cache cost.
 - release and benchmark builds use `opt-level = 3`, LTO, and one codegen unit; the interactive timing comparison no longer uses the former size-optimized `opt-level = "z"` profile.
+- WGSL hot paths retain their existing `f32` formulas and output layouts while using more parallel work: Eq.106 reduces its 129 frequencies across a 64-lane workgroup per target, MMFFT maps its 64 tricubic corners to 64 lanes, FMM shares per-level target boxes inside each workgroup, and Werner reads edge lengths precomputed with the source geometry.
 - the Eq.106 status line separates source preparation, CPU spectrum/evaluation command encoding, asynchronous GPU batch completion plus mapped readback, design-matrix assembly, Clarabel solve, verification, total time, dispatch count, spectrum rebuild count, and cache hit/miss. A cache hit explicitly reports that GPU stages were skipped. Browser timestamp queries remain disabled on Dawn/Metal because query-set allocation can fail even when the feature bit is advertised.
 
 The reported `fit` is a synthetic volume-weighted density score against the known reference model. It is not a posterior probability, confidence level, or real-observation accuracy. One external trajectory cannot uniquely recover an arbitrary three-dimensional density field without assumptions and regularization.
+
+### Near-synchronous robust pericenter planning
+
+The probe controls retain the existing 620 m benchmark orbit and add a `Near-sync ellipse` preset. The preset starts at apocenter with position `(-1097.269, 51.622, 0) m`, uses Ryugu's spin axis as the orbit normal, and derives velocity from the existing circular-speed multiplier with `speed_factor = 0.82408`; the displayed velocity is therefore not an independently hard-coded state. The nominal two-body orbit has period `27495.468 s`, semimajor axis `831.624 m`, eccentricity `0.320889`, pericenter radius `564.765 m`, and apocenter radius `1098.483 m`.
+
+The planning contract is separate from the 56-variable Clarabel density inversion above. It describes a local `1800 s` pericenter window, fourth-order Eq.106 elements no longer than `300 s`, a `10 m` candidate trust radius, a `20 m` hard transverse limit, and a relative Taylor remainder target of `1e-3`. The selectable workloads are:
+
+| Profile | Candidate trajectories | Density models | Samples per candidate | Evaluations |
+|---|---:|---:|---:|---:|
+| First | 256 | 16 | 241 | 987,136 |
+| Stress | 1,024 | 32 | 512 | 16,777,216 |
+
+The upper-right comparison panel keeps `Density fit` and `Inversion time` and adds gravity error, gradient error, pericenter error, Eq.106 segment count, speedup versus GPU FMM, and cold-start amortization. Planning results are accepted only when Eq.106, MMFFT, and FMM carry the same nonzero reference-capture, candidate-array, density-model, and sample-array identities; request all four outputs (gravity, spatial gradient, minimum altitude, and objective); use the selected `B x K x H` workload; and identify their actual GPU backends. Missing or mismatched results remain `N/A`, and the UI withholds a winner instead of mixing them with CPU treecode inversion timings.
+
+A fair result must include preprocessing and satisfy relative gravity error `<= 1e-3`, relative gradient error `<= 1e-2`, predicted pericenter error `<= 1 m`, no more than 10 Eq.106 segments for the target result (16 is the hard validity maximum), and cold-start amortization within 256 candidate trajectories. Eq.106 counts as a useful engineering advantage only at `>= 3x` the end-to-end GPU FMM speed and as a strong advantage at `>= 5x`. The existing inversion button, frozen-trajectory contract, Clarabel solve, fit history, and density visualization remain independent and available.
+
+Selecting `First` or `Stress` starts a new planning run identity, and `Invert trajectory` queues that workload against the current frozen capture. The planner now executes the selected `B x K x H` workload incrementally and reports live per-method progress, gradient consistency, sampled pericenter error, segment count, and cold-start amortization instead of deriving them from a single-track inversion. The current implementation marks these rows as shared CPU validation data; the strict GPU winner remains withheld until method-specific Eq.106, MMFFT, and FMM GPU batch outputs carry the same workload identity.
 
 ## Runtime controls
 
@@ -297,6 +316,7 @@ The reported `fit` is a synthetic volume-weighted density score against the know
 | `Invert trajectory` | Run the synthetic inversion after trajectory capture is complete. |
 | Position / velocity rows | Replace one quintic-Hermite control value with `x, y, z`. |
 | `X`, `Y`, `Z`, `Speed` | Change the initial probe state. |
+| `Current orbit` / `Near-sync ellipse` | Select the original benchmark or robust-pericenter planning initial state. |
 | Simulation acceleration | Execute `1×`–`8×` complete fixed updates per rendered frame. |
 | Mouse drag / wheel | Orbit and zoom the camera. |
 

@@ -28,17 +28,10 @@ struct FmmNode {
 @group(0) @binding(3) var<storage, read> particles: array<vec4<f32>>;
 
 var<workgroup> shared_acc: array<vec4<f32>, 64>;
+var<workgroup> shared_target_boxes: array<vec4<f32>, 9>;
 
 fn target_box(level: u32) -> vec4<f32> {
-    // Extend the source tree's same-size Cartesian boxes across all space.
-    // Using a separate 16R target root made a target box sixteen times larger
-    // than a source box at the nominally same level, invalidating M2L/L2L.
-    let source_root_half = nodes[0].center_half.w;
-    let half_width = source_root_half / f32(1u << level);
-    let width = 2.0 * half_width;
-    let cell = floor((params.probe_pos + vec3<f32>(source_root_half)) / width);
-    let center = -vec3<f32>(source_root_half) + (cell + vec3<f32>(0.5)) * width;
-    return vec4<f32>(center, half_width);
+    return shared_target_boxes[min(level, 8u)];
 }
 
 fn accepted(index: u32) -> bool {
@@ -50,7 +43,7 @@ fn accepted(index: u32) -> bool {
     // A local expansion must be valid over the whole target box, not merely
     // far from the small source box.  The old source-only ratio accepted very
     // coarse exterior target boxes and evaluated L2L outside convergence.
-    let expansion_radius = sqrt(3.0) * (node.center_half.w + target_cell.w);
+    let expansion_radius = 1.7320508075688772 * (node.center_half.w + target_cell.w);
     return distance > 1.01 * expansion_radius
         && expansion_radius / max(distance, 1.0e-6) < params.theta;
 }
@@ -136,11 +129,12 @@ fn node_field(index: u32) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
     let level = node.metadata.y;
-    if !accepted(index) && level < params.maximum_level {
+    let is_accepted = accepted(index);
+    if !is_accepted && level < params.maximum_level {
         return vec4<f32>(0.0);
     }
     var value = direct_multipole(node, params.probe_pos);
-    if accepted(index) {
+    if is_accepted {
         // Standard far-field path: P2M/M2M -> M2L -> L2L. The geometric
         // acceptance test enforces the expansion disk; no direct multipole
         // substitution is used after an interaction has been accepted.
@@ -161,6 +155,20 @@ fn main(
 ) {
     let index = global_id.x;
     let lane = local_id.x;
+    if lane == 0u {
+        // Every node and ancestor test in this workgroup uses the same target
+        // box at a given level. Construct those boxes once instead of inside
+        // every acceptance call.
+        let source_root_half = nodes[0].center_half.w;
+        for (var level = 0u; level <= min(params.maximum_level, 8u); level += 1u) {
+            let half_width = source_root_half / f32(1u << level);
+            let width = 2.0 * half_width;
+            let cell = floor((params.probe_pos + vec3<f32>(source_root_half)) / width);
+            let center = -vec3<f32>(source_root_half) + (cell + vec3<f32>(0.5)) * width;
+            shared_target_boxes[level] = vec4<f32>(center, half_width);
+        }
+    }
+    workgroupBarrier();
     var value = vec4<f32>(0.0);
     if index < params.node_count {
         value = node_field(index);

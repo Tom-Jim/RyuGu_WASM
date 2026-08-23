@@ -112,10 +112,11 @@ pub fn setup_runtime_error_overlay(mut commands: Commands) {
 
 pub fn runtime_error_overlay_system(
     runtime_error: Res<GravityRuntimeError>,
+    crash: Res<ProbeCrashState>,
     mut overlays: Query<&mut Node, With<RuntimeErrorOverlay>>,
     mut messages: Query<&mut Text, With<RuntimeErrorMessage>>,
 ) {
-    let display = if runtime_error.is_active() {
+    let display = if runtime_error.is_active() && !crash.active {
         Display::Flex
     } else {
         Display::None
@@ -464,7 +465,7 @@ pub fn setup_probe_controls(mut commands: Commands, probe_initial: Res<ProbeInit
                 flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::SpaceEvenly,
                 width: px(450),
-                height: px(270),
+                height: px(306),
                 padding: UiRect::all(px(12)),
                 border: UiRect::all(px(1)),
                 border_radius: BorderRadius::all(px(7)),
@@ -482,6 +483,23 @@ pub fn setup_probe_controls(mut commands: Commands, probe_initial: Res<ProbeInit
                 },
                 TextColor(Color::srgb(0.85, 0.95, 1.0)),
             ));
+
+            panel
+                .spawn(Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(8),
+                    height: px(26),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for preset in [
+                        ProbeOrbitPreset::CurrentBenchmark,
+                        ProbeOrbitPreset::NearSynchronousPlanning,
+                    ] {
+                        row.spawn(probe_orbit_preset_button(preset, probe_initial.preset));
+                    }
+                });
 
             let controls = [
                 (

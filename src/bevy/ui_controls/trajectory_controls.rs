@@ -47,13 +47,16 @@ pub fn probe_slider_system(
         return;
     }
 
+    let scalar_changed = next.position != probe_initial.position
+        || next.speed_factor != probe_initial.speed_factor;
+    if scalar_changed {
+        next.preset = ProbeOrbitPreset::Custom;
+    }
+
     for (label, mut text) in labels.iter_mut() {
         **text = probe_value_text(label.0, next);
     }
 
-    if next == *probe_initial {
-        return;
-    }
     *probe_initial = next;
 
     gravity_acceleration.0 = Vec3::ZERO;
@@ -412,62 +415,6 @@ pub fn trajectory_inversion_input_system(
             }
         }
     }
-}
-
-pub fn setup_density_inversion_timing_panel(mut commands: Commands) {
-    let labels = [(2, "Eq.106"), (3, "MMFFT"), (4, "FMM")];
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                right: px(15),
-                top: px(180),
-                width: px(420),
-                padding: UiRect::all(px(10)),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(4),
-                border: UiRect::all(px(1)),
-                border_radius: BorderRadius::all(px(7)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.02, 0.03, 0.06, 0.9)),
-            BorderColor::all(Color::srgba(0.3, 0.7, 0.75, 0.65)),
-            DensityInversionTimingPanel,
-        ))
-        .with_children(|panel| {
-            panel.spawn((
-                Text::new("Density inversion history (best fit; G starts a new run)"),
-                TextFont {
-                    font_size: bevy::text::FontSize::Px(13.0),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.82, 0.96, 1.0)),
-            ));
-            for (method_index, label) in labels {
-                panel.spawn((
-                    Text::new(format!("{label:<8}  --")),
-                    TextFont {
-                        font_size: bevy::text::FontSize::Px(11.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.55, 0.82, 0.9)),
-                    DensityInversionTimingLabel(method_index),
-                ));
-            }
-            panel.spawn((
-                Text::new("Waiting for inversion"),
-                TextFont {
-                    font_size: bevy::text::FontSize::Px(10.0),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.72, 0.72, 0.76)),
-                Node {
-                    margin: UiRect::top(px(3)),
-                    ..default()
-                },
-                DensityInversionStatusLabel,
-            ));
-        });
 }
 
 pub fn trajectory_inversion_ui_system(

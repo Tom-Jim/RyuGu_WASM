@@ -228,7 +228,7 @@ fn build_werner_source_system(
         let tensor = outer_product(sides[0].face_normal, sides[0].edge_outward)
             + outer_product(sides[1].face_normal, sides[1].edge_outward);
         let rows = tensor.transpose();
-        push_vec4(&mut edge_bytes, p0.extend(0.0));
+        push_vec4(&mut edge_bytes, p0.extend((p1 - p0).length()));
         push_vec4(&mut edge_bytes, p1.extend(0.0));
         push_vec4(&mut edge_bytes, rows.x_axis.extend(0.0));
         push_vec4(&mut edge_bytes, rows.y_axis.extend(0.0));
