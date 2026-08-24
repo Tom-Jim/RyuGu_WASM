@@ -71,6 +71,7 @@ fn uniform_bytes(
 fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
     buffer_entry(binding, BufferBindingType::Uniform)
 }
+
 fn storage_ro_entry(binding: u32) -> BindGroupLayoutEntry {
     buffer_entry(binding, BufferBindingType::Storage { read_only: true })
 }

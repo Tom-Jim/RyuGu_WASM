@@ -48,8 +48,8 @@ fn dispatch_eq106(
         };
         let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_uniform"),
-            size: 96,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            size: 96 * 256,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let sources = render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -66,33 +66,34 @@ fn dispatch_eq106(
         let operator_tensor = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_toroidal_operator_tensor"),
             contents: operator_bytes,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::UNIFORM,
         });
         let psi_operator = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_complex_psi_operator"),
             contents: psi_bytes,
             usage: BufferUsages::STORAGE,
         });
+        let mut density_mode_bytes = vec![0_u8; 544 * 16];
+        density_mode_bytes[..mode_bytes.len()].copy_from_slice(mode_bytes);
         let density_modes = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_density_fourier_modes"),
-            contents: mode_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            contents: &density_mode_bytes,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
         let targets = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("eq106_targets"),
             contents: &extracted.target_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
-        let coefficient_count = taylor_coefficient_count(buffer_taylor_order) as u64;
         let spectrum = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_spectrum"),
-            size: coefficient_count * FREQUENCY_COUNT as u64 * 32,
+            size: 45 * 129 * 32 * u64::from(element_capacity),
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let line_samples = render_device.create_buffer(&BufferDescriptor {
             label: Some("eq106_line_samples"),
-            size: coefficient_count * QUADRATURE_COUNT as u64 * 16,
+            size: 45 * 64 * 16 * u64::from(element_capacity),
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -125,14 +126,14 @@ fn dispatch_eq106(
         let layout = render_device.create_bind_group_layout(
             "eq106_complex_bgl_runtime",
             &[
-                uniform_entry(0),
+                storage_ro_entry(0),
                 storage_ro_entry(1),
                 storage_ro_entry(2),
                 storage_rw_entry(3),
                 storage_rw_entry(4),
-                storage_ro_entry(5),
+                uniform_entry(5),
                 storage_rw_entry(6),
-                storage_ro_entry(7),
+                uniform_entry(7),
                 storage_ro_entry(8),
                 storage_ro_entry(9),
             ],
@@ -275,25 +276,12 @@ fn dispatch_eq106(
         let query_set = inner.timing_query_set.as_ref();
         let mut timing_layout = Eq106TimingLayout::default();
         let mut next_query = 0_u32;
-        let mut batch_bind_groups = Vec::with_capacity(extracted.batch_elements.len());
-        let mut batch_uniforms = Vec::with_capacity(extracted.batch_elements.len());
+        // The WGSL uniform block has a fixed 256-element array. Keep the
+        // binding range large enough for the declared block even when a
+        // request contains fewer active trajectory elements.
+        let mut parameter_bytes = vec![0_u8; 96 * 256];
         for (element_index, element) in extracted.batch_elements.iter().enumerate() {
-            let (build_begin, build_end, evaluation_begin, evaluation_end) = if query_set.is_some()
-            {
-                let indices = (next_query, next_query + 1, next_query + 2, next_query + 3);
-                timing_layout.build_pairs.push((indices.0, indices.1));
-                timing_layout.evaluation_pairs.push((indices.2, indices.3));
-                next_query += 4;
-                (
-                    Some(indices.0),
-                    Some(indices.1),
-                    Some(indices.2),
-                    Some(indices.3),
-                )
-            } else {
-                (None, None, None, None)
-            };
-            let uniform_bytes = uniform_bytes(
+            let bytes = uniform_bytes(
                 element.line_origin,
                 element.line_origin,
                 element.line_direction,
@@ -302,107 +290,75 @@ fn dispatch_eq106(
                 element.line_limit,
                 element.taylor_order,
                 extracted.density_mode_count,
-                inner.segment_id.wrapping_add(element_index as u32 + 1),
+                element_index as u32 + 1,
                 evaluate_dual_certificate && element.target_offset == 0,
                 false,
                 element.target_count,
                 element.target_offset,
             );
-            let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("eq106_trajectory_element_uniform"),
-                contents: &uniform_bytes,
-                usage: BufferUsages::UNIFORM,
+            let offset = element_index * 96;
+            parameter_bytes[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        let parameter_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("eq106_trajectory_segment_params"),
+            contents: &parameter_bytes,
+            usage: BufferUsages::STORAGE,
+        });
+        let bind_group = render_device.create_bind_group(
+            "eq106_trajectory_batch_bg",
+            &inner.layout,
+            &[
+                BindGroupEntry { binding: 0, resource: parameter_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: inner.sources.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: inner.quadrature.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: inner.spectrum.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: inner.output.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: inner.operator_tensor.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: inner.line_samples.as_entire_binding() },
+                BindGroupEntry { binding: 7, resource: inner.density_modes.as_entire_binding() },
+                BindGroupEntry { binding: 8, resource: inner.psi_operator.as_entire_binding() },
+                BindGroupEntry { binding: 9, resource: inner.targets.as_entire_binding() },
+            ],
+        );
+        let segment_count = extracted.batch_elements.len() as u32;
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("eq106_trajectory_line_samples_batch"), timestamp_writes: None,
             });
-            let bind_group = render_device.create_bind_group(
-                "eq106_trajectory_element_bg",
-                &inner.layout,
-                &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: inner.sources.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 2,
-                        resource: inner.quadrature.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 3,
-                        resource: inner.spectrum.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 4,
-                        resource: inner.output.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 5,
-                        resource: inner.operator_tensor.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 6,
-                        resource: inner.line_samples.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 7,
-                        resource: inner.density_modes.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 8,
-                        resource: inner.psi_operator.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 9,
-                        resource: inner.targets.as_entire_binding(),
-                    },
-                ],
-            );
-
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("eq106_trajectory_line_samples_pass"),
-                    timestamp_writes: timestamp_writes(query_set, build_begin, None),
-                });
-                pass.set_pipeline(line_samples);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("eq106_trajectory_assemble_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(assemble);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(
-                    (taylor_coefficient_count(element.taylor_order) * FREQUENCY_COUNT).div_ceil(64),
-                    1,
-                    1,
-                );
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("eq106_trajectory_analytic_pass"),
-                    timestamp_writes: timestamp_writes(query_set, None, build_end),
-                });
-                pass.set_pipeline(analytic);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), 1, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("eq106_trajectory_evaluate_pass"),
-                    timestamp_writes: timestamp_writes(query_set, evaluation_begin, evaluation_end),
-                });
-                pass.set_pipeline(evaluate);
-                pass.set_bind_group(0, &bind_group, &[]);
-                let (width, height) = target_dispatch_grid(element.target_count);
-                pass.dispatch_workgroups(width, height, 1);
-            }
-            batch_uniforms.push(uniform);
-            batch_bind_groups.push(bind_group);
+            pass.set_pipeline(line_samples);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), segment_count, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("eq106_trajectory_spectrum_batch"), timestamp_writes: None,
+            });
+            pass.set_pipeline(assemble);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((45 * FREQUENCY_COUNT).div_ceil(64), segment_count, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("eq106_trajectory_analytic_batch"), timestamp_writes: None,
+            });
+            pass.set_pipeline(analytic);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), segment_count, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("eq106_trajectory_evaluate_batch"), timestamp_writes: None,
+            });
+            pass.set_pipeline(evaluate);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let max_targets = extracted
+                .batch_elements
+                .iter()
+                .map(|element| element.target_count)
+                .max()
+                .unwrap_or(1);
+            let (width, height) = target_dispatch_grid(max_targets);
+            pass.dispatch_workgroups(width, height, segment_count);
         }
         encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);
         if let (Some(query_set), Some(resolve)) = (query_set, inner.timing_resolve.as_ref()) {

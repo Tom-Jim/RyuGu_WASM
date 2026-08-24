@@ -7,11 +7,12 @@ mod gpu;
 mod interface;
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
+use bevy::log::{Level, LogPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::WgpuLimits;
 use bevy::render::{
     RenderPlugin,
-    settings::{Backends, RenderCreation, WgpuSettings},
+    settings::{Backends, InstanceFlags, RenderCreation, WgpuSettings},
 };
 use bevy::window::PresentMode;
 use bevy::winit::{UpdateMode, WinitSettings};
@@ -215,7 +216,6 @@ pub fn main() {
         show_webgpu_error();
         return;
     }
-
     let (backends, limits) = if has_webgpu {
         (
             Backends::BROWSER_WEBGPU,
@@ -268,6 +268,15 @@ pub fn main() {
         })
         .add_plugins(
             DefaultPlugins
+                .set(LogPlugin {
+                    // Keep runtime output usable. WGSL source is still emitted
+                    // once by the Eq.106 pipeline loader at debug level, while
+                    // Naga's per-expression trace and per-frame pipeline state
+                    // logs are disabled because they can starve the simulation.
+                    level: Level::DEBUG,
+                    filter: "wgsl=debug,wgpu=warn,naga=warn,bevy_render=warn,bevy_shader=warn,ryugu_wasm=debug".into(),
+                    ..default()
+                })
                 .set(AssetPlugin {
                     meta_check: AssetMetaCheck::Never,
                     ..default()
@@ -286,6 +295,7 @@ pub fn main() {
                     render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                         backends: Some(backends),
                         limits,
+                        instance_flags: InstanceFlags::debugging(),
                         ..default()
                     })),
                     ..default()

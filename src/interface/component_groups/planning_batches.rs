@@ -108,6 +108,9 @@ pub struct PlanningGpuRequest {
     pub candidate_start: u32,
     pub candidate_count: u32,
     pub warm_repetition: bool,
+    /// First uses a throughput-oriented compute benchmark; Stress preserves
+    /// render-friendly pacing so the 3D view remains responsive.
+    pub compute_benchmark: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -19,8 +19,8 @@ use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-        BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding,
-        BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferSize, BufferUsages,
+        BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor,
+        BufferInitDescriptor, BufferUsages,
         CachedComputePipelineId, CachedPipelineState,
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, MapMode,
         PipelineCache, ShaderStages,
@@ -28,6 +28,7 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
 };
 use bevy::shader::ShaderCacheError;
+use bevy::log::{debug, error, trace};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use wgpu29::{ComputePassTimestampWrites, QuerySet};
@@ -35,8 +36,8 @@ use wgpu29::{ComputePassTimestampWrites, QuerySet};
 const HALF_COUNT: u32 = 64;
 const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
 const QUADRATURE_COUNT: u32 = 64;
-const TAYLOR_MAX_ORDER: u32 = 4;
-const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 15;
+const TAYLOR_MAX_ORDER: u32 = 8;
+const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 45;
 const DUAL_CERTIFICATE_CADENCE: u32 = 30;
 const OUTPUT_ROWS_PER_BLOCK: u64 = 9;
 const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
@@ -336,15 +337,16 @@ impl Plugin for Eq106GpuComputePlugin {
 
 impl FromWorld for Eq106ComputePipeline {
     fn from_world(world: &mut World) -> Self {
+        log_eq106_wgsl_source();
         let entries = [
-            uniform_entry(0),
+            storage_ro_entry(0),
             storage_ro_entry(1),
             storage_ro_entry(2),
             storage_rw_entry(3),
             storage_rw_entry(4),
-            storage_ro_entry(5),
+            uniform_entry(5),
             storage_rw_entry(6),
-            storage_ro_entry(7),
+            uniform_entry(7),
             storage_ro_entry(8),
             storage_ro_entry(9),
         ];
@@ -395,6 +397,19 @@ impl FromWorld for Eq106ComputePipeline {
             analytic_id,
             evaluate_id,
         }
+    }
+}
+
+fn log_eq106_wgsl_source() {
+    let source = include_str!("../../../assets/shaders/eq106_complex.wgsl");
+    debug!(
+        target: "wgsl::eq106",
+        bytes = source.len(),
+        lines = source.lines().count(),
+        "loading Eq.106 WGSL source"
+    );
+    for (line_number, line) in source.lines().enumerate() {
+        trace!(target: "wgsl::eq106", line = line_number + 1, "WGSL {line}");
     }
 }
 

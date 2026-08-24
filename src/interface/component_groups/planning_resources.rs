@@ -116,6 +116,10 @@ pub enum PlanningWorkloadProfile {
 }
 
 impl PlanningWorkloadProfile {
+    pub fn is_compute_benchmark(self) -> bool {
+        matches!(self, Self::First)
+    }
+
     pub fn dimensions(self) -> (u32, u32, u32) {
         match self {
             Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),

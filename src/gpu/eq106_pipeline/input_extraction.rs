@@ -14,8 +14,11 @@ fn extract_eq106_input(
 ) {
     // Selection alone is insufficient: an uncertified segment must never be
     // submitted after adaptive splitting leaves the Taylor convergence disk.
+    // Bootstrap the first Eq.106 sample before the adaptive planner has a
+    // trajectory window. The planner itself is fed by completed GPU snapshots;
+    // requiring `kernel_ready` here creates a circular wait after switching
+    // methods because the switch clears both the orbit history and planner.
     extracted.enabled = **active == ActiveGravityMethod::CurvedArcEq106
-        && planner.kernel_ready
         && planner.mode != crate::cpu::curved_arc::CurvedArcMode::Error;
     if !extracted.enabled {
         return;
@@ -404,7 +407,7 @@ fn dispatch_eq106_single_target(
         longitudinal_limit,
         extracted.taylor_order,
         extracted.density_mode_count,
-        inner.segment_id,
+        1,
         evaluate_dual_certificate,
         false,
         inner.target_count,
@@ -575,6 +578,12 @@ fn report_eq106_pipeline_errors(
                 | ShaderCacheError::ShaderImportNotYetAvailable,
             ) => {}
             CachedPipelineState::Err(error) => {
+                error!(
+                    target: "wgsl::eq106",
+                    pipeline = name,
+                    error = ?error,
+                    "Eq.106 compute pipeline compilation failed"
+                );
                 if let Ok(mut slot) = channel.pipeline_error.try_lock()
                     && slot.is_none()
                 {

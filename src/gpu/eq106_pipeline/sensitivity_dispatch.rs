@@ -63,8 +63,8 @@ fn dispatch_eq106_sensitivity_matrix(
     let mut uniforms = Vec::with_capacity(resource_count);
     let mut bind_groups = Vec::with_capacity(resource_count);
     for (column, source) in source_buffers.iter().enumerate() {
-        for (element_index, element) in extracted.batch_elements.iter().enumerate() {
-            let bytes = uniform_bytes(
+        for element in &extracted.batch_elements {
+                let bytes = uniform_bytes(
                 element.line_origin,
                 element.line_origin,
                 element.line_direction,
@@ -73,9 +73,7 @@ fn dispatch_eq106_sensitivity_matrix(
                 element.line_limit,
                 element.taylor_order,
                 extracted.density_mode_count,
-                inner
-                    .segment_id
-                    .wrapping_add((column * extracted.batch_elements.len() + element_index) as u32 + 1),
+                    1,
                 false,
                 true,
                 element.target_count,
@@ -83,8 +81,12 @@ fn dispatch_eq106_sensitivity_matrix(
             );
             let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("eq106_sensitivity_element_uniform"),
-                contents: &bytes,
-                usage: BufferUsages::UNIFORM,
+                contents: &{
+                    let mut data = vec![0_u8; 96 * 256];
+                    data[..bytes.len()].copy_from_slice(&bytes);
+                    data
+                },
+                usage: BufferUsages::STORAGE,
             });
             let bind_group = render_device.create_bind_group(
                 "eq106_sensitivity_element_bg",

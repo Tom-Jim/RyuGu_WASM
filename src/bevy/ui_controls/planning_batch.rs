@@ -52,14 +52,19 @@ pub fn planning_batch_evaluator_system(
         return;
     }
     if rendering_needs_priority() {
-        planning.status = format!(
-            "{} stress yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
-            job.method.planning_label(),
-            crate::browser_frame_rate().unwrap_or(0.0),
-            crate::browser_recent_frame_ms().unwrap_or(0.0),
-        );
-        planning.batch_job = Some(job);
-        return;
+        if job.profile.is_compute_benchmark() {
+            // First is the fixed compute benchmark. Its timing must not include
+            // render-priority gaps; Stress remains paced below.
+        } else {
+            planning.status = format!(
+                "{} planning yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
+                job.method.planning_label(),
+                crate::browser_frame_rate().unwrap_or(0.0),
+                crate::browser_recent_frame_ms().unwrap_or(0.0),
+            );
+            planning.batch_job = Some(job);
+            return;
+        }
     }
     let payload_key = job.run_id
         ^ (job.method.performance_index() as u64).rotate_left(17)
@@ -123,6 +128,7 @@ pub fn planning_batch_evaluator_system(
         candidate_start: job.candidate_start,
         candidate_count: request_candidate_count,
         warm_repetition: job.warm_repetition,
+        compute_benchmark: job.profile.is_compute_benchmark(),
     };
     job.awaiting_gpu = true;
     planning.status = planning_progress_text(&job);

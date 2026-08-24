@@ -222,7 +222,7 @@ fn dispatch_planning_eq106(
         state.operator = Some(render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("planning_eq106_operator"),
             contents: &planning.eq106_operator,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::UNIFORM,
         }));
         state.psi = Some(render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("planning_eq106_psi"),
@@ -231,8 +231,8 @@ fn dispatch_planning_eq106(
         }));
         state.dummy_modes = Some(render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("planning_eq106_unused_modes"),
-            contents: &[0; 16],
-            usage: BufferUsages::STORAGE,
+            contents: &vec![0_u8; 544 * 16],
+            usage: BufferUsages::UNIFORM,
         }));
     }
     if state.payload_request_id != planning.payload.request_id || state.sources.is_none() {
@@ -244,10 +244,14 @@ fn dispatch_planning_eq106(
         }));
     }
     let coefficient_count = taylor_coefficient_count(TAYLOR_MAX_ORDER) as u64;
+    if starting_request {
+        state.spectrum = None;
+        state.line_samples = None;
+    }
     if state.spectrum.is_none() {
         state.spectrum = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_spectrum"),
-            size: coefficient_count * FREQUENCY_COUNT as u64 * 32,
+            size: coefficient_count * FREQUENCY_COUNT as u64 * 32 * elements.len().max(1) as u64,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -255,7 +259,7 @@ fn dispatch_planning_eq106(
     if state.line_samples.is_none() {
         state.line_samples = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_line_samples"),
-            size: coefficient_count * QUADRATURE_COUNT as u64 * 16,
+            size: coefficient_count * QUADRATURE_COUNT as u64 * 16 * elements.len().max(1) as u64,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -328,8 +332,8 @@ fn dispatch_planning_eq106(
         state.layout = Some(render_device.create_bind_group_layout(
             "planning_eq106_bgl",
             &[
-                uniform_entry(0), storage_ro_entry(1), storage_ro_entry(2), storage_rw_entry(3),
-                storage_rw_entry(4), storage_ro_entry(5), storage_rw_entry(6), storage_ro_entry(7),
+                storage_ro_entry(0), storage_ro_entry(1), storage_ro_entry(2), storage_rw_entry(3),
+                storage_rw_entry(4), uniform_entry(5), storage_rw_entry(6), uniform_entry(7),
                 storage_ro_entry(8), storage_ro_entry(9),
             ],
         ));
@@ -339,10 +343,7 @@ fn dispatch_planning_eq106(
         method_preprocess_started.elapsed().as_secs_f64() * 1.0e3;
     if starting_request {
         let uniform_size = 96_u64;
-        let uniform_alignment =
-            u64::from(render_device.limits().min_uniform_buffer_offset_alignment).max(1);
-        let uniform_stride = uniform_size.div_ceil(uniform_alignment) * uniform_alignment;
-        let mut uniform_data = vec![0_u8; uniform_stride as usize * elements.len().max(1)];
+        let mut uniform_data = vec![0_u8; uniform_size as usize * 256];
         for (element_index, element) in elements.iter().enumerate() {
             let mut bytes = uniform_bytes(
                 element.line_origin,
@@ -360,48 +361,38 @@ fn dispatch_planning_eq106(
                 element.target_offset,
             );
             bytes[92..96].copy_from_slice(&(global_state_start as u32).to_le_bytes());
-            let offset = element_index * uniform_stride as usize;
+            let offset = element_index * uniform_size as usize;
             uniform_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
         }
         let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("planning_eq106_uniforms"),
             contents: &uniform_data,
-            usage: BufferUsages::UNIFORM,
+            usage: BufferUsages::STORAGE,
         });
-        state.active_bind_groups = (0..elements.len())
-            .map(|element_index| {
-                render_device.create_bind_group(
-                    "planning_eq106_bg",
-                    &layout,
-                    &[
-                        BindGroupEntry {
-                            binding: 0,
-                            resource: BindingResource::Buffer(BufferBinding {
-                                buffer: &uniform,
-                                offset: element_index as u64 * uniform_stride,
-                                size: BufferSize::new(uniform_size),
-                            }),
-                        },
-                        BindGroupEntry { binding: 1, resource: sources.as_entire_binding() },
-                        BindGroupEntry { binding: 2, resource: quadrature.as_entire_binding() },
-                        BindGroupEntry { binding: 3, resource: spectrum.as_entire_binding() },
-                        BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
-                        BindGroupEntry { binding: 5, resource: operator.as_entire_binding() },
-                        BindGroupEntry { binding: 6, resource: line_samples.as_entire_binding() },
-                        BindGroupEntry { binding: 7, resource: dummy_modes.as_entire_binding() },
-                        BindGroupEntry { binding: 8, resource: psi.as_entire_binding() },
-                        BindGroupEntry { binding: 9, resource: shared.positions.as_entire_binding() },
-                    ],
-                )
-            })
-            .collect();
+        let bind_group = render_device.create_bind_group(
+            "planning_eq106_batch_bg",
+            &layout,
+            &[
+                BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: sources.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: quadrature.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: spectrum.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: operator.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: line_samples.as_entire_binding() },
+                BindGroupEntry { binding: 7, resource: dummy_modes.as_entire_binding() },
+                BindGroupEntry { binding: 8, resource: psi.as_entire_binding() },
+                BindGroupEntry { binding: 9, resource: shared.positions.as_entire_binding() },
+            ],
+        );
+        state.active_bind_groups = vec![bind_group];
         state.active_uniform = Some(uniform);
     }
-    let stage_budget = planning_eq106_stage_budget();
+    let stage_budget = planning_eq106_stage_budget(request.compute_benchmark, 4);
     if stage_budget == 0 {
         return;
     }
-    let total_stages = elements.len() * 4;
+    let total_stages = 4;
     let stage_end = (state.next_stage + stage_budget).min(total_stages);
     let final_submission = stage_end == total_stages;
     let _uniform = state.active_uniform.as_ref();
@@ -413,33 +404,34 @@ fn dispatch_planning_eq106(
     if state.next_stage == 0 {
         encoder.clear_buffer(&output, 0, None);
     }
-    for flat_stage in state.next_stage..stage_end {
-        let element_index = flat_stage / 4;
-        let stage = flat_stage % 4;
-        let element = &elements[element_index];
-        let bind_group = &bind_groups[element_index];
-        let (label, pipeline, width, height) = match stage {
+    let segment_count = elements.len() as u32;
+    let max_targets = elements.iter().map(|element| element.target_count).max().unwrap_or(1);
+    for stage in state.next_stage..stage_end {
+        let (label, pipeline, width, height, depth) = match stage {
             0 => (
                 "planning_eq106_line",
                 line_samples_pipeline,
                 QUADRATURE_COUNT.div_ceil(64),
+                segment_count,
                 1,
             ),
             1 => (
                 "planning_eq106_spectrum",
                 assemble_pipeline,
-                (taylor_coefficient_count(element.taylor_order) * FREQUENCY_COUNT).div_ceil(64),
+                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * FREQUENCY_COUNT).div_ceil(64),
+                segment_count,
                 1,
             ),
             2 => (
                 "planning_eq106_analytic",
                 analytic_pipeline,
                 FREQUENCY_COUNT.div_ceil(64),
+                segment_count,
                 1,
             ),
             _ => {
-                let (width, height) = target_dispatch_grid(element.target_count);
-                ("planning_eq106_evaluate", evaluate_pipeline, width, height)
+                let (width, height) = target_dispatch_grid(max_targets);
+                ("planning_eq106_evaluate", evaluate_pipeline, width, height, segment_count)
             }
         };
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -447,8 +439,8 @@ fn dispatch_planning_eq106(
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(width, height, 1);
+        pass.set_bind_group(0, &bind_groups[0], &[]);
+        pass.dispatch_workgroups(width, height, depth);
     }
     let reduction_resources = final_submission.then(|| {
         let resources = crate::gpu::planning_reduction::encode_planning_reduction(
@@ -576,7 +568,9 @@ fn dispatch_planning_eq106(
                     method_preprocess_ms,
                     command_submission_ms,
                     gpu_completion_map_ms,
-                    dispatch_count: element_count.saturating_mul(4).saturating_add(1),
+                    // Four batched compute passes plus one reduction pass;
+                    // segments are the z/y dimension, not separate submits.
+                    dispatch_count: 5,
                     forward_kernel_evaluations: u64::from(source_count)
                         * u64::from(QUADRATURE_COUNT)
                         * u64::from(element_count)
@@ -592,7 +586,10 @@ fn dispatch_planning_eq106(
     });
 }
 
-fn planning_eq106_stage_budget() -> usize {
+fn planning_eq106_stage_budget(compute_benchmark: bool, total_stages: usize) -> usize {
+    if compute_benchmark {
+        return total_stages.max(1);
+    }
     let average_fps = crate::browser_frame_rate();
     let recent_frame_ms = crate::browser_recent_frame_ms();
     let frame_over_budget = average_fps.is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
@@ -601,5 +598,7 @@ fn planning_eq106_stage_budget() -> usize {
     if frame_over_budget {
         return 0;
     }
-    1
+    // Interactive Stress still yields periodically, but a small batch of
+    // stages per frame avoids turning the benchmark into one dispatch/frame.
+    8.min(total_stages.max(1))
 }

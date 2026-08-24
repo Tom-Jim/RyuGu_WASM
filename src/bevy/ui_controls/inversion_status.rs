@@ -242,10 +242,15 @@ fn update_planning_comparison_status(
     let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
     let evaluations = u64::from(candidate_count) * u64::from(density_count) * u64::from(sample_count);
     let prefix = format!(
-        "build v{} ({}) | {} | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        "build v{} ({}) | {} [{}] | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
         env!("CARGO_PKG_VERSION"),
         option_env!("RYUGU_GIT_SHA").unwrap_or("unknown"),
         planning.workload_profile.label(),
+        if planning.workload_profile.is_compute_benchmark() {
+            "compute benchmark"
+        } else {
+            "interactive wall"
+        },
         candidate_count,
         density_count,
         sample_count,
