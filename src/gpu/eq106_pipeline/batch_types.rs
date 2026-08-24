@@ -487,6 +487,7 @@ fn poll_eq106_readback(
     mut batch_result: ResMut<Eq106TrajectoryBatchResult>,
     mut sensitivity: ResMut<Eq106SensitivityMatrix>,
     mut performance: ResMut<Eq106PerformanceMetrics>,
+    mut planner: ResMut<CurvedArcPlannerState>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
     if channel.in_flight.load(Ordering::Acquire)
@@ -575,15 +576,35 @@ fn poll_eq106_readback(
     }
     let decoded = match decode_eq106_packet(&packet, angular_velocity_world) {
         Ok(decoded) => decoded,
-        Err(Eq106DecodeError::Incomplete) => {
-            runtime_error.raise("Equation (106) batch readback is incomplete.");
+        Err(Eq106DecodeError::Incomplete { actual, expected }) => {
+            runtime_error.raise(format!(
+                "Equation (106) batch readback is incomplete: {actual} rows, expected {expected}."
+            ));
             return;
         }
-        Err(Eq106DecodeError::InvalidSample) => {
-            channel.rebuild_requested.store(true, Ordering::Release);
+        Err(Eq106DecodeError::Rejected { sample, reason }) => {
+            planner.consecutive_rejections = planner.consecutive_rejections.saturating_add(1);
+            let retry = planner.consecutive_rejections;
+            let message = format!(
+                "Eq.106 waiting: {} at sample {}; retry {retry}/4, Taylor order {}.",
+                reason.message(),
+                sample + 1,
+                planner.taylor_order,
+            );
+            planner.reject_status = Some(message.clone());
+            warn!(target: "eq106::certificate", %message, "Eq.106 sample rejected");
+            if retry >= 4 {
+                runtime_error.raise(format!(
+                    "Equation (106) stopped after four consecutive certificate failures. {message}"
+                ));
+            } else {
+                channel.rebuild_requested.store(true, Ordering::Release);
+            }
             return;
         }
     };
+    planner.consecutive_rejections = 0;
+    planner.reject_status = None;
 
     if let Some(capture_id) = packet.batch_capture_id {
         batch_result.capture_id = Some(capture_id);
@@ -593,10 +614,41 @@ fn poll_eq106_readback(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Eq106DecodeError {
-    Incomplete,
-    InvalidSample,
+    Incomplete { actual: usize, expected: usize },
+    Rejected { sample: usize, reason: Eq106RejectReason },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Eq106RejectReason {
+    TaylorField { value: f32, limit: f32 },
+    ImaginaryResidual { value: f32, limit: f32 },
+    SpectralTail { value: f32, limit: f32 },
+    TransverseRatio { value: f32, limit: f32 },
+    NonFinite,
+    NonPhysical,
+}
+
+impl Eq106RejectReason {
+    fn message(self) -> String {
+        match self {
+            Self::TaylorField { value, limit } => {
+                format!("field-tail certificate {value:.3e} > {limit:.3e}")
+            }
+            Self::ImaginaryResidual { value, limit } => {
+                format!("imaginary residual {value:.3e} > {limit:.3e}")
+            }
+            Self::SpectralTail { value, limit } => {
+                format!("spectral-tail certificate {value:.3e} > {limit:.3e}")
+            }
+            Self::TransverseRatio { value, limit } => {
+                format!("transverse ratio {value:.3e} > {limit:.3e}")
+            }
+            Self::NonFinite => "non-finite field, certificate, or Jacobian".into(),
+            Self::NonPhysical => "non-physical potential or field magnitude".into(),
+        }
+    }
 }
 
 fn decode_eq106_packet(
@@ -605,7 +657,10 @@ fn decode_eq106_packet(
 ) -> Result<Vec<GravityFieldSample>, Eq106DecodeError> {
     let expected_rows = packet.snapshots.len() * OUTPUT_ROWS_PER_BLOCK as usize;
     if packet.partial_sums.len() != expected_rows {
-        return Err(Eq106DecodeError::Incomplete);
+        return Err(Eq106DecodeError::Incomplete {
+            actual: packet.partial_sums.len(),
+            expected: expected_rows,
+        });
     }
     packet
         .snapshots
@@ -618,7 +673,10 @@ fn decode_eq106_packet(
                 snapshot,
                 angular_velocity_world,
             )
-            .ok_or(Eq106DecodeError::InvalidSample)
+            .map_err(|reason| Eq106DecodeError::Rejected {
+                sample: index,
+                reason,
+            })
         })
         .collect()
 }
@@ -627,15 +685,52 @@ fn decode_eq106_sample(
     rows: &[[f32; 4]],
     base_snapshot: &GravityRequestSnapshot,
     angular_velocity_world: Vec3,
-) -> Option<GravityFieldSample> {
+) -> Result<GravityFieldSample, Eq106RejectReason> {
     let field = rows[0];
     let certificate = rows[1];
-    if certificate[0] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-        || certificate[1] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-        || certificate[2] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-        || certificate[3] > 0.30
-    {
-        return None;
+    for (value, reason) in [
+        (
+            certificate[0],
+            Eq106RejectReason::TaylorField {
+                value: certificate[0],
+                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+            },
+        ),
+        (
+            certificate[1],
+            Eq106RejectReason::ImaginaryResidual {
+                value: certificate[1],
+                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+            },
+        ),
+        (
+            certificate[2],
+            Eq106RejectReason::SpectralTail {
+                value: certificate[2],
+                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+            },
+        ),
+        (
+            certificate[3],
+            Eq106RejectReason::TransverseRatio {
+                value: certificate[3],
+                limit: 0.30,
+            },
+        ),
+    ] {
+        if !value.is_finite() {
+            return Err(Eq106RejectReason::NonFinite);
+        }
+        let limit = match reason {
+            Eq106RejectReason::TransverseRatio { limit, .. }
+            | Eq106RejectReason::TaylorField { limit, .. }
+            | Eq106RejectReason::ImaginaryResidual { limit, .. }
+            | Eq106RejectReason::SpectralTail { limit, .. } => limit,
+            _ => unreachable!(),
+        };
+        if value > limit {
+            return Err(reason);
+        }
     }
     let potentials = rows[6];
     let anchor_row = rows[7];
@@ -663,7 +758,18 @@ fn decode_eq106_sample(
         || !local_coordinates.iter().all(|value| value.is_finite())
         || !jacobian.is_finite()
     {
-        return None;
+        return Err(if !acceleration.is_finite()
+            || !positive_potential.is_finite()
+            || independent_potential.is_some_and(|potential| !potential.is_finite())
+            || !anchor_position.is_finite()
+            || !line_origin.is_finite()
+            || !local_coordinates.iter().all(|value| value.is_finite())
+            || !jacobian.is_finite()
+        {
+            Eq106RejectReason::NonFinite
+        } else {
+            Eq106RejectReason::NonPhysical
+        });
     }
 
     let mut snapshot = base_snapshot.clone();
@@ -677,7 +783,7 @@ fn decode_eq106_sample(
     snapshot.probe_position =
         snapshot.ryugu_transform.translation + future_rotation * anchor_position;
 
-    Some(GravityFieldSample {
+    Ok(GravityFieldSample {
         snapshot,
         predictive: false,
         body_acceleration: acceleration,

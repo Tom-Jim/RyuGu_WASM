@@ -18,6 +18,7 @@ const RADIAL_LAYER_COUNT: u32 = 4;
 
 #[derive(Resource, Default)]
 struct ExtractedGravityInput {
+    enabled: bool,
     probe: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
     source_bytes: Option<Vec<u8>>,
@@ -274,9 +275,14 @@ fn extract_gravity_input_system(
     mut extracted: ResMut<ExtractedGravityInput>,
     source: Extract<Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>>,
     clock: Extract<Res<SimulationClock>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
+    extracted.enabled = !planning.blocks_realtime_gpu();
+    if !extracted.enabled {
+        return;
+    }
     let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
@@ -325,7 +331,7 @@ fn dispatch_gravity_system(
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
         return;
     };
-    if extracted.source_count == 0 {
+    if !extracted.enabled || extracted.source_count == 0 {
         return;
     }
 

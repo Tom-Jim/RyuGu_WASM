@@ -9,10 +9,9 @@ fn dispatch_eq106(
 ) {
     let Some(pipelines) = pipelines else { return };
     report_eq106_pipeline_errors(&cache, &pipelines, &channel);
-    let (Some(line_samples), Some(assemble), Some(analytic), Some(evaluate)) = (
+    let (Some(line_samples), Some(assemble), Some(evaluate)) = (
         cache.get_compute_pipeline(pipelines.line_samples_id),
         cache.get_compute_pipeline(pipelines.assemble_id),
-        cache.get_compute_pipeline(pipelines.analytic_id),
         cache.get_compute_pipeline(pipelines.evaluate_id),
     ) else {
         return;
@@ -226,7 +225,6 @@ fn dispatch_eq106(
             inner,
             line_samples,
             assemble,
-            analytic,
             evaluate,
             &render_device,
             &render_queue,
@@ -340,14 +338,6 @@ fn dispatch_eq106(
             pass.set_pipeline(assemble);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups((45 * FREQUENCY_COUNT).div_ceil(64), segment_count, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("eq106_trajectory_analytic_batch"), timestamp_writes: None,
-            });
-            pass.set_pipeline(analytic);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), segment_count, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -480,7 +470,6 @@ fn dispatch_eq106(
         inner,
         line_samples,
         assemble,
-        analytic,
         evaluate,
         &render_device,
         &render_queue,

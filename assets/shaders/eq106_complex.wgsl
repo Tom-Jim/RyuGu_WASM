@@ -735,9 +735,6 @@ fn evaluate_field(
     var derivative_v = vec3<f32>(0.0);
     var imaginary_field = vec3<f32>(0.0);
     var last_order_field = vec3<f32>(0.0);
-    var last_order_derivative_h = vec3<f32>(0.0);
-    var last_order_derivative_u = vec3<f32>(0.0);
-    var last_order_derivative_v = vec3<f32>(0.0);
     var tail_field = vec3<f32>(0.0);
     // A cheap, same-field diagnostic: reconstruct the Taylor polynomial at
     // symmetric transverse offsets and compare its finite difference with the
@@ -917,15 +914,6 @@ fn evaluate_field(
                 }
                 if degree == active_order {
                     last_order_field += reconstructed.xyz * value;
-                    last_order_derivative_h += reconstructed_derivative_h * value;
-                    if a > 0u {
-                        last_order_derivative_u += reconstructed.xyz * f32(a)
-                            * monomial(u, v, a - 1u, b);
-                    }
-                    if b > 0u {
-                        last_order_derivative_v += reconstructed.xyz * f32(b)
-                            * monomial(u, v, a, b - 1u);
-                    }
                 }
             }
         }
@@ -946,28 +934,15 @@ fn evaluate_field(
     let derivative_x = derivative_h * tangent.x + derivative_u * normal.x + derivative_v * binormal.x;
     let derivative_y = derivative_h * tangent.y + derivative_u * normal.y + derivative_v * binormal.y;
     let derivative_z = derivative_h * tangent.z + derivative_u * normal.z + derivative_v * binormal.z;
-    let last_order_derivative_x = last_order_derivative_h * tangent.x
-        + last_order_derivative_u * normal.x + last_order_derivative_v * binormal.x;
-    let last_order_derivative_y = last_order_derivative_h * tangent.y
-        + last_order_derivative_u * normal.y + last_order_derivative_v * binormal.y;
-    let last_order_derivative_z = last_order_derivative_h * tangent.z
-        + last_order_derivative_u * normal.z + last_order_derivative_v * binormal.z;
     let field_scale = max(length(field.xyz), 1.0e-12);
     let field_taylor_residual = length(last_order_field) / field_scale;
-    let gradient_scale = max(sqrt(
-        dot(derivative_x, derivative_x)
-        + dot(derivative_y, derivative_y)
-        + dot(derivative_z, derivative_z)
-    ), 1.0e-12);
-    let gradient_taylor_residual = sqrt(
-        dot(last_order_derivative_x, last_order_derivative_x)
-        + dot(last_order_derivative_y, last_order_derivative_y)
-        + dot(last_order_derivative_z, last_order_derivative_z)
-    ) / gradient_scale;
-    // One certificate gates both the field and its analytic Jacobian. This
-    // prevents a small value tail from hiding a derivative tail amplified by
-    // the Taylor degree.
-    let taylor_residual = max(field_taylor_residual, gradient_taylor_residual);
+    // The highest retained derivative is part of the solution, not the first
+    // omitted term. In particular at A=1,u=v=0 it is usually the dominant
+    // transverse gradient and must not be treated as a unit-sized remainder.
+    // Gradient-tail admission is controlled by the CPU geometric bound
+    // (A+1)*epsilon^A/(1-epsilon)^2; the shader certificate reports only the
+    // observable field tail plus independent spectral diagnostics.
+    let taylor_residual = field_taylor_residual;
     let imaginary_residual = length(imaginary_field) / field_scale;
     let spectral_tail_residual = length(tail_field) / field_scale;
     let transverse_ratio = length(vec2<f32>(u, v)) / max(eq_params.line_limit, 1.0);

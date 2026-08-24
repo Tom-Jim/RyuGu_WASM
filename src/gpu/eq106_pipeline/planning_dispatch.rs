@@ -284,13 +284,11 @@ fn dispatch_planning_eq106(
     }
     let output_size = target_count as u64 * OUTPUT_BYTES;
     let verification_targets = if starting_request {
-        let targets = crate::gpu::planning_reduction::planning_verification_targets(request, batch)
-            .into_iter()
-            .filter(|target| {
-                let candidate = *target / batch.samples_per_candidate;
-                !invalid_candidates.contains(&candidate)
-            })
-            .collect::<Vec<_>>();
+        // Use exactly the same verification population as MMFFT/FMM.  An
+        // Eq.106 rejection is a measured failure, not a reason to shrink the
+        // denominator after seeing the result.
+        let targets =
+            crate::gpu::planning_reduction::planning_verification_targets(request, batch);
         state.active_verification_targets.clone_from(&targets);
         targets
     } else {
@@ -567,6 +565,7 @@ fn dispatch_planning_eq106(
                 }
             }
             let compact_rows = &full_rows[request_candidate_count as usize..];
+            let mut valid_targets = Vec::with_capacity(state_indices.len());
             for (target_index, target_rows) in state_indices.iter().copied().zip(
                 compact_rows
                 .chunks_exact(5)
@@ -584,6 +583,7 @@ fn dispatch_planning_eq106(
                     && certificate[2] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
                     && certificate[3] <= 0.30
                     && target_rows[4][3] <= PLANNING_GRADIENT_ERROR_LIMIT;
+                valid_targets.push(valid);
                 if !valid {
                     let candidate = target_index / samples_per_candidate;
                     if let Some(rejected) = rejected_candidates.get_mut(candidate as usize) {
@@ -598,18 +598,25 @@ fn dispatch_planning_eq106(
                 .chunks_exact(5)
                 .take(state_indices.len())
                 .map(|target_rows| target_rows[4][3])
+                .filter(|error| error.is_finite())
                 .fold(0.0_f32, f32::max);
-            let mut filtered_indices = Vec::with_capacity(state_indices.len());
+            let mut common_indices = Vec::with_capacity(state_indices.len());
             let mut rows = Vec::with_capacity(state_indices.len() * 4);
-            for (target_index, target_rows) in state_indices.iter().copied().zip(
-                compact_rows
-                    .chunks_exact(5)
-                    .take(state_indices.len()),
-            ) {
+            for ((target_index, target_rows), target_valid) in state_indices
+                .iter()
+                .copied()
+                .zip(compact_rows.chunks_exact(5).take(state_indices.len()))
+                .zip(valid_targets)
+            {
                 let candidate = target_index / samples_per_candidate;
-                if !rejected_candidates[candidate as usize] {
-                    filtered_indices.push(target_index);
+                common_indices.push(target_index);
+                if target_valid && !rejected_candidates[candidate as usize] {
                     rows.extend([target_rows[0], target_rows[2], target_rows[3], target_rows[4]]);
+                } else {
+                    // Keep the point and charge the rejected candidate a full
+                    // reference-relative error instead of survivor-biasing
+                    // Eq.106 by silently omitting it.
+                    rows.extend([[0.0; 4]; 4]);
                 }
             }
             drop(view);
@@ -617,7 +624,7 @@ fn dispatch_planning_eq106(
             (
                 rows,
                 candidate_metrics,
-                filtered_indices,
+                common_indices,
                 maximum_gradient_self_fd_relative_error,
             )
         } else {
@@ -689,8 +696,8 @@ fn planning_eq106_stage_budget(compute_benchmark: bool, total_stages: usize) -> 
     if frame_over_budget {
         return 0;
     }
-    // Interactive Stress yields after at most half of the four-stage Eq.106
-    // pipeline so the visible frame can reach the queue between submissions.
+    // Reserved for non-benchmark diagnostic callers. Both user-selectable
+    // planning profiles use the full-stage fairness path above.
     2.min(total_stages.max(1))
 }
 
@@ -699,7 +706,7 @@ mod planning_stage_budget_tests {
     use super::planning_eq106_stage_budget;
 
     #[test]
-    fn first_encodes_every_stage_but_stress_remains_paced() {
+    fn fixed_benchmarks_encode_every_stage_but_interactive_runs_remain_paced() {
         assert_eq!(planning_eq106_stage_budget(true, 4), 4);
         assert!(planning_eq106_stage_budget(false, 4) <= 2);
     }

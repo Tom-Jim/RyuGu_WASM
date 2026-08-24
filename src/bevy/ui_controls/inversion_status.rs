@@ -112,10 +112,11 @@ fn comparison_metric_text(
     let value = match planning.selected_metric {
         ComparisonMetric::GravityRelativeError => {
             format!(
-                "{verification}gravity {:.3e} | valid {}/{} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
+                "{verification}gravity {:.3e} | valid {}/{} | f64 samples {} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
                 result.relative_gravity_error,
                 result.valid_candidate_count,
                 result.workload.candidate_count,
+                result.verification_sample_count,
                 result.common_preparation_ms,
                 result.preprocessing_ms,
                 result.command_submission_ms,

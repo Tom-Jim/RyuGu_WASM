@@ -3,6 +3,7 @@ fn extract_eq106_input(
     source: Extract<Option<Res<AggregatedGravitySource>>>,
     operator_tensor: Extract<Option<Res<Eq106OperatorTensorResource>>>,
     active: Extract<Res<ActiveGravityMethod>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     clock: Extract<Res<SimulationClock>>,
     planner: Extract<Res<CurvedArcPlannerState>>,
     benchmark: Extract<Res<GravityBenchmarkTrajectory>>,
@@ -19,7 +20,8 @@ fn extract_eq106_input(
     // requiring `kernel_ready` here creates a circular wait after switching
     // methods because the switch clears both the orbit history and planner.
     extracted.enabled = **active == ActiveGravityMethod::CurvedArcEq106
-        && planner.mode != crate::cpu::curved_arc::CurvedArcMode::Error;
+        && planner.mode != crate::cpu::curved_arc::CurvedArcMode::Error
+        && !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }
@@ -321,7 +323,6 @@ fn dispatch_eq106_single_target(
     inner: &mut Eq106GpuBuffersInner,
     line_samples: &wgpu29::ComputePipeline,
     assemble: &wgpu29::ComputePipeline,
-    analytic: &wgpu29::ComputePipeline,
     evaluate: &wgpu29::ComputePipeline,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
@@ -439,7 +440,7 @@ fn dispatch_eq106_single_target(
         drop(pass);
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("eq106_assemble_pass"),
-            timestamp_writes: None,
+            timestamp_writes: timestamp_writes(query_set, None, build_end),
         });
         pass.set_pipeline(assemble);
         pass.set_bind_group(0, &inner.bind_group, &[]);
@@ -449,18 +450,9 @@ fn dispatch_eq106_single_target(
             1,
         );
         drop(pass);
-        // Replace the zeroth (on-line) coefficient with Eqs. (47),(68)-(70)
-        // evaluated from the certified complex Psi/Psi_x operator. Higher
-        // coefficients remain the exact local Newton Taylor continuation of
-        // Eq. (118), and vanish at the reference line itself.
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("eq106_analytic_spectrum_pass"),
-            timestamp_writes: timestamp_writes(query_set, None, build_end),
-        });
-        pass.set_pipeline(analytic);
-        pass.set_bind_group(0, &inner.bind_group, &[]);
-        pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), 1, 1);
-        drop(pass);
+        // Coefficient zero and all transverse coefficients come from the same
+        // sampled spectrum. This is intentionally identical to planning and
+        // avoids mixing an analytic c00 with sampled c10/c01 derivatives.
         inner.spectrum_ready = true;
     }
     let (evaluation_begin, evaluation_end) = if query_set.is_some() {

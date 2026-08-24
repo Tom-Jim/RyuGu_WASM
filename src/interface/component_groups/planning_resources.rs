@@ -112,25 +112,27 @@ impl ProbeInitialConditions {
 pub enum PlanningWorkloadProfile {
     #[default]
     First,
-    Stress,
+    InteractiveStress,
 }
 
 impl PlanningWorkloadProfile {
     pub fn is_compute_benchmark(self) -> bool {
-        matches!(self, Self::First)
+        // Both visible workloads use the same fairness contract. "Interactive"
+        // describes the live progress UI, not adaptive benchmark scheduling.
+        matches!(self, Self::First | Self::InteractiveStress)
     }
 
     pub fn dimensions(self) -> (u32, u32, u32) {
         match self {
             Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),
-            Self::Stress => (PLANNING_CANDIDATE_COUNT, 32, 512),
+            Self::InteractiveStress => (PLANNING_CANDIDATE_COUNT, 32, 512),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::First => "First 32x4x241",
-            Self::Stress => "Stress 2048x32x512",
+            Self::InteractiveStress => "Interactive Stress 2048x32x512",
         }
     }
 }
@@ -279,6 +281,8 @@ pub struct PlanningMethodMetrics {
     pub planning_objective: f32,
     pub segment_count: u32,
     pub valid_candidate_count: u32,
+    /// Number of common f64 reference states used in the error denominator.
+    pub verification_sample_count: u64,
     pub cold_amortization_candidates: u32,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
@@ -293,6 +297,8 @@ pub struct PlanningBatchJob {
     pub run_id: u64,
     pub profile: PlanningWorkloadProfile,
     pub method: ActiveGravityMethod,
+    pub method_order: [ActiveGravityMethod; 3],
+    pub method_order_index: usize,
     pub batch_id: u64,
     pub candidate_count: u32,
     pub density_model_count: u32,
@@ -316,6 +322,7 @@ pub struct PlanningBatchJob {
     pub gradient_error_sum: f64,
     pub gradient_reference_sum: f64,
     pub gradient_samples: u64,
+    pub verification_sample_count: u64,
     pub maximum_gradient_self_fd_relative_error: f32,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
@@ -407,6 +414,14 @@ impl Default for PlanningComparisonState {
 }
 
 impl PlanningComparisonState {
+    pub fn blocks_realtime_gpu(&self) -> bool {
+        // Interactive Stress must remain a live application mode: the probe,
+        // Eq.106 residual, and Jacobi histories continue advancing while its
+        // planning batches run. Only the short First benchmark owns the GPU
+        // and physics clock exclusively.
+        self.run_requested && self.workload_profile == PlanningWorkloadProfile::First
+    }
+
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
         let eq106 = self.results[ActiveGravityMethod::CurvedArcEq106.performance_index()]?;
         let mmfft = self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?;
@@ -482,6 +497,17 @@ impl PlanningComparisonState {
                 fmm.valid_candidate_count
             ));
         }
+        if eq106.verification_sample_count == 0
+            || eq106.verification_sample_count != mmfft.verification_sample_count
+            || eq106.verification_sample_count != fmm.verification_sample_count
+        {
+            failures.push(format!(
+                "f64 verification samples differ: Eq.106 {}, FFT-grid {}, treecode {}",
+                eq106.verification_sample_count,
+                mmfft.verification_sample_count,
+                fmm.verification_sample_count
+            ));
+        }
         if !failures.is_empty() {
             return Some(format!("no eligible winner: {}", failures.join("; ")));
         }
@@ -502,5 +528,20 @@ impl PlanningComparisonState {
                 speedup_vs_fft, speedup_vs_tree
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod planning_profile_tests {
+    use super::PlanningWorkloadProfile;
+
+    #[test]
+    fn both_visible_profiles_use_fixed_batch_scheduling() {
+        assert!(PlanningWorkloadProfile::First.is_compute_benchmark());
+        assert!(PlanningWorkloadProfile::InteractiveStress.is_compute_benchmark());
+        assert_eq!(
+            PlanningWorkloadProfile::InteractiveStress.dimensions(),
+            (2_048, 32, 512)
+        );
     }
 }

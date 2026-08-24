@@ -38,7 +38,7 @@ pub fn planning_batch_evaluator_system(
                 finish_planning_method(&job, &batch, packet.backend, &mut planning);
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
-                if job.method == ActiveGravityMethod::Fmm {
+                if job.method_order_index + 1 == job.method_order.len() {
                     planning.run_requested = false;
                     planning.status = format!(
                         "{} GPU batch complete: all methods used the identical frozen 15 m tube and density matrix.",
@@ -62,8 +62,9 @@ pub fn planning_batch_evaluator_system(
     }
     if rendering_needs_priority() {
         if job.profile.is_compute_benchmark() {
-            // First is the fixed compute benchmark. Its timing must not include
-            // render-priority gaps; Stress remains paced below.
+            // Fair benchmark timing must not include method-dependent
+            // render-priority gaps. The progress UI remains responsive because
+            // GPU submissions and readbacks are asynchronous.
         } else {
             planning.status = format!(
                 "{} planning yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
@@ -151,6 +152,9 @@ fn reduce_planning_packet(
 ) {
     let reduction_started = bevy::platform::time::Instant::now();
     let mut verification_ms = 0.0;
+    job.verification_sample_count = job
+        .verification_sample_count
+        .saturating_add(packet.state_indices.len() as u64);
     job.maximum_gradient_self_fd_relative_error = job
         .maximum_gradient_self_fd_relative_error
         .max(packet.timing.gradient_self_fd_relative_error);
@@ -517,6 +521,7 @@ fn finish_planning_method(
             0
         },
         valid_candidate_count: job.candidate_valid.iter().filter(|valid| **valid).count() as u32,
+        verification_sample_count: job.verification_sample_count,
         cold_amortization_candidates,
         dispatch_count: job.dispatch_count,
         forward_kernel_evaluations: job.forward_kernel_evaluations,
@@ -547,19 +552,14 @@ fn finish_planning_method(
         maximum_tile = job.maximum_tile_size_used,
         "planning method complete"
     );
-    if job.method == ActiveGravityMethod::Fmm
-        && let Some(verdict) = planning.fair_verdict()
-    {
+    if let Some(verdict) = planning.fair_verdict() {
         info!(target: "planning::benchmark", %verdict, "planning fairness verdict");
     }
 }
 
 fn advance_planning_method(job: &mut PlanningBatchJob) {
-    job.method = match job.method {
-        ActiveGravityMethod::CurvedArcEq106 => ActiveGravityMethod::MmfftCompressed,
-        ActiveGravityMethod::MmfftCompressed => ActiveGravityMethod::Fmm,
-        _ => ActiveGravityMethod::Fmm,
-    };
+    job.method_order_index += 1;
+    job.method = job.method_order[job.method_order_index];
     job.density_model = 0;
     job.candidate_start = 0;
     job.candidate_tile_size = if job.profile.is_compute_benchmark() {
@@ -580,6 +580,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.gradient_error_sum = 0.0;
     job.gradient_reference_sum = 0.0;
     job.gradient_samples = 0;
+    job.verification_sample_count = 0;
     job.maximum_gradient_self_fd_relative_error = 0.0;
     job.pericenter_error_m = 0.0;
     job.minimum_altitude_m = f32::INFINITY;

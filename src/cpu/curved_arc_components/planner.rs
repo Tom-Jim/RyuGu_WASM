@@ -13,6 +13,7 @@ const PLANNING_WINDOW_POINTS: usize = 128;
 const MIN_SEGMENT_POINTS: usize = 4;
 const EPSILON_TARGET: f64 = 0.20;
 const TAYLOR_REMAINDER_TARGET: f64 = 1.0e-3;
+const TAYLOR_GRADIENT_REMAINDER_TARGET: f64 = 4.0e-2;
 // The production GPU evaluator caches the complete two-dimensional basis
 // through P=4, giving J=(P+1)(P+2)/2=15 coefficient spectra per segment.
 const MAX_TAYLOR_ORDER: u32 = 4;
@@ -210,6 +211,10 @@ pub struct CurvedArcPlannerState {
     pub active_segment: Option<CurvedArcSegment>,
     pub taylor_order: u32,
     pub kernel_status: Eq106KernelStatus,
+    /// Last structured GPU certificate rejection, shown even before the first
+    /// accepted history sample so bootstrap failures are not a black box.
+    pub reject_status: Option<String>,
+    pub consecutive_rejections: u32,
 }
 
 impl CurvedArcPlannerState {
@@ -467,7 +472,10 @@ pub fn monitor_curved_arc_system(
     if points.len() < MIN_SEGMENT_POINTS {
         planner.mode = CurvedArcMode::NonPeriodic;
         planner.kernel_ready = planner.kernel_status == Eq106KernelStatus::Ready;
-        planner.taylor_order = 1;
+        // Bootstrap cannot infer curvature from one to three points. Build the
+        // complete available jet so the first accepted GPU sample can advance
+        // the orbit and populate the geometry window.
+        planner.taylor_order = MAX_TAYLOR_ORDER;
         planner.epsilon_max = Some(0.0);
         return;
     }
@@ -634,7 +642,12 @@ fn evaluate_segment(
 
     let taylor_order = select_taylor_order(epsilon_max);
     let remainder_bound = taylor_order
-        .and_then(|order| taylor_remainder_bound(epsilon_max, order))
+        .and_then(|order| {
+            taylor_remainder_bound(epsilon_max, order).zip(
+                taylor_gradient_remainder_bound(epsilon_max, order),
+            )
+        })
+        .map(|(field, gradient)| field.max(gradient))
         .unwrap_or(f64::INFINITY);
 
     CurvedArcSegment {
@@ -661,5 +674,7 @@ fn select_taylor_order(epsilon_max: f64) -> Option<u32> {
     (1u32..=MAX_TAYLOR_ORDER).find(|&order| {
         taylor_remainder_bound(epsilon_max, order)
             .is_some_and(|bound| bound <= TAYLOR_REMAINDER_TARGET)
+            && taylor_gradient_remainder_bound(epsilon_max, order)
+                .is_some_and(|bound| bound <= TAYLOR_GRADIENT_REMAINDER_TARGET)
     })
 }

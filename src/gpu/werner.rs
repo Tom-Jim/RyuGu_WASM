@@ -51,6 +51,7 @@ struct WernerSource {
 
 #[derive(Resource, Default)]
 struct ExtractedWernerInput {
+    enabled: bool,
     probe: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
     edge_bytes: Option<Vec<u8>>,
@@ -272,9 +273,14 @@ fn extract_werner_input_system(
     mut extracted: ResMut<ExtractedWernerInput>,
     source: Extract<Option<Res<WernerSource>>>,
     clock: Extract<Res<SimulationClock>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
+    extracted.enabled = !planning.blocks_realtime_gpu();
+    if !extracted.enabled {
+        return;
+    }
     let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
@@ -314,6 +320,9 @@ fn dispatch_werner_system(
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
         return;
     };
+    if !extracted.enabled {
+        return;
+    }
     let item_count = extracted.edge_count.max(extracted.face_count);
     if item_count == 0 {
         return;

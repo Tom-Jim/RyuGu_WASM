@@ -372,11 +372,12 @@ fn extract_fmm_input(
     mut extracted: ResMut<ExtractedFmmInput>,
     source: Extract<Option<Res<FmmSource>>>,
     active: Extract<Res<ActiveGravityMethod>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     clock: Extract<Res<SimulationClock>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    extracted.enabled = **active == ActiveGravityMethod::Fmm;
+    extracted.enabled = **active == ActiveGravityMethod::Fmm && !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }

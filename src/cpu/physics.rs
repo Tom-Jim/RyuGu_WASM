@@ -222,9 +222,12 @@ pub fn physics_system(
     mut inversion: ResMut<TrajectoryInversionState>,
     time: Res<Time<Fixed>>,
     active_method: Res<ActiveGravityMethod>,
-    simulation_acceleration: Res<SimulationAcceleration>,
+    (simulation_acceleration, planning): (
+        Res<SimulationAcceleration>,
+        Res<PlanningComparisonState>,
+    ),
 ) {
-    if runtime_error.is_active() {
+    if runtime_error.is_active() || planning.blocks_realtime_gpu() {
         return;
     }
     let Some(ryugu_transform) = ryugu_query.iter().next() else {

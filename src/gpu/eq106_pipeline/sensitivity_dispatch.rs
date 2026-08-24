@@ -2,7 +2,6 @@ fn dispatch_eq106_sensitivity_matrix(
     inner: &mut Eq106GpuBuffersInner,
     line_samples_pipeline: &wgpu29::ComputePipeline,
     assemble_pipeline: &wgpu29::ComputePipeline,
-    analytic_pipeline: &wgpu29::ComputePipeline,
     evaluate_pipeline: &wgpu29::ComputePipeline,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
@@ -170,15 +169,6 @@ fn dispatch_eq106_sensitivity_matrix(
                     1,
                     1,
                 );
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("eq106_sensitivity_analytic_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(analytic_pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), 1, 1);
             }
             spectrum_encoding_ms += spectrum_encoding_started.elapsed().as_secs_f64() * 1.0e3;
             let evaluation_encoding_started = Instant::now();

@@ -80,6 +80,10 @@ fn update_performance_chart_segments(
         };
         let delta = Vec2::new(x1 - x0, y1 - y0);
         let length = delta.length();
+        if !delta.is_finite() || !length.is_finite() {
+            node.display = Display::None;
+            continue;
+        }
         node.display = Display::Flex;
         node.left = px((x0 + x1) * 0.5 - length * 0.5);
         node.top = px((y0 + y1) * 0.5 - 1.0);

@@ -154,13 +154,15 @@ pub fn setup_density_inversion_timing_panel(
                     ..default()
                 })
                 .with_children(|row| {
-                    for profile in [PlanningWorkloadProfile::First, PlanningWorkloadProfile::Stress]
-                    {
+                    for profile in [
+                        PlanningWorkloadProfile::First,
+                        PlanningWorkloadProfile::InteractiveStress,
+                    ] {
                         row.spawn((
                             selection_button(
                                 profile.label(),
                                 profile == planning.workload_profile,
-                                200.0,
+                                205.0,
                             ),
                             PlanningWorkloadButton(profile),
                         ));
@@ -409,10 +411,13 @@ pub fn update_planning_results_from_inversion_system(
     commands.insert_resource(batch);
     commands.insert_resource(PlanningGpuRequest::default());
     commands.insert_resource(PlanningMethodPayload::default());
+    let method_order = planning_method_order(planning.run_id);
     planning.batch_job = Some(PlanningBatchJob {
         run_id: planning.run_id,
         profile: planning.workload_profile,
-        method: ActiveGravityMethod::CurvedArcEq106,
+        method: method_order[0],
+        method_order,
+        method_order_index: 0,
         batch_id,
         candidate_count: dimensions.0,
         density_model_count: dimensions.1,
@@ -438,6 +443,7 @@ pub fn update_planning_results_from_inversion_system(
         gradient_error_sum: 0.0,
         gradient_reference_sum: 0.0,
         gradient_samples: 0,
+        verification_sample_count: 0,
         maximum_gradient_self_fd_relative_error: 0.0,
         pericenter_error_m: 0.0,
         minimum_altitude_m: f32::INFINITY,
@@ -462,10 +468,45 @@ pub fn update_planning_results_from_inversion_system(
         spectral_element_count: 0,
     });
     planning.status = format!(
-        "{} batch planning started: 0/{} evaluations, Eq.106.",
+        "{} batch planning started: 0/{} evaluations, order {} -> {} -> {}.",
         planning.workload_profile.label(),
-        planning.batch_job.as_ref().map_or(0, |job| job.total_evaluations)
+        planning.batch_job.as_ref().map_or(0, |job| job.total_evaluations),
+        method_order[0].planning_label(),
+        method_order[1].planning_label(),
+        method_order[2].planning_label(),
     );
+}
+
+fn planning_method_order(_run_id: u64) -> [ActiveGravityMethod; 3] {
+    // A visible benchmark always begins with Eq.106. This keeps First and
+    // Interactive Stress predictable and prevents a new run from apparently
+    // starting at the third method merely because its run id changed.
+    [
+        ActiveGravityMethod::CurvedArcEq106,
+        ActiveGravityMethod::MmfftCompressed,
+        ActiveGravityMethod::Fmm,
+    ]
+}
+
+#[cfg(test)]
+mod planning_method_order_tests {
+    use super::planning_method_order;
+    use crate::interface::components::ActiveGravityMethod;
+
+    #[test]
+    fn every_run_starts_with_eq106_and_uses_the_same_order() {
+        let first = planning_method_order(0);
+        let second = planning_method_order(1);
+        let third = planning_method_order(2);
+        assert_eq!(first[0], ActiveGravityMethod::CurvedArcEq106);
+        assert_eq!(second, first);
+        assert_eq!(third, first);
+        for order in [first, second, third] {
+            assert!(order.contains(&ActiveGravityMethod::CurvedArcEq106));
+            assert!(order.contains(&ActiveGravityMethod::MmfftCompressed));
+            assert!(order.contains(&ActiveGravityMethod::Fmm));
+        }
+    }
 }
 
 #[derive(Component)]

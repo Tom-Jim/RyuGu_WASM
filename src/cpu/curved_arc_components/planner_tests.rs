@@ -8,6 +8,20 @@ fn taylor_remainder_bound(epsilon_max: f64, taylor_order: u32) -> Option<f64> {
     bound.is_finite().then_some(bound)
 }
 
+fn taylor_gradient_remainder_bound(
+    epsilon_max: f64,
+    taylor_order: u32,
+) -> Option<f64> {
+    if !epsilon_max.is_finite() || epsilon_max >= 1.0 {
+        return None;
+    }
+    let denominator = (1.0 - epsilon_max).max(f64::EPSILON).powi(2);
+    let bound = f64::from(taylor_order + 1)
+        * epsilon_max.powi(taylor_order as i32)
+        / denominator;
+    bound.is_finite().then_some(bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +52,10 @@ mod tests {
         assert!(select_taylor_order(0.1).is_some_and(|order| order >= 2));
         assert!(select_taylor_order(0.7).is_none());
         assert!(taylor_remainder_bound(0.2, 4).is_some_and(|value| value < 1.0e-3));
+        assert!(
+            taylor_gradient_remainder_bound(0.2, 4)
+                .is_some_and(|value| value < TAYLOR_GRADIENT_REMAINDER_TARGET)
+        );
         assert!(taylor_remainder_bound(1.0, 2).is_none());
     }
 

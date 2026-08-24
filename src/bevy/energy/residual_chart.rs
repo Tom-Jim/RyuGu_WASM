@@ -111,6 +111,10 @@ pub fn update_jacobi_chart_system(
 
         let delta = to - from;
         let length = delta.length();
+        if !delta.is_finite() || !length.is_finite() {
+            node.display = Display::None;
+            continue;
+        }
         let midpoint = (from + to) * 0.5;
         node.display = Display::Flex;
         node.left = px(midpoint.x - length * 0.5);
@@ -207,11 +211,14 @@ pub fn update_eq106_residual_chart_system(
         for (label, mut text) in &mut labels {
             **text = match label {
                 Eq106ResidualChartLabel::Current => "|epsilon_106| = --".to_owned(),
-                Eq106ResidualChartLabel::Status => format!(
-                    "{} | segments: {}",
-                    planner.mode.as_str(),
-                    planner.segments.len(),
-                ),
+                Eq106ResidualChartLabel::Status => planner.reject_status.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} | A{} | segments: {}",
+                        planner.mode.as_str(),
+                        planner.taylor_order,
+                        planner.segments.len(),
+                    )
+                }),
                 Eq106ResidualChartLabel::TimeStart => "0 s".to_owned(),
                 _ => "--".to_owned(),
             };
@@ -244,7 +251,9 @@ pub fn update_eq106_residual_chart_system(
     let time_end = samples
         .last()
         .map_or(time_start + 1.0, |sample| sample.simulation_time_seconds)
-        .max(time_start + f64::EPSILON);
+        // `time_start + f64::EPSILON` can round straight back to time_start
+        // once the clock is above one second, producing 0/0 chart points.
+        .max(time_start + 1.0e-6);
     let time_span = time_end - time_start;
     let point_for = |sample: crate::cpu::curved_arc::CurvedArcResidualSample| {
         let x = ((sample.simulation_time_seconds - time_start) / time_span).clamp(0.0, 1.0) as f32
@@ -265,6 +274,10 @@ pub fn update_eq106_residual_chart_system(
         };
         let delta = to - from;
         let length = delta.length();
+        if !delta.is_finite() || !length.is_finite() {
+            node.display = Display::None;
+            continue;
+        }
         let midpoint = (from + to) * 0.5;
         node.display = Display::Flex;
         node.left = px(midpoint.x - length * 0.5);
