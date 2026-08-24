@@ -235,8 +235,13 @@ fn comparison_metric_text(
                     }
                 };
                 format!(
-                    "{verification}Eq.106 {:.2} ms | {} | {} | requests {}/{}/{} | dispatch {}/{}/{}",
+                    "{verification}Eq.106 raw {:.2} ms, certified est. {:.2} ms | warm raw/cert {:.2}/{:.2} ms | build est. {:.2} ms | hot {:.1} ns/target | {} | {} | requests {}/{}/{} | dispatch {}/{}/{}",
                     eq106.total_ms,
+                    eq106.certified_estimated_total_ms,
+                    eq106.warm_evaluation_ms,
+                    eq106.certified_warm_evaluation_ms,
+                    eq106.build_ms,
+                    eq106.hot_query_ns_per_target,
                     relation("FFT", mmfft.total_ms),
                     relation("tree", fmm.total_ms),
                     eq106.gpu_request_count,
@@ -248,8 +253,10 @@ fn comparison_metric_text(
                 )
             } else {
                 format!(
-                    "{verification}completed | {:.2} ms | requests {} | dispatch {} | {}",
+                    "{verification}completed | {:.2} ms | build est. {:.2} ms | hot {:.1} ns/target | requests {} | dispatch {} | {}",
                     result.total_ms,
+                    result.build_ms,
+                    result.hot_query_ns_per_target,
                     result.gpu_request_count,
                     result.dispatch_count,
                     result.method.planning_label(),
@@ -260,10 +267,26 @@ fn comparison_metric_text(
             if result.warm_evaluation_ms <= 0.0 {
                 return format!("{marker}{name:<12} N/A (cold/warm GPU timing pending)");
             }
-            format!(
-                "{verification}{} candidate-equivalents (diagnostic, run B={})",
-                result.cold_amortization_candidates, result.workload.candidate_count
-            )
+            if planning.completed_workload().is_some() && index == 2 {
+                let tree = planning.results[4].expect("completed tree timing");
+                let denominator = tree.hot_query_ns_per_target - result.hot_query_ns_per_target;
+                let break_even = if denominator > 0.0 {
+                    ((result.build_ms - tree.build_ms) * 1.0e6 / denominator).max(0.0)
+                } else {
+                    f64::INFINITY
+                };
+                format!(
+                    "{verification}build est. {:.2} ms, hot {:.1} ns/target | Eq/tree break-even Q={:.3e}",
+                    result.build_ms, result.hot_query_ns_per_target, break_even
+                )
+            } else {
+                format!(
+                    "{verification}build est. {:.2} ms | hot {:.1} ns/target | {} candidate-equivalents",
+                    result.build_ms,
+                    result.hot_query_ns_per_target,
+                    result.cold_amortization_candidates,
+                )
+            }
         }
         ComparisonMetric::SegmentCount => "not applicable (no Eq.106 spectral segments)".into(),
         ComparisonMetric::DensityFit | ComparisonMetric::InversionTime => unreachable!(),

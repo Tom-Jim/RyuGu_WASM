@@ -1,4 +1,10 @@
 use bevy::math::{DMat3, DQuat, DVec3};
+use std::collections::HashMap;
+
+#[derive(Default)]
+pub(crate) struct PlanningReferenceCache {
+    fields: HashMap<(u64, u64, u32, [u32; 3]), (DVec3, DMat3)>,
+}
 
 pub fn planning_batch_evaluator_system(
     batch: Res<PlanningCandidateBatch>,
@@ -7,6 +13,7 @@ pub fn planning_batch_evaluator_system(
     mut gpu_result: ResMut<PlanningGpuResult>,
     mut planning: ResMut<PlanningComparisonState>,
     mut mmfft_workspace: Local<crate::gpu::mmfft::PlanningMmfftWorkspace>,
+    mut reference_cache: Local<PlanningReferenceCache>,
 ) {
     let Some(mut job) = planning.batch_job.take() else {
         return;
@@ -32,9 +39,34 @@ pub fn planning_batch_evaluator_system(
             && packet.request.warm_repetition == job.warm_repetition
         {
             if job.warm_repetition {
-                job.warm_evaluation_ms = packet.timing.method_preprocess_ms
+                let repetition_ms = packet.timing.method_preprocess_ms
                     + packet.timing.command_submission_ms
                     + packet.timing.gpu_completion_map_ms;
+                if job.method == ActiveGravityMethod::CurvedArcEq106
+                    && !job.certified_repetition
+                {
+                    job.warm_evaluation_ms = repetition_ms;
+                    job.certified_repetition = true;
+                    job.awaiting_gpu = false;
+                    planning.status = "Eq.106 raw tile complete; measuring certified overhead.".into();
+                    planning.batch_job = Some(job);
+                    return;
+                }
+                if job.method == ActiveGravityMethod::CurvedArcEq106 {
+                    job.certified_warm_evaluation_ms = repetition_ms;
+                    for (maximum, value) in job
+                        .self_fd_step_maxima
+                        .iter_mut()
+                        .zip(packet.self_fd_step_maxima)
+                    {
+                        if value.is_finite() {
+                            *maximum = maximum.max(value);
+                        }
+                    }
+                } else {
+                    job.warm_evaluation_ms = repetition_ms;
+                    job.certified_warm_evaluation_ms = repetition_ms;
+                }
                 finish_planning_method(&job, &batch, packet.backend, &mut planning);
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
@@ -46,13 +78,26 @@ pub fn planning_batch_evaluator_system(
                         let source_count = planning.requested_source_count;
                         planning.source_curve_samples.push(PlanningSourceCurveSample {
                             source_count,
-                            times_ms: [eq106.total_ms, mmfft.total_ms, fmm.total_ms],
+                            times_ms: [
+                                eq106.total_ms,
+                                eq106.certified_estimated_total_ms,
+                                mmfft.total_ms,
+                                fmm.total_ms,
+                            ],
+                            build_ms: [eq106.build_ms, mmfft.build_ms, fmm.build_ms],
+                            query_ns_per_target: [
+                                eq106.hot_query_ns_per_target,
+                                mmfft.hot_query_ns_per_target,
+                                fmm.hot_query_ns_per_target,
+                            ],
                             eligible: [
+                                eq106.accuracy_eligible(),
                                 eq106.accuracy_eligible(),
                                 mmfft.accuracy_eligible(),
                                 fmm.accuracy_eligible(),
                             ],
                         });
+                        persist_source_curve(&planning.source_curve_samples);
                         planning.source_curve_repeat += 1;
                         if planning.source_curve_repeat >= PLANNING_SOURCE_REPEATS {
                             planning.source_curve_repeat = 0;
@@ -87,7 +132,7 @@ pub fn planning_batch_evaluator_system(
                 }
                 advance_planning_method(&mut job);
             } else {
-                reduce_planning_packet(&mut job, &batch, &packet);
+                reduce_planning_packet(&mut job, &batch, &packet, &mut reference_cache);
                 adapt_candidate_tile(&mut job, &packet);
                 advance_planning_tile(&mut job, packet.request.candidate_count);
             }
@@ -177,6 +222,8 @@ pub fn planning_batch_evaluator_system(
         candidate_start: job.candidate_start,
         candidate_count: request_candidate_count,
         warm_repetition: job.warm_repetition,
+        eq106_certified: job.method == ActiveGravityMethod::CurvedArcEq106
+            && job.certified_repetition,
         compute_benchmark: job.profile.is_compute_benchmark(),
     };
     job.awaiting_gpu = true;
@@ -188,9 +235,15 @@ fn reduce_planning_packet(
     job: &mut PlanningBatchJob,
     batch: &PlanningCandidateBatch,
     packet: &PlanningGpuPacket,
+    reference_cache: &mut PlanningReferenceCache,
 ) {
     let reduction_started = bevy::platform::time::Instant::now();
     let mut verification_ms = 0.0;
+    if packet.request.candidate_start == 0 {
+        job.first_tile_ms += packet.timing.method_preprocess_ms
+            + packet.timing.command_submission_ms
+            + packet.timing.gpu_completion_map_ms;
+    }
     job.verification_sample_count = job
         .verification_sample_count
         .saturating_add(packet.state_indices.len() as u64);
@@ -326,10 +379,11 @@ fn reduce_planning_packet(
             ),
         );
         let verification_started = bevy::platform::time::Instant::now();
-        let (reference_field, reference_gradient) = direct_planning_reference(
+        let (reference_field, reference_gradient) = direct_planning_reference_cached(
             state.body_position().as_dvec3(),
             batch,
             packet.request.density_model,
+            reference_cache,
         );
         verification_ms += verification_started.elapsed().as_secs_f64() * 1.0e3;
         if !method_field.is_finite()
@@ -393,16 +447,30 @@ fn reduce_planning_packet(
     job.reduction_ms += (total_reduction_ms - verification_ms).max(0.0);
 }
 
-fn direct_planning_reference(
+fn direct_planning_reference_cached(
     target: DVec3,
     batch: &PlanningCandidateBatch,
     density_model: u32,
+    cache: &mut PlanningReferenceCache,
 ) -> (DVec3, DMat3) {
+    let key = (
+        batch.basis_hash,
+        batch.density_model_hash,
+        density_model,
+        [
+            (target.x as f32).to_bits(),
+            (target.y as f32).to_bits(),
+            (target.z as f32).to_bits(),
+        ],
+    );
+    if let Some(reference) = cache.fields.get(&key) {
+        return *reference;
+    }
     let row_start = density_model as usize * 56;
     let densities = &batch.density_models[row_start..row_start + 56];
     let mut acceleration = DVec3::ZERO;
     let mut gradient = DMat3::ZERO;
-    for source in batch.reference_basis_records.iter() {
+    for source in batch.basis_records.iter() {
         let position = DVec3::new(
             f64::from(source.position_volume[0]),
             f64::from(source.position_volume[1]),
@@ -425,7 +493,9 @@ fn direct_planning_reference(
             * (-DMat3::IDENTITY * inverse_radius3
                 + outer * (3.0 * inverse_radius3 / radius2));
     }
-    (acceleration, gradient)
+    let reference = (acceleration, gradient);
+    cache.fields.insert(key, reference);
+    reference
 }
 
 fn matrix_norm_squared(matrix: DMat3) -> f64 {
@@ -492,6 +562,7 @@ fn advance_planning_tile(job: &mut PlanningBatchJob, completed_candidates: u32) 
         .candidate_count
         .saturating_sub(job.candidate_tile_size.min(job.candidate_count));
     job.warm_repetition = true;
+    job.certified_repetition = false;
 }
 
 fn top_candidate_scores(
@@ -571,6 +642,21 @@ fn finish_planning_method(
         job.warm_evaluation_ms / f64::from(job.last_request_candidate_count.max(1));
     let cold_amortization_candidates =
         (job.preprocessing_ms / warm_per_candidate.max(f64::MIN_POSITIVE)).ceil() as u32;
+    let warm_target_count = f64::from(job.last_request_candidate_count.max(1))
+        * f64::from(job.samples_per_candidate.max(1));
+    let hot_query_ns_per_target = job.warm_evaluation_ms / warm_target_count * 1.0e6;
+    let gpu_build_ms = (job.first_tile_ms
+        - job.warm_evaluation_ms * f64::from(job.density_model_count))
+    .max(0.0);
+    let build_ms = job.preprocessing_ms + gpu_build_ms;
+    let certified_overhead_per_target =
+        (job.certified_warm_evaluation_ms - job.warm_evaluation_ms).max(0.0)
+            / warm_target_count;
+    let certified_estimated_total_ms =
+        total_ms + certified_overhead_per_target * job.total_evaluations as f64;
+    let raw_gpu_request_count = job.gpu_request_count.saturating_sub(u32::from(
+        job.method == ActiveGravityMethod::CurvedArcEq106,
+    ));
     let verified = gravity_error.is_finite()
         && gradient_error.is_finite()
         && job.pericenter_error_m.is_finite()
@@ -603,6 +689,10 @@ fn finish_planning_method(
         verification_ms: job.verification_ms,
         gpu_completion_map_ms: job.gpu_completion_map_ms,
         warm_evaluation_ms: job.warm_evaluation_ms,
+        certified_warm_evaluation_ms: job.certified_warm_evaluation_ms,
+        certified_estimated_total_ms,
+        build_ms,
+        hot_query_ns_per_target,
         total_ms,
         relative_gravity_error: gravity_error,
         gradient_relative_error: gradient_error,
@@ -627,7 +717,10 @@ fn finish_planning_method(
         dispatch_count: job.dispatch_count,
         forward_kernel_evaluations: job.forward_kernel_evaluations,
         density_combinations: job.total_evaluations,
-        gpu_request_count: job.gpu_request_count,
+        // Eq.106 performs one additional certified probe after the same raw
+        // warm request used by every method. Keep that diagnostic request out
+        // of the raw fairness count reported here.
+        gpu_request_count: raw_gpu_request_count,
         minimum_tile_candidates: job.minimum_tile_size_used.min(job.maximum_tile_size_used),
         maximum_tile_candidates: job.maximum_tile_size_used,
         top_candidates,
@@ -643,11 +736,14 @@ fn finish_planning_method(
         reduction_ms = job.reduction_ms,
         verification_ms = job.verification_ms,
         warm_evaluation_ms = job.warm_evaluation_ms,
+        certified_warm_evaluation_ms = job.certified_warm_evaluation_ms,
+        certified_estimated_total_ms,
         gravity_error,
         gradient_error,
         gradient_self_fd_error = job.maximum_gradient_self_fd_relative_error,
         valid_candidates = job.candidate_valid.iter().filter(|valid| **valid).count(),
-        gpu_requests = job.gpu_request_count,
+        gpu_requests = raw_gpu_request_count,
+        certified_probe_requests = u32::from(job.method == ActiveGravityMethod::CurvedArcEq106),
         dispatch_count = job.dispatch_count,
         minimum_tile = job.minimum_tile_size_used.min(job.maximum_tile_size_used),
         maximum_tile = job.maximum_tile_size_used,
@@ -675,6 +771,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.last_request_candidate_count = 0;
     job.awaiting_gpu = false;
     job.warm_repetition = false;
+    job.certified_repetition = false;
     job.gravity_error_sum = 0.0;
     job.gravity_reference_sum = 0.0;
     job.gravity_samples = 0;
@@ -706,6 +803,8 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.verification_ms = 0.0;
     job.gpu_completion_map_ms = 0.0;
     job.warm_evaluation_ms = 0.0;
+    job.certified_warm_evaluation_ms = 0.0;
+    job.first_tile_ms = 0.0;
     job.dispatch_count = 0;
     job.forward_kernel_evaluations = 0;
     job.spectral_element_count = 0;

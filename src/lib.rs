@@ -35,15 +35,16 @@ use bevy_app::{
         probe_orbit_preset_style_system, probe_orbit_preset_system, probe_slider_system,
         probe_slider_visual_system, reset_after_probe_crash_scene_system,
         reset_after_probe_crash_state_system, reset_inversion_on_method_change,
-        runtime_error_overlay_system, runtime_error_reset_system, section_toggle_system,
-        setup_density_inversion_timing_panel, setup_fps_ui, setup_performance_chart_segments,
-        setup_performance_controls, setup_probe_controls, setup_probe_crash_overlay,
-        setup_runtime_error_overlay, setup_simulation_acceleration_control,
-        setup_trajectory_inversion_controls, simulation_acceleration_slider_system,
-        simulation_acceleration_slider_visual_system, source_scale_curve_ui_system,
-        trajectory_inversion_input_system, trajectory_inversion_ui_system,
-        update_gpu_memory_estimate_system, update_hint_on_mode_change,
-        update_planning_results_from_inversion_system, update_ui_scale_system,
+        restore_source_curve_system, runtime_error_overlay_system, runtime_error_reset_system,
+        section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
+        setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
+        setup_probe_crash_overlay, setup_runtime_error_overlay,
+        setup_simulation_acceleration_control, setup_trajectory_inversion_controls,
+        simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
+        source_scale_curve_ui_system, trajectory_inversion_input_system,
+        trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
+        update_hint_on_mode_change, update_planning_results_from_inversion_system,
+        update_ui_scale_system,
     },
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -349,6 +350,7 @@ pub fn main() {
             setup_trajectory_inversion_controls,
             setup_density_inversion_timing_panel,
             setup_performance_chart_segments,
+            restore_source_curve_system,
         )
             .chain(),
     )

@@ -36,6 +36,106 @@ fn selection_button(label: &str, selected: bool, width: f32) -> impl Bundle {
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+export function savePlanningCurve(text) {
+  if (text) localStorage.setItem('ryugu-source-curve-v2', text);
+  else localStorage.removeItem('ryugu-source-curve-v2');
+}
+export function loadPlanningCurve() {
+  return localStorage.getItem('ryugu-source-curve-v2') || '';
+}
+export function downloadPlanningCurve(name, text, mime) {
+  const url = URL.createObjectURL(new Blob([text], {type: mime}));
+  const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = name; anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+")]
+unsafe extern "C" {
+    #[wasm_bindgen(js_name = savePlanningCurve)]
+    fn save_planning_curve(text: &str);
+    #[wasm_bindgen(js_name = loadPlanningCurve)]
+    fn load_planning_curve() -> String;
+    #[wasm_bindgen(js_name = downloadPlanningCurve)]
+    fn download_planning_curve(name: &str, text: &str, mime: &str);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn source_curve_csv(samples: &[PlanningSourceCurveSample]) -> String {
+    let mut text = String::from(
+        "source_count,eq106_raw_ms,eq106_certified_ms,fft_ms,tree_ms,eq_build_ms,fft_build_ms,tree_build_ms,eq_query_ns,fft_query_ns,tree_query_ns,eq_raw_eligible,eq_cert_eligible,fft_eligible,tree_eligible\n",
+    );
+    for sample in samples {
+        text.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            sample.source_count,
+            sample.times_ms[0], sample.times_ms[1], sample.times_ms[2], sample.times_ms[3],
+            sample.build_ms[0], sample.build_ms[1], sample.build_ms[2],
+            sample.query_ns_per_target[0], sample.query_ns_per_target[1], sample.query_ns_per_target[2],
+            sample.eligible[0], sample.eligible[1], sample.eligible[2], sample.eligible[3],
+        ));
+    }
+    text
+}
+
+#[cfg(target_arch = "wasm32")]
+fn source_curve_json(samples: &[PlanningSourceCurveSample]) -> String {
+    let rows = samples
+        .iter()
+        .map(|sample| format!(
+            "{{\"source_count\":{},\"times_ms\":{:?},\"build_ms\":{:?},\"query_ns_per_target\":{:?},\"eligible\":{:?}}}",
+            sample.source_count, sample.times_ms, sample.build_ms,
+            sample.query_ns_per_target, sample.eligible,
+        ))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"schema\":2,\"samples\":[{rows}]}}")
+}
+
+pub(crate) fn persist_source_curve(samples: &[PlanningSourceCurveSample]) {
+    #[cfg(target_arch = "wasm32")]
+    save_planning_curve(&source_curve_csv(samples));
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = samples;
+}
+
+pub fn restore_source_curve_system(mut planning: ResMut<PlanningComparisonState>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let restored = load_planning_curve();
+        let mut samples = Vec::new();
+        for line in restored.lines().skip(1) {
+            let fields = line.split(',').collect::<Vec<_>>();
+            if fields.len() != 15 {
+                continue;
+            }
+            let number = |index: usize| fields[index].parse::<f64>().ok();
+            let boolean = |index: usize| fields[index].parse::<bool>().ok();
+            let Some(source_count) = fields[0].parse::<u32>().ok() else {
+                continue;
+            };
+            let Some(sample) = (|| Some(PlanningSourceCurveSample {
+                source_count,
+                times_ms: [number(1)?, number(2)?, number(3)?, number(4)?],
+                build_ms: [number(5)?, number(6)?, number(7)?],
+                query_ns_per_target: [number(8)?, number(9)?, number(10)?],
+                eligible: [boolean(11)?, boolean(12)?, boolean(13)?, boolean(14)?],
+            }))() else {
+                continue;
+            };
+            samples.push(sample);
+        }
+        if !samples.is_empty() {
+            planning.source_curve_samples = samples;
+            planning.source_curve_visible = true;
+            planning.status = "Restored incremental source-crossover results.".into();
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = &mut planning;
+}
+
 pub(crate) fn probe_orbit_preset_button(
     preset: ProbeOrbitPreset,
     current: ProbeOrbitPreset,
@@ -233,10 +333,24 @@ pub fn setup_density_inversion_timing_panel(
                 ))
                 .with_children(|card| {
                     card.spawn((
-                        Text::new("Source-count crossover — median of 10 rotated-order runs"),
+                        Text::new("Real spatial source crossover — incremental 10-run statistics"),
                         TextFont { font_size: bevy::text::FontSize::Px(18.0), ..default() },
                         TextColor(Color::srgb(0.88, 0.98, 1.0)),
                     ));
+                    card.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(8),
+                        ..default()
+                    }).with_children(|row| {
+                        row.spawn((
+                            selection_button("Export CSV", false, 130.0),
+                            SourceScaleCurveExportButton(false),
+                        ));
+                        row.spawn((
+                            selection_button("Export JSON", false, 130.0),
+                            SourceScaleCurveExportButton(true),
+                        ));
+                    });
                     card.spawn((
                         Button,
                         SourceScaleCurveCloseButton,
@@ -263,13 +377,14 @@ pub fn setup_density_inversion_timing_panel(
                         },
                         BorderColor::all(Color::srgb(0.2, 0.38, 0.45)),
                     )).with_children(|plot| {
-                        for method in 0..3 {
+                        for method in 0..4 {
                             let color = match method {
                                 0 => Color::srgb(0.2, 0.95, 1.0),
-                                1 => Color::srgb(1.0, 0.65, 0.2),
+                                1 => Color::srgb(0.65, 0.45, 1.0),
+                                2 => Color::srgb(1.0, 0.65, 0.2),
                                 _ => Color::srgb(0.35, 0.95, 0.5),
                             };
-                            for index in 0..4 {
+                            for index in 0..(PLANNING_SOURCE_COUNTS.len() - 1) {
                                 plot.spawn((
                                     SourceScaleCurveSegment { method, index },
                                     Node {
@@ -309,6 +424,10 @@ pub fn planning_comparison_control_system(
         &Interaction,
         (Changed<Interaction>, With<SourceScaleCurveCloseButton>),
     >,
+    export_interactions: Query<
+        (&Interaction, &SourceScaleCurveExportButton),
+        (Changed<Interaction>, With<Button>),
+    >,
     mut planning: ResMut<PlanningComparisonState>,
     mut request: ResMut<PlanningGpuRequest>,
     mut payload: ResMut<PlanningMethodPayload>,
@@ -322,14 +441,15 @@ pub fn planning_comparison_control_system(
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed)
     {
-        planning.workload_profile = PlanningWorkloadProfile::InteractiveStress;
+        planning.workload_profile = PlanningWorkloadProfile::SourceCrossover;
         planning.selected_metric = ComparisonMetric::SpeedupVsGpuFmm;
         planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
         planning.source_curve_active = true;
-        planning.source_curve_visible = false;
+        planning.source_curve_visible = true;
         planning.source_curve_index = 0;
         planning.source_curve_repeat = 0;
         planning.source_curve_samples.clear();
+        persist_source_curve(&planning.source_curve_samples);
         planning.results = std::array::from_fn(|_| None);
         planning.batch_job = None;
         planning.run_requested = true;
@@ -337,7 +457,7 @@ pub fn planning_comparison_control_system(
         *request = PlanningGpuRequest::default();
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
-        planning.status = "Source curve queued: 1024 sources, repeat 1/10, Eq.106 first.".into();
+        planning.status = "Source crossover queued: 1024 real positions, repeat 1/10, Eq.106 first.".into();
     }
     if close_interactions
         .iter()
@@ -348,6 +468,7 @@ pub fn planning_comparison_control_system(
         planning.source_curve_index = 0;
         planning.source_curve_repeat = 0;
         planning.source_curve_samples.clear();
+        persist_source_curve(&planning.source_curve_samples);
         planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
         planning.run_requested = false;
         planning.batch_job = None;
@@ -357,6 +478,26 @@ pub fn planning_comparison_control_system(
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
         planning.status = "Source curve reset.".into();
+    }
+    if let Some(json) = export_interactions.iter().find_map(|(interaction, button)| {
+        (*interaction == Interaction::Pressed).then_some(button.0)
+    }) {
+        #[cfg(target_arch = "wasm32")]
+        if json {
+            download_planning_curve(
+                "ryugu-source-crossover.json",
+                &source_curve_json(&planning.source_curve_samples),
+                "application/json",
+            );
+        } else {
+            download_planning_curve(
+                "ryugu-source-crossover.csv",
+                &source_curve_csv(&planning.source_curve_samples),
+                "text/csv",
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = json;
     }
     if let Some(metric) = metric_interactions.iter().find_map(|(interaction, button)| {
         (*interaction == Interaction::Pressed).then_some(button.0)
@@ -477,7 +618,7 @@ pub fn update_planning_results_from_inversion_system(
             planning.status = "Planning queued: the common 1024-source geometry is not ready.".into();
             return;
         };
-        let Some((voxels, _)) = crate::cpu::inversion::build_density_voxels(
+        let Some((voxels, voxel_size)) = crate::cpu::inversion::build_density_voxels(
             &radial,
             ActiveGravityMethod::CurvedArcEq106,
         ) else {
@@ -492,6 +633,7 @@ pub fn update_planning_results_from_inversion_system(
             inversion.capture_epoch,
             source_hash,
             planning.requested_source_count,
+            voxel_size,
             &inversion.knots,
             &voxels,
             &aggregated,
@@ -592,6 +734,7 @@ pub fn update_planning_results_from_inversion_system(
         last_request_candidate_count: 0,
         awaiting_gpu: false,
         warm_repetition: false,
+        certified_repetition: false,
         total_evaluations: u64::from(dimensions.0)
             * u64::from(dimensions.1)
             * u64::from(dimensions.2),
@@ -627,6 +770,8 @@ pub fn update_planning_results_from_inversion_system(
         verification_ms: 0.0,
         gpu_completion_map_ms: 0.0,
         warm_evaluation_ms: 0.0,
+        certified_warm_evaluation_ms: 0.0,
+        first_tile_ms: 0.0,
         dispatch_count: 0,
         forward_kernel_evaluations: 0,
         spectral_element_count: 0,
@@ -659,7 +804,7 @@ fn source_timing_summary(mut values: Vec<f64>) -> Option<(f64, f64, f64)> {
     }
     let last = values.len() - 1;
     let percentile = |fraction: f64| values[(fraction * last as f64).round() as usize];
-    let median = if values.len() % 2 == 0 {
+    let median = if values.len().is_multiple_of(2) {
         0.5 * (values[last / 2] + values[last / 2 + 1])
     } else {
         values[last / 2]
@@ -692,9 +837,9 @@ pub fn source_scale_curve_ui_system(
     if !planning.source_curve_visible {
         return;
     }
-    let mut points = [[None; 5]; 3];
-    let mut eligible_counts = [[0_u32; 5]; 3];
-    for method in 0..3 {
+    let mut points = [[None; PLANNING_SOURCE_COUNTS.len()]; 4];
+    let mut eligible_counts = [[0_u32; PLANNING_SOURCE_COUNTS.len()]; 4];
+    for method in 0..4 {
         for (source_index, source_count) in PLANNING_SOURCE_COUNTS.iter().copied().enumerate() {
             let values = planning
                 .source_curve_samples
@@ -737,11 +882,14 @@ pub fn source_scale_curve_ui_system(
         node.width = px(length.max(0.5));
         transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
     }
-    let names = ["Eq.106", "FFT-grid", "treecode"];
+    let names = ["Eq.106 raw", "Eq.106 certified", "FFT-grid", "treecode"];
     let mut lines = vec![
-        "x: source count (log scale) | y: total method time (ms) | median line; text shows P10/P90 and eligible runs".to_string(),
+        format!(
+            "{} | x: real source count (log) | y: total time ms | median line; P10/P90 below",
+            planning.status
+        ),
     ];
-    for method in 0..3 {
+    for method in 0..4 {
         let values = PLANNING_SOURCE_COUNTS
             .iter()
             .enumerate()
@@ -756,6 +904,46 @@ pub fn source_scale_curve_ui_system(
             .collect::<Vec<_>>()
             .join(" | ");
         lines.push(format!("{} — {values}", names[method]));
+    }
+    if let Some(last) = planning.source_curve_samples.last() {
+        lines.push(format!(
+            "Latest build-est. ms [Eq/FFT/tree] {:.2}/{:.2}/{:.2}; hot ns/target {:.1}/{:.1}/{:.1}",
+            last.build_ms[0], last.build_ms[1], last.build_ms[2],
+            last.query_ns_per_target[0], last.query_ns_per_target[1], last.query_ns_per_target[2],
+        ));
+        let samples = planning
+            .source_curve_samples
+            .iter()
+            .filter(|sample| sample.source_count == last.source_count)
+            .collect::<Vec<_>>();
+        let build = std::array::from_fn::<_, 3, _>(|method| {
+            source_timing_summary(samples.iter().map(|sample| sample.build_ms[method]).collect())
+                .map(|summary| summary.0)
+                .unwrap_or(f64::NAN)
+        });
+        let query = std::array::from_fn::<_, 3, _>(|method| {
+            source_timing_summary(
+                samples
+                    .iter()
+                    .map(|sample| sample.query_ns_per_target[method])
+                    .collect(),
+            )
+            .map(|summary| summary.0)
+            .unwrap_or(f64::NAN)
+        });
+        let break_even = |baseline: usize| {
+            let denominator = query[baseline] - query[0];
+            if denominator > 0.0 {
+                ((build[0] - build[baseline]) * 1.0e6 / denominator).max(0.0)
+            } else {
+                f64::INFINITY
+            }
+        };
+        lines.push(format!(
+            "{}-source medians: build-est. Eq/FFT/tree {:.2}/{:.2}/{:.2} ms; hot {:.1}/{:.1}/{:.1} ns/target; Qcross Eq/FFT {:.3e}, Eq/tree {:.3e}",
+            last.source_count, build[0], build[1], build[2], query[0], query[1], query[2],
+            break_even(1), break_even(2),
+        ));
     }
     for mut summary in summaries.iter_mut() {
         *summary = Text::new(lines.join("\n"));

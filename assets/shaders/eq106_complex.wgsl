@@ -845,14 +845,16 @@ fn evaluate_field(
                 );
                 if eq_params.inversion_mode == 0u {
                     let spectral_derivative = evaluation_spectral_derivative[frequency_index];
-                    local_imaginary += vec3<f32>(x.y, y.y, z.y);
                     local_derivative += vec3<f32>(
                         complex_mul(sample.acceleration_x, spectral_derivative).x,
                         complex_mul(sample.acceleration_y, spectral_derivative).x,
                         complex_mul(sample.acceleration_z, spectral_derivative).x,
                     );
-                    if abs(signed_index) == i32(eq_params.half_count) {
-                        local_tail += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+                    if eq_params.evaluate_dual_certificate != 0u {
+                        local_imaginary += vec3<f32>(x.y, y.y, z.y);
+                        if abs(signed_index) == i32(eq_params.half_count) {
+                            local_tail += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+                        }
                     }
                 }
             }
@@ -891,10 +893,6 @@ fn evaluate_field(
                     raw_derivative_h * edge_response
                     - raw.xyz * edge_response_derivative
                 ) / (edge_response * edge_response);
-                imaginary_field += evaluation_imaginary[0].xyz
-                    * inversion_scale / edge_response * value;
-                tail_field += evaluation_tail[0].xyz
-                    * inversion_scale / edge_response * abs(value);
                 derivative_h += reconstructed_derivative_h * value;
                 if a > 0u {
                     derivative_u += reconstructed.xyz * f32(a) * monomial(u, v, a - 1u, b);
@@ -915,8 +913,14 @@ fn evaluate_field(
                             * monomial(u, v - delta, a, b);
                     }
                 }
-                if degree == active_order {
-                    last_order_field += reconstructed.xyz * value;
+                if eq_params.evaluate_dual_certificate != 0u {
+                    imaginary_field += evaluation_imaginary[0].xyz
+                        * inversion_scale / edge_response * value;
+                    tail_field += evaluation_tail[0].xyz
+                        * inversion_scale / edge_response * abs(value);
+                    if degree == active_order {
+                        last_order_field += reconstructed.xyz * value;
+                    }
                 }
             }
         }
@@ -938,7 +942,8 @@ fn evaluate_field(
     let derivative_y = derivative_h * tangent.y + derivative_u * normal.y + derivative_v * binormal.y;
     let derivative_z = derivative_h * tangent.z + derivative_u * normal.z + derivative_v * binormal.z;
     let field_scale = max(length(field.xyz), 1.0e-12);
-    let field_taylor_residual = length(last_order_field) / field_scale;
+    let certificate_active = eq_params.evaluate_dual_certificate != 0u;
+    let field_taylor_residual = select(0.0, length(last_order_field) / field_scale, certificate_active);
     // The highest retained derivative is part of the solution, not the first
     // omitted term. In particular at A=1,u=v=0 it is usually the dominant
     // transverse gradient and must not be treated as a unit-sized remainder.
@@ -946,9 +951,13 @@ fn evaluate_field(
     // (A+1)*epsilon^A/(1-epsilon)^2; the shader certificate reports only the
     // observable field tail plus independent spectral diagnostics.
     let taylor_residual = field_taylor_residual;
-    let imaginary_residual = length(imaginary_field) / field_scale;
-    let spectral_tail_residual = length(tail_field) / field_scale;
-    let transverse_ratio = length(vec2<f32>(u, v)) / max(eq_params.line_limit, 1.0);
+    let imaginary_residual = select(0.0, length(imaginary_field) / field_scale, certificate_active);
+    let spectral_tail_residual = select(0.0, length(tail_field) / field_scale, certificate_active);
+    let transverse_ratio = select(
+        0.0,
+        length(vec2<f32>(u, v)) / max(eq_params.line_limit, 1.0),
+        certificate_active,
+    );
     var self_fd_errors: array<f32, 5>;
     if self_fd_active {
         let self_fd_scale = max(sqrt(

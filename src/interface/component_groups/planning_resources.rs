@@ -19,7 +19,9 @@ pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
 pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
-pub const PLANNING_SOURCE_COUNTS: [u32; 5] = [1_024, 2_048, 4_096, 65_536, 262_144];
+pub const PLANNING_SOURCE_COUNTS: [u32; 9] = [
+    1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
+];
 pub const PLANNING_SOURCE_REPEATS: u32 = 10;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
 pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
@@ -112,19 +114,26 @@ pub enum PlanningWorkloadProfile {
     #[default]
     First,
     InteractiveStress,
+    /// Internal source-crossover workload: enough hot targets for stable GPU
+    /// timing without repeating the 33.5-million-query Stress matrix.
+    SourceCrossover,
 }
 
 impl PlanningWorkloadProfile {
     pub fn is_compute_benchmark(self) -> bool {
         // Both visible workloads use the same fairness contract. "Interactive"
         // describes the live progress UI, not adaptive benchmark scheduling.
-        matches!(self, Self::First | Self::InteractiveStress)
+        matches!(
+            self,
+            Self::First | Self::InteractiveStress | Self::SourceCrossover
+        )
     }
 
     pub fn dimensions(self) -> (u32, u32, u32) {
         match self {
             Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),
             Self::InteractiveStress => (PLANNING_CANDIDATE_COUNT, 32, 512),
+            Self::SourceCrossover => (64, 4, 96),
         }
     }
 
@@ -132,6 +141,7 @@ impl PlanningWorkloadProfile {
         match self {
             Self::First => "First 32x4x241",
             Self::InteractiveStress => "Interactive Stress 2048x32x512",
+            Self::SourceCrossover => "Source crossover 64x4x96",
         }
     }
 }
@@ -271,6 +281,10 @@ pub struct PlanningMethodMetrics {
     pub verification_ms: f64,
     pub gpu_completion_map_ms: f64,
     pub warm_evaluation_ms: f64,
+    pub certified_warm_evaluation_ms: f64,
+    pub certified_estimated_total_ms: f64,
+    pub build_ms: f64,
+    pub hot_query_ns_per_target: f64,
     pub total_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
@@ -320,6 +334,7 @@ pub struct PlanningBatchJob {
     pub last_request_candidate_count: u32,
     pub awaiting_gpu: bool,
     pub warm_repetition: bool,
+    pub certified_repetition: bool,
     pub total_evaluations: u64,
     pub gravity_error_sum: f64,
     pub gravity_reference_sum: f64,
@@ -353,6 +368,8 @@ pub struct PlanningBatchJob {
     pub verification_ms: f64,
     pub gpu_completion_map_ms: f64,
     pub warm_evaluation_ms: f64,
+    pub certified_warm_evaluation_ms: f64,
+    pub first_tile_ms: f64,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,
@@ -396,8 +413,13 @@ pub struct PlanningComparisonState {
 #[derive(Clone, Copy, Debug)]
 pub struct PlanningSourceCurveSample {
     pub source_count: u32,
-    pub times_ms: [f64; 3],
-    pub eligible: [bool; 3],
+    /// Eq.106 raw, Eq.106 certified estimate, FFT-grid, treecode.
+    pub times_ms: [f64; 4],
+    /// Build/preprocess timing for Eq.106 raw, FFT-grid, treecode.
+    pub build_ms: [f64; 3],
+    /// Warm-query nanoseconds per target for Eq.106 raw, FFT-grid, treecode.
+    pub query_ns_per_target: [f64; 3],
+    pub eligible: [bool; 4],
 }
 
 #[derive(Resource, Debug, Default)]

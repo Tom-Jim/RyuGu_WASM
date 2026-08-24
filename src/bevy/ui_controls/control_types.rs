@@ -192,6 +192,9 @@ pub(crate) struct SourceScaleCurveOverlay;
 #[derive(Component)]
 pub(crate) struct SourceScaleCurveCloseButton;
 
+#[derive(Component, Clone, Copy)]
+pub(crate) struct SourceScaleCurveExportButton(pub bool);
+
 #[derive(Component)]
 pub(crate) struct SourceScaleCurveSummary;
 

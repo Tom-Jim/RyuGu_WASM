@@ -383,7 +383,7 @@ fn dispatch_planning_eq106(
                 element.taylor_order,
                 0,
                 element.spectrum_index,
-                true,
+                request.eq106_certified,
                 false,
                 element.target_count,
                 element.target_offset,

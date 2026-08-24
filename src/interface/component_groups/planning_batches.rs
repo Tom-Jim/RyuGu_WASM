@@ -80,9 +80,6 @@ pub struct PlanningCandidateBatch {
     pub density_seed: u64,
     pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
-    /// Exact canonical equivalent used only by the excluded f64 truth path;
-    /// split GPU records are colocated and their volumes sum to these rows.
-    pub reference_basis_records: Arc<[PlanningBasisRecord]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,
@@ -135,6 +132,9 @@ pub struct PlanningGpuRequest {
     pub candidate_start: u32,
     pub candidate_count: u32,
     pub warm_repetition: bool,
+    /// Eq.106 only: enable independent certificate and five-step self-FD.
+    /// The raw path still computes the complete field and 3x3 Jacobian.
+    pub eq106_certified: bool,
     /// First and Interactive Stress both use the fairness-oriented fixed
     /// schedule; the latter remains interactive through progress rendering.
     pub compute_benchmark: bool,

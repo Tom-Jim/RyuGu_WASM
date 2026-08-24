@@ -26,7 +26,6 @@ pub(crate) struct PlanningBatchBuilder {
     density_seed: u64,
     target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
-    reference_basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
 }
 
@@ -39,6 +38,7 @@ impl PlanningBatchBuilder {
         capture_epoch: u64,
         source_hash: u64,
         requested_source_count: u32,
+        voxel_size: f32,
         reference_knots: &[TrajectoryInversionKnot],
         voxels: &[InvertedDensityVoxel],
         source: &AggregatedGravitySource,
@@ -72,8 +72,24 @@ impl PlanningBatchBuilder {
                 })
             })
             .collect::<Vec<_>>();
-        let basis_records = refine_basis_records(&canonical_basis_records, requested_source_count)?;
-        let basis_hash = mix_hash(basis.hash, u64::from(requested_source_count));
+        let basis_records = spatially_refine_basis_records(
+            &canonical_basis_records,
+            voxels,
+            voxel_size,
+            requested_source_count,
+        )?;
+        let basis_hash = basis_records.iter().fold(
+            mix_hash(basis.hash, u64::from(requested_source_count)),
+            |hash, record| {
+                let hash = record
+                    .position_volume
+                    .into_iter()
+                    .fold(hash, |hash, value| {
+                        mix_hash(hash, u64::from(value.to_bits()))
+                    });
+                mix_hash(hash, u64::from(record.voxel_index))
+            },
+        );
         let density_seed = mix_hash(
             mix_hash(source_hash, basis.hash),
             mix_hash(capture_id, 0x1060_d315_7a11_5eed),
@@ -109,7 +125,6 @@ impl PlanningBatchBuilder {
             density_seed,
             target_mass,
             basis_records,
-            reference_basis_records: canonical_basis_records,
             basis_hash,
         })
     }
@@ -209,7 +224,6 @@ impl PlanningBatchBuilder {
                 density_seed: self.density_seed,
                 target_mass: self.target_mass,
                 basis_records: Arc::from(self.basis_records),
-                reference_basis_records: Arc::from(self.reference_basis_records),
                 reference_arc_hash,
                 candidate_hash,
                 density_model_hash,
@@ -221,15 +235,26 @@ impl PlanningBatchBuilder {
     }
 }
 
-/// Split each canonical aggregate into colocated equal-volume records. All
-/// backends therefore see the same requested source count, geometry, density
-/// assignment, and conserved asteroid mass.
-fn refine_basis_records(
+/// Deterministically replace every parent quadrature source with an
+/// antithetic cloud inside a representative micro-voxel centred on the
+/// original quadrature source. The micro-voxel side is bounded by both the
+/// density-grid voxel size and the cube root of the parent's volume. Each cloud
+/// preserves the parent's total volume and centre of mass, while additional
+/// pairs sample genuinely distinct spatial positions. All backends and the
+/// independent f64 reference consume this exact same refined point set.
+fn spatially_refine_basis_records(
     canonical: &[PlanningBasisRecord],
+    voxels: &[InvertedDensityVoxel],
+    voxel_size: f32,
     requested: u32,
 ) -> Option<Vec<PlanningBasisRecord>> {
     let requested = requested as usize;
-    if canonical.is_empty() || requested < canonical.len() {
+    if canonical.is_empty()
+        || requested < canonical.len()
+        || voxels.is_empty()
+        || !voxel_size.is_finite()
+        || voxel_size <= 0.0
+    {
         return None;
     }
     let base = requested / canonical.len();
@@ -237,11 +262,58 @@ fn refine_basis_records(
     let mut refined = Vec::with_capacity(requested);
     for (index, record) in canonical.iter().copied().enumerate() {
         let copies = base + usize::from(index < remainder);
-        let mut split = record;
-        split.position_volume[3] /= copies as f32;
-        refined.extend(std::iter::repeat_n(split, copies));
+        let _voxel = voxels.get(record.voxel_index as usize)?;
+        let parent_volume = record.position_volume[3];
+        if !parent_volume.is_finite() || parent_volume <= 0.0 {
+            return None;
+        }
+        let centre = Vec3::from_array(record.position_volume[..3].try_into().ok()?);
+        if !centre.is_finite() {
+            return None;
+        }
+        let micro_voxel_side = voxel_size.min(parent_volume.cbrt());
+        let safe_extent = 0.45 * micro_voxel_side;
+        let pair_count = copies / 2;
+        let has_centre = !copies.is_multiple_of(2);
+        let nominal_volume = f64::from(parent_volume) / copies as f64;
+        for pair in 0..pair_count {
+            let direction = refinement_direction(index, pair);
+            let radial_fraction = 0.35 + 0.55 * radical_inverse_vdc((pair + 1) as u32);
+            let offset = direction * safe_extent * radial_fraction;
+            let pair_volume = if !has_centre && pair + 1 == pair_count {
+                0.5 * (f64::from(parent_volume)
+                    - 2.0 * nominal_volume * (pair_count.saturating_sub(1)) as f64)
+            } else {
+                nominal_volume
+            } as f32;
+            for position in [centre + offset, centre - offset] {
+                let mut child = record;
+                child.position_volume = [position.x, position.y, position.z, pair_volume];
+                refined.push(child);
+            }
+        }
+        if has_centre {
+            let used = 2.0 * nominal_volume * pair_count as f64;
+            let mut child = record;
+            child.position_volume[3] = (f64::from(parent_volume) - used).max(0.0) as f32;
+            refined.push(child);
+        }
     }
     (refined.len() == requested).then_some(refined)
+}
+
+fn radical_inverse_vdc(value: u32) -> f32 {
+    value.reverse_bits() as f32 * 2.328_306_4e-10
+}
+
+fn refinement_direction(parent: usize, pair: usize) -> Vec3 {
+    let sequence = (parent as u32)
+        .wrapping_mul(0x9e37_79b9)
+        .wrapping_add(pair as u32 + 1);
+    let z = 1.0 - 2.0 * radical_inverse_vdc(sequence);
+    let azimuth = std::f32::consts::TAU * radical_inverse_vdc(sequence.wrapping_mul(0x85eb_ca6b));
+    let radius = (1.0 - z * z).max(0.0).sqrt();
+    Vec3::new(radius * azimuth.cos(), radius * azimuth.sin(), z).normalize_or_zero()
 }
 
 fn central_reference_states(
@@ -507,6 +579,7 @@ fn mix_hash(hash: u64, value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::math::DVec3;
 
     fn test_voxels() -> Vec<InvertedDensityVoxel> {
         (0..56)
@@ -550,5 +623,98 @@ mod tests {
         let (first, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 4, 7).unwrap();
         let (stress, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 32, 7).unwrap();
         assert_eq!(first, stress[..first.len()]);
+    }
+
+    #[test]
+    fn spatial_refinement_is_distinct_and_preserves_parent_mass_and_centroid() {
+        let voxels = vec![InvertedDensityVoxel {
+            center: Vec3::new(12.0, -4.0, 8.0),
+            volume: 1_000.0,
+            density: 1_700.0,
+            baseline_density: 1_700.0,
+            reference_density: 1_700.0,
+            grid: [2, 1, 2],
+        }];
+        let parent = PlanningBasisRecord {
+            position_volume: [12.0, -4.0, 8.0, 1_000.0],
+            voxel_index: 0,
+            _padding: [0; 3],
+        };
+        let refined = spatially_refine_basis_records(&[parent], &voxels, 20.0, 8).unwrap();
+        assert_eq!(refined.len(), 8);
+
+        let mut positions = refined
+            .iter()
+            .map(|record| {
+                (
+                    record.position_volume[0].to_bits(),
+                    record.position_volume[1].to_bits(),
+                    record.position_volume[2].to_bits(),
+                )
+            })
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), refined.len());
+
+        let volume = refined
+            .iter()
+            .map(|record| f64::from(record.position_volume[3]))
+            .sum::<f64>();
+        let centroid = refined.iter().fold(DVec3::ZERO, |moment, record| {
+            moment
+                + DVec3::new(
+                    f64::from(record.position_volume[0]),
+                    f64::from(record.position_volume[1]),
+                    f64::from(record.position_volume[2]),
+                ) * f64::from(record.position_volume[3])
+        }) / volume;
+        assert!((volume - 1_000.0).abs() <= 1.0e-5);
+        assert!(centroid.distance(DVec3::new(12.0, -4.0, 8.0)) <= 1.0e-5);
+        assert!(refined.iter().all(|record| {
+            Vec3::from_array(record.position_volume[..3].try_into().unwrap())
+                .distance(Vec3::new(12.0, -4.0, 8.0))
+                < 9.0
+        }));
+    }
+
+    #[test]
+    fn spatial_refinement_supports_non_power_of_two_source_counts() {
+        let voxels = vec![InvertedDensityVoxel {
+            center: Vec3::ZERO,
+            volume: 2.0,
+            density: 1.0,
+            baseline_density: 1.0,
+            reference_density: 1.0,
+            grid: [0; 3],
+        }];
+        let parents = [
+            PlanningBasisRecord {
+                position_volume: [-2.0, 0.0, 0.0, 2.0],
+                voxel_index: 0,
+                _padding: [0; 3],
+            },
+            PlanningBasisRecord {
+                position_volume: [2.0, 0.0, 0.0, 3.0],
+                voxel_index: 0,
+                _padding: [0; 3],
+            },
+        ];
+        let refined = spatially_refine_basis_records(&parents, &voxels, 2.0, 9).unwrap();
+        assert_eq!(refined.len(), 9);
+        for (parent_index, expected_volume) in [2.0_f64, 3.0].into_iter().enumerate() {
+            let actual = refined
+                .iter()
+                .filter(|record| {
+                    if parent_index == 0 {
+                        record.position_volume[0] < 0.0
+                    } else {
+                        record.position_volume[0] > 0.0
+                    }
+                })
+                .map(|record| f64::from(record.position_volume[3]))
+                .sum::<f64>();
+            assert!((actual - expected_volume).abs() <= 1.0e-6);
+        }
     }
 }
