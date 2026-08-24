@@ -327,6 +327,11 @@ fn matrix_norm_squared(matrix: DMat3) -> f64 {
 }
 
 fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) {
+    // First is a fixed throughput benchmark. Browser FPS depends on method
+    // order and must not alter later methods' request counts or batch widths.
+    if job.profile.is_compute_benchmark() {
+        return;
+    }
     let request_ms = packet.timing.method_preprocess_ms
         + packet.timing.command_submission_ms
         + packet.timing.gpu_completion_map_ms;
@@ -508,6 +513,31 @@ fn finish_planning_method(
         maximum_tile_candidates: job.maximum_tile_size_used,
         top_candidates,
     });
+    info!(
+        target: "planning::benchmark",
+        method = ?job.method,
+        backend = ?backend,
+        total_ms,
+        preprocessing_ms = job.preprocessing_ms,
+        command_submission_ms = job.command_submission_ms,
+        gpu_completion_map_ms = job.gpu_completion_map_ms,
+        reduction_ms = job.reduction_ms,
+        verification_ms = job.verification_ms,
+        warm_evaluation_ms = job.warm_evaluation_ms,
+        gravity_error,
+        gradient_error,
+        valid_candidates = job.candidate_valid.iter().filter(|valid| **valid).count(),
+        gpu_requests = job.gpu_request_count,
+        dispatch_count = job.dispatch_count,
+        minimum_tile = job.minimum_tile_size_used.min(job.maximum_tile_size_used),
+        maximum_tile = job.maximum_tile_size_used,
+        "planning method complete"
+    );
+    if job.method == ActiveGravityMethod::Fmm
+        && let Some(verdict) = planning.fair_verdict()
+    {
+        info!(target: "planning::benchmark", %verdict, "planning fairness verdict");
+    }
 }
 
 fn advance_planning_method(job: &mut PlanningBatchJob) {
@@ -518,7 +548,11 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     };
     job.density_model = 0;
     job.candidate_start = 0;
-    job.candidate_tile_size = PLANNING_GENERIC_TILE_INITIAL_CANDIDATES;
+    job.candidate_tile_size = if job.profile.is_compute_benchmark() {
+        PLANNING_GENERIC_TILE_MAX_CANDIDATES
+    } else {
+        PLANNING_GENERIC_TILE_INITIAL_CANDIDATES
+    };
     job.minimum_tile_size_used = u32::MAX;
     job.maximum_tile_size_used = 0;
     job.gpu_request_count = 0;

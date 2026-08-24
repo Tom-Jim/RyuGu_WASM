@@ -404,10 +404,13 @@ fn build_radial_power_series(
 }
 
 @compute @workgroup_size(64, 1, 1)
-fn assemble_line_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn assemble_line_samples(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
     let quadrature_index = global_id.x;
     let segment_index = global_id.y;
-    if quadrature_index == 0u {
+    if local_index == 0u {
         eq_params = segment_params[segment_index];
     }
     workgroupBarrier();
@@ -465,9 +468,12 @@ fn assemble_line_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 
 @compute @workgroup_size(64, 1, 1)
-fn assemble_spectrum(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn assemble_spectrum(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
     let segment_index = global_id.y;
-    if global_id.x == 0u {
+    if local_index == 0u {
         eq_params = segment_params[segment_index];
     }
     workgroupBarrier();
@@ -506,9 +512,12 @@ fn assemble_spectrum(@builtin(global_invocation_id) global_id: vec3<u32>) {
 // jet has been assembled. It performs no half-line quadrature and its cost is
 // O(N_source N_frequency) table/recurrence work per new spectral element.
 @compute @workgroup_size(64, 1, 1)
-fn assemble_analytic_spectrum(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn assemble_analytic_spectrum(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
     let segment_index = global_id.y;
-    if global_id.x == 0u {
+    if local_index == 0u {
         eq_params = segment_params[segment_index];
     }
     workgroupBarrier();

@@ -209,7 +209,9 @@ mod tests {
             .map(|position| Vec3::new(-position.y, position.x, 0.0).normalize() * 0.235_503)
             .collect::<Vec<_>>();
 
-        let times = [0.0, 1.0, 2.0];
+        let times = (0..positions.len())
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
         let elements =
             build_trajectory_batch_elements(&positions, &velocities, &times, 464.765, 1_200.0);
         assert!(!elements.is_empty());

@@ -1,3 +1,7 @@
+fn finite_chart_sample(simulation_time_seconds: f64, value: f64) -> bool {
+    simulation_time_seconds.is_finite() && value.is_finite()
+}
+
 pub fn update_jacobi_chart_system(
     active_method: Res<ActiveGravityMethod>,
     history: Res<JacobiHistory>,
@@ -40,7 +44,14 @@ pub fn update_jacobi_chart_system(
         **axis = "C_J (m^2/s^2)".to_owned();
     }
 
-    let samples: Vec<JacobiSample> = history.samples.iter().copied().collect();
+    let samples: Vec<JacobiSample> = history
+        .samples
+        .iter()
+        .copied()
+        .filter(|sample| {
+            finite_chart_sample(sample.simulation_time_seconds, sample.jacobi_constant)
+        })
+        .collect();
     if samples.is_empty() {
         for (_, mut node, _) in segments.iter_mut() {
             node.display = Display::None;
@@ -172,7 +183,20 @@ pub fn update_eq106_residual_chart_system(
         return;
     }
 
-    let samples: Vec<_> = history.samples.iter().copied().collect();
+    // A failed or not-yet-ready Eq.106 step may temporarily publish an
+    // infinite convergence bound.  Such a diagnostic is meaningful to the
+    // planner, but it is not a drawable chart coordinate: passing the
+    // resulting NaN angle to `Rot2` panics in Bevy and aborts the WASM event
+    // loop.  Keep the diagnostic history intact and omit only non-finite
+    // points from the visualization.
+    let samples: Vec<_> = history
+        .samples
+        .iter()
+        .copied()
+        .filter(|sample| {
+            finite_chart_sample(sample.simulation_time_seconds, sample.epsilon_max)
+        })
+        .collect();
     if samples.is_empty() {
         for (_, mut node, _) in &mut segments {
             node.display = Display::None;
@@ -291,7 +315,6 @@ pub fn update_eq106_residual_chart_system(
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -310,6 +333,13 @@ mod tests {
     #[test]
     fn invalid_jacobi_input_is_rejected() {
         assert!(rotating_frame_jacobi_constant(Vec3::NAN, Vec3::ZERO, 1.0, Vec3::Y).is_none());
+    }
+
+    #[test]
+    fn chart_samples_require_finite_time_and_value() {
+        assert!(finite_chart_sample(1.0, 2.0));
+        assert!(!finite_chart_sample(f64::NAN, 2.0));
+        assert!(!finite_chart_sample(1.0, f64::INFINITY));
     }
 
     #[test]

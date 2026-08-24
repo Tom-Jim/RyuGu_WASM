@@ -208,6 +208,9 @@ fn dispatch_eq106_sensitivity_matrix(
 
     let shared = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
+    let submitted_at = Arc::clone(&channel.submitted_at);
+    let error_slot = Arc::clone(&channel.pipeline_error);
+    let rebuild_requested = Arc::clone(&channel.rebuild_requested);
     let mapped_staging = staging.clone();
     let snapshots = extracted.target_snapshots.clone();
     let element_count = extracted.batch_elements.len() as u32;
@@ -215,36 +218,55 @@ fn dispatch_eq106_sensitivity_matrix(
     let sensitivity_basis_hash = extracted.sensitivity_basis_hash;
     let sensitivity_configuration_hash = eq106_sensitivity_configuration_hash();
     let readback_started = Instant::now();
+    if let Ok(mut submitted) = channel.submitted_at.lock() {
+        *submitted = Some(readback_started);
+    }
     mapped_staging
         .slice(..)
         .map_async(MapMode::Read, move |result| {
-            if result.is_ok() {
-                let view = staging.slice(..).get_mapped_range();
-                let values = bytes_to_f32x4(&view);
-                let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
-                if let Ok(mut guard) = shared.lock() {
-                    *guard = Some(Eq106ReadbackPacket {
-                        partial_sums: values,
-                        snapshots,
-                        batch_capture_id: Some(capture_id),
-                        sensitivity_column_count: column_count as u32,
-                        sensitivity_source_hash,
-                        sensitivity_basis_hash,
-                        sensitivity_configuration_hash,
-                        timings: Eq106TimingSample {
-                            spectrum_build_ms: Some(spectrum_encoding_ms),
-                            target_evaluation_ms: Some(evaluation_encoding_ms),
-                            cpu_readback_wait_ms,
-                            target_count: target_count as u32,
-                            spectral_element_count: element_count,
-                            dispatch_count: 1,
-                            spectrum_rebuild_count: column_count as u32 * element_count,
-                            ..default()
-                        },
-                    });
+            match result {
+                Ok(()) => {
+                    let view = staging.slice(..).get_mapped_range();
+                    let values = bytes_to_f32x4(&view);
+                    let cpu_readback_wait_ms =
+                        readback_started.elapsed().as_secs_f64() * 1.0e3;
+                    if let Ok(mut guard) = shared.lock() {
+                        *guard = Some(Eq106ReadbackPacket {
+                            partial_sums: values,
+                            snapshots,
+                            batch_capture_id: Some(capture_id),
+                            sensitivity_column_count: column_count as u32,
+                            sensitivity_source_hash,
+                            sensitivity_basis_hash,
+                            sensitivity_configuration_hash,
+                            timings: Eq106TimingSample {
+                                spectrum_build_ms: Some(spectrum_encoding_ms),
+                                target_evaluation_ms: Some(evaluation_encoding_ms),
+                                cpu_readback_wait_ms,
+                                target_count: target_count as u32,
+                                spectral_element_count: element_count,
+                                dispatch_count: 1,
+                                spectrum_rebuild_count: column_count as u32 * element_count,
+                                ..default()
+                            },
+                        });
+                    }
+                    drop(view);
+                    staging.unmap();
                 }
-                drop(view);
-                staging.unmap();
+                Err(error) => {
+                    rebuild_requested.store(true, Ordering::Release);
+                    if let Ok(mut slot) = error_slot.lock()
+                        && slot.is_none()
+                    {
+                        *slot = Some(format!(
+                            "Equation (106) GPU sensitivity readback failed: {error:?}"
+                        ));
+                    }
+                }
+            }
+            if let Ok(mut submitted) = submitted_at.lock() {
+                submitted.take();
             }
             in_flight.store(false, Ordering::Release);
         });

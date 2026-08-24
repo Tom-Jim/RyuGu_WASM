@@ -210,7 +210,6 @@ pub fn update_gpu_memory_estimate_system(
     aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
     eq106_tensor: Option<Res<Eq106OperatorTensorResource>>,
-    eq106_planner: Option<Res<CurvedArcPlannerState>>,
     eq106_performance: Res<Eq106PerformanceMetrics>,
     mmfft: Option<Res<MmfftCompressedSource>>,
     fmm: Option<Res<FmmSource>>,
@@ -228,10 +227,6 @@ pub fn update_gpu_memory_estimate_system(
         bytes[1] = edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
     }
     if let (Some(source), Some(tensor)) = (aggregated.as_ref(), eq106_tensor) {
-        let order = eq106_planner
-            .as_ref()
-            .map_or(1, |planner| planner.taylor_order.clamp(1, 4));
-        let coefficient_count = u64::from((order + 1) * (order + 2) / 2);
         let timing = eq106_performance.latest.unwrap_or_default();
         let target_count = u64::from(timing.target_count.max(1));
         // Timestamp query pools are disabled for browser/Metal stability.
@@ -241,9 +236,9 @@ pub fn update_gpu_memory_estimate_system(
             + 64 * 8
             + tensor.tensor.coefficients.len() as u64 * 4
             + tensor.psi.coefficients.len() as u64 * 4
-            + 96
-            + coefficient_count * 64 * 16
-            + coefficient_count * 129 * 32
+            + 96 * 256
+            + 45 * 64 * 16
+            + 45 * 129 * 32
             + target_count * 16
             + 2 * target_count * 9 * 16
             + 2 * timestamp_bytes;
@@ -431,6 +426,24 @@ pub fn method_toggle_system(
         c_history.0.push_back(probe_initial.position);
         r_transform.rotation = Quat::IDENTITY;
         r_transform.translation = Vec3::ZERO;
+    }
+}
+
+/// Method changes reset the physical epoch, so every GPU history must be
+/// cleared together even though snapshot keys also provide epoch isolation.
+pub fn clear_gpu_histories_on_method_change(
+    active_method: Res<ActiveGravityMethod>,
+    mut eq106_samples: Option<ResMut<Eq106GpuHistory>>,
+    mut fmm_samples: Option<ResMut<FmmGravityHistory>>,
+) {
+    if !active_method.is_changed() {
+        return;
+    }
+    if let Some(samples) = eq106_samples.as_deref_mut() {
+        samples.0.clear();
+    }
+    if let Some(samples) = fmm_samples.as_deref_mut() {
+        samples.0.clear();
     }
 }
 

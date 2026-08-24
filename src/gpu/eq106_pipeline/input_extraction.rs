@@ -508,6 +508,9 @@ fn dispatch_eq106_single_target(
 
     let shared = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
+    let submitted_at = Arc::clone(&channel.submitted_at);
+    let error_slot = Arc::clone(&channel.pipeline_error);
+    let rebuild_requested = Arc::clone(&channel.rebuild_requested);
     let staging = inner.staging.clone();
     let map_staging = staging.clone();
     let snapshots = extracted.target_snapshots.clone();
@@ -516,46 +519,64 @@ fn dispatch_eq106_single_target(
     let target_count = inner.target_count;
     let timestamp_period_ns = render_queue.get_timestamp_period();
     let readback_started = Instant::now();
+    if let Ok(mut submitted) = channel.submitted_at.lock() {
+        *submitted = Some(readback_started);
+    }
     map_staging
         .slice(..)
         .map_async(MapMode::Read, move |result| {
-            if result.is_ok() {
-                let view = staging.slice(..).get_mapped_range();
-                let values = bytes_to_f32x4(&view[..output_size]);
-                let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
-                let timings = if timing_layout.query_count > 0 {
-                    let end =
-                        output_size + timing_layout.query_count as usize * TIMESTAMP_BYTES as usize;
-                    decode_gpu_timings(
-                        &view[output_size..end],
-                        timestamp_period_ns,
-                        &timing_layout,
-                        cpu_readback_wait_ms,
-                        target_count,
-                        1,
-                    )
-                } else {
-                    Eq106TimingSample {
-                        cpu_readback_wait_ms,
-                        target_count,
-                        spectral_element_count: 1,
-                        ..default()
+            match result {
+                Ok(()) => {
+                    let view = staging.slice(..).get_mapped_range();
+                    let values = bytes_to_f32x4(&view[..output_size]);
+                    let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
+                    let timings = if timing_layout.query_count > 0 {
+                        let end = output_size
+                            + timing_layout.query_count as usize * TIMESTAMP_BYTES as usize;
+                        decode_gpu_timings(
+                            &view[output_size..end],
+                            timestamp_period_ns,
+                            &timing_layout,
+                            cpu_readback_wait_ms,
+                            target_count,
+                            1,
+                        )
+                    } else {
+                        Eq106TimingSample {
+                            cpu_readback_wait_ms,
+                            target_count,
+                            spectral_element_count: 1,
+                            ..default()
+                        }
+                    };
+                    if let Ok(mut guard) = shared.lock() {
+                        *guard = Some(Eq106ReadbackPacket {
+                            partial_sums: values,
+                            snapshots,
+                            batch_capture_id,
+                            sensitivity_column_count: 0,
+                            sensitivity_source_hash: 0,
+                            sensitivity_basis_hash: 0,
+                            sensitivity_configuration_hash: 0,
+                            timings,
+                        });
                     }
-                };
-                if let Ok(mut guard) = shared.lock() {
-                    *guard = Some(Eq106ReadbackPacket {
-                        partial_sums: values,
-                        snapshots,
-                        batch_capture_id,
-                        sensitivity_column_count: 0,
-                        sensitivity_source_hash: 0,
-                        sensitivity_basis_hash: 0,
-                        sensitivity_configuration_hash: 0,
-                        timings,
-                    });
+                    drop(view);
+                    staging.unmap();
                 }
-                drop(view);
-                staging.unmap();
+                Err(error) => {
+                    rebuild_requested.store(true, Ordering::Release);
+                    if let Ok(mut slot) = error_slot.lock()
+                        && slot.is_none()
+                    {
+                        *slot = Some(format!(
+                            "Equation (106) GPU readback failed: {error:?}"
+                        ));
+                    }
+                }
+            }
+            if let Ok(mut submitted) = submitted_at.lock() {
+                submitted.take();
             }
             in_flight.store(false, Ordering::Release);
         });

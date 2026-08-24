@@ -28,9 +28,10 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
 };
 use bevy::shader::ShaderCacheError;
-use bevy::log::{debug, error, trace};
+use bevy::log::{debug, error, info, trace};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use wgpu29::{ComputePassTimestampWrites, QuerySet};
 
 const HALF_COUNT: u32 = 64;
@@ -44,6 +45,7 @@ const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
 const TAYLOR_REMAINDER_TARGET: f32 = 1.0e-3;
 const TIMESTAMP_BYTES: u64 = 8;
 const TARGET_DISPATCH_WIDTH: u32 = 65_535;
+const EQ106_GPU_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const fn eq106_sensitivity_configuration_hash() -> u64 {
     (FREQUENCY_COUNT as u64) << 32
@@ -332,6 +334,9 @@ impl Plugin for Eq106GpuComputePlugin {
         let channel = app.world().resource::<Eq106GpuReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
+        // Queue all four shaders during application startup. This keeps the
+        // first Eq.106 selection and the First benchmark free of compile time.
+        render_app.init_resource::<Eq106ComputePipeline>();
     }
 }
 
@@ -430,6 +435,18 @@ fn poll_eq106_readback(
     mut performance: ResMut<Eq106PerformanceMetrics>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
+    if channel.in_flight.load(Ordering::Acquire)
+        && let Ok(mut submitted_at) = channel.submitted_at.try_lock()
+        && submitted_at
+            .as_ref()
+            .is_some_and(|started| started.elapsed() > EQ106_GPU_TIMEOUT)
+    {
+        submitted_at.take();
+        runtime_error.raise(
+            "Equation (106) GPU request exceeded 10 seconds; possible shader hang or device loss.",
+        );
+        return;
+    }
     if let Ok(mut error) = channel.pipeline_error.try_lock()
         && let Some(message) = error.take()
     {

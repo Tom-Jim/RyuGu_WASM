@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::platform::time::Instant;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -650,6 +651,9 @@ pub struct Eq106GpuReadbackChannel {
     pub data: Arc<Mutex<Option<Eq106ReadbackPacket>>>,
     pub pipeline_error: Arc<Mutex<Option<String>>>,
     pub in_flight: Arc<AtomicBool>,
+    /// Wall-clock start of the active command submission. The main world uses
+    /// this to turn a lost device or hung shader into an explicit failure.
+    pub submitted_at: Arc<Mutex<Option<Instant>>>,
     /// Set by the main-world certificate check when the cached local spectral
     /// element must be shortened and rebuilt. The render world consumes it
     /// before submitting another query for the same simulation snapshot.

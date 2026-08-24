@@ -489,6 +489,15 @@ fn dispatch_planning_eq106(
     let request_candidate_count = request.candidate_count;
     let samples_per_candidate = batch.samples_per_candidate;
     let invalid_candidates_for_readback = invalid_candidates;
+    info!(
+        target: "planning::eq106",
+        request_id = request.request_id,
+        candidate_count = request.candidate_count,
+        target_count,
+        spectral_elements = element_count,
+        maximum_elements_per_candidate = reported_segment_count,
+        "Eq.106 dispatch builds each spectral element once, evaluates its targets in parallel, and reuses the spectrum across those targets"
+    );
     state.clear_active();
     mapped.slice(..staging_size).map_async(MapMode::Read, move |result| {
         let request_wall_ms = request_wall_started.elapsed().as_secs_f64() * 1.0e3;
@@ -598,7 +607,18 @@ fn planning_eq106_stage_budget(compute_benchmark: bool, total_stages: usize) -> 
     if frame_over_budget {
         return 0;
     }
-    // Interactive Stress still yields periodically, but a small batch of
-    // stages per frame avoids turning the benchmark into one dispatch/frame.
-    8.min(total_stages.max(1))
+    // Interactive Stress yields after at most half of the four-stage Eq.106
+    // pipeline so the visible frame can reach the queue between submissions.
+    2.min(total_stages.max(1))
+}
+
+#[cfg(test)]
+mod planning_stage_budget_tests {
+    use super::planning_eq106_stage_budget;
+
+    #[test]
+    fn first_encodes_every_stage_but_stress_remains_paced() {
+        assert_eq!(planning_eq106_stage_budget(true, 4), 4);
+        assert!(planning_eq106_stage_budget(false, 4) <= 2);
+    }
 }

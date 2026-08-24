@@ -71,6 +71,7 @@ impl Default for Eq106GpuReadbackChannel {
             data: Arc::new(Mutex::new(None)),
             pipeline_error: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
+            submitted_at: Arc::new(Mutex::new(None)),
             rebuild_requested: Arc::new(AtomicBool::new(false)),
         }
     }
