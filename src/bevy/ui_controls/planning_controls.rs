@@ -145,6 +145,10 @@ pub fn setup_density_inversion_timing_panel(
                             ComparisonMetricButton(metric),
                         ));
                     }
+                    row.spawn((
+                        selection_button("Source curve 1K→262K", false, 205.0),
+                        SourceScaleCurveButton,
+                    ));
                 });
             panel
                 .spawn(Node {
@@ -194,6 +198,101 @@ pub fn setup_density_inversion_timing_panel(
                 DensityInversionStatusLabel,
             ));
         });
+
+    commands
+        .spawn((
+            SourceScaleCurveOverlay,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                right: px(0),
+                top: px(0),
+                bottom: px(0),
+                display: Display::None,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.01, 0.015, 0.025, 0.92)),
+            ZIndex(900),
+        ))
+        .with_children(|overlay| {
+            overlay
+                .spawn((
+                    Node {
+                        width: px(900),
+                        height: px(610),
+                        padding: UiRect::all(px(20)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(10),
+                        border: UiRect::all(px(1)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.025, 0.045, 0.07)),
+                    BorderColor::all(Color::srgb(0.25, 0.75, 0.8)),
+                ))
+                .with_children(|card| {
+                    card.spawn((
+                        Text::new("Source-count crossover — median of 10 rotated-order runs"),
+                        TextFont { font_size: bevy::text::FontSize::Px(18.0), ..default() },
+                        TextColor(Color::srgb(0.88, 0.98, 1.0)),
+                    ));
+                    card.spawn((
+                        Button,
+                        SourceScaleCurveCloseButton,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            right: px(12),
+                            top: px(10),
+                            width: px(34),
+                            height: px(30),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.35, 0.08, 0.1)),
+                        children![(Text::new("X"), TextColor(Color::WHITE))],
+                    ));
+                    card.spawn((
+                        Node {
+                            position_type: PositionType::Relative,
+                            width: px(840),
+                            height: px(330),
+                            border: UiRect::all(px(1)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgb(0.2, 0.38, 0.45)),
+                    )).with_children(|plot| {
+                        for method in 0..3 {
+                            let color = match method {
+                                0 => Color::srgb(0.2, 0.95, 1.0),
+                                1 => Color::srgb(1.0, 0.65, 0.2),
+                                _ => Color::srgb(0.35, 0.95, 0.5),
+                            };
+                            for index in 0..4 {
+                                plot.spawn((
+                                    SourceScaleCurveSegment { method, index },
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        display: Display::None,
+                                        height: px(3),
+                                        ..default()
+                                    },
+                                    UiTransform::IDENTITY,
+                                    BackgroundColor(color),
+                                ));
+                            }
+                        }
+                    });
+                    card.spawn((
+                        SourceScaleCurveSummary,
+                        Text::new("Waiting for source-count runs"),
+                        TextFont { font_size: bevy::text::FontSize::Px(11.0), ..default() },
+                        TextColor(Color::srgb(0.74, 0.9, 0.94)),
+                        Node { max_width: px(840), ..default() },
+                    ));
+                });
+        });
 }
 
 pub fn planning_comparison_control_system(
@@ -205,6 +304,11 @@ pub fn planning_comparison_control_system(
         (&Interaction, &PlanningWorkloadButton),
         (Changed<Interaction>, With<Button>),
     >,
+    curve_interactions: Query<&Interaction, (Changed<Interaction>, With<SourceScaleCurveButton>)>,
+    close_interactions: Query<
+        &Interaction,
+        (Changed<Interaction>, With<SourceScaleCurveCloseButton>),
+    >,
     mut planning: ResMut<PlanningComparisonState>,
     mut request: ResMut<PlanningGpuRequest>,
     mut payload: ResMut<PlanningMethodPayload>,
@@ -214,9 +318,52 @@ pub fn planning_comparison_control_system(
         Query<(&PlanningWorkloadButton, &mut BackgroundColor)>,
     )>,
 ) {
+    if curve_interactions
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        planning.workload_profile = PlanningWorkloadProfile::InteractiveStress;
+        planning.selected_metric = ComparisonMetric::SpeedupVsGpuFmm;
+        planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
+        planning.source_curve_active = true;
+        planning.source_curve_visible = false;
+        planning.source_curve_index = 0;
+        planning.source_curve_repeat = 0;
+        planning.source_curve_samples.clear();
+        planning.results = std::array::from_fn(|_| None);
+        planning.batch_job = None;
+        planning.run_requested = true;
+        planning.run_id = planning.run_id.wrapping_add(1);
+        *request = PlanningGpuRequest::default();
+        *payload = PlanningMethodPayload::default();
+        gpu_result.0 = None;
+        planning.status = "Source curve queued: 1024 sources, repeat 1/10, Eq.106 first.".into();
+    }
+    if close_interactions
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        planning.source_curve_active = false;
+        planning.source_curve_visible = false;
+        planning.source_curve_index = 0;
+        planning.source_curve_repeat = 0;
+        planning.source_curve_samples.clear();
+        planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
+        planning.run_requested = false;
+        planning.batch_job = None;
+        planning.results = std::array::from_fn(|_| None);
+        planning.reference_duration_seconds = 0.0;
+        *request = PlanningGpuRequest::default();
+        *payload = PlanningMethodPayload::default();
+        gpu_result.0 = None;
+        planning.status = "Source curve reset.".into();
+    }
     if let Some(metric) = metric_interactions.iter().find_map(|(interaction, button)| {
         (*interaction == Interaction::Pressed).then_some(button.0)
     }) {
+        planning.source_curve_active = false;
+        planning.source_curve_visible = false;
+        planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
         planning.selected_metric = metric;
         if metric.is_inversion() {
             planning.run_requested = false;
@@ -248,6 +395,9 @@ pub fn planning_comparison_control_system(
             (*interaction == Interaction::Pressed).then_some(button.0)
         })
     {
+        planning.source_curve_active = false;
+        planning.source_curve_visible = false;
+        planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
         planning.workload_profile = profile;
         planning.results = std::array::from_fn(|_| None);
         planning.batch_job = None;
@@ -315,6 +465,7 @@ pub fn update_planning_results_from_inversion_system(
             planning.run_id,
             capture_id,
             source_hash,
+            planning.requested_source_count,
         )
     });
     if !builder_matches {
@@ -340,6 +491,7 @@ pub fn update_planning_results_from_inversion_system(
             capture_id,
             inversion.capture_epoch,
             source_hash,
+            planning.requested_source_count,
             &inversion.knots,
             &voxels,
             &aggregated,
@@ -351,9 +503,10 @@ pub fn update_planning_results_from_inversion_system(
         };
         *batch_builder = Some(builder);
         planning.status = format!(
-            "{} candidate preparation: 0 / {} trajectories.",
+            "{} candidate preparation: 0 / {} trajectories ({} sources).",
             planning.workload_profile.label(),
-            dimensions.0
+            dimensions.0,
+            planning.requested_source_count,
         );
         return;
     }
@@ -411,7 +564,12 @@ pub fn update_planning_results_from_inversion_system(
     commands.insert_resource(batch);
     commands.insert_resource(PlanningGpuRequest::default());
     commands.insert_resource(PlanningMethodPayload::default());
-    let method_order = planning_method_order(planning.run_id);
+    let order_rotation = if planning.source_curve_active {
+        planning.source_curve_repeat as usize
+    } else {
+        0
+    };
+    let method_order = planning_method_order(order_rotation);
     planning.batch_job = Some(PlanningBatchJob {
         run_id: planning.run_id,
         profile: planning.workload_profile,
@@ -444,6 +602,12 @@ pub fn update_planning_results_from_inversion_system(
         gradient_reference_sum: 0.0,
         gradient_samples: 0,
         verification_sample_count: 0,
+        raw_gravity_error_sum: 0.0,
+        raw_gradient_error_sum: 0.0,
+        rejected_sample_count: 0,
+        rejection_counts: [0; 6],
+        self_fd_step_maxima: [0.0; 5],
+        first_rejection: None,
         maximum_gradient_self_fd_relative_error: 0.0,
         pericenter_error_m: 0.0,
         minimum_altitude_m: f32::INFINITY,
@@ -477,15 +641,125 @@ pub fn update_planning_results_from_inversion_system(
     );
 }
 
-fn planning_method_order(_run_id: u64) -> [ActiveGravityMethod; 3] {
-    // A visible benchmark always begins with Eq.106. This keeps First and
-    // Interactive Stress predictable and prevents a new run from apparently
-    // starting at the third method merely because its run id changed.
-    [
+fn planning_method_order(rotation: usize) -> [ActiveGravityMethod; 3] {
+    let mut order = [
         ActiveGravityMethod::CurvedArcEq106,
         ActiveGravityMethod::MmfftCompressed,
         ActiveGravityMethod::Fmm,
-    ]
+    ];
+    order.rotate_left(rotation % 3);
+    order
+}
+
+fn source_timing_summary(mut values: Vec<f64>) -> Option<(f64, f64, f64)> {
+    values.retain(|value| value.is_finite() && *value > 0.0);
+    values.sort_by(f64::total_cmp);
+    if values.is_empty() {
+        return None;
+    }
+    let last = values.len() - 1;
+    let percentile = |fraction: f64| values[(fraction * last as f64).round() as usize];
+    let median = if values.len() % 2 == 0 {
+        0.5 * (values[last / 2] + values[last / 2 + 1])
+    } else {
+        values[last / 2]
+    };
+    Some((median, percentile(0.1), percentile(0.9)))
+}
+
+pub fn source_scale_curve_ui_system(
+    planning: Res<PlanningComparisonState>,
+    mut roots: Query<
+        &mut Node,
+        (
+            With<SourceScaleCurveOverlay>,
+            Without<SourceScaleCurveSegment>,
+        ),
+    >,
+    mut summaries: Query<&mut Text, With<SourceScaleCurveSummary>>,
+    mut segments: Query<
+        (&SourceScaleCurveSegment, &mut Node, &mut UiTransform),
+        Without<SourceScaleCurveOverlay>,
+    >,
+) {
+    for mut root in roots.iter_mut() {
+        root.display = if planning.source_curve_visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    if !planning.source_curve_visible {
+        return;
+    }
+    let mut points = [[None; 5]; 3];
+    let mut eligible_counts = [[0_u32; 5]; 3];
+    for method in 0..3 {
+        for (source_index, source_count) in PLANNING_SOURCE_COUNTS.iter().copied().enumerate() {
+            let values = planning
+                .source_curve_samples
+                .iter()
+                .filter(|sample| sample.source_count == source_count)
+                .map(|sample| {
+                    eligible_counts[method][source_index] += u32::from(sample.eligible[method]);
+                    sample.times_ms[method]
+                })
+                .collect();
+            points[method][source_index] = source_timing_summary(values);
+        }
+    }
+    let maximum = points
+        .iter()
+        .flatten()
+        .filter_map(|point| point.map(|value| value.2))
+        .fold(1.0_f64, f64::max);
+    let log_min = f64::from(PLANNING_SOURCE_COUNTS[0]).ln();
+    let log_span = f64::from(*PLANNING_SOURCE_COUNTS.last().unwrap()).ln() - log_min;
+    for (segment, mut node, mut transform) in segments.iter_mut() {
+        let (Some(from), Some(to)) = (
+            points[segment.method][segment.index],
+            points[segment.method][segment.index + 1],
+        ) else {
+            node.display = Display::None;
+            continue;
+        };
+        let x = |index: usize| {
+            ((f64::from(PLANNING_SOURCE_COUNTS[index]).ln() - log_min) / log_span) as f32 * 800.0
+                + 20.0
+        };
+        let y = |milliseconds: f64| (1.0 - milliseconds / maximum) as f32 * 290.0 + 20.0;
+        let (x0, x1, y0, y1) = (x(segment.index), x(segment.index + 1), y(from.0), y(to.0));
+        let delta = Vec2::new(x1 - x0, y1 - y0);
+        let length = delta.length();
+        node.display = Display::Flex;
+        node.left = px((x0 + x1) * 0.5 - length * 0.5);
+        node.top = px((y0 + y1) * 0.5 - 1.5);
+        node.width = px(length.max(0.5));
+        transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
+    }
+    let names = ["Eq.106", "FFT-grid", "treecode"];
+    let mut lines = vec![
+        "x: source count (log scale) | y: total method time (ms) | median line; text shows P10/P90 and eligible runs".to_string(),
+    ];
+    for method in 0..3 {
+        let values = PLANNING_SOURCE_COUNTS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, source)| {
+                points[method][index].map(|(median, p10, p90)| {
+                    format!(
+                        "{source}: {median:.1} [{p10:.1},{p90:.1}] {}/{} eligible",
+                        eligible_counts[method][index], PLANNING_SOURCE_REPEATS
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        lines.push(format!("{} — {values}", names[method]));
+    }
+    for mut summary in summaries.iter_mut() {
+        *summary = Text::new(lines.join("\n"));
+    }
 }
 
 #[cfg(test)]
@@ -494,13 +768,13 @@ mod planning_method_order_tests {
     use crate::interface::components::ActiveGravityMethod;
 
     #[test]
-    fn every_run_starts_with_eq106_and_uses_the_same_order() {
+    fn repeat_orders_rotate_without_changing_membership() {
         let first = planning_method_order(0);
         let second = planning_method_order(1);
         let third = planning_method_order(2);
         assert_eq!(first[0], ActiveGravityMethod::CurvedArcEq106);
-        assert_eq!(second, first);
-        assert_eq!(third, first);
+        assert_eq!(second[0], ActiveGravityMethod::MmfftCompressed);
+        assert_eq!(third[0], ActiveGravityMethod::Fmm);
         for order in [first, second, third] {
             assert!(order.contains(&ActiveGravityMethod::CurvedArcEq106));
             assert!(order.contains(&ActiveGravityMethod::MmfftCompressed));

@@ -183,6 +183,24 @@ pub(crate) struct DensityInversionTimingLabel(pub usize);
 #[derive(Component)]
 pub(crate) struct DensityInversionStatusLabel;
 
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveButton;
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveOverlay;
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveCloseButton;
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveSummary;
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct SourceScaleCurveSegment {
+    pub method: usize,
+    pub index: usize,
+}
+
 #[derive(Component, Clone, Copy)]
 pub(crate) struct TrajectoryInversionField {
     pub index: usize,

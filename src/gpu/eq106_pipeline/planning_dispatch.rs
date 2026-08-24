@@ -295,7 +295,8 @@ fn dispatch_planning_eq106(
         state.active_verification_targets.clone()
     };
     let metric_size = u64::from(request.candidate_count) * 16;
-    let staging_size = metric_size + verification_targets.len() as u64 * 5 * 16;
+    // Six contiguous evaluator rows plus the two non-contiguous FD scan rows.
+    let staging_size = metric_size + verification_targets.len() as u64 * 8 * 16;
     if state.output_size != output_size || state.output.is_none() {
         state.output_size = output_size;
         state.output = Some(render_device.create_buffer(&BufferDescriptor {
@@ -382,8 +383,8 @@ fn dispatch_planning_eq106(
                 element.taylor_order,
                 0,
                 element.spectrum_index,
-                false,
                 true,
+                false,
                 element.target_count,
                 element.target_offset,
             );
@@ -494,12 +495,20 @@ fn dispatch_planning_eq106(
         );
         encoder.copy_buffer_to_buffer(&metrics, 0, &staging, 0, metric_size);
         for (compact_index, target_index) in verification_targets.iter().copied().enumerate() {
+            let compact_offset = metric_size + compact_index as u64 * 8 * 16;
             encoder.copy_buffer_to_buffer(
                 &output,
                 u64::from(target_index) * OUTPUT_BYTES,
                 &staging,
-                metric_size + compact_index as u64 * 5 * 16,
-                5 * 16,
+                compact_offset,
+                6 * 16,
+            );
+            encoder.copy_buffer_to_buffer(
+                &output,
+                u64::from(target_index) * OUTPUT_BYTES + 9 * 16,
+                &staging,
+                compact_offset + 6 * 16,
+                2 * 16,
             );
         }
         resources
@@ -566,9 +575,12 @@ fn dispatch_planning_eq106(
             }
             let compact_rows = &full_rows[request_candidate_count as usize..];
             let mut valid_targets = Vec::with_capacity(state_indices.len());
+            let mut rejection_counts = [0_u64; 6];
+            let mut self_fd_step_maxima = [0.0_f32; 5];
+            let mut first_rejection = None;
             for (target_index, target_rows) in state_indices.iter().copied().zip(
                 compact_rows
-                .chunks_exact(5)
+                .chunks_exact(8)
                 .take(state_indices.len()),
             ) {
                 let certificate = target_rows[1];
@@ -576,16 +588,60 @@ fn dispatch_planning_eq106(
                     .into_iter()
                     .flatten()
                     .all(f32::is_finite);
-                let valid = finite
-                    && certificate.iter().copied().all(f32::is_finite)
-                    && certificate[0] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-                    && certificate[1] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-                    && certificate[2] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-                    && certificate[3] <= 0.30
-                    && target_rows[4][3] <= PLANNING_GRADIENT_ERROR_LIMIT;
+                let fd_errors = [
+                    target_rows[6][0],
+                    target_rows[6][1],
+                    target_rows[6][2],
+                    target_rows[6][3],
+                    target_rows[7][0],
+                ];
+                for (maximum, error) in self_fd_step_maxima.iter_mut().zip(fd_errors) {
+                    if error.is_finite() {
+                        *maximum = maximum.max(error);
+                    }
+                }
+                let local_candidate = target_index / samples_per_candidate;
+                let outside_tube = invalid_candidates_for_readback.contains(&local_candidate);
+                let rejection = if outside_tube {
+                    Some(3)
+                } else if !finite
+                    || certificate.iter().copied().any(|value| !value.is_finite())
+                {
+                    Some(5)
+                } else if certificate[0] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE {
+                    Some(0)
+                } else if certificate[1] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE {
+                    Some(1)
+                } else if certificate[2] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE {
+                    Some(2)
+                } else if certificate[3] > 0.30 {
+                    Some(3)
+                } else {
+                    None
+                };
+                // The f32 self-FD scan is an internal consistency warning,
+                // not an accuracy oracle. Cancellation at small step sizes
+                // must not zero otherwise finite fields; f64 truth below
+                // remains the common qualification criterion.
+                if fd_errors.iter().copied().any(|value| !value.is_finite())
+                    || fd_errors[2] > PLANNING_GRADIENT_ERROR_LIMIT
+                {
+                    rejection_counts[4] += 1;
+                }
+                if let Some(reason) = rejection {
+                    rejection_counts[reason] += 1;
+                    first_rejection.get_or_insert([
+                        packet_request.density_model,
+                        packet_request.candidate_start + target_index / samples_per_candidate,
+                        target_index % samples_per_candidate,
+                        target_rows[5][3].max(0.0) as u32,
+                        reason as u32,
+                    ]);
+                }
+                let valid = rejection.is_none();
                 valid_targets.push(valid);
                 if !valid {
-                    let candidate = target_index / samples_per_candidate;
+                    let candidate = local_candidate;
                     if let Some(rejected) = rejected_candidates.get_mut(candidate as usize) {
                         *rejected = true;
                     }
@@ -595,21 +651,23 @@ fn dispatch_planning_eq106(
                 }
             }
             let maximum_gradient_self_fd_relative_error = compact_rows
-                .chunks_exact(5)
+                .chunks_exact(8)
                 .take(state_indices.len())
                 .map(|target_rows| target_rows[4][3])
                 .filter(|error| error.is_finite())
                 .fold(0.0_f32, f32::max);
             let mut common_indices = Vec::with_capacity(state_indices.len());
             let mut rows = Vec::with_capacity(state_indices.len() * 4);
+            let mut raw_rows = Vec::with_capacity(state_indices.len() * 4);
             for ((target_index, target_rows), target_valid) in state_indices
                 .iter()
                 .copied()
-                .zip(compact_rows.chunks_exact(5).take(state_indices.len()))
+                .zip(compact_rows.chunks_exact(8).take(state_indices.len()))
                 .zip(valid_targets)
             {
                 let candidate = target_index / samples_per_candidate;
                 common_indices.push(target_index);
+                raw_rows.extend([target_rows[0], target_rows[2], target_rows[3], target_rows[4]]);
                 if target_valid && !rejected_candidates[candidate as usize] {
                     rows.extend([target_rows[0], target_rows[2], target_rows[3], target_rows[4]]);
                 } else {
@@ -619,23 +677,49 @@ fn dispatch_planning_eq106(
                     rows.extend([[0.0; 4]; 4]);
                 }
             }
+            let rejected_sample_count = state_indices
+                .iter()
+                .filter(|target_index| {
+                    rejected_candidates[(**target_index / samples_per_candidate) as usize]
+                })
+                .count() as u64;
             drop(view);
             staging.unmap();
             (
                 rows,
+                raw_rows,
                 candidate_metrics,
                 common_indices,
                 maximum_gradient_self_fd_relative_error,
+                rejection_counts,
+                self_fd_step_maxima,
+                first_rejection,
+                rejected_sample_count,
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new(), f32::NAN)
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                f32::NAN,
+                [0; 6],
+                [f32::NAN; 5],
+                None,
+                0,
+            )
         };
         if let Ok(mut guard) = shared_data.lock() {
             *guard = Some(PlanningGpuPacket {
                 request: packet_request,
-                state_indices: rows.2,
+                state_indices: rows.3,
                 rows: rows.0,
-                candidate_metrics: rows.1,
+                raw_rows: rows.1,
+                candidate_metrics: rows.2,
+                rejection_counts: rows.5,
+                self_fd_step_maxima: rows.6,
+                first_rejection: rows.7,
+                rejected_sample_count: rows.8,
                 readback_valid: result.is_ok(),
                 timing: PlanningGpuTiming {
                     method_preprocess_ms,
@@ -652,7 +736,7 @@ fn dispatch_planning_eq106(
                             * u64::from(FREQUENCY_COUNT)
                             * u64::from(taylor_coefficient_count(TAYLOR_MAX_ORDER)),
                     spectral_element_count: reported_segment_count,
-                    gradient_self_fd_relative_error: rows.3,
+                    gradient_self_fd_relative_error: rows.4,
                 },
                 backend: PlanningExecutionBackend::GpuEq106,
             });

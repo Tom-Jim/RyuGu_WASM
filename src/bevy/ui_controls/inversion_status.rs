@@ -111,8 +111,28 @@ fn comparison_metric_text(
     let total = result.total_ms;
     let value = match planning.selected_metric {
         ComparisonMetric::GravityRelativeError => {
+            let certificate = if result.method == ActiveGravityMethod::CurvedArcEq106 {
+                let first = result.first_rejection.map_or_else(
+                    || "none".to_string(),
+                    |failure| {
+                        format!(
+                            "density {} candidate {} sample {} segment {} reason {}",
+                            failure[0], failure[1], failure[2], failure[3], failure[4]
+                        )
+                    },
+                );
+                format!(
+                    " | raw {:.3e}, penalty {:.3e} | rejected samples {} | reject T/I/S/X/FDwarn/NF {:?} | first {first}",
+                    result.raw_relative_gravity_error,
+                    result.relative_gravity_error,
+                    result.rejected_sample_count,
+                    result.rejection_counts,
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{verification}gravity {:.3e} | valid {}/{} | f64 samples {} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
+                "{verification}gravity {:.3e}{certificate} | valid {}/{} | f64 samples {} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
                 result.relative_gravity_error,
                 result.valid_candidate_count,
                 result.workload.candidate_count,
@@ -136,8 +156,14 @@ fn comparison_metric_text(
         ComparisonMetric::GradientRelativeError => {
             if result.method == ActiveGravityMethod::CurvedArcEq106 {
                 format!(
-                    "{verification}gradient relative error {:.3e} | same-field transverse FD {:.3e}",
-                    result.gradient_relative_error, result.gradient_self_fd_relative_error
+                    "{verification}gradient raw {:.3e}, penalty {:.3e} | self-FD max [0.25,0.5,1,2,4m] = [{:.3e}, {:.3e}, {:.3e}, {:.3e}, {:.3e}]",
+                    result.raw_gradient_relative_error,
+                    result.gradient_relative_error,
+                    result.self_fd_step_maxima[0],
+                    result.self_fd_step_maxima[1],
+                    result.self_fd_step_maxima[2],
+                    result.self_fd_step_maxima[3],
+                    result.self_fd_step_maxima[4],
                 )
             } else {
                 format!(

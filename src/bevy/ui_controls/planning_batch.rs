@@ -39,6 +39,45 @@ pub fn planning_batch_evaluator_system(
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
                 if job.method_order_index + 1 == job.method_order.len() {
+                    if planning.source_curve_active {
+                        let eq106 = planning.results[2].expect("completed Eq.106 curve result");
+                        let mmfft = planning.results[3].expect("completed FFT curve result");
+                        let fmm = planning.results[4].expect("completed tree curve result");
+                        let source_count = planning.requested_source_count;
+                        planning.source_curve_samples.push(PlanningSourceCurveSample {
+                            source_count,
+                            times_ms: [eq106.total_ms, mmfft.total_ms, fmm.total_ms],
+                            eligible: [
+                                eq106.accuracy_eligible(),
+                                mmfft.accuracy_eligible(),
+                                fmm.accuracy_eligible(),
+                            ],
+                        });
+                        planning.source_curve_repeat += 1;
+                        if planning.source_curve_repeat >= PLANNING_SOURCE_REPEATS {
+                            planning.source_curve_repeat = 0;
+                            planning.source_curve_index += 1;
+                        }
+                        if planning.source_curve_index < PLANNING_SOURCE_COUNTS.len() {
+                            planning.requested_source_count =
+                                PLANNING_SOURCE_COUNTS[planning.source_curve_index];
+                            planning.results = std::array::from_fn(|_| None);
+                            planning.run_id = planning.run_id.wrapping_add(1);
+                            planning.status = format!(
+                                "Source curve queued: {} sources, repeat {}/{}.",
+                                planning.requested_source_count,
+                                planning.source_curve_repeat + 1,
+                                PLANNING_SOURCE_REPEATS
+                            );
+                            return;
+                        }
+                        planning.source_curve_active = false;
+                        planning.source_curve_visible = true;
+                        planning.run_requested = false;
+                        planning.status =
+                            "Source crossover curve complete: median and P10/P90 ready.".into();
+                        return;
+                    }
                     planning.run_requested = false;
                     planning.status = format!(
                         "{} GPU batch complete: all methods used the identical frozen 15 m tube and density matrix.",
@@ -155,14 +194,41 @@ fn reduce_planning_packet(
     job.verification_sample_count = job
         .verification_sample_count
         .saturating_add(packet.state_indices.len() as u64);
+    job.rejected_sample_count = job
+        .rejected_sample_count
+        .saturating_add(packet.rejected_sample_count);
+    if job.first_rejection.is_none() {
+        job.first_rejection = packet.first_rejection;
+    }
+    for (total, count) in job
+        .rejection_counts
+        .iter_mut()
+        .zip(packet.rejection_counts)
+    {
+        *total = total.saturating_add(count);
+    }
+    for (maximum, value) in job
+        .self_fd_step_maxima
+        .iter_mut()
+        .zip(packet.self_fd_step_maxima)
+    {
+        if value.is_finite() {
+            *maximum = maximum.max(value);
+        }
+    }
     job.maximum_gradient_self_fd_relative_error = job
         .maximum_gradient_self_fd_relative_error
         .max(packet.timing.gradient_self_fd_relative_error);
     if !packet.readback_valid
         || packet.rows.len() != packet.state_indices.len() * 4
+        || packet.raw_rows.len() != packet.state_indices.len() * 4
         || packet.candidate_metrics.len() != packet.request.candidate_count as usize
         || packet
             .rows
+            .iter()
+            .any(|row| row.iter().any(|value| !value.is_finite()))
+        || packet
+            .raw_rows
             .iter()
             .any(|row| row.iter().any(|value| !value.is_finite()))
         || packet
@@ -237,6 +303,28 @@ fn reduce_planning_packet(
                 f64::from(packet.rows[verification_index * 4 + 3][2]),
             ),
         );
+        let raw_field = DVec3::new(
+            f64::from(packet.raw_rows[verification_index * 4][0]),
+            f64::from(packet.raw_rows[verification_index * 4][1]),
+            f64::from(packet.raw_rows[verification_index * 4][2]),
+        );
+        let raw_gradient = DMat3::from_cols(
+            DVec3::new(
+                f64::from(packet.raw_rows[verification_index * 4 + 1][0]),
+                f64::from(packet.raw_rows[verification_index * 4 + 1][1]),
+                f64::from(packet.raw_rows[verification_index * 4 + 1][2]),
+            ),
+            DVec3::new(
+                f64::from(packet.raw_rows[verification_index * 4 + 2][0]),
+                f64::from(packet.raw_rows[verification_index * 4 + 2][1]),
+                f64::from(packet.raw_rows[verification_index * 4 + 2][2]),
+            ),
+            DVec3::new(
+                f64::from(packet.raw_rows[verification_index * 4 + 3][0]),
+                f64::from(packet.raw_rows[verification_index * 4 + 3][1]),
+                f64::from(packet.raw_rows[verification_index * 4 + 3][2]),
+            ),
+        );
         let verification_started = bevy::platform::time::Instant::now();
         let (reference_field, reference_gradient) = direct_planning_reference(
             state.body_position().as_dvec3(),
@@ -258,6 +346,8 @@ fn reduce_planning_packet(
         job.gradient_error_sum += matrix_norm_squared(method_gradient - reference_gradient);
         job.gradient_reference_sum += matrix_norm_squared(reference_gradient);
         job.gradient_samples += 1;
+        job.raw_gravity_error_sum += (raw_field - reference_field).length_squared();
+        job.raw_gradient_error_sum += matrix_norm_squared(raw_gradient - reference_gradient);
         let local_candidate = local / batch.samples_per_candidate as usize;
         let current_time = f64::from(state.position_time[3]);
         if let Some(previous_time) = previous_verified_time[local_candidate] {
@@ -312,7 +402,7 @@ fn direct_planning_reference(
     let densities = &batch.density_models[row_start..row_start + 56];
     let mut acceleration = DVec3::ZERO;
     let mut gradient = DMat3::ZERO;
-    for source in batch.basis_records.iter() {
+    for source in batch.reference_basis_records.iter() {
         let position = DVec3::new(
             f64::from(source.position_volume[0]),
             f64::from(source.position_volume[1]),
@@ -454,6 +544,12 @@ fn finish_planning_method(
     let gradient_error = (job.gradient_error_sum
         / job.gradient_reference_sum.max(f64::MIN_POSITIVE))
     .sqrt() as f32;
+    let raw_gravity_error = (job.raw_gravity_error_sum
+        / job.gravity_reference_sum.max(f64::MIN_POSITIVE))
+    .sqrt() as f32;
+    let raw_gradient_error = (job.raw_gradient_error_sum
+        / job.gradient_reference_sum.max(f64::MIN_POSITIVE))
+    .sqrt() as f32;
     let model_discrimination = (job.discrimination_sum
         / job
             .discrimination_reference_sum
@@ -510,7 +606,12 @@ fn finish_planning_method(
         total_ms,
         relative_gravity_error: gravity_error,
         gradient_relative_error: gradient_error,
-        gradient_self_fd_relative_error: job.maximum_gradient_self_fd_relative_error,
+        raw_relative_gravity_error: raw_gravity_error,
+        raw_gradient_relative_error: raw_gradient_error,
+        rejected_sample_count: job.rejected_sample_count,
+        rejection_counts: job.rejection_counts,
+        self_fd_step_maxima: job.self_fd_step_maxima,
+        first_rejection: job.first_rejection,
         pericenter_error_m: job.pericenter_error_m,
         minimum_altitude_m,
         model_discrimination,
@@ -581,6 +682,12 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.gradient_reference_sum = 0.0;
     job.gradient_samples = 0;
     job.verification_sample_count = 0;
+    job.raw_gravity_error_sum = 0.0;
+    job.raw_gradient_error_sum = 0.0;
+    job.rejected_sample_count = 0;
+    job.rejection_counts = [0; 6];
+    job.self_fd_step_maxima = [0.0; 5];
+    job.first_rejection = None;
     job.maximum_gradient_self_fd_relative_error = 0.0;
     job.pericenter_error_m = 0.0;
     job.minimum_altitude_m = f32::INFINITY;

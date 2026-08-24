@@ -74,7 +74,8 @@ const TAYLOR_MAX_ORDER: u32 = 8u;
 const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 45u;
 const QUADRATURE_CAPACITY: u32 = 64u;
 const SPECTRUM_FREQUENCY_CAPACITY: u32 = 129u;
-const OUTPUT_ROWS_PER_BLOCK: u32 = 9u;
+const OUTPUT_ROWS_PER_BLOCK: u32 = 11u;
+const SELF_FD_DELTAS = array<f32, 5>(0.25, 0.5, 1.0, 2.0, 4.0);
 const TARGET_DISPATCH_WIDTH: u32 = 65535u;
 const TOROIDAL_MODE_COUNT: u32 = 17u;
 const TOROIDAL_SEGMENT_COUNT: u32 = 12u;
@@ -743,16 +744,15 @@ fn evaluate_field(
     // One metre keeps the f32 field subtraction above cancellation noise;
     // its O(delta^2) truncation remains negligible relative to the hundreds
     // of metres source distance in the certified exterior tube.
-    let self_fd_delta = 1.0;
     // The direct f64 benchmark still verifies every First target.  This
     // same-field consistency check is sampled so its Eq.106-only arithmetic
     // cannot dominate the performance comparison.
     let self_fd_active = eq_params.evaluate_dual_certificate != 0u
         && target_index % 32u == 0u;
-    var self_fd_u_plus = vec3<f32>(0.0);
-    var self_fd_u_minus = vec3<f32>(0.0);
-    var self_fd_v_plus = vec3<f32>(0.0);
-    var self_fd_v_minus = vec3<f32>(0.0);
+    var self_fd_u_plus: array<vec3<f32>, 5>;
+    var self_fd_u_minus: array<vec3<f32>, 5>;
+    var self_fd_v_plus: array<vec3<f32>, 5>;
+    var self_fd_v_minus: array<vec3<f32>, 5>;
 
     var independent_potential = 0.0;
     if lane == 0u && target_active && eq_params.evaluate_dual_certificate != 0u && target_index == 0u {
@@ -903,14 +903,17 @@ fn evaluate_field(
                     derivative_v += reconstructed.xyz * f32(b) * monomial(u, v, a, b - 1u);
                 }
                 if self_fd_active {
-                    self_fd_u_plus += reconstructed.xyz
-                        * monomial(u + self_fd_delta, v, a, b);
-                    self_fd_u_minus += reconstructed.xyz
-                        * monomial(u - self_fd_delta, v, a, b);
-                    self_fd_v_plus += reconstructed.xyz
-                        * monomial(u, v + self_fd_delta, a, b);
-                    self_fd_v_minus += reconstructed.xyz
-                        * monomial(u, v - self_fd_delta, a, b);
+                    for (var fd_index = 0u; fd_index < 5u; fd_index += 1u) {
+                        let delta = SELF_FD_DELTAS[fd_index];
+                        self_fd_u_plus[fd_index] += reconstructed.xyz
+                            * monomial(u + delta, v, a, b);
+                        self_fd_u_minus[fd_index] += reconstructed.xyz
+                            * monomial(u - delta, v, a, b);
+                        self_fd_v_plus[fd_index] += reconstructed.xyz
+                            * monomial(u, v + delta, a, b);
+                        self_fd_v_minus[fd_index] += reconstructed.xyz
+                            * monomial(u, v - delta, a, b);
+                    }
                 }
                 if degree == active_order {
                     last_order_field += reconstructed.xyz * value;
@@ -946,18 +949,23 @@ fn evaluate_field(
     let imaginary_residual = length(imaginary_field) / field_scale;
     let spectral_tail_residual = length(tail_field) / field_scale;
     let transverse_ratio = length(vec2<f32>(u, v)) / max(eq_params.line_limit, 1.0);
-    var self_fd_relative_error = 0.0;
+    var self_fd_errors: array<f32, 5>;
     if self_fd_active {
-        let self_fd_u = (self_fd_u_plus - self_fd_u_minus) / (2.0 * self_fd_delta);
-        let self_fd_v = (self_fd_v_plus - self_fd_v_minus) / (2.0 * self_fd_delta);
-        let self_fd_error = sqrt(
-            dot(self_fd_u - derivative_u, self_fd_u - derivative_u)
-            + dot(self_fd_v - derivative_v, self_fd_v - derivative_v)
-        );
         let self_fd_scale = max(sqrt(
             dot(derivative_u, derivative_u) + dot(derivative_v, derivative_v)
         ), 1.0e-12);
-        self_fd_relative_error = self_fd_error / self_fd_scale;
+        for (var fd_index = 0u; fd_index < 5u; fd_index += 1u) {
+            let delta = SELF_FD_DELTAS[fd_index];
+            let self_fd_u = (self_fd_u_plus[fd_index] - self_fd_u_minus[fd_index])
+                / (2.0 * delta);
+            let self_fd_v = (self_fd_v_plus[fd_index] - self_fd_v_minus[fd_index])
+                / (2.0 * delta);
+            let self_fd_error = sqrt(
+                dot(self_fd_u - derivative_u, self_fd_u - derivative_u)
+                + dot(self_fd_v - derivative_v, self_fd_v - derivative_v)
+            );
+            self_fd_errors[fd_index] = self_fd_error / self_fd_scale;
+        }
     }
     let output_base = target_index * OUTPUT_ROWS_PER_BLOCK;
 
@@ -970,7 +978,7 @@ fn evaluate_field(
     );
     output[output_base + 2u] = vec4<f32>(derivative_x, 0.0);
     output[output_base + 3u] = vec4<f32>(derivative_y, 0.0);
-    output[output_base + 4u] = vec4<f32>(derivative_z, self_fd_relative_error);
+    output[output_base + 4u] = vec4<f32>(derivative_z, self_fd_errors[2]);
     output[output_base + 5u] = vec4<f32>(h, u, v, f32(eq_params.segment_id));
     output[output_base + 6u] = vec4<f32>(
         field.w,
@@ -980,4 +988,8 @@ fn evaluate_field(
     );
     output[output_base + 7u] = vec4<f32>(probe_pos, f32(eq_params.target_count));
     output[output_base + 8u] = vec4<f32>(eq_params.line_origin, 0.0);
+    output[output_base + 9u] = vec4<f32>(
+        self_fd_errors[0], self_fd_errors[1], self_fd_errors[2], self_fd_errors[3]
+    );
+    output[output_base + 10u] = vec4<f32>(self_fd_errors[4], 0.0, 0.0, 0.0);
 }

@@ -62,6 +62,7 @@ pub struct PlanningCandidateBatch {
     pub capture_id: u64,
     pub capture_epoch: u64,
     pub source_hash: u64,
+    pub source_count: u32,
     pub candidate_count: u32,
     pub density_model_count: u32,
     pub samples_per_candidate: u32,
@@ -79,6 +80,9 @@ pub struct PlanningCandidateBatch {
     pub density_seed: u64,
     pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
+    /// Exact canonical equivalent used only by the excluded f64 truth path;
+    /// split GPU records are colocated and their volumes sum to these rows.
+    pub reference_basis_records: Arc<[PlanningBasisRecord]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,
@@ -107,6 +111,7 @@ impl PlanningCandidateBatch {
             reference_capture_id: self.capture_id,
             reference_capture_epoch: self.capture_epoch,
             source_hash: self.source_hash,
+            source_count: self.source_count,
             basis_hash: self.basis_hash,
             reference_arc_hash: self.reference_arc_hash,
             candidate_hash: self.candidate_hash,
@@ -158,6 +163,19 @@ pub struct PlanningGpuPacket {
     pub state_indices: Vec<u32>,
     /// Four rows per target: acceleration/potential and three Jacobian columns.
     pub rows: Vec<[f32; 4]>,
+    /// Unmodified method output before certificate failures are converted to
+    /// common full-penalty rows.
+    pub raw_rows: Vec<[f32; 4]>,
+    /// Taylor, imaginary, spectral, transverse, self-FD, and non-finite
+    /// rejection counts. Non-Eq.106 methods leave these at zero.
+    pub rejection_counts: [u64; 6],
+    /// Validation rows charged the full penalty after candidate-level gating.
+    pub rejected_sample_count: u64,
+    /// Maximum self-FD mismatch at 0.25, 0.5, 1, 2, and 4 metres.
+    pub self_fd_step_maxima: [f32; 5],
+    /// First certificate rejection as density, global candidate, sample,
+    /// Taylor segment, and reason index. Self-FD warnings do not reject.
+    pub first_rejection: Option<[u32; 5]>,
     /// One GPU-reduced row per candidate: field separation, baseline energy,
     /// minimum altitude, and Jacobian energy.
     pub candidate_metrics: Vec<[f32; 4]>,

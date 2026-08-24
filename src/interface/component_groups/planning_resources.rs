@@ -18,10 +18,9 @@ pub const NEAR_SYNC_RELATIVE_REMAINDER_TARGET: f32 = 1.0e-3;
 pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
 pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
-pub const PLANNING_EQ106_TARGET_SEGMENTS: u32 = 10;
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
-pub const PLANNING_USEFUL_SPEEDUP: f64 = 3.0;
-pub const PLANNING_STRONG_SPEEDUP: f64 = 5.0;
+pub const PLANNING_SOURCE_COUNTS: [u32; 5] = [1_024, 2_048, 4_096, 65_536, 262_144];
+pub const PLANNING_SOURCE_REPEATS: u32 = 10;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
 pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
 
@@ -194,6 +193,7 @@ pub struct PlanningWorkloadIdentity {
     pub reference_capture_id: u64,
     pub reference_capture_epoch: u64,
     pub source_hash: u64,
+    pub source_count: u32,
     pub basis_hash: u64,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
@@ -274,7 +274,12 @@ pub struct PlanningMethodMetrics {
     pub total_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
-    pub gradient_self_fd_relative_error: f32,
+    pub raw_relative_gravity_error: f32,
+    pub raw_gradient_relative_error: f32,
+    pub rejected_sample_count: u64,
+    pub rejection_counts: [u64; 6],
+    pub self_fd_step_maxima: [f32; 5],
+    pub first_rejection: Option<[u32; 5]>,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
     pub model_discrimination: f32,
@@ -323,6 +328,12 @@ pub struct PlanningBatchJob {
     pub gradient_reference_sum: f64,
     pub gradient_samples: u64,
     pub verification_sample_count: u64,
+    pub raw_gravity_error_sum: f64,
+    pub raw_gradient_error_sum: f64,
+    pub rejected_sample_count: u64,
+    pub rejection_counts: [u64; 6],
+    pub self_fd_step_maxima: [f32; 5],
+    pub first_rejection: Option<[u32; 5]>,
     pub maximum_gradient_self_fd_relative_error: f32,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
@@ -349,7 +360,8 @@ pub struct PlanningBatchJob {
 
 impl PlanningMethodMetrics {
     pub fn accuracy_eligible(self) -> bool {
-        self.workload.is_complete()
+        self.gpu_batch_verified
+            && self.workload.is_complete()
             && self.relative_gravity_error.is_finite()
             && self.relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
             && self.gradient_relative_error.is_finite()
@@ -357,7 +369,7 @@ impl PlanningMethodMetrics {
             && self.pericenter_error_m.is_finite()
             && self.pericenter_error_m <= PLANNING_PERICENTER_ERROR_LIMIT_METERS
             && self.top_candidates[0].objective.is_finite()
-            && self.valid_candidate_count > 0
+            && self.valid_candidate_count == self.workload.candidate_count
             && self.total_ms.is_finite()
             && self.total_ms > 0.0
     }
@@ -373,6 +385,19 @@ pub struct PlanningComparisonState {
     pub reference_duration_seconds: f32,
     pub status: String,
     pub batch_job: Option<PlanningBatchJob>,
+    pub requested_source_count: u32,
+    pub source_curve_active: bool,
+    pub source_curve_visible: bool,
+    pub source_curve_index: usize,
+    pub source_curve_repeat: u32,
+    pub source_curve_samples: Vec<PlanningSourceCurveSample>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlanningSourceCurveSample {
+    pub source_count: u32,
+    pub times_ms: [f64; 3],
+    pub eligible: [bool; 3],
 }
 
 #[derive(Resource, Debug, Default)]
@@ -409,6 +434,12 @@ impl Default for PlanningComparisonState {
             reference_duration_seconds: 0.0,
             status: "Choose a planning metric to run First, or use inversion metrics with the inversion button.".into(),
             batch_job: None,
+            requested_source_count: PLANNING_SOURCE_COUNTS[0],
+            source_curve_active: false,
+            source_curve_visible: false,
+            source_curve_index: 0,
+            source_curve_repeat: 0,
+            source_curve_samples: Vec::new(),
         }
     }
 }
@@ -446,87 +477,77 @@ impl PlanningComparisonState {
         let eq106 = self.results[2]?;
         let mmfft = self.results[3]?;
         let fmm = self.results[4]?;
-        let mut failures = Vec::new();
-        for (name, result) in [("Eq.106", eq106), ("FFT-grid", mmfft), ("treecode", fmm)] {
-            let failure_count = failures.len();
+        let methods = [("Eq.106", eq106), ("FFT-grid", mmfft), ("treecode", fmm)];
+        let common_samples = eq106.verification_sample_count > 0
+            && eq106.verification_sample_count == mmfft.verification_sample_count
+            && eq106.verification_sample_count == fmm.verification_sample_count;
+        let mut eligible = Vec::new();
+        let mut disqualified = Vec::new();
+        for (name, result) in methods {
+            let mut reasons = Vec::new();
             if !result.gpu_batch_verified {
-                failures.push(format!("{name} GPU verification failed"));
+                reasons.push("GPU verification failed".to_string());
             }
             if !result.relative_gravity_error.is_finite()
                 || result.relative_gravity_error > PLANNING_GRAVITY_ERROR_LIMIT
             {
-                failures.push(format!(
-                    "{name} gravity {:.3e} > {:.1e}",
+                reasons.push(format!(
+                    "gravity {:.3e} > {:.1e}",
                     result.relative_gravity_error, PLANNING_GRAVITY_ERROR_LIMIT
                 ));
             }
             if !result.gradient_relative_error.is_finite()
                 || result.gradient_relative_error > PLANNING_GRADIENT_ERROR_LIMIT
             {
-                failures.push(format!(
-                    "{name} gradient {:.3e} > {:.1e}",
+                reasons.push(format!(
+                    "gradient {:.3e} > {:.1e}",
                     result.gradient_relative_error, PLANNING_GRADIENT_ERROR_LIMIT
                 ));
             }
             if !result.pericenter_error_m.is_finite()
                 || result.pericenter_error_m > PLANNING_PERICENTER_ERROR_LIMIT_METERS
             {
-                failures.push(format!(
-                    "{name} pericenter {:.3e}m > {:.1}m",
+                reasons.push(format!(
+                    "pericenter {:.3e}m > {:.1}m",
                     result.pericenter_error_m, PLANNING_PERICENTER_ERROR_LIMIT_METERS
                 ));
             }
-            if !result.accuracy_eligible() && failures.len() == failure_count {
-                failures.push(format!("{name} has incomplete score or timing data"));
+            if result.valid_candidate_count != result.workload.candidate_count {
+                reasons.push(format!(
+                    "coverage {}/{}",
+                    result.valid_candidate_count, result.workload.candidate_count
+                ));
+            }
+            if name == "Eq.106" && result.segment_count > PLANNING_EQ106_MAX_SEGMENTS {
+                reasons.push(format!(
+                    "segments {} > {}",
+                    result.segment_count, PLANNING_EQ106_MAX_SEGMENTS
+                ));
+            }
+            if !common_samples {
+                reasons.push(format!(
+                    "non-common f64 sample count {}",
+                    result.verification_sample_count
+                ));
+            }
+            if reasons.is_empty() && result.accuracy_eligible() {
+                eligible.push((name, result.total_ms));
+            } else {
+                if reasons.is_empty() {
+                    reasons.push("incomplete score or timing data".into());
+                }
+                disqualified.push(format!("{name} disqualified: {}", reasons.join(", ")));
             }
         }
-        if eq106.segment_count > PLANNING_EQ106_MAX_SEGMENTS {
-            failures.push(format!(
-                "Eq.106 segments {} > {}",
-                eq106.segment_count, PLANNING_EQ106_MAX_SEGMENTS
-            ));
-        }
-        if eq106.valid_candidate_count == 0
-            || eq106.valid_candidate_count != mmfft.valid_candidate_count
-            || eq106.valid_candidate_count != fmm.valid_candidate_count
-        {
-            failures.push(format!(
-                "valid candidates differ: Eq.106 {}, FFT-grid {}, treecode {}",
-                eq106.valid_candidate_count,
-                mmfft.valid_candidate_count,
-                fmm.valid_candidate_count
-            ));
-        }
-        if eq106.verification_sample_count == 0
-            || eq106.verification_sample_count != mmfft.verification_sample_count
-            || eq106.verification_sample_count != fmm.verification_sample_count
-        {
-            failures.push(format!(
-                "f64 verification samples differ: Eq.106 {}, FFT-grid {}, treecode {}",
-                eq106.verification_sample_count,
-                mmfft.verification_sample_count,
-                fmm.verification_sample_count
-            ));
-        }
-        if !failures.is_empty() {
-            return Some(format!("no eligible winner: {}", failures.join("; ")));
-        }
-        let speedup_vs_fft = mmfft.total_ms / eq106.total_ms;
-        let speedup_vs_tree = fmm.total_ms / eq106.total_ms;
-        let minimum_speedup = speedup_vs_fft.min(speedup_vs_tree);
-        Some(if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
-            && minimum_speedup >= PLANNING_STRONG_SPEEDUP
-        {
-            "Eq.106 strong advantage (>=5x both fixed baselines)".into()
-        } else if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
-            && minimum_speedup >= PLANNING_USEFUL_SPEEDUP
-        {
-            "Eq.106 useful advantage (>=3x both fixed baselines)".into()
+        eligible.sort_by(|left, right| left.1.total_cmp(&right.1));
+        let verdict = eligible.first().map_or_else(
+            || "No eligible winner".to_string(),
+            |(name, milliseconds)| format!("Eligible winner: {name} ({milliseconds:.2} ms)"),
+        );
+        Some(if disqualified.is_empty() {
+            verdict
         } else {
-            format!(
-                "Eq.106 has no effective advantage: {:.3}x vs FFT-grid, {:.3}x vs treecode",
-                speedup_vs_fft, speedup_vs_tree
-            )
+            format!("{verdict}; {}", disqualified.join("; "))
         })
     }
 }

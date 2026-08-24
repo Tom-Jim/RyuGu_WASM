@@ -40,10 +40,10 @@ use bevy_app::{
         setup_performance_controls, setup_probe_controls, setup_probe_crash_overlay,
         setup_runtime_error_overlay, setup_simulation_acceleration_control,
         setup_trajectory_inversion_controls, simulation_acceleration_slider_system,
-        simulation_acceleration_slider_visual_system, trajectory_inversion_input_system,
-        trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
-        update_hint_on_mode_change, update_planning_results_from_inversion_system,
-        update_ui_scale_system,
+        simulation_acceleration_slider_visual_system, source_scale_curve_ui_system,
+        trajectory_inversion_input_system, trajectory_inversion_ui_system,
+        update_gpu_memory_estimate_system, update_hint_on_mode_change,
+        update_planning_results_from_inversion_system, update_ui_scale_system,
     },
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -394,6 +394,7 @@ pub fn main() {
             update_planning_results_from_inversion_system,
             planning_batch_evaluator_system,
             density_inversion_timing_ui_system,
+            source_scale_curve_ui_system,
         )
             .chain(),
     )

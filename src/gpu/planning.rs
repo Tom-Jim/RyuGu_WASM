@@ -551,7 +551,12 @@ fn dispatch_planning_method(
                 *guard = Some(PlanningGpuPacket {
                     request: packet_request,
                     state_indices,
+                    raw_rows: rows.0.clone(),
                     rows: rows.0,
+                    rejection_counts: [0; 6],
+                    rejected_sample_count: 0,
+                    self_fd_step_maxima: [0.0; 5],
+                    first_rejection: None,
                     candidate_metrics: rows.1,
                     readback_valid: result.is_ok(),
                     timing: PlanningGpuTiming {

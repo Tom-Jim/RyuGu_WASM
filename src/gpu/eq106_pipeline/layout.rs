@@ -111,8 +111,8 @@ mod tests {
         }
     }
 
-    fn output_rows(position: Vec3, acceleration: Vec3) -> [[f32; 4]; 9] {
-        let mut rows = [[0.0; 4]; 9];
+    fn output_rows(position: Vec3, acceleration: Vec3) -> [[f32; 4]; 11] {
+        let mut rows = [[0.0; 4]; 11];
         rows[0] = [acceleration.x, acceleration.y, acceleration.z, 1.0];
         rows[6] = [1.0, 0.0, 0.0, 0.0];
         rows[7] = [position.x, position.y, position.z, 2.0];

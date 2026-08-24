@@ -10,6 +10,7 @@ pub(crate) struct PlanningBatchBuilder {
     capture_id: u64,
     capture_epoch: u64,
     source_hash: u64,
+    source_count: u32,
     body_radius: f32,
     candidate_count: u32,
     density_model_count: u32,
@@ -25,6 +26,7 @@ pub(crate) struct PlanningBatchBuilder {
     density_seed: u64,
     target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
+    reference_basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
 }
 
@@ -36,6 +38,7 @@ impl PlanningBatchBuilder {
         capture_id: u64,
         capture_epoch: u64,
         source_hash: u64,
+        requested_source_count: u32,
         reference_knots: &[TrajectoryInversionKnot],
         voxels: &[InvertedDensityVoxel],
         source: &AggregatedGravitySource,
@@ -52,7 +55,7 @@ impl PlanningBatchBuilder {
             samples_per_candidate as usize,
         )?;
         let reference_states = central_reference_states(&reference_samples)?;
-        let basis_records = basis
+        let canonical_basis_records = basis
             .columns
             .iter()
             .enumerate()
@@ -69,6 +72,8 @@ impl PlanningBatchBuilder {
                 })
             })
             .collect::<Vec<_>>();
+        let basis_records = refine_basis_records(&canonical_basis_records, requested_source_count)?;
+        let basis_hash = mix_hash(basis.hash, u64::from(requested_source_count));
         let density_seed = mix_hash(
             mix_hash(source_hash, basis.hash),
             mix_hash(capture_id, 0x1060_d315_7a11_5eed),
@@ -86,6 +91,7 @@ impl PlanningBatchBuilder {
             capture_id,
             capture_epoch,
             source_hash,
+            source_count: requested_source_count,
             body_radius: source.radius as f32,
             candidate_count,
             density_model_count,
@@ -103,7 +109,8 @@ impl PlanningBatchBuilder {
             density_seed,
             target_mass,
             basis_records,
-            basis_hash: basis.hash,
+            reference_basis_records: canonical_basis_records,
+            basis_hash,
         })
     }
 
@@ -113,11 +120,13 @@ impl PlanningBatchBuilder {
         run_id: u64,
         capture_id: u64,
         source_hash: u64,
+        requested_source_count: u32,
     ) -> bool {
         self.profile == profile
             && self.run_id == run_id
             && self.capture_id == capture_id
             && self.source_hash == source_hash
+            && self.source_count == requested_source_count
     }
 
     pub(crate) fn advance(&mut self, candidate_budget: u32) -> bool {
@@ -187,6 +196,7 @@ impl PlanningBatchBuilder {
                 capture_id: self.capture_id,
                 capture_epoch: self.capture_epoch,
                 source_hash: self.source_hash,
+                source_count: self.source_count,
                 candidate_count: self.candidate_count,
                 density_model_count: self.density_model_count,
                 samples_per_candidate: self.samples_per_candidate,
@@ -199,6 +209,7 @@ impl PlanningBatchBuilder {
                 density_seed: self.density_seed,
                 target_mass: self.target_mass,
                 basis_records: Arc::from(self.basis_records),
+                reference_basis_records: Arc::from(self.reference_basis_records),
                 reference_arc_hash,
                 candidate_hash,
                 density_model_hash,
@@ -208,6 +219,29 @@ impl PlanningBatchBuilder {
             self.preparation_ms,
         ))
     }
+}
+
+/// Split each canonical aggregate into colocated equal-volume records. All
+/// backends therefore see the same requested source count, geometry, density
+/// assignment, and conserved asteroid mass.
+fn refine_basis_records(
+    canonical: &[PlanningBasisRecord],
+    requested: u32,
+) -> Option<Vec<PlanningBasisRecord>> {
+    let requested = requested as usize;
+    if canonical.is_empty() || requested < canonical.len() {
+        return None;
+    }
+    let base = requested / canonical.len();
+    let remainder = requested % canonical.len();
+    let mut refined = Vec::with_capacity(requested);
+    for (index, record) in canonical.iter().copied().enumerate() {
+        let copies = base + usize::from(index < remainder);
+        let mut split = record;
+        split.position_volume[3] /= copies as f32;
+        refined.extend(std::iter::repeat_n(split, copies));
+    }
+    (refined.len() == requested).then_some(refined)
 }
 
 fn central_reference_states(
