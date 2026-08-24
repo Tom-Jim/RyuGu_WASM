@@ -191,6 +191,7 @@ fn performance_button(label: &str, width: f32) -> impl Bundle {
         BackgroundColor(Color::srgb(0.05, 0.25, 0.3)),
         children![(
             Text::new(label),
+            FocusPolicy::Pass,
             TextFont {
                 font_size: bevy::text::FontSize::Px(13.0),
                 ..default()
@@ -445,7 +446,7 @@ pub fn trajectory_inversion_ui_system(
                 TrajectoryVectorField::Velocity => knot.velocity,
             })
         } else {
-            "waiting for 5 s capture…".into()
+            "waiting for 5 s capture...".into()
         };
         **text = format!("{:02}  {display}", field.index + 1);
     }

@@ -245,7 +245,7 @@ fn build_werner_source_system(
     }
     let density = RYUGU_MASS / volume as f32;
     info!(
-        "[werner] closed polyhedron: {} faces, {} shared edges, volume={:.6e} m³, rho={:.6e} kg/m³",
+        "[werner] closed polyhedron: {} faces, {} shared edges, volume={:.6e} m^3, rho={:.6e} kg/m^3",
         face_count, edge_count, volume, density
     );
     commands.insert_resource(WernerSource {

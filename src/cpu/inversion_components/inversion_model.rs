@@ -17,7 +17,7 @@ use bevy::platform::time::Instant;
 use bevy::prelude::*;
 
 // Fifteen Hermite intervals provide 241 acceleration samples (723 scalar
-// components). A 4³ grid leaves the 56 shape-intersecting cells; mass
+// components). A 4^3 grid leaves the 56 shape-intersecting cells; mass
 // conservation and spatial regularization control the remaining gravity null
 // space without removing three-dimensional voxel freedom.
 const VOXEL_SIDE: usize = 4;

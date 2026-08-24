@@ -364,7 +364,7 @@ impl ActiveGravityMethod {
 
     pub fn planning_label(self) -> &'static str {
         match self {
-            Self::CurvedArcEq106 => "Eq.106 GPU spectral",
+            Self::CurvedArcEq106 => "Eq.106 sampled-spectrum proxy",
             Self::MmfftCompressed => "CPU FFT grid + GPU interpolation",
             Self::Fmm => "GPU order-2 octree treecode",
             _ => self.as_str(),

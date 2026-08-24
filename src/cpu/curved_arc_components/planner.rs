@@ -77,7 +77,7 @@ pub struct AggregatedGravitySource {
 #[derive(Clone, Copy, Debug)]
 pub struct CurvedArcResidualSample {
     pub simulation_time_seconds: f64,
-    /// Conservative convergence health metric: ε = |δq_max| / d_safe.
+    /// Conservative convergence health metric: epsilon = |delta_q_max| / d_safe.
     /// This is the Eq. (118) Taylor series ratio bound, not the Eq. (157) dual
     /// residual. Always populated so the chart has a stable y-range.
     pub epsilon_max: f64,
@@ -523,8 +523,8 @@ pub fn monitor_curved_arc_system(
     }
 
     if let Some(epsilon_max) = epsilon_max {
-        // Adaptive Taylor order: Eq. (118) truncation. ε = |δq|/d_safe; the
-        // truncation remainder of order A is bounded by ε^(A+1). Pick the
+        // Adaptive Taylor order: Eq. (118) truncation. epsilon = |delta_q|/d_safe; the
+        // truncation remainder of order A is bounded by epsilon^(A+1). Pick the
         // smallest A that keeps the next term below 1e-3.
         let taylor_order = planner.taylor_order;
         if let Some(sample) = eq106_history.as_ref().and_then(|history| {
@@ -662,8 +662,8 @@ fn evaluate_segment(
 
 /// Adaptive Taylor truncation order for Eq. (118).
 ///
-/// The remainder of the Taylor expansion of `exp(δq·∇)` truncated at order A
-/// is bounded by `ε^(A+1) / (1 - ε)` when `ε < 1`. We pick the smallest A in
+/// The remainder of the Taylor expansion of `exp(delta_q dot gradient)` truncated at order A
+/// is bounded by `epsilon^(A+1) / (1 - epsilon)` when `epsilon < 1`. We pick the smallest A in
 /// [1, MAX_TAYLOR_ORDER] whose full geometric remainder meets the target.
 /// Order 0 is forbidden (zeroth-order = straight line, Eq. (106) requires
 /// at least first-order correction, Eq. (119)).

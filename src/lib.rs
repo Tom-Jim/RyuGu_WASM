@@ -42,9 +42,9 @@ use bevy_app::{
         setup_simulation_acceleration_control, setup_trajectory_inversion_controls,
         simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
         source_scale_curve_ui_system, trajectory_inversion_input_system,
-        trajectory_inversion_ui_system, update_gpu_memory_estimate_system,
-        update_hint_on_mode_change, update_planning_results_from_inversion_system,
-        update_ui_scale_system,
+        trajectory_inversion_ui_system, ui_text_focus_pass_system,
+        update_gpu_memory_estimate_system, update_hint_on_mode_change,
+        update_planning_results_from_inversion_system, update_ui_scale_system,
     },
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -134,7 +134,7 @@ use wasm_bindgen::prelude::*;
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.9);color:white;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:99999;font-family:sans-serif;text-align:center;padding:20px;box-sizing:border-box;";
         div.innerHTML = `
-            <h1 style="color:#ff4444;margin-bottom:20px;font-size:2.5rem;">⚠️ WebGPU Not Supported</h1>
+            <h1 style="color:#ff4444;margin-bottom:20px;font-size:2.5rem;">WebGPU Not Supported</h1>
             <p style="font-size:1.2rem;max-width:700px;line-height:1.6;">
                 This simulation features a custom <b>GPU-accelerated Gravity architecture</b>.
             </p>
@@ -260,12 +260,7 @@ pub fn main() {
         .init_resource::<CurvedArcResidualHistory>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
-            focused_mode: UpdateMode::Reactive {
-                wait: Duration::from_secs_f64(1.0 / 60.0),
-                react_to_device_events: false,
-                react_to_user_events: false,
-                react_to_window_events: false,
-            },
+            focused_mode: UpdateMode::reactive(Duration::from_secs_f64(1.0 / 60.0)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 30.0)),
         })
         .add_plugins(
@@ -425,6 +420,7 @@ pub fn main() {
         Update,
         (
             update_ui_scale_system,
+            ui_text_focus_pass_system,
             runtime_error_overlay_system,
             simulation_acceleration_slider_system,
             simulation_acceleration_slider_visual_system,

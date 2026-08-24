@@ -29,15 +29,15 @@ $$
 \rho(r)=C\ln\left(1+\frac{r}{10\,\mathrm m}\right),
 $$
 
-while the Werner–Scheeres model is a homogeneous reference.
+while the Werner-Scheeres model is a homogeneous reference.
 
 | UI method | Source preparation | Runtime evaluation | Main qualification |
 |---|---|---|---|
-| **GPU Radial Analytic** | The star-shaped mesh is divided into four equal-volume radial layers per angular cell; layer masses are integrated analytically. | WebGPU evaluates the field with eight-node Gauss–Legendre radial quadrature. | A direct heterogeneous reference. The mass integration is analytic, but the field evaluation is quadrature rather than a closed-form solver. |
+| **GPU Radial Analytic** | The star-shaped mesh is divided into four equal-volume radial layers per angular cell; layer masses are integrated analytically. | WebGPU evaluates the field with eight-node Gauss-Legendre radial quadrature. | A direct heterogeneous reference. The mass integration is analytic, but the field evaluation is quadrature rather than a closed-form solver. |
 | **GPU Werner Polyhedron** | CPU constructs oriented faces, shared edges, and geometric dyads. | WebGPU evaluates the homogeneous closed-polyhedron formula. | Homogeneous only; unusable boundary or non-manifold edge records are skipped and reported during preprocessing. |
-| **Eq.106 Adaptive Curved-Arc** | The shared `4 × 8 × 32 = 1024` source aggregation, special-function tables, and trajectory segments are prepared. | WebGPU builds and caches transformed line spectra, then evaluates acceleration, potential, and a local Jacobian. | Experimental hybrid realization of Eq.106; most useful when many samples reuse a geometrically guarded near-straight segment. |
+| **Eq.106 Adaptive Curved-Arc** | The shared `4 x 8 x 32 = 1024` source aggregation, special-function tables, and trajectory segments are prepared. | WebGPU builds and caches transformed line spectra, then evaluates acceleration, potential, and a local Jacobian. | Experimental hybrid realization of Eq.106; most useful when many samples reuse a geometrically guarded near-straight segment. |
 | **Common source discretization** | The original `786432` radial records are mass-preservingly aggregated into the same `1024` point sources. | Radial, Eq.106, the FFT-grid path, and the treecode consume this identical source set for method-to-method comparisons. | Werner remains a separate homogeneous closed-polyhedron reference. |
-| **CPU FFT Grid + GPU Interpolation** | CPU performs a zero-padded Newton-kernel FFT convolution on two grids (`64³` and `16³`). | WebGPU samples the cached potential fields with tricubic interpolation and differentiates the interpolant. | This is CPU FFT preprocessing plus GPU interpolation, not an end-to-end GPU MMFFT implementation. Accuracy depends on grid spacing, interpolation, and boundary coverage. |
+| **CPU FFT Grid + GPU Interpolation** | CPU performs a zero-padded Newton-kernel FFT convolution on two grids (`64^3` and `16^3`). | WebGPU samples the cached potential fields with tricubic interpolation and differentiates the interpolant. | This is CPU FFT preprocessing plus GPU interpolation, not an end-to-end GPU MMFFT implementation. Accuracy depends on grid spacing, interpolation, and boundary coverage. |
 | **GPU Order-2 Octree Treecode** | CPU builds a fixed-depth octree and order-two multipole hierarchy. | WebGPU traverses the tree; accepted far cells use multipoles, while non-separated leaves use direct P2P. | This is a Barnes-Hut-style treecode, not a complete P2M/M2M/M2L/L2L/L2P FMM. |
 
 ## Mathematical core of Equation (106)
@@ -61,7 +61,7 @@ $$
 
 ### 2. Straight-reference-line transform
 
-Around a chosen reference line, write the transverse source–line distance as $a$ and the signed longitudinal source coordinate as $z'$. For $\mathrm{Re}(s)>0$, define
+Around a chosen reference line, write the transverse source-line distance as $a$ and the signed longitudinal source coordinate as $z'$. For $\mathrm{Re}(s)>0$, define
 
 $$
 F(s;a,z')=\int_0^\infty
@@ -194,7 +194,7 @@ flowchart LR
     Topology --> WernerSource["Werner faces<br/>and shared edges"]
 
     RadialSource --> RadialGPU["Radial quadrature<br/>WebGPU"]
-    RadialSource --> EqSource["Eq.106<br/>4 × 8 × 32 tensor"]
+    RadialSource --> EqSource["Eq.106<br/>4 x 8 x 32 tensor"]
     RadialSource --> MMFFTBuild["Two-level FFT grids<br/>CPU preprocessing"]
     RadialSource --> FMMBuild["Octree + multipoles<br/>CPU preprocessing"]
 
@@ -227,18 +227,18 @@ flowchart TD
     Source["Mass-preserving source tensor"] --> Samples["64 half-line samples<br/>direct Newton Taylor jet"]
     Planner --> Samples
     Samples --> Numerical["Numerical Laplace spectra<br/>for transverse coefficients"]
-    Tables["Precomputed Ψ and Ψx tables"] --> Analytic["Analytical Eq.70/Eq.106<br/>reference-line coefficient"]
+    Tables["Precomputed Psi and Psix tables"] --> Analytic["Analytical Eq.70/Eq.106<br/>reference-line coefficient"]
     Numerical --> Merge["Cached 129-bin<br/>complex spectrum"]
     Analytic --> Merge
     Merge --> Inverse["Finite-band<br/>Bromwich inversion"]
-    Planner --> Offset["Transverse offset<br/>order ≤ 4"]
+    Planner --> Offset["Transverse offset<br/>order <= 4"]
     Offset --> Taylor["Bivariate Taylor correction"]
     Inverse --> Taylor
     Taylor --> Output["Acceleration + potential<br/>Jacobian + certificates"]
-    Source --> Toroidal["Fourier–toroidal potential<br/>m = 0…16"]
+    Source --> Toroidal["Fourier-toroidal potential<br/>m = 0...16"]
     Toroidal --> Residual["Eq.157 dual-representation<br/>residual diagnostic"]
     Output --> Residual
-    Output --> Readback["GPU readback → CPU physics"]
+    Output --> Readback["GPU readback -> CPU physics"]
 ```
 
 ## Diagnostics and density inversion
@@ -256,7 +256,7 @@ Its relative drift is a consistency diagnostic for the coupled force, potential,
 
 ### Dual-representation residual
 
-Eq.106 also compares its curve-integrated potential change with a truncated Fourier–toroidal potential representation (`m = 0…16`). This is useful for detecting disagreement between two numerical representations, but the two paths share the same density model. The residual is therefore not an independent physical measurement or a proof of density identifiability.
+Eq.106 also compares its curve-integrated potential change with a truncated Fourier-toroidal potential representation (`m = 0...16`). This is useful for detecting disagreement between two numerical representations, but the two paths share the same density model. The residual is therefore not an independent physical measurement or a proof of density identifiability.
 
 ### Synthetic density inversion
 
@@ -267,16 +267,16 @@ The interactive inversion freezes one immutable capture before comparing methods
 - the synthetic observation vector is generated at all 241 training states from all `786432` logarithmic-density radial records by an independent `f64` order-two tree with a strict `0.025` opening tolerance; the result is cached by `capture_id` and source hash, so every inverse backend receives identical observations without repeating the high-resolution build;
 - the Quintic Hermite sampler evaluates position, its analytic time derivative, and acceleration from the same polynomial; editing a knot changes the capture identity and regenerates both the matrix geometry and observations;
 - validation uses a separate body-frame-offset holdout arc that is never included in the QP; its predictions use unit-density bases assembled from the original radial records rather than voxel-centroid kernels;
-- the interior is represented by a `4³` Cartesian grid (`56` occupied voxels for the bundled model);
+- the interior is represented by a `4^3` Cartesian grid (`56` occupied voxels for the bundled model);
 - the `1024` mass-preserving aggregated sources are assigned once to those 56 voxels and normalized to unit-density voxel volume; Eq.106, MMFFT, and the treecode consume the identical source positions, volumes, column ownership, and frozen target array;
 - each inverse backend supplies a unit-density response matrix `A` for the same 723-component acceleration vector; forward models never predict density directly, and Clarabel solves for the 56 density variables;
 - Eq.106 builds all 56 unit-density voxel columns in one GPU command encoder, submits once, and reads one compact acceleration-only matrix back once; Jacobian, residual, dual-certificate, and timestamp-query output is disabled for this inversion-only path;
 - the Eq.106 matrix cache identity combines the frozen `capture_id`, source geometry hash, shared basis hash, voxel/sample dimensions, and a frequency/quadrature/Taylor configuration signature; a density update reuses the geometry operator instead of rebuilding it;
 - MMFFT builds each column with its real CIC deposition, zero-padded FFT convolution, hierarchy selection, and tricubic derivative rather than a softened Newton substitute;
-- one cold MMFFT matrix build now creates each level's Newton kernel spectrum once, reuses cached forward/inverse RustFFT plans and scratch storage, performs the convolution in a reusable `Complex64` density buffer, and skips hierarchy levels unused by the frozen target array. The numerical precision and `64³`/`16³` grids are unchanged;
+- one cold MMFFT matrix build now creates each level's Newton kernel spectrum once, reuses cached forward/inverse RustFFT plans and scratch storage, performs the convolution in a reusable `Complex64` density buffer, and skips hierarchy levels unused by the frozen target array. The numerical precision and `64^3`/`16^3` grids are unchanged;
 - the third inversion row is explicitly a CPU `f64` quadrupole treecode using the shared distributed basis. It is distinct from the runtime GPU order-two treecode;
 - MMFFT and treecode matrices are cached by `capture_id`, source hash, shared basis hash, and sample count, matching the Eq.106 warm-reuse semantics;
-- Rust assembles the shared `56 × 56` convex QP and Clarabel solves it with exact total-mass equality, density bounds, spatial and radial smoothness, and a weak uniform prior.
+- Rust assembles the shared `56 x 56` convex QP and Clarabel solves it with exact total-mass equality, density bounds, spatial and radial smoothness, and a weak uniform prior.
 - the data term uses an explicit diagonal covariance (`0.1%` relative acceleration noise with an absolute floor) instead of implicit per-sample normalization; three reproducible seeded Gaussian realizations are solved and their density estimates are averaged, while holdout observations remain noiseless;
 - Radial is the forward-only truth generator for the shared long observation orbit; it is intentionally absent from the inversion button and fit history alongside Werner.
 - Werner remains a forward-only homogeneous polyhedron diagnostic and is intentionally absent from the inversion button and fit history.
@@ -321,7 +321,7 @@ Common trajectory/density preparation is reported separately and excluded from e
 | Position / velocity rows | Replace one quintic-Hermite control value with `x, y, z`. |
 | `X`, `Y`, `Z`, `Speed` | Change the initial probe state. |
 | `Current orbit` / `Near-sync ellipse` | Select the original benchmark or robust-pericenter planning initial state. |
-| Simulation acceleration | Execute `1×`–`8×` complete fixed updates per rendered frame. |
+| Simulation acceleration | Execute `1x`-`8x` complete fixed updates per rendered frame. |
 | Mouse drag / wheel | Orbit and zoom the camera. |
 
 Changing the initial conditions or gravity method resets the trajectory and waits for a field sample associated with the new request.

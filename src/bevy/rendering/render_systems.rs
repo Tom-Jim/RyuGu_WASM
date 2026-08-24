@@ -67,7 +67,7 @@ pub fn render_section_system(
     let stride = (n_verts / 2000).max(1);
     let local_verts: Vec<Vec3> = topo.positions.iter().step_by(stride).copied().collect();
 
-    // Decompose inverse transform: world → body metres → local mesh space.
+    // Decompose inverse transform: world -> body metres -> local mesh space.
     // The recovered voxels live in body metres, while topology vertices retain
     // the unscaled mesh coordinates.
     let inv_rot = ryugu_tf.rotation.inverse();

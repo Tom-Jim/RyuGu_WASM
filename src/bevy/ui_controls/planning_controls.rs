@@ -27,6 +27,7 @@ fn selection_button(label: &str, selected: bool, width: f32) -> impl Bundle {
         }),
         children![(
             Text::new(label),
+            FocusPolicy::Pass,
             TextFont {
                 font_size: bevy::text::FontSize::Px(10.0),
                 ..default()
@@ -194,7 +195,7 @@ pub fn setup_density_inversion_timing_panel(
     planning: Res<PlanningComparisonState>,
 ) {
     let labels = [
-        (2, "Eq.106"),
+        (2, "Eq.106 numeric proxy"),
         (3, "FFT grid + GPU"),
         (4, "GPU treecode"),
     ];
@@ -246,7 +247,7 @@ pub fn setup_density_inversion_timing_panel(
                         ));
                     }
                     row.spawn((
-                        selection_button("Source curve 1K→262K", false, 205.0),
+                        selection_button("Quadrature sources 1K->262K", false, 235.0),
                         SourceScaleCurveButton,
                     ));
                 });
@@ -333,7 +334,7 @@ pub fn setup_density_inversion_timing_panel(
                 ))
                 .with_children(|card| {
                     card.spawn((
-                        Text::new("Real spatial source crossover — incremental 10-run statistics"),
+                        Text::new("Quadrature-source crossover - fixed 56 density unknowns"),
                         TextFont { font_size: bevy::text::FontSize::Px(18.0), ..default() },
                         TextColor(Color::srgb(0.88, 0.98, 1.0)),
                     ));
@@ -457,7 +458,7 @@ pub fn planning_comparison_control_system(
         *request = PlanningGpuRequest::default();
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
-        planning.status = "Source crossover queued: 1024 real positions, repeat 1/10, Eq.106 first.".into();
+        planning.status = "Quadrature-source crossover queued: 1024 distinct positions, 56 density unknowns, repeat 1/10, Eq.106 proxy first.".into();
     }
     if close_interactions
         .iter()
@@ -731,6 +732,7 @@ pub fn update_planning_results_from_inversion_system(
         minimum_tile_size_used: u32::MAX,
         maximum_tile_size_used: 0,
         gpu_request_count: 0,
+        raw_gpu_request_count: 0,
         last_request_candidate_count: 0,
         awaiting_gpu: false,
         warm_repetition: false,
@@ -747,6 +749,17 @@ pub fn update_planning_results_from_inversion_system(
         verification_sample_count: 0,
         raw_gravity_error_sum: 0.0,
         raw_gradient_error_sum: 0.0,
+        pointwise_gravity_errors: Vec::new(),
+        pointwise_gradient_errors: Vec::new(),
+        certified_gravity_error_sum: 0.0,
+        certified_gravity_reference_sum: 0.0,
+        certified_gradient_error_sum: 0.0,
+        certified_gradient_reference_sum: 0.0,
+        certified_gravity_samples: 0,
+        certified_gradient_samples: 0,
+        certified_verification_sample_count: 0,
+        certified_rejected_sample_count: 0,
+        certified_candidate_valid: vec![true; dimensions.0 as usize],
         rejected_sample_count: 0,
         rejection_counts: [0; 6],
         self_fd_step_maxima: [0.0; 5],
@@ -764,6 +777,7 @@ pub fn update_planning_results_from_inversion_system(
         candidate_minimum_altitude_m: vec![f32::INFINITY; dimensions.0 as usize],
         candidate_valid: vec![true; dimensions.0 as usize],
         common_preparation_ms,
+        one_time_preparation_ms: 0.0,
         preprocessing_ms: 0.0,
         command_submission_ms: 0.0,
         reduction_ms: 0.0,
@@ -771,6 +785,7 @@ pub fn update_planning_results_from_inversion_system(
         gpu_completion_map_ms: 0.0,
         warm_evaluation_ms: 0.0,
         certified_warm_evaluation_ms: 0.0,
+        certified_full_pass_ms: 0.0,
         first_tile_ms: 0.0,
         dispatch_count: 0,
         forward_kernel_evaluations: 0,
@@ -882,10 +897,15 @@ pub fn source_scale_curve_ui_system(
         node.width = px(length.max(0.5));
         transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
     }
-    let names = ["Eq.106 raw", "Eq.106 certified", "FFT-grid", "treecode"];
+    let names = [
+        "Eq.106 proxy raw",
+        "Eq.106 proxy certified estimate",
+        "FFT-grid",
+        "treecode",
+    ];
     let mut lines = vec![
         format!(
-            "{} | x: real source count (log) | y: total time ms | median line; P10/P90 below",
+            "{} | x: distinct quadrature points (log; density K fixed at 56) | y: measured total time ms | median; P10/P90 below",
             planning.status
         ),
     ];
@@ -903,7 +923,7 @@ pub fn source_scale_curve_ui_system(
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        lines.push(format!("{} — {values}", names[method]));
+        lines.push(format!("{} - {values}", names[method]));
     }
     if let Some(last) = planning.source_curve_samples.last() {
         lines.push(format!(
@@ -931,18 +951,9 @@ pub fn source_scale_curve_ui_system(
             .map(|summary| summary.0)
             .unwrap_or(f64::NAN)
         });
-        let break_even = |baseline: usize| {
-            let denominator = query[baseline] - query[0];
-            if denominator > 0.0 {
-                ((build[0] - build[baseline]) * 1.0e6 / denominator).max(0.0)
-            } else {
-                f64::INFINITY
-            }
-        };
         lines.push(format!(
-            "{}-source medians: build-est. Eq/FFT/tree {:.2}/{:.2}/{:.2} ms; hot {:.1}/{:.1}/{:.1} ns/target; Qcross Eq/FFT {:.3e}, Eq/tree {:.3e}",
+            "{} quadrature-point medians: diagnostic build allocation Eq/FFT/tree {:.2}/{:.2}/{:.2} ms; measured hot {:.1}/{:.1}/{:.1} ns/target. No extrapolated Qcross: only directly measured totals are admissible.",
             last.source_count, build[0], build[1], build[2], query[0], query[1], query[2],
-            break_even(1), break_even(2),
         ));
     }
     for mut summary in summaries.iter_mut() {

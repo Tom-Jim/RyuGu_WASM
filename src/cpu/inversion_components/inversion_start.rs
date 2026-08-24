@@ -49,7 +49,7 @@ pub fn start_density_inversion_system(
         ));
         return;
     }
-    let Some(basis_sources) = build_voxel_basis_sources(&voxels, &aggregated) else {
+    let Some(basis_sources) = build_voxel_basis_sources(&voxels, &aggregated, voxel_size) else {
         inversion.error = Some("The shared 1024-source voxel basis is not ready.".into());
         return;
     };

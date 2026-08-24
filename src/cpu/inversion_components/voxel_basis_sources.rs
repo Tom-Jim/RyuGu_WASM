@@ -1,25 +1,45 @@
 pub(crate) fn build_voxel_basis_sources(
     voxels: &[InvertedDensityVoxel],
     source: &AggregatedGravitySource,
+    voxel_size: f32,
 ) -> Option<VoxelBasisSources> {
-    if voxels.is_empty() || source.sources.is_empty() {
+    if voxels.is_empty()
+        || source.sources.is_empty()
+        || !voxel_size.is_finite()
+        || voxel_size <= 0.0
+    {
         return None;
     }
+    let grid_radius = 0.5 * VOXEL_SIDE as f64 * f64::from(voxel_size);
     let mut groups = vec![Vec::<(DVec3, f64)>::new(); voxels.len()];
     for point in &source.sources {
         if !point.position.is_finite() || !point.mass.is_finite() || point.mass <= 0.0 {
             continue;
         }
+        let coordinate = |value: f64| {
+            (((value + grid_radius) / f64::from(voxel_size)).floor() as isize)
+                .clamp(0, VOXEL_SIDE as isize - 1) as u8
+        };
+        let grid = [
+            coordinate(point.position.x),
+            coordinate(point.position.y),
+            coordinate(point.position.z),
+        ];
         let index = voxels
             .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| {
-                left.center
-                    .as_dvec3()
-                    .distance_squared(point.position)
-                    .total_cmp(&right.center.as_dvec3().distance_squared(point.position))
-            })
-            .map(|(index, _)| index)?;
+            .position(|voxel| voxel.grid == grid)
+            .or_else(|| {
+                voxels
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        left.center
+                            .as_dvec3()
+                            .distance_squared(point.position)
+                            .total_cmp(&right.center.as_dvec3().distance_squared(point.position))
+                    })
+                    .map(|(index, _)| index)
+            })?;
         groups[index].push((point.position, point.mass));
     }
 

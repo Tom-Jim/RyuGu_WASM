@@ -67,6 +67,10 @@ pub struct PlanningCandidateBatch {
     pub density_model_count: u32,
     pub samples_per_candidate: u32,
     pub body_radius: f32,
+    /// Exact enclosing radius of the spatially refined quadrature sources.
+    /// Eq.106 convergence bounds must use this value, not the radius of the
+    /// pre-refinement 1024-source aggregate.
+    pub eq106_source_radius: f32,
     /// Frozen centre arc in body-fixed coordinates. Eq.106 builds one
     /// canonical spectrum from this arc and shares it across every candidate
     /// trajectory in the certified tube.
@@ -80,6 +84,11 @@ pub struct PlanningCandidateBatch {
     pub density_seed: u64,
     pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
+    /// Eq.106 geometry-only source records `(x,y,z,volume)`. Unlike the
+    /// per-method payload this buffer is invariant across density models.
+    pub eq106_volume_source_bytes: Arc<[u8]>,
+    /// Contiguous `(start,count)` ranges for the 56 density voxels.
+    pub eq106_voxel_source_ranges: Arc<[[u32; 2]]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,
@@ -215,5 +224,8 @@ pub struct PlanningMethodPayload {
     pub grid_sizes: [u32; 2],
     pub half_extents: [f32; 2],
     pub total_mass: f32,
+    /// Program-lifetime setup excluded symmetrically from repeated-workload
+    /// totals (for example FFT plans/static Newton kernel or Eq operator table).
+    pub one_time_preparation_ms: f64,
     pub preparation_ms: f64,
 }

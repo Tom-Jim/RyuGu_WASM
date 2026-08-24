@@ -329,7 +329,7 @@ fn dispatch_eq106(
             });
             pass.set_pipeline(line_samples);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), segment_count, 1);
+            pass.dispatch_workgroups(QUADRATURE_COUNT, segment_count, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {

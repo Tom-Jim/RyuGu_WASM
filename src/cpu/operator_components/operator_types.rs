@@ -108,7 +108,7 @@ pub struct ToroidalOperatorTensor {
 }
 
 /// Piecewise-Chebyshev representation of
-/// `L(x)=∫_0^∞ exp(-x t)/sqrt(1+t²)dt = π/2 (H_0(x)-Y_0(x))`
+/// `L(x)=integral_0^infinity exp(-x t)/sqrt(1+t^2)dt = pi/2 (H_0(x)-Y_0(x))`
 /// and its complex derivative. Together with the finite-eta recurrence in the
 /// shader this is the certified `(x,eta)->(Psi,Psi_x)` map used by Eq. (70).
 #[derive(Clone, Debug, PartialEq)]

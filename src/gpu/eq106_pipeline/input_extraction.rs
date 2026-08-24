@@ -436,7 +436,7 @@ fn dispatch_eq106_single_target(
         });
         pass.set_pipeline(line_samples);
         pass.set_bind_group(0, &inner.bind_group, &[]);
-        pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups(QUADRATURE_COUNT, 1, 1);
         drop(pass);
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("eq106_assemble_pass"),
@@ -584,6 +584,19 @@ fn report_eq106_pipeline_errors(
         ("sampled spectrum", pipelines.assemble_id),
         ("analytic Eq.70 spectrum", pipelines.analytic_id),
         ("inverse spectrum", pipelines.evaluate_id),
+        (
+            "planning voxel line samples",
+            pipelines.planning_voxel_line_samples_id,
+        ),
+        (
+            "planning voxel basis spectrum",
+            pipelines.planning_voxel_spectrum_id,
+        ),
+        (
+            "planning voxel spectrum combination",
+            pipelines.planning_combine_spectrum_id,
+        ),
+        ("planning inverse spectrum", pipelines.planning_evaluate_id),
     ] {
         match cache.get_compute_pipeline_state(id) {
             CachedPipelineState::Err(

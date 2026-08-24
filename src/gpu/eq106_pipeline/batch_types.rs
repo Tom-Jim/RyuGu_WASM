@@ -349,6 +349,10 @@ struct Eq106ComputePipeline {
     assemble_id: CachedComputePipelineId,
     analytic_id: CachedComputePipelineId,
     evaluate_id: CachedComputePipelineId,
+    planning_voxel_line_samples_id: CachedComputePipelineId,
+    planning_voxel_spectrum_id: CachedComputePipelineId,
+    planning_combine_spectrum_id: CachedComputePipelineId,
+    planning_evaluate_id: CachedComputePipelineId,
 }
 
 pub struct Eq106GpuComputePlugin;
@@ -445,6 +449,54 @@ impl FromWorld for Eq106ComputePipeline {
             label: Some("eq106_evaluate_field".into()),
             layout: vec![layout],
             immediate_size: 0,
+            shader: shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("evaluate_field".into()),
+            zero_initialize_workgroup_memory: false,
+        });
+        let planning_layout = BindGroupLayoutDescriptor::new(
+            "eq106_planning_voxel_bgl",
+            &[
+                storage_ro_entry(0), storage_ro_entry(1), storage_ro_entry(2),
+                storage_rw_entry(3), storage_rw_entry(4), uniform_entry(5),
+                storage_rw_entry(6), uniform_entry(7), storage_ro_entry(8),
+                storage_ro_entry(9),
+            ],
+        );
+        let planning_voxel_line_samples_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_voxel_line_samples".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("assemble_voxel_line_samples".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_voxel_spectrum_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_voxel_spectrum".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("assemble_voxel_spectrum".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_combine_spectrum_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_combine_spectrum".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("combine_voxel_spectrum".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_evaluate_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("eq106_planning_evaluate_field".into()),
+            layout: vec![planning_layout],
+            immediate_size: 0,
             shader,
             shader_defs: vec![],
             entry_point: Some("evaluate_field".into()),
@@ -455,6 +507,10 @@ impl FromWorld for Eq106ComputePipeline {
             assemble_id,
             analytic_id,
             evaluate_id,
+            planning_voxel_line_samples_id,
+            planning_voxel_spectrum_id,
+            planning_combine_spectrum_id,
+            planning_evaluate_id,
         }
     }
 }

@@ -155,7 +155,7 @@ fn dispatch_eq106_sensitivity_matrix(
                 });
                 pass.set_pipeline(line_samples_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
+                pass.dispatch_workgroups(QUADRATURE_COUNT, 1, 1);
             }
             {
                 let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {

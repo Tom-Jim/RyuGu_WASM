@@ -164,7 +164,6 @@ fn extract_planning_input(
     request: Extract<Res<PlanningGpuRequest>>,
     payload: Extract<Res<PlanningMethodPayload>>,
     operator: Extract<Option<Res<crate::cpu::eq106_operator::Eq106OperatorTensorResource>>>,
-    source: Extract<Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>>,
 ) {
     if batch.batch_id == 0 || request.batch_id != batch.batch_id {
         extracted.batch = None;
@@ -187,7 +186,7 @@ fn extract_planning_input(
         extracted.eq106_operator = Arc::from(operator.tensor.as_le_bytes());
         extracted.eq106_psi = Arc::from(operator.psi.as_le_bytes());
     }
-    extracted.source_radius = source.as_ref().map_or(0.0, |source| source.radius as f32);
+    extracted.source_radius = batch.eq106_source_radius;
 }
 
 fn prepare_planning_shared_buffers(
