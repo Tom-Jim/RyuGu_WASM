@@ -643,6 +643,120 @@ fn assemble_voxel_spectrum(
     }
 }
 
+// Full Eq. (106) coefficient-zero correction for the planning basis bank.
+// The sampled Taylor jet above supplies higher coefficients, while this pass
+// evaluates the analytic Eqs. (47),(68)-(70) transform directly for each
+// voxel's source range.  Keeping it per voxel preserves the 56-column basis
+// cache: density changes still only reweight cached spectra.
+@compute @workgroup_size(64, 1, 1)
+fn assemble_voxel_analytic_spectrum(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
+    let segment_index = global_id.y;
+    let voxel_index = global_id.z;
+    if local_index == 0u {
+        eq_params = segment_params[segment_index];
+    }
+    workgroupBarrier();
+    let frequency_index = global_id.x;
+    let frequency_count = 2u * eq_params.half_count + 1u;
+    if frequency_index >= frequency_count || voxel_index >= PLANNING_VOXEL_COUNT {
+        return;
+    }
+    let signed_index = i32(frequency_index) - i32(eq_params.half_count);
+    let omega = f32(signed_index) * eq_params.omega_step;
+    let s = vec2<f32>(eq_params.sigma, omega);
+    let radius = 2.0 / max(eq_params.sigma, 1.0e-12);
+    let basis = transverse_basis(eq_params.line_direction);
+    let tangent = basis[0];
+    let group = density_modes.records[voxel_index];
+    let source_begin = u32(group.x);
+    let source_end = source_begin + u32(group.y);
+    var result: SpectrumSample;
+    result.acceleration_x = vec2<f32>(0.0);
+    result.acceleration_y = vec2<f32>(0.0);
+    result.acceleration_z = vec2<f32>(0.0);
+    result.potential = vec2<f32>(0.0);
+    var valid = true;
+    for (var source_index = source_begin; source_index < source_end; source_index += 1u) {
+        let source = sources[source_index];
+        let relative = source.xyz - eq_params.line_origin;
+        let z_prime = dot(relative, tangent);
+        let transverse = relative - z_prime * tangent;
+        let a = length(transverse);
+        let normalized_a = a / radius;
+        let scale = eq_params.g_const * source.w;
+        if normalized_a < exp(PSI_LOG_A_MIN) {
+            if z_prime >= -1.0e-5 * radius {
+                valid = false;
+                continue;
+            }
+            let w = -s * z_prime;
+            let psi = scaled_e1_axis_limit(w);
+            let vertical = complex_mul(s, psi) - vec2<f32>(1.0 / abs(z_prime), 0.0);
+            result.acceleration_x += vertical * (scale * tangent.x);
+            result.acceleration_y += vertical * (scale * tangent.y);
+            result.acceleration_z += vertical * (scale * tangent.z);
+            result.potential += psi * scale;
+            continue;
+        }
+        if normalized_a > exp(PSI_LOG_A_MAX) {
+            valid = false;
+            continue;
+        }
+        let eta = z_prime / a;
+        let x = s * a;
+        var psi = vec2<f32>(0.0);
+        var psi_x = vec2<f32>(0.0);
+        if length(x) >= 16.0 || -x.x * eta >= 6.0 {
+            let full = psi_full_asymptotic(x, eta);
+            psi = full.value;
+            psi_x = full.derivative;
+        } else {
+            let base = psi_base(signed_index, normalized_a);
+            let correction = finite_eta_correction(x, eta);
+            let phase = complex_exp(-x * eta);
+            psi = complex_mul(phase, base.value) + correction.value;
+            psi_x = complex_mul(phase, base.derivative - eta * base.value) + correction.derivative;
+        }
+        let inverse_boundary = inverseSqrt(1.0 + eta * eta);
+        let x_psi = complex_mul(x, psi);
+        let k_v = x_psi - vec2<f32>(inverse_boundary, 0.0);
+        let k_h = complex_mul(x, psi_x) + eta * x_psi
+            - vec2<f32>(eta * inverse_boundary, 0.0);
+        let horizontal_direction = transverse / a;
+        let horizontal = k_h * (-scale / a);
+        let vertical = k_v * (scale / a);
+        result.acceleration_x += horizontal * horizontal_direction.x + vertical * tangent.x;
+        result.acceleration_y += horizontal * horizontal_direction.y + vertical * tangent.y;
+        result.acceleration_z += horizontal * horizontal_direction.z + vertical * tangent.z;
+        result.potential += psi * scale;
+    }
+    if !valid {
+        let invalid = 3.0e30;
+        result.acceleration_x = vec2<f32>(invalid);
+        result.acceleration_y = vec2<f32>(invalid);
+        result.acceleration_z = vec2<f32>(invalid);
+        result.potential = vec2<f32>(invalid);
+    }
+    let bank_voxel = voxel_index % PLANNING_VOXEL_BANK_COUNT;
+    let destination = (((eq_params.segment_id - 1u) * PLANNING_VOXEL_BANK_COUNT + bank_voxel)
+        * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY)
+        + frequency_index;
+    let packed_a = vec4<f32>(result.acceleration_x, result.acceleration_y);
+    let packed_b = vec4<f32>(result.acceleration_z, result.potential);
+    if voxel_index < PLANNING_VOXEL_BANK_COUNT {
+        let low_offset = u32(density_modes.records[112].x) + 2u * destination;
+        line_samples[low_offset] = packed_a;
+        line_samples[low_offset + 1u] = packed_b;
+    } else {
+        let high_offset = PLANNING_OUTPUT_PREFIX_VEC4 + 2u * destination;
+        output[high_offset] = packed_a;
+        output[high_offset + 1u] = packed_b;
+    }
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn combine_voxel_spectrum(
     @builtin(global_invocation_id) global_id: vec3<u32>,

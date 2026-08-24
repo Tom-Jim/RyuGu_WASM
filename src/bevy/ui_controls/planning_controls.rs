@@ -195,7 +195,7 @@ pub fn setup_density_inversion_timing_panel(
     planning: Res<PlanningComparisonState>,
 ) {
     let labels = [
-        (2, "Eq.106 numeric proxy"),
+        (2, "Eq.106 full forward"),
         (3, "FFT grid + GPU"),
         (4, "GPU treecode"),
     ];
@@ -458,7 +458,7 @@ pub fn planning_comparison_control_system(
         *request = PlanningGpuRequest::default();
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
-        planning.status = "Quadrature-source crossover queued: 1024 distinct positions, 56 density unknowns, repeat 1/10, Eq.106 proxy first.".into();
+        planning.status = "Quadrature-source crossover queued: 1024 distinct positions, fixed 56 density unknowns, repeat 1/10, Eq.106 full forward first.".into();
     }
     if close_interactions
         .iter()
@@ -541,25 +541,25 @@ pub fn planning_comparison_control_system(
         planning.source_curve_visible = false;
         planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
         planning.workload_profile = profile;
+        // Workload buttons are explicit benchmark actions.  If the UI is
+        // still on an inversion-only metric (the default is Density fit),
+        // selecting First/Stress must not merely recolor the button and leave
+        // the user with a permanently idle N/A panel.
+        if planning.selected_metric.is_inversion() {
+            planning.selected_metric = ComparisonMetric::SpeedupVsGpuFmm;
+        }
         planning.results = std::array::from_fn(|_| None);
         planning.batch_job = None;
         planning.reference_duration_seconds = 0.0;
         *request = PlanningGpuRequest::default();
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
-        planning.run_requested = !planning.selected_metric.is_inversion();
-        if planning.run_requested {
-            planning.run_id = planning.run_id.wrapping_add(1);
-            planning.status = format!(
-                "{} selected: the planning workload is queued for the frozen capture.",
-                profile.label()
-            );
-        } else {
-            planning.status = format!(
-                "{} selected for planning metrics; choose a non-inversion metric to run it.",
-                profile.label()
-            );
-        }
+        planning.run_requested = true;
+        planning.run_id = planning.run_id.wrapping_add(1);
+        planning.status = format!(
+            "{} selected: full Eq.106 forward and the common GPU baselines are queued for the frozen capture.",
+            profile.label()
+        );
     }
     for (button, mut color) in button_sets.p0().iter_mut() {
         color.0 = if button.0 == planning.selected_metric {
@@ -735,6 +735,7 @@ pub fn update_planning_results_from_inversion_system(
         raw_gpu_request_count: 0,
         last_request_candidate_count: 0,
         awaiting_gpu: false,
+        awaiting_gpu_frames: 0,
         warm_repetition: false,
         certified_repetition: false,
         total_evaluations: u64::from(dimensions.0)
@@ -898,14 +899,14 @@ pub fn source_scale_curve_ui_system(
         transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
     }
     let names = [
-        "Eq.106 proxy raw",
-        "Eq.106 proxy certified estimate",
+        "Eq.106 full forward raw",
+        "Eq.106 full forward certified",
         "FFT-grid",
         "treecode",
     ];
     let mut lines = vec![
         format!(
-            "{} | x: distinct quadrature points (log; density K fixed at 56) | y: measured total time ms | median; P10/P90 below",
+            "{} | x: distinct quadrature points (log) | y: measured total time ms | fixed 56 density unknowns; 4 models/run; median; P10/P90 below",
             planning.status
         ),
     ];

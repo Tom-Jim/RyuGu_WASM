@@ -9,7 +9,9 @@
 // This is a truncated discrete operator: mode truncation, interval mapping,
 // coefficient quantization and GPU f32 arithmetic are reported explicitly.
 
-use crate::interface::components::{ActiveGravityMethod, GravityRuntimeError};
+use crate::interface::components::{
+    ActiveGravityMethod, GravityRuntimeError, PlanningComparisonState,
+};
 use crate::cpu::eq106_reference::{Complex64, Eq106Error};
 use bevy::prelude::*;
 #[cfg(any(test, feature = "regenerate-operators"))]
@@ -146,12 +148,13 @@ pub fn build_eq106_operator_tensor_system(
     attempted: Option<Res<Eq106OperatorBuildAttempted>>,
     source_data: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     active_method: Res<ActiveGravityMethod>,
+    planning: Res<PlanningComparisonState>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
     if existing.is_some()
         || attempted.is_some()
         || source_data.is_none()
-        || *active_method != ActiveGravityMethod::CurvedArcEq106
+        || (*active_method != ActiveGravityMethod::CurvedArcEq106 && !planning.run_requested)
     {
         return;
     }

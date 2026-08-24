@@ -119,11 +119,13 @@ fn dispatch_planning_eq106(
     let (
         Some(voxel_line_samples_pipeline),
         Some(voxel_spectrum_pipeline),
+        Some(voxel_analytic_pipeline),
         Some(combine_spectrum_pipeline),
         Some(evaluate_pipeline),
     ) = (
         cache.get_compute_pipeline(pipelines.planning_voxel_line_samples_id),
         cache.get_compute_pipeline(pipelines.planning_voxel_spectrum_id),
+        cache.get_compute_pipeline(pipelines.planning_voxel_analytic_id),
         cache.get_compute_pipeline(pipelines.planning_combine_spectrum_id),
         cache.get_compute_pipeline(pipelines.planning_evaluate_id),
     ) else {
@@ -507,7 +509,7 @@ fn dispatch_planning_eq106(
     // follow a different discretisation from coefficients 1..A, which is especially harmful for
     // the spatial derivative used by the gradient benchmark.
     let total_stages = if build_basis_spectrum {
-        4
+        5
     } else if build_spectrum {
         2
     } else {
@@ -537,9 +539,9 @@ fn dispatch_planning_eq106(
         let physical_stage = if build_basis_spectrum {
             stage
         } else if build_spectrum {
-            stage + 2
+            stage + 3
         } else {
-            3
+            4
         };
         let (label, pipeline, width, height, depth) = match physical_stage {
             0 => (
@@ -557,6 +559,13 @@ fn dispatch_planning_eq106(
                 56,
             ),
             2 => (
+                "planning_eq106_voxel_analytic_spectrum",
+                voxel_analytic_pipeline,
+                FREQUENCY_COUNT.div_ceil(64),
+                canonical_segment_count,
+                56,
+            ),
+            3 => (
                 "planning_eq106_combine_voxel_spectrum",
                 combine_spectrum_pipeline,
                 (taylor_coefficient_count(TAYLOR_MAX_ORDER) * FREQUENCY_COUNT).div_ceil(64),
@@ -833,11 +842,11 @@ fn dispatch_planning_eq106(
                     method_preprocess_ms,
                     command_submission_ms,
                     gpu_completion_map_ms,
-                    // First geometry: voxel line + voxel spectrum + combine +
-                    // evaluate + reduction. New density: combine + evaluate +
-                    // reduction. Candidate tiles reuse the combined spectrum.
+                    // First geometry: voxel line + sampled spectrum + analytic
+                    // coefficient-zero correction + combine + evaluate +
+                    // reduction. New density: combine + evaluate + reduction.
                     dispatch_count: if build_basis_spectrum {
-                        5
+                        6
                     } else if build_spectrum {
                         3
                     } else {
@@ -847,6 +856,10 @@ fn dispatch_planning_eq106(
                         * u64::from(source_count)
                         * u64::from(QUADRATURE_COUNT)
                         * u64::from(canonical_element_count)
+                        + u64::from(build_basis_spectrum)
+                            * u64::from(source_count)
+                            * u64::from(FREQUENCY_COUNT)
+                            * u64::from(canonical_element_count)
                         + u64::from(build_spectrum)
                             * 56
                             * u64::from(FREQUENCY_COUNT)

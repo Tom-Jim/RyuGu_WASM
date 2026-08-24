@@ -245,7 +245,7 @@ fn comparison_metric_text(
                     }
                 };
                 format!(
-                    "{verification}Eq.106 proxy raw {:.2} ms, certified estimate {:.2} ms (measured full hot pass {:.2} + reused geometry build) | warm raw/cert-tail {:.2}/{:.2} ms | build diagnostic {:.2} ms | hot {:.1} ns/target | {} | {} | raw/cert requests {}/{}; FFT/tree {}/{} | dispatch {}/{}/{}",
+                    "{verification}Eq.106 full forward raw {:.2} ms, certified estimate {:.2} ms (measured full hot pass {:.2} + reused geometry build) | warm raw/cert-tail {:.2}/{:.2} ms | build diagnostic {:.2} ms | hot {:.1} ns/target | {} | {} | raw/cert requests {}/{}; FFT/tree {}/{} | dispatch {}/{}/{}",
                     eq106.total_ms,
                     eq106.certified_estimated_total_ms,
                     eq106.certified_full_pass_ms,
@@ -322,7 +322,7 @@ fn update_planning_comparison_status(
     );
     if planning.completed_workload().is_none() {
         **text = format!(
-            "{prefix}{}\nThis is local observation-curve screening in a 15 m tube, not dynamically propagated orbit optimization. Metrics come from the identical shared BxKxH validation run. Eq.106 is the sampled-line numerical-spectrum proxy; preprocessing layers and eligibility must match before a fairness verdict.",
+            "{prefix}{}\nThis is local observation-curve screening in a 15 m tube, not dynamically propagated orbit optimization. Metrics come from the identical shared BxKxH validation run. Eq.106 uses the sampled higher-order jet plus analytic coefficient-zero spectral correction and full field/gradient evaluation; preprocessing layers and eligibility must match before a fairness verdict.",
             planning.status,
         );
         color.0 = Color::srgb(1.0, 0.78, 0.25);

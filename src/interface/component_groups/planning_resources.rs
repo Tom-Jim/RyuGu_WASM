@@ -352,6 +352,9 @@ pub struct PlanningBatchJob {
     pub raw_gpu_request_count: u32,
     pub last_request_candidate_count: u32,
     pub awaiting_gpu: bool,
+    /// Frames spent waiting for the packet belonging to the current request.
+    /// A lost WebGPU map/readback must never leave the UI at 0% forever.
+    pub awaiting_gpu_frames: u32,
     pub warm_repetition: bool,
     pub certified_repetition: bool,
     pub total_evaluations: u64,
@@ -439,6 +442,18 @@ impl PlanningMethodMetrics {
             && self.certified_relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
             && self.certified_gradient_relative_error.is_finite()
             && self.certified_gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
+            // The certified pass must satisfy the same pointwise outlier
+            // policy as the ordinary pass.  Until certified pointwise strata
+            // are stored separately, the raw strata are the conservative
+            // common gate for both reported Eq.106 timings.
+            && self.gravity_error_p99.is_finite()
+            && self.gravity_error_p99 <= 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gravity_error_max.is_finite()
+            && self.gravity_error_max <= 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gradient_error_p99.is_finite()
+            && self.gradient_error_p99 <= 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
+            && self.gradient_error_max.is_finite()
+            && self.gradient_error_max <= 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
             && self.certified_verification_sample_count == self.verification_sample_count
             && self.certified_rejected_sample_count == 0
             && self.certified_valid_candidate_count == self.workload.candidate_count
@@ -555,7 +570,7 @@ impl PlanningComparisonState {
         let mmfft = self.results[3]?;
         let fmm = self.results[4]?;
         let methods = [
-            ("Eq.106 sampled-spectrum proxy", eq106),
+            ("Eq.106 full forward", eq106),
             ("FFT-grid", mmfft),
             ("treecode", fmm),
         ];

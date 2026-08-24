@@ -351,6 +351,7 @@ struct Eq106ComputePipeline {
     evaluate_id: CachedComputePipelineId,
     planning_voxel_line_samples_id: CachedComputePipelineId,
     planning_voxel_spectrum_id: CachedComputePipelineId,
+    planning_voxel_analytic_id: CachedComputePipelineId,
     planning_combine_spectrum_id: CachedComputePipelineId,
     planning_evaluate_id: CachedComputePipelineId,
 }
@@ -483,6 +484,16 @@ impl FromWorld for Eq106ComputePipeline {
                 entry_point: Some("assemble_voxel_spectrum".into()),
                 zero_initialize_workgroup_memory: false,
             });
+        let planning_voxel_analytic_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_voxel_analytic_spectrum".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("assemble_voxel_analytic_spectrum".into()),
+                zero_initialize_workgroup_memory: false,
+            });
         let planning_combine_spectrum_id =
             cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some("eq106_planning_combine_spectrum".into()),
@@ -509,6 +520,7 @@ impl FromWorld for Eq106ComputePipeline {
             evaluate_id,
             planning_voxel_line_samples_id,
             planning_voxel_spectrum_id,
+            planning_voxel_analytic_id,
             planning_combine_spectrum_id,
             planning_evaluate_id,
         }

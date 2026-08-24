@@ -1,6 +1,8 @@
 use bevy::math::{DMat3, DQuat, DVec3};
 use std::collections::HashMap;
 
+const PLANNING_GPU_WAIT_TIMEOUT_FRAMES: u32 = 1_800;
+
 #[derive(Default)]
 pub(crate) struct PlanningReferenceCache {
     fields: HashMap<(u64, u64, u32, [u32; 3]), (DVec3, DMat3)>,
@@ -34,10 +36,31 @@ pub fn planning_batch_evaluator_system(
         return;
     }
     if let Some(packet) = gpu_result.0.take() {
-        if packet.request.request_id == job.request_id
-            && packet.request.batch_id == job.batch_id
+        let packet_belongs_to_job = packet.request.batch_id == job.batch_id
             && packet.request.method == Some(job.method)
-            && packet.request.warm_repetition == job.warm_repetition
+            && packet.request.warm_repetition == job.warm_repetition;
+        if packet_belongs_to_job && packet.request.request_id != job.request_id {
+            // A packet from a cancelled/previous request must not strand the
+            // current job in `awaiting_gpu=true`.  Drop it and retry the
+            // current request on this frame.
+            job.awaiting_gpu = false;
+            job.awaiting_gpu_frames = 0;
+            planning.status = format!(
+                "{} discarded stale GPU packet {}; retrying request {}.",
+                job.method.planning_label(),
+                packet.request.request_id,
+                job.request_id
+            );
+        } else if !packet_belongs_to_job && job.awaiting_gpu {
+            job.awaiting_gpu = false;
+            job.awaiting_gpu_frames = 0;
+            planning.status = format!(
+                "{} discarded mismatched GPU packet; retrying request {}.",
+                job.method.planning_label(),
+                job.request_id
+            );
+        } else if packet.request.request_id == job.request_id
+            && packet_belongs_to_job
         {
             if job.warm_repetition {
                 let repetition_ms = packet.timing.method_preprocess_ms
@@ -52,7 +75,8 @@ pub fn planning_batch_evaluator_system(
                     job.density_model = 0;
                     job.candidate_start = 0;
                     job.awaiting_gpu = false;
-                    planning.status = "Eq.106 proxy raw pass complete; starting full certified BxKxH pass over the common validation strata.".into();
+                    job.awaiting_gpu_frames = 0;
+                    planning.status = "Eq.106 full forward raw pass complete; starting full certified BxKxH pass over the common validation strata.".into();
                     planning.batch_job = Some(job);
                     return;
                 }
@@ -67,6 +91,7 @@ pub fn planning_batch_evaluator_system(
                     );
                     if !advance_certified_tile(&mut job, packet.request.candidate_count) {
                         job.awaiting_gpu = false;
+                        job.awaiting_gpu_frames = 0;
                         planning.status = planning_progress_text(&job);
                         planning.batch_job = Some(job);
                         return;
@@ -117,7 +142,7 @@ pub fn planning_batch_evaluator_system(
                             planning.results = std::array::from_fn(|_| None);
                             planning.run_id = planning.run_id.wrapping_add(1);
                             planning.status = format!(
-                                "Quadrature-source curve queued: {} distinct points, fixed density K=56, repeat {}/{}.",
+                                "Quadrature-source curve queued: {} distinct points, fixed 56 density unknowns, repeat {}/{}.",
                                 planning.requested_source_count,
                                 planning.source_curve_repeat + 1,
                                 PLANNING_SOURCE_REPEATS
@@ -145,9 +170,25 @@ pub fn planning_batch_evaluator_system(
                 advance_planning_tile(&mut job, packet.request.candidate_count);
             }
             job.awaiting_gpu = false;
+            job.awaiting_gpu_frames = 0;
         }
     }
     if job.awaiting_gpu {
+        job.awaiting_gpu_frames = job.awaiting_gpu_frames.saturating_add(1);
+        if job.awaiting_gpu_frames >= PLANNING_GPU_WAIT_TIMEOUT_FRAMES {
+            planning.status = format!(
+                "{} stopped after {} frames without a matching GPU readback (request {}).",
+                job.method.planning_label(),
+                PLANNING_GPU_WAIT_TIMEOUT_FRAMES,
+                job.request_id
+            );
+            planning.run_requested = false;
+            job.awaiting_gpu = false;
+            *request = PlanningGpuRequest::default();
+            *payload = PlanningMethodPayload::default();
+            planning.batch_job = None;
+            return;
+        }
         planning.status = planning_progress_text(&job);
         planning.batch_job = Some(job);
         return;
@@ -237,6 +278,7 @@ pub fn planning_batch_evaluator_system(
         compute_benchmark: job.profile.is_compute_benchmark(),
     };
     job.awaiting_gpu = true;
+    job.awaiting_gpu_frames = 0;
     planning.status = planning_progress_text(&job);
     planning.batch_job = Some(job);
 }
@@ -778,7 +820,11 @@ fn finish_planning_method(
     let total_ms = job.preprocessing_ms
         + job.command_submission_ms
         + job.reduction_ms
-        + job.gpu_completion_map_ms;
+        + job.gpu_completion_map_ms
+        // Charge the same CPU f64 reference comparison to every backend.
+        // Previously this common validation work was measured but omitted
+        // from total_ms, making the certified Eq.106 line incomparable.
+        + job.verification_ms;
     let warm_per_candidate =
         job.warm_evaluation_ms / f64::from(job.last_request_candidate_count.max(1));
     let cold_amortization_candidates =
@@ -791,7 +837,7 @@ fn finish_planning_method(
     .max(0.0);
     let build_ms = job.preprocessing_ms + gpu_build_ms;
     let certified_estimated_total_ms = if job.method == ActiveGravityMethod::CurvedArcEq106 {
-        build_ms + job.certified_full_pass_ms
+        build_ms + job.certified_full_pass_ms + job.verification_ms
     } else {
         total_ms
     };
@@ -950,6 +996,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.raw_gpu_request_count = 0;
     job.last_request_candidate_count = 0;
     job.awaiting_gpu = false;
+    job.awaiting_gpu_frames = 0;
     job.warm_repetition = false;
     job.certified_repetition = false;
     job.gravity_error_sum = 0.0;
