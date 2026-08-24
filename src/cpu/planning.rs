@@ -17,9 +17,13 @@ pub(crate) struct PlanningBatchBuilder {
     next_candidate: u32,
     preparation_ms: f64,
     reference_samples: Vec<TrajectoryInversionKnot>,
+    reference_states: Vec<PlanningCandidateState>,
     states: Vec<PlanningCandidateState>,
     gpu_position_bytes: Vec<u8>,
     density_models: Vec<f32>,
+    density_model_masses: Vec<f64>,
+    density_seed: u64,
+    target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
 }
@@ -43,15 +47,11 @@ impl PlanningBatchBuilder {
             return None;
         }
         let basis = build_voxel_basis_sources(voxels, source)?;
-        let reference = voxels
-            .iter()
-            .map(|voxel| voxel.reference_density)
-            .collect::<Vec<_>>();
-        let density_models = structured_equal_mass_models(voxels, &reference, density_model_count)?;
         let reference_samples = crate::cpu::inversion::sample_frozen_trajectory_at_count(
             reference_knots,
             samples_per_candidate as usize,
         )?;
+        let reference_states = central_reference_states(&reference_samples)?;
         let basis_records = basis
             .columns
             .iter()
@@ -69,6 +69,17 @@ impl PlanningBatchBuilder {
                 })
             })
             .collect::<Vec<_>>();
+        let density_seed = mix_hash(
+            mix_hash(source_hash, basis.hash),
+            mix_hash(capture_id, 0x1060_d315_7a11_5eed),
+        );
+        let target_mass = source.total_mass;
+        let (density_models, density_model_masses) = uniform_random_equal_mass_models(
+            voxels,
+            target_mass,
+            density_model_count,
+            density_seed,
+        )?;
         Some(Self {
             profile,
             run_id,
@@ -82,11 +93,15 @@ impl PlanningBatchBuilder {
             next_candidate: 0,
             preparation_ms: started.elapsed().as_secs_f64() * 1.0e3,
             reference_samples,
+            reference_states,
             states: Vec::with_capacity(candidate_count as usize * samples_per_candidate as usize),
             gpu_position_bytes: Vec::with_capacity(
                 candidate_count as usize * samples_per_candidate as usize * 16,
             ),
             density_models,
+            density_model_masses,
+            density_seed,
+            target_mass,
             basis_records,
             basis_hash: basis.hash,
         })
@@ -152,6 +167,20 @@ impl PlanningBatchBuilder {
             mix_hash(mix_hash(self.run_id, self.capture_id), self.capture_epoch),
             mix_hash(candidate_hash, density_model_hash),
         );
+        let maximum_relative_mass_error = self
+            .density_model_masses
+            .iter()
+            .map(|mass| ((mass - self.target_mass) / self.target_mass).abs())
+            .fold(0.0_f64, f64::max);
+        info!(
+            target: "planning::density",
+            seed = self.density_seed,
+            model_count = self.density_model_count,
+            voxel_count = 56,
+            target_mass = self.target_mass,
+            maximum_relative_mass_error,
+            "generated uniformly randomized positive voxel-density models with conserved asteroid mass"
+        );
         Some((
             PlanningCandidateBatch {
                 batch_id,
@@ -162,9 +191,13 @@ impl PlanningBatchBuilder {
                 density_model_count: self.density_model_count,
                 samples_per_candidate: self.samples_per_candidate,
                 body_radius: self.body_radius,
+                reference_states: Arc::from(self.reference_states),
                 states: Arc::from(self.states),
                 gpu_position_bytes: Arc::from(self.gpu_position_bytes),
                 density_models: Arc::from(self.density_models),
+                density_model_masses: Arc::from(self.density_model_masses),
+                density_seed: self.density_seed,
+                target_mass: self.target_mass,
                 basis_records: Arc::from(self.basis_records),
                 reference_arc_hash,
                 candidate_hash,
@@ -175,6 +208,40 @@ impl PlanningBatchBuilder {
             self.preparation_ms,
         ))
     }
+}
+
+fn central_reference_states(
+    reference: &[TrajectoryInversionKnot],
+) -> Option<Vec<PlanningCandidateState>> {
+    let angular_velocity =
+        RYUGU_SPIN_AXIS.normalize_or_zero() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
+    reference
+        .iter()
+        .enumerate()
+        .map(|(sample, state)| {
+            if !state.position.is_finite()
+                || !state.velocity.is_finite()
+                || !state.body_rotation.is_finite()
+                || !state.simulation_time_seconds.is_finite()
+            {
+                return None;
+            }
+            let body_position = state.body_rotation.inverse() * state.position;
+            let body_velocity = state.body_rotation.inverse()
+                * (state.velocity - angular_velocity.cross(state.position));
+            Some(PlanningCandidateState {
+                position_time: [
+                    body_position.x,
+                    body_position.y,
+                    body_position.z,
+                    state.simulation_time_seconds as f32,
+                ],
+                velocity_distance: [body_velocity.x, body_velocity.y, body_velocity.z, 0.0],
+                body_rotation: state.body_rotation.to_array(),
+                identity: [u32::MAX, sample as u32, 0, 0],
+            })
+        })
+        .collect()
 }
 
 fn append_tube_candidate_states(
@@ -267,56 +334,55 @@ fn candidate_tube_parameters(candidate: u32, candidate_count: u32) -> (f32, f32,
     (radius, phase, harmonic, phase_rate)
 }
 
-fn structured_equal_mass_models(
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn uniform_unit_random(state: &mut u64) -> f64 {
+    (splitmix64(state) >> 11) as f64 * (1.0 / (1_u64 << 53) as f64)
+}
+
+/// Generates independent voxel densities from a uniform distribution and
+/// then applies one scalar normalization per model. The spatial randomness is
+/// therefore preserved while every row represents exactly the same asteroid
+/// mass to f32 storage precision.
+fn uniform_random_equal_mass_models(
     voxels: &[InvertedDensityVoxel],
-    reference: &[f32],
+    target_mass: f64,
     model_count: u32,
-) -> Option<Vec<f32>> {
-    let target_mass = voxels
-        .iter()
-        .zip(reference)
-        .map(|(voxel, density)| voxel.volume as f64 * f64::from(*density))
-        .sum::<f64>();
-    if !target_mass.is_finite() || target_mass <= 0.0 {
+    seed: u64,
+) -> Option<(Vec<f32>, Vec<f64>)> {
+    if voxels.is_empty()
+        || model_count == 0
+        || !target_mass.is_finite()
+        || target_mass <= 0.0
+        || voxels
+            .iter()
+            .any(|voxel| !voxel.volume.is_finite() || voxel.volume <= 0.0)
+    {
         return None;
     }
-    let radius = voxels
+    let total_volume = voxels
         .iter()
-        .map(|voxel| voxel.center.length())
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
+        .map(|voxel| f64::from(voxel.volume))
+        .sum::<f64>();
+    let mean_density = target_mass / total_volume;
+    let correction_index = voxels
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.volume.total_cmp(&right.volume))?
+        .0;
+    let mut random_state = seed;
     let mut models = Vec::with_capacity(model_count as usize * voxels.len());
-    for model in 0..model_count {
-        let phase = std::f32::consts::TAU * model as f32 / model_count.max(1) as f32;
-        let axis = Vec3::new(
-            (phase * 1.7).cos(),
-            (phase * 2.3).sin(),
-            (phase * 0.7 + 0.4).cos(),
-        )
-        .normalize_or_zero();
+    let mut masses = Vec::with_capacity(model_count as usize);
+    for _ in 0..model_count {
         let mut row = voxels
             .iter()
-            .zip(reference)
-            .map(|(voxel, base)| {
-                let position = voxel.center / radius;
-                let radial = position.length().clamp(0.0, 1.0);
-                let lobe = position.dot(axis);
-                let shell = (std::f32::consts::PI * radial).cos();
-                let rubble = (position.x * 17.0 + phase).sin()
-                    * (position.y * 13.0 - phase * 0.7).cos()
-                    * (position.z * 11.0 + phase * 1.3).sin();
-                let pattern = match model % 8 {
-                    0 => 0.0,
-                    1 => 0.28 * (1.0 - radial),
-                    2 => -0.24 * (1.0 - radial),
-                    3 => 0.22 * shell,
-                    4 => 0.26 * lobe,
-                    5 => 0.20 * (2.0 * lobe * lobe - 0.5),
-                    6 => 0.18 * rubble,
-                    _ => 0.14 * shell + 0.16 * lobe + 0.10 * rubble,
-                };
-                (*base * (1.0 + pattern)).max(250.0)
-            })
+            .map(|_| (mean_density * (0.35 + 1.30 * uniform_unit_random(&mut random_state))) as f32)
             .collect::<Vec<_>>();
         let mass = voxels
             .iter()
@@ -327,9 +393,34 @@ fn structured_equal_mass_models(
         for density in &mut row {
             *density = (f64::from(*density) * scale) as f32;
         }
+        // Correct the f32 rounding residual in the largest voxel. Two passes
+        // are enough to reach the representable mass nearest to target_mass.
+        for _ in 0..2 {
+            let corrected_mass = voxels
+                .iter()
+                .zip(&row)
+                .map(|(voxel, density)| voxel.volume as f64 * f64::from(*density))
+                .sum::<f64>();
+            let correction =
+                (target_mass - corrected_mass) / f64::from(voxels[correction_index].volume);
+            row[correction_index] = (f64::from(row[correction_index]) + correction) as f32;
+        }
+        let final_mass = voxels
+            .iter()
+            .zip(&row)
+            .map(|(voxel, density)| voxel.volume as f64 * f64::from(*density))
+            .sum::<f64>();
+        if row
+            .iter()
+            .any(|density| !density.is_finite() || *density <= 0.0)
+            || ((final_mass - target_mass) / target_mass).abs() > 2.0e-7
+        {
+            return None;
+        }
         models.extend(row);
+        masses.push(final_mass);
     }
-    Some(models)
+    Some((models, masses))
 }
 
 fn hash_reference_samples(samples: &[TrajectoryInversionKnot]) -> u64 {
@@ -377,4 +468,53 @@ fn hash_f32_iter(values: impl IntoIterator<Item = f32>) -> u64 {
 
 fn mix_hash(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_voxels() -> Vec<InvertedDensityVoxel> {
+        (0..56)
+            .map(|index| InvertedDensityVoxel {
+                center: Vec3::new(index as f32, 0.0, 0.0),
+                volume: 1_000.0 + 17.0 * index as f32,
+                density: 1_700.0,
+                baseline_density: 1_700.0,
+                reference_density: 1_700.0,
+                grid: [index as u8, 0, 0],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn randomized_density_rows_are_distinct_positive_and_mass_preserving() {
+        let voxels = test_voxels();
+        let target_mass = 2.45e8;
+        let (models, masses) =
+            uniform_random_equal_mass_models(&voxels, target_mass, 32, 0x1065).unwrap();
+        assert_eq!(models.len(), 32 * 56);
+        assert_eq!(masses.len(), 32);
+        assert!(
+            models
+                .iter()
+                .all(|density| density.is_finite() && *density > 0.0)
+        );
+        assert!(
+            masses
+                .iter()
+                .all(|mass| ((mass - target_mass) / target_mass).abs() <= 2.0e-7)
+        );
+        for pair in models.chunks_exact(56).collect::<Vec<_>>().windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn first_random_models_are_the_prefix_of_stress_for_the_same_capture() {
+        let voxels = test_voxels();
+        let (first, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 4, 7).unwrap();
+        let (stress, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 32, 7).unwrap();
+        assert_eq!(first, stress[..first.len()]);
+    }
 }

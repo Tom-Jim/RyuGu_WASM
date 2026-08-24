@@ -4,9 +4,12 @@ pub const PLANNING_TRAJECTORY_TUBE_RADIUS_METERS: f32 = 15.0;
 pub const PLANNING_GPU_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
-pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 1;
-pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 1;
-pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 8;
+// Stress uses the same candidate-tile range for all three GPU backends.  A
+// method-specific tile width changes request counts and hides dispatch/readback
+// overhead inside what is meant to be a shared-workload robustness run.
+pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 8;
+pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
+pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
 pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 8;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
@@ -63,10 +66,18 @@ pub struct PlanningCandidateBatch {
     pub density_model_count: u32,
     pub samples_per_candidate: u32,
     pub body_radius: f32,
+    /// Frozen centre arc in body-fixed coordinates. Eq.106 builds one
+    /// canonical spectrum from this arc and shares it across every candidate
+    /// trajectory in the certified tube.
+    pub reference_states: Arc<[PlanningCandidateState]>,
     pub states: Arc<[PlanningCandidateState]>,
     pub gpu_position_bytes: Arc<[u8]>,
     /// Row-major `K x 56` density matrix. Every row has identical total mass.
     pub density_models: Arc<[f32]>,
+    /// Auditable f64 mass reconstructed from every randomized density row.
+    pub density_model_masses: Arc<[f64]>,
+    pub density_seed: u64,
+    pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
@@ -78,6 +89,17 @@ pub struct PlanningCandidateBatch {
 impl PlanningCandidateBatch {
     pub fn state_count(&self) -> usize {
         self.candidate_count as usize * self.samples_per_candidate as usize
+    }
+
+    pub fn density_mass_is_conserved(&self) -> bool {
+        self.density_seed != 0
+            && self.target_mass.is_finite()
+            && self.target_mass > 0.0
+            && self.density_model_masses.len() == self.density_model_count as usize
+            && self.density_model_masses.iter().all(|mass| {
+                mass.is_finite()
+                    && ((mass - self.target_mass) / self.target_mass).abs() <= 2.0e-7
+            })
     }
 
     pub fn workload_identity(&self) -> PlanningWorkloadIdentity {
@@ -123,6 +145,10 @@ pub struct PlanningGpuTiming {
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,
+    /// Eq.106 analytic transverse Jacobian versus a same-field central finite
+    /// difference. Other backends report zero because this diagnostic is
+    /// specific to the cached Taylor reconstruction.
+    pub gradient_self_fd_relative_error: f32,
 }
 
 #[derive(Clone, Debug)]

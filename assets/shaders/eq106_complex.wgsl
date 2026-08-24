@@ -735,7 +735,27 @@ fn evaluate_field(
     var derivative_v = vec3<f32>(0.0);
     var imaginary_field = vec3<f32>(0.0);
     var last_order_field = vec3<f32>(0.0);
+    var last_order_derivative_h = vec3<f32>(0.0);
+    var last_order_derivative_u = vec3<f32>(0.0);
+    var last_order_derivative_v = vec3<f32>(0.0);
     var tail_field = vec3<f32>(0.0);
+    // A cheap, same-field diagnostic: reconstruct the Taylor polynomial at
+    // symmetric transverse offsets and compare its finite difference with the
+    // analytic u/v derivative assembled below. This catches coefficient
+    // indexing and transverse-basis mistakes without another spectrum build.
+    // One metre keeps the f32 field subtraction above cancellation noise;
+    // its O(delta^2) truncation remains negligible relative to the hundreds
+    // of metres source distance in the certified exterior tube.
+    let self_fd_delta = 1.0;
+    // The direct f64 benchmark still verifies every First target.  This
+    // same-field consistency check is sampled so its Eq.106-only arithmetic
+    // cannot dominate the performance comparison.
+    let self_fd_active = eq_params.evaluate_dual_certificate != 0u
+        && target_index % 32u == 0u;
+    var self_fd_u_plus = vec3<f32>(0.0);
+    var self_fd_u_minus = vec3<f32>(0.0);
+    var self_fd_v_plus = vec3<f32>(0.0);
+    var self_fd_v_minus = vec3<f32>(0.0);
 
     var independent_potential = 0.0;
     if lane == 0u && target_active && eq_params.evaluate_dual_certificate != 0u && target_index == 0u {
@@ -885,8 +905,27 @@ fn evaluate_field(
                 if b > 0u {
                     derivative_v += reconstructed.xyz * f32(b) * monomial(u, v, a, b - 1u);
                 }
+                if self_fd_active {
+                    self_fd_u_plus += reconstructed.xyz
+                        * monomial(u + self_fd_delta, v, a, b);
+                    self_fd_u_minus += reconstructed.xyz
+                        * monomial(u - self_fd_delta, v, a, b);
+                    self_fd_v_plus += reconstructed.xyz
+                        * monomial(u, v + self_fd_delta, a, b);
+                    self_fd_v_minus += reconstructed.xyz
+                        * monomial(u, v - self_fd_delta, a, b);
+                }
                 if degree == active_order {
                     last_order_field += reconstructed.xyz * value;
+                    last_order_derivative_h += reconstructed_derivative_h * value;
+                    if a > 0u {
+                        last_order_derivative_u += reconstructed.xyz * f32(a)
+                            * monomial(u, v, a - 1u, b);
+                    }
+                    if b > 0u {
+                        last_order_derivative_v += reconstructed.xyz * f32(b)
+                            * monomial(u, v, a, b - 1u);
+                    }
                 }
             }
         }
@@ -907,11 +946,44 @@ fn evaluate_field(
     let derivative_x = derivative_h * tangent.x + derivative_u * normal.x + derivative_v * binormal.x;
     let derivative_y = derivative_h * tangent.y + derivative_u * normal.y + derivative_v * binormal.y;
     let derivative_z = derivative_h * tangent.z + derivative_u * normal.z + derivative_v * binormal.z;
+    let last_order_derivative_x = last_order_derivative_h * tangent.x
+        + last_order_derivative_u * normal.x + last_order_derivative_v * binormal.x;
+    let last_order_derivative_y = last_order_derivative_h * tangent.y
+        + last_order_derivative_u * normal.y + last_order_derivative_v * binormal.y;
+    let last_order_derivative_z = last_order_derivative_h * tangent.z
+        + last_order_derivative_u * normal.z + last_order_derivative_v * binormal.z;
     let field_scale = max(length(field.xyz), 1.0e-12);
-    let taylor_residual = length(last_order_field) / field_scale;
+    let field_taylor_residual = length(last_order_field) / field_scale;
+    let gradient_scale = max(sqrt(
+        dot(derivative_x, derivative_x)
+        + dot(derivative_y, derivative_y)
+        + dot(derivative_z, derivative_z)
+    ), 1.0e-12);
+    let gradient_taylor_residual = sqrt(
+        dot(last_order_derivative_x, last_order_derivative_x)
+        + dot(last_order_derivative_y, last_order_derivative_y)
+        + dot(last_order_derivative_z, last_order_derivative_z)
+    ) / gradient_scale;
+    // One certificate gates both the field and its analytic Jacobian. This
+    // prevents a small value tail from hiding a derivative tail amplified by
+    // the Taylor degree.
+    let taylor_residual = max(field_taylor_residual, gradient_taylor_residual);
     let imaginary_residual = length(imaginary_field) / field_scale;
     let spectral_tail_residual = length(tail_field) / field_scale;
     let transverse_ratio = length(vec2<f32>(u, v)) / max(eq_params.line_limit, 1.0);
+    var self_fd_relative_error = 0.0;
+    if self_fd_active {
+        let self_fd_u = (self_fd_u_plus - self_fd_u_minus) / (2.0 * self_fd_delta);
+        let self_fd_v = (self_fd_v_plus - self_fd_v_minus) / (2.0 * self_fd_delta);
+        let self_fd_error = sqrt(
+            dot(self_fd_u - derivative_u, self_fd_u - derivative_u)
+            + dot(self_fd_v - derivative_v, self_fd_v - derivative_v)
+        );
+        let self_fd_scale = max(sqrt(
+            dot(derivative_u, derivative_u) + dot(derivative_v, derivative_v)
+        ), 1.0e-12);
+        self_fd_relative_error = self_fd_error / self_fd_scale;
+    }
     let output_base = target_index * OUTPUT_ROWS_PER_BLOCK;
 
     output[output_base] = field;
@@ -923,7 +995,7 @@ fn evaluate_field(
     );
     output[output_base + 2u] = vec4<f32>(derivative_x, 0.0);
     output[output_base + 3u] = vec4<f32>(derivative_y, 0.0);
-    output[output_base + 4u] = vec4<f32>(derivative_z, 0.0);
+    output[output_base + 4u] = vec4<f32>(derivative_z, self_fd_relative_error);
     output[output_base + 5u] = vec4<f32>(h, u, v, f32(eq_params.segment_id));
     output[output_base + 6u] = vec4<f32>(
         field.w,

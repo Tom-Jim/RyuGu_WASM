@@ -133,7 +133,17 @@ fn comparison_metric_text(
             )
         }
         ComparisonMetric::GradientRelativeError => {
-            format!("{verification}gradient relative error {:.3e}", result.gradient_relative_error)
+            if result.method == ActiveGravityMethod::CurvedArcEq106 {
+                format!(
+                    "{verification}gradient relative error {:.3e} | same-field transverse FD {:.3e}",
+                    result.gradient_relative_error, result.gradient_self_fd_relative_error
+                )
+            } else {
+                format!(
+                    "{verification}gradient relative error {:.3e}",
+                    result.gradient_relative_error
+                )
+            }
         }
         ComparisonMetric::PericenterError => {
             format!("{verification}pericenter error {:.4} m", result.pericenter_error_m)

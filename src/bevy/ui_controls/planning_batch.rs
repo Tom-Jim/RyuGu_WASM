@@ -16,6 +16,15 @@ pub fn planning_batch_evaluator_system(
         planning.batch_job = Some(job);
         return;
     }
+    if !batch.density_mass_is_conserved() {
+        planning.status =
+            "Planning stopped: randomized voxel densities failed asteroid-mass conservation."
+                .into();
+        planning.run_requested = false;
+        *request = PlanningGpuRequest::default();
+        *payload = PlanningMethodPayload::default();
+        return;
+    }
     if let Some(packet) = gpu_result.0.take() {
         if packet.request.request_id == job.request_id
             && packet.request.batch_id == job.batch_id
@@ -142,6 +151,9 @@ fn reduce_planning_packet(
 ) {
     let reduction_started = bevy::platform::time::Instant::now();
     let mut verification_ms = 0.0;
+    job.maximum_gradient_self_fd_relative_error = job
+        .maximum_gradient_self_fd_relative_error
+        .max(packet.timing.gradient_self_fd_relative_error);
     if !packet.readback_valid
         || packet.rows.len() != packet.state_indices.len() * 4
         || packet.candidate_metrics.len() != packet.request.candidate_count as usize
@@ -494,6 +506,7 @@ fn finish_planning_method(
         total_ms,
         relative_gravity_error: gravity_error,
         gradient_relative_error: gradient_error,
+        gradient_self_fd_relative_error: job.maximum_gradient_self_fd_relative_error,
         pericenter_error_m: job.pericenter_error_m,
         minimum_altitude_m,
         model_discrimination,
@@ -526,6 +539,7 @@ fn finish_planning_method(
         warm_evaluation_ms = job.warm_evaluation_ms,
         gravity_error,
         gradient_error,
+        gradient_self_fd_error = job.maximum_gradient_self_fd_relative_error,
         valid_candidates = job.candidate_valid.iter().filter(|valid| **valid).count(),
         gpu_requests = job.gpu_request_count,
         dispatch_count = job.dispatch_count,
@@ -549,7 +563,8 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.density_model = 0;
     job.candidate_start = 0;
     job.candidate_tile_size = if job.profile.is_compute_benchmark() {
-        PLANNING_GENERIC_TILE_MAX_CANDIDATES
+        // First is deliberately fixed at eight candidates for every method.
+        PLANNING_GPU_TILE_INITIAL_CANDIDATES
     } else {
         PLANNING_GENERIC_TILE_INITIAL_CANDIDATES
     };
@@ -565,6 +580,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.gradient_error_sum = 0.0;
     job.gradient_reference_sum = 0.0;
     job.gradient_samples = 0;
+    job.maximum_gradient_self_fd_relative_error = 0.0;
     job.pericenter_error_m = 0.0;
     job.minimum_altitude_m = f32::INFINITY;
     job.discrimination_sum = 0.0;
@@ -597,7 +613,7 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
         "cold batch"
     };
     format!(
-        "{} {}: {} / {} density combinations, {} model {}, tile {}, GPU requests {}, dispatches {}.",
+        "{} {}: {} / {} density combinations, {} model {}, tile {}, GPU requests {}, dispatches {}; random seed {}, mass rel. error {:.2e}.",
         job.profile.label(),
         job.method.planning_label(),
         completed.min(job.total_evaluations),
@@ -607,5 +623,7 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
         job.candidate_tile_size,
         job.gpu_request_count,
         job.dispatch_count,
+        job.density_seed,
+        job.maximum_density_mass_relative_error,
     )
 }

@@ -235,4 +235,64 @@ mod tests {
                 && element.line_limit <= 1_200.0
         }));
     }
+
+    #[test]
+    fn canonical_tube_segments_cover_offset_candidates_and_share_spectrum_slots() {
+        let radius = 620.0_f32;
+        let positions = (0..241)
+            .map(|index| {
+                let angle = 0.35 * index as f32 / 240.0;
+                Vec3::new(-radius * angle.cos(), radius * angle.sin(), -65.459)
+            })
+            .collect::<Vec<_>>();
+        let velocities = positions
+            .iter()
+            .map(|position| Vec3::new(-position.y, position.x, 0.0).normalize() * 0.235_503)
+            .collect::<Vec<_>>();
+        let times = (0..positions.len())
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let elements = build_canonical_tube_elements(
+            &positions,
+            &velocities,
+            &times,
+            464.765,
+            1_200.0,
+            PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
+        );
+        assert!(!elements.is_empty());
+        assert_eq!(
+            elements.iter().map(|element| element.target_count).sum::<u32>(),
+            positions.len() as u32
+        );
+        assert_eq!(
+            elements
+                .iter()
+                .map(|element| element.spectrum_index)
+                .collect::<Vec<_>>(),
+            (1..=elements.len() as u32).collect::<Vec<_>>()
+        );
+
+        for lateral_sign in [-1.0_f32, 1.0] {
+            for element in &elements {
+                let start = element.target_offset as usize;
+                let end = start + element.target_count as usize;
+                for position in &positions[start..end] {
+                    let offset_position =
+                        *position + lateral_sign * PLANNING_TRAJECTORY_TUBE_RADIUS_METERS * Vec3::Z;
+                    assert!(canonical_element_accepts(element, offset_position, 464.765));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_taylor_order_certifies_the_gradient_tail() {
+        for epsilon in [0.01_f32, 0.05, 0.10, 0.20] {
+            let order = select_batch_taylor_order(epsilon).unwrap();
+            let gradient_bound = (order as f32 + 1.0) * epsilon.powi(order as i32)
+                / (1.0 - epsilon).powi(2);
+            assert!(gradient_bound <= TAYLOR_GRADIENT_REMAINDER_TARGET);
+        }
+    }
 }

@@ -9,6 +9,7 @@ struct PlanningEq106DispatchState {
     active_elements: Vec<Eq106BatchElement>,
     active_invalid_candidates: Vec<u32>,
     active_maximum_elements_per_candidate: u32,
+    active_build_spectrum: bool,
     active_verification_targets: Vec<u32>,
     active_uniform: Option<Buffer>,
     active_bind_groups: Vec<BindGroup>,
@@ -30,8 +31,8 @@ struct PlanningEq106DispatchState {
     baseline: Option<Buffer>,
     metrics: Option<Buffer>,
     staging: Option<Buffer>,
-    element_tiles:
-        std::collections::HashMap<(u32, u32), (Vec<Eq106BatchElement>, u32, Vec<u32>)>,
+    canonical_elements: Vec<Eq106BatchElement>,
+    spectrum_ready: bool,
 }
 
 impl PlanningEq106DispatchState {
@@ -44,6 +45,7 @@ impl PlanningEq106DispatchState {
         self.active_elements.clear();
         self.active_invalid_candidates.clear();
         self.active_maximum_elements_per_candidate = 0;
+        self.active_build_spectrum = false;
         self.active_verification_targets.clear();
         self.active_uniform = None;
         self.active_bind_groups.clear();
@@ -94,10 +96,9 @@ fn dispatch_planning_eq106(
         return;
     };
     let Some(pipelines) = pipelines else { return };
-    let (Some(line_samples_pipeline), Some(assemble_pipeline), Some(analytic_pipeline), Some(evaluate_pipeline)) = (
+    let (Some(line_samples_pipeline), Some(assemble_pipeline), Some(evaluate_pipeline)) = (
         cache.get_compute_pipeline(pipelines.line_samples_id),
         cache.get_compute_pipeline(pipelines.assemble_id),
-        cache.get_compute_pipeline(pipelines.analytic_id),
         cache.get_compute_pipeline(pipelines.evaluate_id),
     ) else {
         return;
@@ -130,73 +131,92 @@ fn dispatch_planning_eq106(
     let samples_per_candidate = batch.samples_per_candidate as usize;
     let global_state_start = request.candidate_start as usize * samples_per_candidate;
     let target_count = request.candidate_count as usize * samples_per_candidate;
-    if state.batch_id != batch.batch_id {
-        state.element_tiles.clear();
+    let batch_changed = state.batch_id != batch.batch_id;
+    if batch_changed {
+        let positions = batch
+            .reference_states
+            .iter()
+            .map(|state| state.body_position())
+            .collect::<Vec<_>>();
+        let velocities = batch
+            .reference_states
+            .iter()
+            .map(|state| state.body_velocity())
+            .collect::<Vec<_>>();
+        let times = batch
+            .reference_states
+            .iter()
+            .map(|state| state.position_time[3])
+            .collect::<Vec<_>>();
+        state.canonical_elements = build_canonical_tube_elements(
+            &positions,
+            &velocities,
+            &times,
+            planning.source_radius,
+            4.0 * planning.source_radius,
+            PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
+        );
+        let mut expected_offset = 0_u32;
+        let complete = state.canonical_elements.iter().all(|element| {
+            let contiguous = element.target_offset == expected_offset;
+            expected_offset = expected_offset.saturating_add(element.target_count);
+            contiguous
+        }) && expected_offset == batch.samples_per_candidate;
+        if !complete || state.canonical_elements.is_empty() {
+            error!(
+                target: "planning::eq106",
+                expected = batch.samples_per_candidate,
+                covered = expected_offset,
+                "canonical Eq.106 tube segmentation did not cover the frozen centre arc"
+            );
+            state.clear_active();
+            channel.in_flight.store(false, Ordering::Release);
+            return;
+        }
+        state.spectrum = None;
+        state.line_samples = None;
+        state.spectrum_ready = false;
     }
-    let tile_key = (request.candidate_start, request.candidate_count);
     let (elements, maximum_elements_per_candidate, invalid_candidates) = if !starting_request {
         (
             state.active_elements.clone(),
             state.active_maximum_elements_per_candidate,
             state.active_invalid_candidates.clone(),
         )
-    } else if let Some(cached) = state.element_tiles.get(&tile_key) {
-        cached.clone()
     } else {
-        let mut elements = Vec::new();
-        let mut maximum_elements_per_candidate = 0_u32;
+        let mut elements = Vec::with_capacity(
+            request.candidate_count as usize * state.canonical_elements.len(),
+        );
         let mut invalid_candidates = Vec::new();
         for local_candidate in 0..request.candidate_count as usize {
             let start = global_state_start + local_candidate * samples_per_candidate;
             let end = start + samples_per_candidate;
-            let positions = batch.states[start..end]
-                .iter()
-                .map(|state| state.body_position())
-                .collect::<Vec<_>>();
-            let velocities = batch.states[start..end]
-                .iter()
-                .map(|state| state.body_velocity())
-                .collect::<Vec<_>>();
-            let times = batch.states[start..end]
-                .iter()
-                .map(|state| state.position_time[3])
-                .collect::<Vec<_>>();
             let local_offset = local_candidate as u32 * batch.samples_per_candidate;
-            let mut candidate_elements = build_trajectory_batch_elements(
-                &positions,
-                &velocities,
-                &times,
-                planning.source_radius,
-                4.0 * planning.source_radius,
-            );
-            let mut expected_offset = 0_u32;
-            let complete = candidate_elements.iter().all(|element| {
-                let contiguous = element.target_offset == expected_offset;
-                expected_offset = expected_offset.saturating_add(element.target_count);
-                contiguous
-            }) && expected_offset == batch.samples_per_candidate;
-            if !complete {
+            let candidate_states = &batch.states[start..end];
+            let covered = state.canonical_elements.iter().all(|element| {
+                let range_start = element.target_offset as usize;
+                let range_end = range_start + element.target_count as usize;
+                candidate_states[range_start..range_end].iter().all(|candidate| {
+                    canonical_element_accepts(
+                        element,
+                        candidate.body_position(),
+                        planning.source_radius,
+                    )
+                })
+            });
+            if !covered {
                 invalid_candidates.push(local_candidate as u32);
                 continue;
             }
-            maximum_elements_per_candidate =
-                maximum_elements_per_candidate.max(candidate_elements.len() as u32);
-            for element in &mut candidate_elements {
+            for canonical in &state.canonical_elements {
+                let mut element = *canonical;
                 element.target_offset += local_offset;
+                elements.push(element);
             }
-            elements.extend(candidate_elements);
         }
-        state.element_tiles.insert(
-            tile_key,
-            (
-                elements.clone(),
-                maximum_elements_per_candidate,
-                invalid_candidates.clone(),
-            ),
-        );
         (
             elements,
-            maximum_elements_per_candidate,
+            state.canonical_elements.len() as u32,
             invalid_candidates,
         )
     };
@@ -207,7 +227,7 @@ fn dispatch_planning_eq106(
             .clone_from(&invalid_candidates);
         state.active_maximum_elements_per_candidate = maximum_elements_per_candidate;
     }
-    let common_changed = state.batch_id != batch.batch_id
+    let common_changed = batch_changed
         || state.quadrature.is_none()
         || state.operator.is_none()
         || state.psi.is_none()
@@ -237,6 +257,7 @@ fn dispatch_planning_eq106(
     }
     if state.payload_request_id != planning.payload.request_id || state.sources.is_none() {
         state.payload_request_id = planning.payload.request_id;
+        state.spectrum_ready = false;
         state.sources = Some(render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("planning_eq106_sources"),
             contents: &planning.payload.primary,
@@ -244,14 +265,11 @@ fn dispatch_planning_eq106(
         }));
     }
     let coefficient_count = taylor_coefficient_count(TAYLOR_MAX_ORDER) as u64;
-    if starting_request {
-        state.spectrum = None;
-        state.line_samples = None;
-    }
+    let canonical_count = state.canonical_elements.len().max(1) as u64;
     if state.spectrum.is_none() {
         state.spectrum = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_spectrum"),
-            size: coefficient_count * FREQUENCY_COUNT as u64 * 32 * elements.len().max(1) as u64,
+            size: coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -259,7 +277,7 @@ fn dispatch_planning_eq106(
     if state.line_samples.is_none() {
         state.line_samples = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_line_samples"),
-            size: coefficient_count * QUADRATURE_COUNT as u64 * 16 * elements.len().max(1) as u64,
+            size: coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -342,8 +360,19 @@ fn dispatch_planning_eq106(
     state.active_method_preprocess_ms +=
         method_preprocess_started.elapsed().as_secs_f64() * 1.0e3;
     if starting_request {
+        state.active_build_spectrum = !state.spectrum_ready;
         let uniform_size = 96_u64;
         let mut uniform_data = vec![0_u8; uniform_size as usize * 256];
+        if elements.len() > 256 {
+            error!(
+                target: "planning::eq106",
+                evaluator_elements = elements.len(),
+                "canonical Eq.106 evaluator exceeded the 256-element uniform capacity"
+            );
+            state.clear_active();
+            channel.in_flight.store(false, Ordering::Release);
+            return;
+        }
         for (element_index, element) in elements.iter().enumerate() {
             let mut bytes = uniform_bytes(
                 element.line_origin,
@@ -354,9 +383,9 @@ fn dispatch_planning_eq106(
                 element.line_limit,
                 element.taylor_order,
                 0,
-                element_index as u32 + 1,
+                element.spectrum_index,
                 false,
-                false,
+                true,
                 element.target_count,
                 element.target_offset,
             );
@@ -388,11 +417,16 @@ fn dispatch_planning_eq106(
         state.active_bind_groups = vec![bind_group];
         state.active_uniform = Some(uniform);
     }
-    let stage_budget = planning_eq106_stage_budget(request.compute_benchmark, 4);
+    let build_spectrum = state.active_build_spectrum;
+    // The planning benchmark deliberately evaluates the coherent spectrum assembled from the
+    // sampled line.  Mixing in the separate analytic zero-order correction makes coefficient 0
+    // follow a different discretisation from coefficients 1..A, which is especially harmful for
+    // the spatial derivative used by the gradient benchmark.
+    let total_stages = if build_spectrum { 3 } else { 1 };
+    let stage_budget = planning_eq106_stage_budget(request.compute_benchmark, total_stages);
     if stage_budget == 0 {
         return;
     }
-    let total_stages = 4;
     let stage_end = (state.next_stage + stage_budget).min(total_stages);
     let final_submission = stage_end == total_stages;
     let _uniform = state.active_uniform.as_ref();
@@ -404,34 +438,39 @@ fn dispatch_planning_eq106(
     if state.next_stage == 0 {
         encoder.clear_buffer(&output, 0, None);
     }
-    let segment_count = elements.len() as u32;
+    let canonical_segment_count = state.canonical_elements.len() as u32;
+    let evaluator_element_count = elements.len() as u32;
     let max_targets = elements.iter().map(|element| element.target_count).max().unwrap_or(1);
     for stage in state.next_stage..stage_end {
-        let (label, pipeline, width, height, depth) = match stage {
+        let physical_stage = if build_spectrum {
+            if stage < 2 { stage } else { 3 }
+        } else {
+            3
+        };
+        let (label, pipeline, width, height, depth) = match physical_stage {
             0 => (
                 "planning_eq106_line",
                 line_samples_pipeline,
                 QUADRATURE_COUNT.div_ceil(64),
-                segment_count,
+                canonical_segment_count,
                 1,
             ),
             1 => (
                 "planning_eq106_spectrum",
                 assemble_pipeline,
                 (taylor_coefficient_count(TAYLOR_MAX_ORDER) * FREQUENCY_COUNT).div_ceil(64),
-                segment_count,
-                1,
-            ),
-            2 => (
-                "planning_eq106_analytic",
-                analytic_pipeline,
-                FREQUENCY_COUNT.div_ceil(64),
-                segment_count,
+                canonical_segment_count,
                 1,
             ),
             _ => {
                 let (width, height) = target_dispatch_grid(max_targets);
-                ("planning_eq106_evaluate", evaluate_pipeline, width, height, segment_count)
+                (
+                    "planning_eq106_evaluate",
+                    evaluate_pipeline,
+                    width,
+                    height,
+                    evaluator_element_count,
+                )
             }
         };
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -473,6 +512,9 @@ fn dispatch_planning_eq106(
     if !final_submission {
         return;
     }
+    if build_spectrum {
+        state.spectrum_ready = true;
+    }
     drop(reduction_resources);
     state.last_request_id = request.request_id;
     let method_preprocess_ms = state.active_method_preprocess_ms;
@@ -482,7 +524,8 @@ fn dispatch_planning_eq106(
     let shared_data = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
     let mapped = staging.clone();
-    let element_count = elements.len() as u32;
+    let canonical_element_count = state.canonical_elements.len() as u32;
+    let evaluator_element_count = elements.len() as u32;
     let reported_segment_count = maximum_elements_per_candidate;
     let source_count = planning.payload.item_count;
     let state_indices = verification_targets;
@@ -494,9 +537,12 @@ fn dispatch_planning_eq106(
         request_id = request.request_id,
         candidate_count = request.candidate_count,
         target_count,
-        spectral_elements = element_count,
+        canonical_spectral_elements = canonical_element_count,
+        evaluator_elements = evaluator_element_count,
+        spectrum_cache_hit = !build_spectrum,
+        analytic_zero_correction = false,
         maximum_elements_per_candidate = reported_segment_count,
-        "Eq.106 dispatch builds each spectral element once, evaluates its targets in parallel, and reuses the spectrum across those targets"
+        "Eq.106 canonical centre-arc spectrum is shared across candidates and candidate tiles"
     );
     state.clear_active();
     mapped.slice(..staging_size).map_async(MapMode::Read, move |result| {
@@ -536,7 +582,8 @@ fn dispatch_planning_eq106(
                     && certificate[0] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
                     && certificate[1] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
                     && certificate[2] <= GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-                    && certificate[3] <= 0.30;
+                    && certificate[3] <= 0.30
+                    && target_rows[4][3] <= PLANNING_GRADIENT_ERROR_LIMIT;
                 if !valid {
                     let candidate = target_index / samples_per_candidate;
                     if let Some(rejected) = rejected_candidates.get_mut(candidate as usize) {
@@ -547,6 +594,11 @@ fn dispatch_planning_eq106(
                     }
                 }
             }
+            let maximum_gradient_self_fd_relative_error = compact_rows
+                .chunks_exact(5)
+                .take(state_indices.len())
+                .map(|target_rows| target_rows[4][3])
+                .fold(0.0_f32, f32::max);
             let mut filtered_indices = Vec::with_capacity(state_indices.len());
             let mut rows = Vec::with_capacity(state_indices.len() * 4);
             for (target_index, target_rows) in state_indices.iter().copied().zip(
@@ -562,9 +614,14 @@ fn dispatch_planning_eq106(
             }
             drop(view);
             staging.unmap();
-            (rows, candidate_metrics, filtered_indices)
+            (
+                rows,
+                candidate_metrics,
+                filtered_indices,
+                maximum_gradient_self_fd_relative_error,
+            )
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), f32::NAN)
         };
         if let Ok(mut guard) = shared_data.lock() {
             *guard = Some(PlanningGpuPacket {
@@ -577,22 +634,47 @@ fn dispatch_planning_eq106(
                     method_preprocess_ms,
                     command_submission_ms,
                     gpu_completion_map_ms,
-                    // Four batched compute passes plus one reduction pass;
-                    // segments are the z/y dimension, not separate submits.
-                    dispatch_count: 5,
-                    forward_kernel_evaluations: u64::from(source_count)
+                    // A cache miss has three Eq.106 passes plus reduction; a
+                    // cache hit executes only evaluate plus reduction.
+                    dispatch_count: if build_spectrum { 4 } else { 2 },
+                    forward_kernel_evaluations: u64::from(build_spectrum)
+                        * u64::from(source_count)
                         * u64::from(QUADRATURE_COUNT)
-                        * u64::from(element_count)
+                        * u64::from(canonical_element_count)
                         + target_count as u64
                             * u64::from(FREQUENCY_COUNT)
                             * u64::from(taylor_coefficient_count(TAYLOR_MAX_ORDER)),
                     spectral_element_count: reported_segment_count,
+                    gradient_self_fd_relative_error: rows.3,
                 },
                 backend: PlanningExecutionBackend::GpuEq106,
             });
         }
         in_flight.store(false, Ordering::Release);
     });
+}
+
+fn canonical_element_accepts(
+    element: &Eq106BatchElement,
+    position: Vec3,
+    source_radius: f32,
+) -> bool {
+    if !position.is_finite() {
+        return false;
+    }
+    let relative = position - element.line_origin;
+    let h = relative.dot(element.line_direction);
+    if !h.is_finite() || h < -1.0e-3 || h > element.line_limit {
+        return false;
+    }
+    let line_point = element.line_origin + h.max(0.0) * element.line_direction;
+    let distance_lower_bound = line_point.length() - source_radius;
+    if !distance_lower_bound.is_finite() || distance_lower_bound <= 0.0 {
+        return false;
+    }
+    let transverse = position.distance(line_point);
+    let epsilon = transverse / distance_lower_bound;
+    select_batch_taylor_order(epsilon).is_some_and(|order| order <= element.taylor_order)
 }
 
 fn planning_eq106_stage_budget(compute_benchmark: bool, total_stages: usize) -> usize {

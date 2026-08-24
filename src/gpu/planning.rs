@@ -561,6 +561,7 @@ fn dispatch_planning_method(
                         dispatch_count: 2,
                         forward_kernel_evaluations: kernel_evaluations,
                         spectral_element_count: 0,
+                        gradient_self_fd_relative_error: 0.0,
                     },
                     backend,
                 });

@@ -356,9 +356,10 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     let builder = batch_builder.as_mut().expect("matched planning builder");
-    if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
-        || crate::browser_recent_frame_ms()
-            .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS)
+    if !planning.workload_profile.is_compute_benchmark()
+        && (crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
+            || crate::browser_recent_frame_ms()
+                .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS))
     {
         planning.status = format!(
             "{} candidate preparation yielded to rendering at {:.1} FPS / {:.1} ms recent frame: {} / {} curves.",
@@ -399,6 +400,12 @@ pub fn update_planning_results_from_inversion_system(
             (last.simulation_time_seconds - first.simulation_time_seconds) as f32
         });
     let batch_id = batch.batch_id;
+    let density_seed = batch.density_seed;
+    let maximum_density_mass_relative_error = batch
+        .density_model_masses
+        .iter()
+        .map(|mass| ((mass - batch.target_mass) / batch.target_mass).abs())
+        .fold(0.0_f64, f64::max);
     commands.insert_resource(batch);
     commands.insert_resource(PlanningGpuRequest::default());
     commands.insert_resource(PlanningMethodPayload::default());
@@ -410,6 +417,8 @@ pub fn update_planning_results_from_inversion_system(
         candidate_count: dimensions.0,
         density_model_count: dimensions.1,
         samples_per_candidate: dimensions.2,
+        density_seed,
+        maximum_density_mass_relative_error,
         request_id: planning.run_id.wrapping_shl(24),
         density_model: 0,
         candidate_start: 0,
@@ -429,6 +438,7 @@ pub fn update_planning_results_from_inversion_system(
         gradient_error_sum: 0.0,
         gradient_reference_sum: 0.0,
         gradient_samples: 0,
+        maximum_gradient_self_fd_relative_error: 0.0,
         pericenter_error_m: 0.0,
         minimum_altitude_m: f32::INFINITY,
         discrimination_sum: 0.0,

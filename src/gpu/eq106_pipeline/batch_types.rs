@@ -43,6 +43,7 @@ const DUAL_CERTIFICATE_CADENCE: u32 = 30;
 const OUTPUT_ROWS_PER_BLOCK: u64 = 9;
 const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
 const TAYLOR_REMAINDER_TARGET: f32 = 1.0e-3;
+const TAYLOR_GRADIENT_REMAINDER_TARGET: f32 = 1.0e-2;
 const TIMESTAMP_BYTES: u64 = 8;
 const TARGET_DISPATCH_WIDTH: u32 = 65_535;
 const EQ106_GPU_TIMEOUT: Duration = Duration::from_secs(10);
@@ -132,14 +133,25 @@ struct Eq106BatchElement {
     line_direction: Vec3,
     line_limit: f32,
     taylor_order: u32,
+    /// One-based slot in the spectrum buffer. Multiple candidate evaluators
+    /// may deliberately reference the same canonical slot.
+    spectrum_index: u32,
 }
 
 fn select_batch_taylor_order(epsilon: f32) -> Option<u32> {
     if !epsilon.is_finite() || !(0.0..1.0).contains(&epsilon) {
         return None;
     }
-    (1..=TAYLOR_MAX_ORDER)
-        .find(|order| epsilon.powi(*order as i32 + 1) / (1.0 - epsilon) <= TAYLOR_REMAINDER_TARGET)
+    (1..=TAYLOR_MAX_ORDER).find(|order| {
+        let field_bound = epsilon.powi(*order as i32 + 1) / (1.0 - epsilon);
+        // Differentiating the Taylor tail amplifies both its leading power and
+        // the geometric-series denominator. A field-only certificate allowed
+        // gradients that were visibly outside the planning tolerance.
+        let gradient_bound = (*order as f32 + 1.0) * epsilon.powi(*order as i32)
+            / (1.0 - epsilon).powi(2);
+        field_bound <= TAYLOR_REMAINDER_TARGET
+            && gradient_bound <= TAYLOR_GRADIENT_REMAINDER_TARGET
+    })
 }
 
 fn build_trajectory_batch_elements(
@@ -148,6 +160,42 @@ fn build_trajectory_batch_elements(
     times: &[f32],
     source_radius: f32,
     certified_line_limit: f32,
+) -> Vec<Eq106BatchElement> {
+    build_tube_batch_elements(
+        positions,
+        velocities,
+        times,
+        source_radius,
+        certified_line_limit,
+        0.0,
+    )
+}
+
+fn build_canonical_tube_elements(
+    positions: &[Vec3],
+    velocities: &[Vec3],
+    times: &[f32],
+    source_radius: f32,
+    certified_line_limit: f32,
+    tube_radius: f32,
+) -> Vec<Eq106BatchElement> {
+    build_tube_batch_elements(
+        positions,
+        velocities,
+        times,
+        source_radius,
+        certified_line_limit,
+        tube_radius.max(0.0),
+    )
+}
+
+fn build_tube_batch_elements(
+    positions: &[Vec3],
+    velocities: &[Vec3],
+    times: &[f32],
+    source_radius: f32,
+    certified_line_limit: f32,
+    tube_radius: f32,
 ) -> Vec<Eq106BatchElement> {
     if positions.is_empty()
         || positions.len() != velocities.len()
@@ -161,16 +209,20 @@ fn build_trajectory_batch_elements(
     let mut elements = Vec::new();
     let mut start = 0;
     while start < positions.len() {
-        let origin = positions[start];
+        let anchor = positions[start];
         let mut direction = velocities[start].normalize_or_zero();
         if direction == Vec3::ZERO
             && let Some(next) = positions.get(start + 1)
         {
-            direction = (*next - origin).normalize_or_zero();
+            direction = (*next - anchor).normalize_or_zero();
         }
         if direction == Vec3::ZERO {
             break;
         }
+        // Shift the line backwards by the full tube radius. Any candidate
+        // offset can therefore project at most to h=0 at the first sample;
+        // evaluate_field never needs to clamp a genuinely negative query.
+        let origin = anchor - tube_radius * direction;
         let mut maximum_h = 0.0_f32;
         let mut maximum_offset = 0.0_f32;
         let mut minimum_line_radius = f32::INFINITY;
@@ -192,7 +244,8 @@ fn build_trajectory_batch_elements(
                 break;
             }
             let line_point = origin + h.max(0.0) * direction;
-            let next_maximum_offset = maximum_offset.max(position.distance(line_point));
+            let next_maximum_offset =
+                maximum_offset.max(position.distance(line_point) + tube_radius);
             let next_minimum_line_radius = minimum_line_radius.min(line_point.length());
             let distance_lower_bound = next_minimum_line_radius - source_radius;
             if distance_lower_bound <= 0.0 {
@@ -202,7 +255,7 @@ fn build_trajectory_batch_elements(
             let Some(order) = select_batch_taylor_order(epsilon) else {
                 break;
             };
-            maximum_h = maximum_h.max(h);
+            maximum_h = maximum_h.max(h + tube_radius);
             maximum_offset = next_maximum_offset;
             minimum_line_radius = next_minimum_line_radius;
             best_count = (end - start + 1) as u32;
@@ -222,6 +275,7 @@ fn build_trajectory_batch_elements(
                 .min(maximum_line_limit)
                 .max(1.0),
             taylor_order: best_order,
+            spectrum_index: elements.len() as u32 + 1,
         });
         start += best_count as usize;
     }
