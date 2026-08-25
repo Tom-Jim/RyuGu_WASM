@@ -206,7 +206,7 @@ mod tests {
             .collect::<Vec<_>>();
         let velocities = positions
             .iter()
-            .map(|position| Vec3::new(-position.y, position.x, 0.0).normalize() * 0.235_503)
+            .map(|position| Vec3::new(position.y, -position.x, 0.0).normalize() * 0.235_503)
             .collect::<Vec<_>>();
 
         let times = (0..positions.len())

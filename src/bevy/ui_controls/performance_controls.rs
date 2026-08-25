@@ -26,7 +26,7 @@ fn performance_time_axis_text(value: &str, left: f32, jacobi: bool, slot: u8) ->
 
 fn performance_time_axis_at(top: f32, jacobi: bool) -> impl Bundle {
     let label = if jacobi {
-        "Simulation time"
+        "Normalized benchmark progress"
     } else {
         "Benchmark progress"
     };
@@ -257,7 +257,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         },
                     ),
                     (
-                        Text::new("Radial analytic"),
+                        Text::new("Radial"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(11.0),
                             ..default()
@@ -265,7 +265,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         TextColor(Color::srgb(0.2, 0.95, 1.0)),
                         Node {
                             position_type: PositionType::Absolute,
-                            left: px(220),
+                            left: px(150),
                             top: px(30),
                             ..default()
                         },
@@ -285,7 +285,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         },
                     ),
                     (
-                        Text::new("Eq.106 near-straight"),
+                        Text::new("Eq.106"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(11.0),
                             ..default()
@@ -293,13 +293,13 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         TextColor(Color::srgb(0.85, 0.45, 1.0)),
                         Node {
                             position_type: PositionType::Absolute,
-                            left: px(470),
+                            left: px(490),
                             top: px(30),
                             ..default()
                         },
                     ),
                     (
-                        Text::new("FFT grid + GPU interpolation"),
+                        Text::new("FFT + interp"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(11.0),
                             ..default()
@@ -307,7 +307,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         TextColor(Color::srgb(1.0, 0.72, 0.2)),
                         Node {
                             position_type: PositionType::Absolute,
-                            left: px(690),
+                            left: px(650),
                             top: px(30),
                             ..default()
                         },
@@ -321,7 +321,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         TextColor(Color::srgb(0.25, 0.9, 0.55)),
                         Node {
                             position_type: PositionType::Absolute,
-                            left: px(820),
+                            left: px(850),
                             top: px(30),
                             ..default()
                         },

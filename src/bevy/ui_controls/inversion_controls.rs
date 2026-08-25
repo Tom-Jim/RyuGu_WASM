@@ -89,7 +89,9 @@ pub fn performance_comparison_system(
         && clock.elapsed_seconds > 0.0
     {
         let dt = time.delta_secs_f64().max(f64::EPSILON);
-        let fps = crate::browser_frame_rate().unwrap_or(1.0 / dt) as f32;
+        // Plot the active benchmark's frame interval. The browser RAF value
+        // is a shared global average and makes every method look identical.
+        let fps = (1.0 / dt).clamp(0.0, 240.0) as f32;
         let phase = state.phase;
         if let Some(history) = state.fps_history.get_mut(phase) {
             // Readback/phase hand-off frames are visible as single-frame FPS
@@ -227,11 +229,9 @@ pub fn performance_comparison_system(
         }
     }
 
-    let jacobi_times = performance_jacobi_time_bounds(&state).unwrap_or((0.0, 0.0));
     for (label, mut text) in texts.p3().iter_mut() {
         **text = if label.jacobi {
-            let fraction = label.slot as f64 / 4.0;
-            format_performance_time(jacobi_times.0 + fraction * (jacobi_times.1 - jacobi_times.0))
+            format!("{}%", label.slot as u32 * 25)
         } else {
             format!("{}%", label.slot as u32 * 25)
         };

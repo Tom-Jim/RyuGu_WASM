@@ -16,9 +16,6 @@ fn update_performance_chart_segments(
         .fold(1.0_f32, f32::max);
     let (jacobi_min, jacobi_max) = performance_jacobi_bounds(state).unwrap_or((0.0, 1.0));
     let jacobi_span = (jacobi_max - jacobi_min).max(1.0e-9);
-    let jacobi_time_bounds = performance_jacobi_time_bounds(state).unwrap_or((0.0, 1.0));
-    let jacobi_time_span = (jacobi_time_bounds.1 - jacobi_time_bounds.0).max(f64::EPSILON);
-
     for (segment, mut node, mut transform) in segments.iter_mut() {
         if !performance_chart_series_enabled(state, segment) {
             node.display = Display::None;
@@ -45,11 +42,12 @@ fn update_performance_chart_segments(
             };
             let a = ((a_drift - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
             let b = ((b_drift - jacobi_min) / jacobi_span).clamp(0.0, 1.0) as f32;
-            let x0 = ((from.simulation_time_seconds - jacobi_time_bounds.0) / jacobi_time_span)
-                .clamp(0.0, 1.0) as f32
-                * PERFORMANCE_CHART_CONTENT_WIDTH;
-            let x1 = ((to.simulation_time_seconds - jacobi_time_bounds.0) / jacobi_time_span)
-                .clamp(0.0, 1.0) as f32
+            // Each method is measured in its own phase and can emit samples
+            // at a different cadence. Use each series' normalized progress so
+            // all five curves share the same 0%..100% horizontal extent.
+            let denominator = (history.len() - 1).max(1) as f32;
+            let x0 = segment.index as f32 / denominator * PERFORMANCE_CHART_CONTENT_WIDTH;
+            let x1 = (segment.index + 1) as f32 / denominator
                 * PERFORMANCE_CHART_CONTENT_WIDTH;
             (x0, x1, (1.0 - a) * 220.0, (1.0 - b) * 220.0)
         } else {
@@ -78,9 +76,14 @@ fn update_performance_chart_segments(
                 y1,
             )
         };
+        if !x0.is_finite() || !x1.is_finite() || !y0.is_finite() || !y1.is_finite() {
+            node.display = Display::None;
+            continue;
+        }
         let delta = Vec2::new(x1 - x0, y1 - y0);
         let length = delta.length();
-        if !delta.is_finite() || !length.is_finite() {
+        let angle = delta.y.atan2(delta.x);
+        if !delta.is_finite() || !length.is_finite() || !angle.is_finite() {
             node.display = Display::None;
             continue;
         }
@@ -88,7 +91,7 @@ fn update_performance_chart_segments(
         node.left = px((x0 + x1) * 0.5 - length * 0.5);
         node.top = px((y0 + y1) * 0.5 - 1.0);
         node.width = px(length.max(0.5));
-        transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
+        transform.rotation = Rot2::radians(angle);
     }
 }
 
@@ -115,27 +118,6 @@ fn performance_jacobi_relative_drift(
     let denominator = baseline.abs().max(1.0e-12);
     let drift = (sample.jacobi_constant - baseline) / denominator;
     drift.is_finite().then_some(drift)
-}
-
-fn performance_jacobi_time_bounds(state: &PerformanceComparisonState) -> Option<(f64, f64)> {
-    let mut times = state
-        .jacobi_history
-        .iter()
-        .flat_map(|series| series.iter().map(|sample| sample.simulation_time_seconds))
-        .filter(|time| time.is_finite());
-    let first = times.next()?;
-    let (minimum, maximum) = times.fold((first, first), |(minimum, maximum), time| {
-        (minimum.min(time), maximum.max(time))
-    });
-    Some((minimum, maximum.max(minimum + f64::EPSILON)))
-}
-
-fn format_performance_time(seconds: f64) -> String {
-    if seconds.abs() >= 3600.0 {
-        format!("{:.2} h", seconds / 3600.0)
-    } else {
-        format!("{seconds:.0} s")
-    }
 }
 
 fn format_axis_value(value: f64) -> String {
@@ -520,12 +502,11 @@ pub fn update_hint_on_mode_change(
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod performance_chart_tests {
     use super::{
         PerformanceChartSegment, clear_performance_method_history, format_vram_text,
         performance_chart_series_count, performance_chart_series_enabled,
-        performance_jacobi_relative_drift, performance_jacobi_time_bounds,
+        performance_jacobi_relative_drift,
     };
     use crate::interface::components::{
         ActiveGravityMethod, GpuMemoryEstimate, JacobiSample, PerformanceComparisonState,
@@ -608,7 +589,7 @@ mod performance_chart_tests {
     }
 
     #[test]
-    fn jacobi_plot_uses_physical_time_and_per_series_relative_drift() {
+    fn jacobi_plot_uses_normalized_progress_and_per_series_relative_drift() {
         let mut state = PerformanceComparisonState::default();
         state.jacobi_history[2] = VecDeque::from([
             JacobiSample {
@@ -622,7 +603,6 @@ mod performance_chart_tests {
                 eq106_diagnostics: None,
             },
         ]);
-        assert_eq!(performance_jacobi_time_bounds(&state), Some((5.0, 25.0)));
         let drift = performance_jacobi_relative_drift(
             &state.jacobi_history[2],
             state.jacobi_history[2].back().unwrap(),

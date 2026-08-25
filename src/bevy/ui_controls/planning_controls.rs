@@ -379,12 +379,7 @@ pub fn setup_density_inversion_timing_panel(
                         BorderColor::all(Color::srgb(0.2, 0.38, 0.45)),
                     )).with_children(|plot| {
                         for method in 0..4 {
-                            let color = match method {
-                                0 => Color::srgb(0.2, 0.95, 1.0),
-                                1 => Color::srgb(0.65, 0.45, 1.0),
-                                2 => Color::srgb(1.0, 0.65, 0.2),
-                                _ => Color::srgb(0.35, 0.95, 0.5),
-                            };
+                            let color = source_curve_method_color(method);
                             for index in 0..(PLANNING_SOURCE_COUNTS.len() - 1) {
                                 plot.spawn((
                                     SourceScaleCurveSegment { method, index },
@@ -400,6 +395,38 @@ pub fn setup_density_inversion_timing_panel(
                             }
                         }
                     });
+                    card.spawn(Node {
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(14),
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new("Curve colors:"),
+                            TextFont {
+                                font_size: bevy::text::FontSize::Px(11.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.74, 0.9, 0.94)),
+                        ));
+                        for (method, label) in [
+                            (0, "Eq.106 raw"),
+                            (1, "Eq.106 certified"),
+                            (2, "FFT-grid"),
+                            (3, "Treecode"),
+                        ] {
+                            row.spawn((
+                                Text::new(label),
+                                TextFont {
+                                    font_size: bevy::text::FontSize::Px(11.0),
+                                    ..default()
+                                },
+                                TextColor(source_curve_method_color(method)),
+                            ));
+                        }
+                    });
                     card.spawn((
                         SourceScaleCurveSummary,
                         Text::new("Waiting for source-count runs"),
@@ -409,6 +436,15 @@ pub fn setup_density_inversion_timing_panel(
                     ));
                 });
         });
+}
+
+fn source_curve_method_color(method: usize) -> Color {
+    match method {
+        0 => Color::srgb(0.2, 0.95, 1.0),
+        1 => Color::srgb(0.65, 0.45, 1.0),
+        2 => Color::srgb(1.0, 0.65, 0.2),
+        _ => Color::srgb(0.35, 0.95, 0.5),
+    }
 }
 
 pub fn planning_comparison_control_system(
@@ -890,13 +926,22 @@ pub fn source_scale_curve_ui_system(
         };
         let y = |milliseconds: f64| (1.0 - milliseconds / maximum) as f32 * 290.0 + 20.0;
         let (x0, x1, y0, y1) = (x(segment.index), x(segment.index + 1), y(from.0), y(to.0));
+        if !x0.is_finite() || !x1.is_finite() || !y0.is_finite() || !y1.is_finite() {
+            node.display = Display::None;
+            continue;
+        }
         let delta = Vec2::new(x1 - x0, y1 - y0);
         let length = delta.length();
+        let angle = delta.y.atan2(delta.x);
+        if !length.is_finite() || !angle.is_finite() {
+            node.display = Display::None;
+            continue;
+        }
         node.display = Display::Flex;
         node.left = px((x0 + x1) * 0.5 - length * 0.5);
         node.top = px((y0 + y1) * 0.5 - 1.5);
         node.width = px(length.max(0.5));
-        transform.rotation = Rot2::radians(delta.y.atan2(delta.x));
+        transform.rotation = Rot2::radians(angle);
     }
     let names = [
         "Eq.106 full forward raw",
