@@ -1,6 +1,7 @@
 pub(crate) struct PlanningMmfftWorkspace {
     batch_id: u64,
     levels: Vec<MmfftLevelWorkspace>,
+    stencils: Vec<Vec<Vec<(usize, f64)>>>,
 }
 
 impl Default for PlanningMmfftWorkspace {
@@ -8,6 +9,7 @@ impl Default for PlanningMmfftWorkspace {
         Self {
             batch_id: 0,
             levels: Vec::new(),
+            stencils: Vec::new(),
         }
     }
 }
@@ -19,6 +21,7 @@ pub(crate) fn build_planning_mmfft_payload(
     cache: &mut PlanningMmfftWorkspace,
 ) -> Option<PlanningMethodPayload> {
     let started = bevy::platform::time::Instant::now();
+    let mut one_time_preparation_ms = 0.0;
     let row_start = model as usize * 56;
     let densities = batch.density_models.get(row_start..row_start + 56)?;
     let records = batch
@@ -39,17 +42,34 @@ pub(crate) fn build_planning_mmfft_payload(
         return None;
     }
     if cache.batch_id != batch.batch_id || cache.levels.len() != LEVEL_GRID_SIZES.len() {
+        let one_time_started = bevy::platform::time::Instant::now();
         cache.batch_id = batch.batch_id;
         cache.levels = LEVEL_GRID_SIZES
             .into_iter()
             .zip(LEVEL_HALF_EXTENTS)
             .map(|(n, half)| MmfftLevelWorkspace::new(n, half))
             .collect();
+        one_time_preparation_ms = one_time_started.elapsed().as_secs_f64() * 1.0e3;
+        let positions = records.iter().map(|record| record.0).collect::<Vec<_>>();
+        cache.stencils = cache
+            .levels
+            .iter()
+            .map(|workspace| {
+                deposition_stencils(
+                    &positions,
+                    workspace.half_extent,
+                    workspace.spacing,
+                    workspace.n,
+                    workspace.p,
+                )
+            })
+            .collect();
     }
+    let masses = records.iter().map(|record| record.1).collect::<Vec<_>>();
     let mut bytes =
         Vec::with_capacity(LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() * 16);
-    for workspace in &mut cache.levels {
-        for sample in workspace.build(&records) {
+    for (workspace, stencils) in cache.levels.iter_mut().zip(&cache.stencils) {
+        for sample in workspace.build_from_stencils(stencils, &masses) {
             for value in *sample {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
@@ -64,7 +84,9 @@ pub(crate) fn build_planning_mmfft_payload(
         grid_sizes: LEVEL_GRID_SIZES.map(|value| value as u32),
         half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
         total_mass: records.iter().map(|record| record.1).sum::<f64>() as f32,
-        preparation_ms: started.elapsed().as_secs_f64() * 1.0e3,
+        one_time_preparation_ms,
+        preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3 - one_time_preparation_ms)
+            .max(0.0),
         ..default()
     })
 }

@@ -26,7 +26,10 @@ fn mmfft_compressed_shader_is_valid() {
 
 #[test]
 fn eq106_complex_shader_is_valid() {
-    validate_wgsl(include_str!("../../assets/shaders/eq106_complex.wgsl"));
+    let source = include_str!("../../assets/shaders/eq106_complex.wgsl");
+    validate_wgsl(source);
+    assert!(!source.contains("if global_id.x == 0u"));
+    assert!(source.matches("@builtin(local_invocation_index)").count() >= 3);
 }
 
 #[test]

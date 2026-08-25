@@ -7,11 +7,12 @@ mod gpu;
 mod interface;
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
+use bevy::log::{Level, LogPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::WgpuLimits;
 use bevy::render::{
     RenderPlugin,
-    settings::{Backends, RenderCreation, WgpuSettings},
+    settings::{Backends, InstanceFlags, RenderCreation, WgpuSettings},
 };
 use bevy::window::PresentMode;
 use bevy::winit::{UpdateMode, WinitSettings};
@@ -26,20 +27,22 @@ use bevy_app::{
     },
     scale::{build_topology_system, normalize_model_scale_system},
     ui::{
-        clear_runtime_error_on_probe_change, density_inversion_timing_ui_system, fps_update_system,
-        method_toggle_system, normal_toggle_system, performance_button_system,
-        performance_comparison_system, performance_method_checkbox_system,
-        planning_batch_evaluator_system, planning_comparison_control_system,
-        probe_collision_system, probe_crash_overlay_system, probe_orbit_preset_style_system,
-        probe_orbit_preset_system, probe_slider_system, probe_slider_visual_system,
-        reset_after_probe_crash_scene_system, reset_after_probe_crash_state_system,
-        reset_inversion_on_method_change, runtime_error_overlay_system, runtime_error_reset_system,
+        clear_gpu_histories_on_method_change, clear_runtime_error_on_probe_change,
+        density_inversion_timing_ui_system, fps_update_system, method_toggle_system,
+        normal_toggle_system, performance_button_system, performance_comparison_system,
+        performance_method_checkbox_system, planning_batch_evaluator_system,
+        planning_comparison_control_system, probe_collision_system, probe_crash_overlay_system,
+        probe_orbit_preset_style_system, probe_orbit_preset_system, probe_slider_system,
+        probe_slider_visual_system, reset_after_probe_crash_scene_system,
+        reset_after_probe_crash_state_system, reset_inversion_on_method_change,
+        restore_source_curve_system, runtime_error_overlay_system, runtime_error_reset_system,
         section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
         setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
         setup_probe_crash_overlay, setup_runtime_error_overlay,
         setup_simulation_acceleration_control, setup_trajectory_inversion_controls,
         simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
-        trajectory_inversion_input_system, trajectory_inversion_ui_system,
+        source_scale_curve_ui_system, trajectory_inversion_input_system,
+        trajectory_inversion_ui_system, ui_text_focus_pass_system,
         update_gpu_memory_estimate_system, update_hint_on_mode_change,
         update_planning_results_from_inversion_system, update_ui_scale_system,
     },
@@ -131,7 +134,7 @@ use wasm_bindgen::prelude::*;
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.9);color:white;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:99999;font-family:sans-serif;text-align:center;padding:20px;box-sizing:border-box;";
         div.innerHTML = `
-            <h1 style="color:#ff4444;margin-bottom:20px;font-size:2.5rem;">⚠️ WebGPU Not Supported</h1>
+            <h1 style="color:#ff4444;margin-bottom:20px;font-size:2.5rem;">WebGPU Not Supported</h1>
             <p style="font-size:1.2rem;max-width:700px;line-height:1.6;">
                 This simulation features a custom <b>GPU-accelerated Gravity architecture</b>.
             </p>
@@ -215,7 +218,6 @@ pub fn main() {
         show_webgpu_error();
         return;
     }
-
     let (backends, limits) = if has_webgpu {
         (
             Backends::BROWSER_WEBGPU,
@@ -258,16 +260,20 @@ pub fn main() {
         .init_resource::<CurvedArcResidualHistory>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
-            focused_mode: UpdateMode::Reactive {
-                wait: Duration::from_secs_f64(1.0 / 60.0),
-                react_to_device_events: false,
-                react_to_user_events: false,
-                react_to_window_events: false,
-            },
+            focused_mode: UpdateMode::reactive(Duration::from_secs_f64(1.0 / 60.0)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 30.0)),
         })
         .add_plugins(
             DefaultPlugins
+                .set(LogPlugin {
+                    // Keep runtime output usable. WGSL source is still emitted
+                    // once by the Eq.106 pipeline loader at debug level, while
+                    // Naga's per-expression trace and per-frame pipeline state
+                    // logs are disabled because they can starve the simulation.
+                    level: Level::DEBUG,
+                    filter: "wgsl=debug,wgpu=warn,naga=warn,bevy_render=warn,bevy_shader=warn,ryugu_wasm=debug".into(),
+                    ..default()
+                })
                 .set(AssetPlugin {
                     meta_check: AssetMetaCheck::Never,
                     ..default()
@@ -286,6 +292,7 @@ pub fn main() {
                     render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                         backends: Some(backends),
                         limits,
+                        instance_flags: InstanceFlags::debugging(),
                         ..default()
                     })),
                     ..default()
@@ -338,6 +345,7 @@ pub fn main() {
             setup_trajectory_inversion_controls,
             setup_density_inversion_timing_panel,
             setup_performance_chart_segments,
+            restore_source_curve_system,
         )
             .chain(),
     )
@@ -366,6 +374,7 @@ pub fn main() {
             performance_button_system,
             performance_method_checkbox_system,
             method_toggle_system,
+            clear_gpu_histories_on_method_change,
             reset_inversion_on_method_change,
         )
             .chain(),
@@ -382,6 +391,7 @@ pub fn main() {
             update_planning_results_from_inversion_system,
             planning_batch_evaluator_system,
             density_inversion_timing_ui_system,
+            source_scale_curve_ui_system,
         )
             .chain(),
     )
@@ -410,6 +420,7 @@ pub fn main() {
         Update,
         (
             update_ui_scale_system,
+            ui_text_focus_pass_system,
             runtime_error_overlay_system,
             simulation_acceleration_slider_system,
             simulation_acceleration_slider_visual_system,

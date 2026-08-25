@@ -13,6 +13,7 @@ const PLANNING_WINDOW_POINTS: usize = 128;
 const MIN_SEGMENT_POINTS: usize = 4;
 const EPSILON_TARGET: f64 = 0.20;
 const TAYLOR_REMAINDER_TARGET: f64 = 1.0e-3;
+const TAYLOR_GRADIENT_REMAINDER_TARGET: f64 = 4.0e-2;
 // The production GPU evaluator caches the complete two-dimensional basis
 // through P=4, giving J=(P+1)(P+2)/2=15 coefficient spectra per segment.
 const MAX_TAYLOR_ORDER: u32 = 4;
@@ -76,7 +77,7 @@ pub struct AggregatedGravitySource {
 #[derive(Clone, Copy, Debug)]
 pub struct CurvedArcResidualSample {
     pub simulation_time_seconds: f64,
-    /// Conservative convergence health metric: ε = |δq_max| / d_safe.
+    /// Conservative convergence health metric: epsilon = |delta_q_max| / d_safe.
     /// This is the Eq. (118) Taylor series ratio bound, not the Eq. (157) dual
     /// residual. Always populated so the chart has a stable y-range.
     pub epsilon_max: f64,
@@ -210,6 +211,10 @@ pub struct CurvedArcPlannerState {
     pub active_segment: Option<CurvedArcSegment>,
     pub taylor_order: u32,
     pub kernel_status: Eq106KernelStatus,
+    /// Last structured GPU certificate rejection, shown even before the first
+    /// accepted history sample so bootstrap failures are not a black box.
+    pub reject_status: Option<String>,
+    pub consecutive_rejections: u32,
 }
 
 impl CurvedArcPlannerState {
@@ -467,7 +472,10 @@ pub fn monitor_curved_arc_system(
     if points.len() < MIN_SEGMENT_POINTS {
         planner.mode = CurvedArcMode::NonPeriodic;
         planner.kernel_ready = planner.kernel_status == Eq106KernelStatus::Ready;
-        planner.taylor_order = 1;
+        // Bootstrap cannot infer curvature from one to three points. Build the
+        // complete available jet so the first accepted GPU sample can advance
+        // the orbit and populate the geometry window.
+        planner.taylor_order = MAX_TAYLOR_ORDER;
         planner.epsilon_max = Some(0.0);
         return;
     }
@@ -515,8 +523,8 @@ pub fn monitor_curved_arc_system(
     }
 
     if let Some(epsilon_max) = epsilon_max {
-        // Adaptive Taylor order: Eq. (118) truncation. ε = |δq|/d_safe; the
-        // truncation remainder of order A is bounded by ε^(A+1). Pick the
+        // Adaptive Taylor order: Eq. (118) truncation. epsilon = |delta_q|/d_safe; the
+        // truncation remainder of order A is bounded by epsilon^(A+1). Pick the
         // smallest A that keeps the next term below 1e-3.
         let taylor_order = planner.taylor_order;
         if let Some(sample) = eq106_history.as_ref().and_then(|history| {
@@ -634,7 +642,12 @@ fn evaluate_segment(
 
     let taylor_order = select_taylor_order(epsilon_max);
     let remainder_bound = taylor_order
-        .and_then(|order| taylor_remainder_bound(epsilon_max, order))
+        .and_then(|order| {
+            taylor_remainder_bound(epsilon_max, order).zip(
+                taylor_gradient_remainder_bound(epsilon_max, order),
+            )
+        })
+        .map(|(field, gradient)| field.max(gradient))
         .unwrap_or(f64::INFINITY);
 
     CurvedArcSegment {
@@ -649,8 +662,8 @@ fn evaluate_segment(
 
 /// Adaptive Taylor truncation order for Eq. (118).
 ///
-/// The remainder of the Taylor expansion of `exp(δq·∇)` truncated at order A
-/// is bounded by `ε^(A+1) / (1 - ε)` when `ε < 1`. We pick the smallest A in
+/// The remainder of the Taylor expansion of `exp(delta_q dot gradient)` truncated at order A
+/// is bounded by `epsilon^(A+1) / (1 - epsilon)` when `epsilon < 1`. We pick the smallest A in
 /// [1, MAX_TAYLOR_ORDER] whose full geometric remainder meets the target.
 /// Order 0 is forbidden (zeroth-order = straight line, Eq. (106) requires
 /// at least first-order correction, Eq. (119)).
@@ -661,5 +674,7 @@ fn select_taylor_order(epsilon_max: f64) -> Option<u32> {
     (1u32..=MAX_TAYLOR_ORDER).find(|&order| {
         taylor_remainder_bound(epsilon_max, order)
             .is_some_and(|bound| bound <= TAYLOR_REMAINDER_TARGET)
+            && taylor_gradient_remainder_bound(epsilon_max, order)
+                .is_some_and(|bound| bound <= TAYLOR_GRADIENT_REMAINDER_TARGET)
     })
 }

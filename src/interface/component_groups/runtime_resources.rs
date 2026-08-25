@@ -71,6 +71,7 @@ impl Default for Eq106GpuReadbackChannel {
             data: Arc::new(Mutex::new(None)),
             pipeline_error: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
+            submitted_at: Arc::new(Mutex::new(None)),
             rebuild_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -363,7 +364,7 @@ impl ActiveGravityMethod {
 
     pub fn planning_label(self) -> &'static str {
         match self {
-            Self::CurvedArcEq106 => "Eq.106 GPU spectral",
+            Self::CurvedArcEq106 => "Eq.106 full forward",
             Self::MmfftCompressed => "CPU FFT grid + GPU interpolation",
             Self::Fmm => "GPU order-2 octree treecode",
             _ => self.as_str(),

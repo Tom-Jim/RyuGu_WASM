@@ -334,11 +334,13 @@ fn extract_mmfft_input_system(
     mut extracted: ResMut<ExtractedMmfftInput>,
     source: Extract<Option<Res<MmfftCompressedSource>>>,
     active_method: Extract<Res<ActiveGravityMethod>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     clock: Extract<Res<SimulationClock>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    extracted.enabled = **active_method == ActiveGravityMethod::MmfftCompressed;
+    extracted.enabled = **active_method == ActiveGravityMethod::MmfftCompressed
+        && !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }

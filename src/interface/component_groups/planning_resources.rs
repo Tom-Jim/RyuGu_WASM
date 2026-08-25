@@ -18,10 +18,11 @@ pub const NEAR_SYNC_RELATIVE_REMAINDER_TARGET: f32 = 1.0e-3;
 pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
 pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
-pub const PLANNING_EQ106_TARGET_SEGMENTS: u32 = 10;
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
-pub const PLANNING_USEFUL_SPEEDUP: f64 = 3.0;
-pub const PLANNING_STRONG_SPEEDUP: f64 = 5.0;
+pub const PLANNING_SOURCE_COUNTS: [u32; 9] = [
+    1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
+];
+pub const PLANNING_SOURCE_REPEATS: u32 = 10;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
 pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
 
@@ -112,21 +113,35 @@ impl ProbeInitialConditions {
 pub enum PlanningWorkloadProfile {
     #[default]
     First,
-    Stress,
+    InteractiveStress,
+    /// Internal source-crossover workload: enough hot targets for stable GPU
+    /// timing without repeating the 33.5-million-query Stress matrix.
+    SourceCrossover,
 }
 
 impl PlanningWorkloadProfile {
+    pub fn is_compute_benchmark(self) -> bool {
+        // Both visible workloads use the same fairness contract. "Interactive"
+        // describes the live progress UI, not adaptive benchmark scheduling.
+        matches!(
+            self,
+            Self::First | Self::InteractiveStress | Self::SourceCrossover
+        )
+    }
+
     pub fn dimensions(self) -> (u32, u32, u32) {
         match self {
             Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),
-            Self::Stress => (PLANNING_CANDIDATE_COUNT, 32, 512),
+            Self::InteractiveStress => (PLANNING_CANDIDATE_COUNT, 32, 512),
+            Self::SourceCrossover => (64, 4, 96),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::First => "First 32x4x241",
-            Self::Stress => "Stress 2048x32x512",
+            Self::InteractiveStress => "Interactive Stress 2048x32x512",
+            Self::SourceCrossover => "Quadrature-source crossover 64x4x96",
         }
     }
 }
@@ -188,6 +203,7 @@ pub struct PlanningWorkloadIdentity {
     pub reference_capture_id: u64,
     pub reference_capture_epoch: u64,
     pub source_hash: u64,
+    pub source_count: u32,
     pub basis_hash: u64,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
@@ -259,26 +275,56 @@ pub struct PlanningMethodMetrics {
     pub gpu_batch_verified: bool,
     pub workload: PlanningWorkloadIdentity,
     pub common_preparation_ms: f64,
+    pub one_time_preparation_ms: f64,
     pub preprocessing_ms: f64,
     pub command_submission_ms: f64,
     pub reduction_ms: f64,
     pub verification_ms: f64,
     pub gpu_completion_map_ms: f64,
     pub warm_evaluation_ms: f64,
+    pub certified_warm_evaluation_ms: f64,
+    /// Measured certified hot pass over the complete BxKxH workload. The
+    /// immutable geometry/basis build is reused and reported separately.
+    pub certified_full_pass_ms: f64,
+    pub certified_estimated_total_ms: f64,
+    pub build_ms: f64,
+    pub hot_query_ns_per_target: f64,
     pub total_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
+    pub raw_relative_gravity_error: f32,
+    pub raw_gradient_relative_error: f32,
+    pub certified_relative_gravity_error: f32,
+    pub certified_gradient_relative_error: f32,
+    /// Pointwise relative-error strata. Unlike the global L2 metric these
+    /// expose weak-field and boundary outliers.
+    pub gravity_error_p95: f32,
+    pub gravity_error_p99: f32,
+    pub gravity_error_max: f32,
+    pub gradient_error_p95: f32,
+    pub gradient_error_p99: f32,
+    pub gradient_error_max: f32,
+    pub rejected_sample_count: u64,
+    pub rejection_counts: [u64; 6],
+    pub self_fd_step_maxima: [f32; 5],
+    pub first_rejection: Option<[u32; 5]>,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
     pub model_discrimination: f32,
     pub planning_objective: f32,
     pub segment_count: u32,
     pub valid_candidate_count: u32,
+    /// Number of common f64 reference states used in the error denominator.
+    pub verification_sample_count: u64,
+    pub certified_verification_sample_count: u64,
+    pub certified_rejected_sample_count: u64,
+    pub certified_valid_candidate_count: u32,
     pub cold_amortization_candidates: u32,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub density_combinations: u64,
     pub gpu_request_count: u32,
+    pub certified_gpu_request_count: u32,
     pub minimum_tile_candidates: u32,
     pub maximum_tile_candidates: u32,
     pub top_candidates: [PlanningCandidateScore; 5],
@@ -288,10 +334,14 @@ pub struct PlanningBatchJob {
     pub run_id: u64,
     pub profile: PlanningWorkloadProfile,
     pub method: ActiveGravityMethod,
+    pub method_order: [ActiveGravityMethod; 3],
+    pub method_order_index: usize,
     pub batch_id: u64,
     pub candidate_count: u32,
     pub density_model_count: u32,
     pub samples_per_candidate: u32,
+    pub density_seed: u64,
+    pub maximum_density_mass_relative_error: f64,
     pub request_id: u64,
     pub density_model: u32,
     pub candidate_start: u32,
@@ -299,9 +349,14 @@ pub struct PlanningBatchJob {
     pub minimum_tile_size_used: u32,
     pub maximum_tile_size_used: u32,
     pub gpu_request_count: u32,
+    pub raw_gpu_request_count: u32,
     pub last_request_candidate_count: u32,
     pub awaiting_gpu: bool,
+    /// Frames spent waiting for the packet belonging to the current request.
+    /// A lost WebGPU map/readback must never leave the UI at 0% forever.
+    pub awaiting_gpu_frames: u32,
     pub warm_repetition: bool,
+    pub certified_repetition: bool,
     pub total_evaluations: u64,
     pub gravity_error_sum: f64,
     pub gravity_reference_sum: f64,
@@ -309,6 +364,25 @@ pub struct PlanningBatchJob {
     pub gradient_error_sum: f64,
     pub gradient_reference_sum: f64,
     pub gradient_samples: u64,
+    pub verification_sample_count: u64,
+    pub raw_gravity_error_sum: f64,
+    pub raw_gradient_error_sum: f64,
+    pub pointwise_gravity_errors: Vec<f32>,
+    pub pointwise_gradient_errors: Vec<f32>,
+    pub certified_gravity_error_sum: f64,
+    pub certified_gravity_reference_sum: f64,
+    pub certified_gradient_error_sum: f64,
+    pub certified_gradient_reference_sum: f64,
+    pub certified_gravity_samples: u64,
+    pub certified_gradient_samples: u64,
+    pub certified_verification_sample_count: u64,
+    pub certified_rejected_sample_count: u64,
+    pub certified_candidate_valid: Vec<bool>,
+    pub rejected_sample_count: u64,
+    pub rejection_counts: [u64; 6],
+    pub self_fd_step_maxima: [f32; 5],
+    pub first_rejection: Option<[u32; 5]>,
+    pub maximum_gradient_self_fd_relative_error: f32,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
     pub discrimination_sum: f64,
@@ -321,12 +395,16 @@ pub struct PlanningBatchJob {
     pub candidate_minimum_altitude_m: Vec<f32>,
     pub candidate_valid: Vec<bool>,
     pub common_preparation_ms: f64,
+    pub one_time_preparation_ms: f64,
     pub preprocessing_ms: f64,
     pub command_submission_ms: f64,
     pub reduction_ms: f64,
     pub verification_ms: f64,
     pub gpu_completion_map_ms: f64,
     pub warm_evaluation_ms: f64,
+    pub certified_warm_evaluation_ms: f64,
+    pub certified_full_pass_ms: f64,
+    pub first_tile_ms: f64,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,
@@ -334,17 +412,53 @@ pub struct PlanningBatchJob {
 
 impl PlanningMethodMetrics {
     pub fn accuracy_eligible(self) -> bool {
-        self.workload.is_complete()
+        self.gpu_batch_verified
+            && self.workload.is_complete()
             && self.relative_gravity_error.is_finite()
             && self.relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
             && self.gradient_relative_error.is_finite()
             && self.gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
+            && self.gravity_error_p99.is_finite()
+            && self.gravity_error_p99 <= 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gravity_error_max.is_finite()
+            && self.gravity_error_max <= 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gradient_error_p99.is_finite()
+            && self.gradient_error_p99 <= 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
+            && self.gradient_error_max.is_finite()
+            && self.gradient_error_max <= 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
             && self.pericenter_error_m.is_finite()
             && self.pericenter_error_m <= PLANNING_PERICENTER_ERROR_LIMIT_METERS
             && self.top_candidates[0].objective.is_finite()
-            && self.valid_candidate_count > 0
+            && self.valid_candidate_count == self.workload.candidate_count
             && self.total_ms.is_finite()
             && self.total_ms > 0.0
+    }
+
+    pub fn certified_accuracy_eligible(self) -> bool {
+        self.method == ActiveGravityMethod::CurvedArcEq106
+            && self.gpu_batch_verified
+            && self.workload.is_complete()
+            && self.certified_relative_gravity_error.is_finite()
+            && self.certified_relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
+            && self.certified_gradient_relative_error.is_finite()
+            && self.certified_gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
+            // The certified pass must satisfy the same pointwise outlier
+            // policy as the ordinary pass.  Until certified pointwise strata
+            // are stored separately, the raw strata are the conservative
+            // common gate for both reported Eq.106 timings.
+            && self.gravity_error_p99.is_finite()
+            && self.gravity_error_p99 <= 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gravity_error_max.is_finite()
+            && self.gravity_error_max <= 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            && self.gradient_error_p99.is_finite()
+            && self.gradient_error_p99 <= 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
+            && self.gradient_error_max.is_finite()
+            && self.gradient_error_max <= 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
+            && self.certified_verification_sample_count == self.verification_sample_count
+            && self.certified_rejected_sample_count == 0
+            && self.certified_valid_candidate_count == self.workload.candidate_count
+            && self.certified_full_pass_ms.is_finite()
+            && self.certified_full_pass_ms > 0.0
     }
 }
 
@@ -358,6 +472,24 @@ pub struct PlanningComparisonState {
     pub reference_duration_seconds: f32,
     pub status: String,
     pub batch_job: Option<PlanningBatchJob>,
+    pub requested_source_count: u32,
+    pub source_curve_active: bool,
+    pub source_curve_visible: bool,
+    pub source_curve_index: usize,
+    pub source_curve_repeat: u32,
+    pub source_curve_samples: Vec<PlanningSourceCurveSample>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlanningSourceCurveSample {
+    pub source_count: u32,
+    /// Eq.106 raw, Eq.106 certified estimate, FFT-grid, treecode.
+    pub times_ms: [f64; 4],
+    /// Build/preprocess timing for Eq.106 raw, FFT-grid, treecode.
+    pub build_ms: [f64; 3],
+    /// Warm-query nanoseconds per target for Eq.106 raw, FFT-grid, treecode.
+    pub query_ns_per_target: [f64; 3],
+    pub eligible: [bool; 4],
 }
 
 #[derive(Resource, Debug, Default)]
@@ -394,11 +526,25 @@ impl Default for PlanningComparisonState {
             reference_duration_seconds: 0.0,
             status: "Choose a planning metric to run First, or use inversion metrics with the inversion button.".into(),
             batch_job: None,
+            requested_source_count: PLANNING_SOURCE_COUNTS[0],
+            source_curve_active: false,
+            source_curve_visible: false,
+            source_curve_index: 0,
+            source_curve_repeat: 0,
+            source_curve_samples: Vec::new(),
         }
     }
 }
 
 impl PlanningComparisonState {
+    pub fn blocks_realtime_gpu(&self) -> bool {
+        // Interactive Stress must remain a live application mode: the probe,
+        // Eq.106 residual, and Jacobi histories continue advancing while its
+        // planning batches run. Only the short First benchmark owns the GPU
+        // and physics clock exclusively.
+        self.run_requested && self.workload_profile == PlanningWorkloadProfile::First
+    }
+
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
         let eq106 = self.results[ActiveGravityMethod::CurvedArcEq106.performance_index()]?;
         let mmfft = self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?;
@@ -423,76 +569,116 @@ impl PlanningComparisonState {
         let eq106 = self.results[2]?;
         let mmfft = self.results[3]?;
         let fmm = self.results[4]?;
-        let mut failures = Vec::new();
-        for (name, result) in [("Eq.106", eq106), ("FFT-grid", mmfft), ("treecode", fmm)] {
-            let failure_count = failures.len();
+        let methods = [
+            ("Eq.106 full forward", eq106),
+            ("FFT-grid", mmfft),
+            ("treecode", fmm),
+        ];
+        let common_samples = eq106.verification_sample_count > 0
+            && eq106.verification_sample_count == mmfft.verification_sample_count
+            && eq106.verification_sample_count == fmm.verification_sample_count;
+        let mut eligible = Vec::new();
+        let mut disqualified = Vec::new();
+        for (name, result) in methods {
+            let mut reasons = Vec::new();
             if !result.gpu_batch_verified {
-                failures.push(format!("{name} GPU verification failed"));
+                reasons.push("GPU verification failed".to_string());
             }
             if !result.relative_gravity_error.is_finite()
                 || result.relative_gravity_error > PLANNING_GRAVITY_ERROR_LIMIT
             {
-                failures.push(format!(
-                    "{name} gravity {:.3e} > {:.1e}",
+                reasons.push(format!(
+                    "gravity {:.3e} > {:.1e}",
                     result.relative_gravity_error, PLANNING_GRAVITY_ERROR_LIMIT
                 ));
             }
             if !result.gradient_relative_error.is_finite()
                 || result.gradient_relative_error > PLANNING_GRADIENT_ERROR_LIMIT
             {
-                failures.push(format!(
-                    "{name} gradient {:.3e} > {:.1e}",
+                reasons.push(format!(
+                    "gradient {:.3e} > {:.1e}",
                     result.gradient_relative_error, PLANNING_GRADIENT_ERROR_LIMIT
+                ));
+            }
+            if !result.gravity_error_p99.is_finite()
+                || result.gravity_error_p99 > 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
+                || !result.gravity_error_max.is_finite()
+                || result.gravity_error_max > 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
+            {
+                reasons.push(format!(
+                    "gravity point p99/max {:.3e}/{:.3e}",
+                    result.gravity_error_p99, result.gravity_error_max
+                ));
+            }
+            if !result.gradient_error_p99.is_finite()
+                || result.gradient_error_p99 > 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
+                || !result.gradient_error_max.is_finite()
+                || result.gradient_error_max > 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
+            {
+                reasons.push(format!(
+                    "gradient point p99/max {:.3e}/{:.3e}",
+                    result.gradient_error_p99, result.gradient_error_max
                 ));
             }
             if !result.pericenter_error_m.is_finite()
                 || result.pericenter_error_m > PLANNING_PERICENTER_ERROR_LIMIT_METERS
             {
-                failures.push(format!(
-                    "{name} pericenter {:.3e}m > {:.1}m",
+                reasons.push(format!(
+                    "pericenter {:.3e}m > {:.1}m",
                     result.pericenter_error_m, PLANNING_PERICENTER_ERROR_LIMIT_METERS
                 ));
             }
-            if !result.accuracy_eligible() && failures.len() == failure_count {
-                failures.push(format!("{name} has incomplete score or timing data"));
+            if result.valid_candidate_count != result.workload.candidate_count {
+                reasons.push(format!(
+                    "coverage {}/{}",
+                    result.valid_candidate_count, result.workload.candidate_count
+                ));
+            }
+            if name.starts_with("Eq.106") && result.segment_count > PLANNING_EQ106_MAX_SEGMENTS {
+                reasons.push(format!(
+                    "segments {} > {}",
+                    result.segment_count, PLANNING_EQ106_MAX_SEGMENTS
+                ));
+            }
+            if !common_samples {
+                reasons.push(format!(
+                    "non-common f64 sample count {}",
+                    result.verification_sample_count
+                ));
+            }
+            if reasons.is_empty() && result.accuracy_eligible() {
+                eligible.push((name, result.total_ms));
+            } else {
+                if reasons.is_empty() {
+                    reasons.push("incomplete score or timing data".into());
+                }
+                disqualified.push(format!("{name} disqualified: {}", reasons.join(", ")));
             }
         }
-        if eq106.segment_count > PLANNING_EQ106_MAX_SEGMENTS {
-            failures.push(format!(
-                "Eq.106 segments {} > {}",
-                eq106.segment_count, PLANNING_EQ106_MAX_SEGMENTS
-            ));
-        }
-        if eq106.valid_candidate_count == 0
-            || eq106.valid_candidate_count != mmfft.valid_candidate_count
-            || eq106.valid_candidate_count != fmm.valid_candidate_count
-        {
-            failures.push(format!(
-                "valid candidates differ: Eq.106 {}, FFT-grid {}, treecode {}",
-                eq106.valid_candidate_count,
-                mmfft.valid_candidate_count,
-                fmm.valid_candidate_count
-            ));
-        }
-        if !failures.is_empty() {
-            return Some(format!("no eligible winner: {}", failures.join("; ")));
-        }
-        let speedup_vs_fft = mmfft.total_ms / eq106.total_ms;
-        let speedup_vs_tree = fmm.total_ms / eq106.total_ms;
-        let minimum_speedup = speedup_vs_fft.min(speedup_vs_tree);
-        Some(if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
-            && minimum_speedup >= PLANNING_STRONG_SPEEDUP
-        {
-            "Eq.106 strong advantage (>=5x both fixed baselines)".into()
-        } else if eq106.segment_count <= PLANNING_EQ106_TARGET_SEGMENTS
-            && minimum_speedup >= PLANNING_USEFUL_SPEEDUP
-        {
-            "Eq.106 useful advantage (>=3x both fixed baselines)".into()
+        eligible.sort_by(|left, right| left.1.total_cmp(&right.1));
+        let verdict = eligible.first().map_or_else(
+            || "No eligible winner".to_string(),
+            |(name, milliseconds)| format!("Eligible winner: {name} ({milliseconds:.2} ms)"),
+        );
+        Some(if disqualified.is_empty() {
+            verdict
         } else {
-            format!(
-                "Eq.106 has no effective advantage: {:.3}x vs FFT-grid, {:.3}x vs treecode",
-                speedup_vs_fft, speedup_vs_tree
-            )
+            format!("{verdict}; {}", disqualified.join("; "))
         })
+    }
+}
+
+#[cfg(test)]
+mod planning_profile_tests {
+    use super::PlanningWorkloadProfile;
+
+    #[test]
+    fn both_visible_profiles_use_fixed_batch_scheduling() {
+        assert!(PlanningWorkloadProfile::First.is_compute_benchmark());
+        assert!(PlanningWorkloadProfile::InteractiveStress.is_compute_benchmark());
+        assert_eq!(
+            PlanningWorkloadProfile::InteractiveStress.dimensions(),
+            (2_048, 32, 512)
+        );
     }
 }

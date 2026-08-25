@@ -9,6 +9,7 @@ use bevy::render::{
     },
     renderer::RenderDevice,
 };
+use std::collections::BTreeSet;
 
 impl crate::gpu::planning::PlanningSharedGpuBuffersInner {
     pub(crate) fn matches(&self, batch: &PlanningCandidateBatch) -> bool {
@@ -24,27 +25,78 @@ pub(crate) fn planning_verification_targets(
     request: &PlanningGpuRequest,
     batch: &PlanningCandidateBatch,
 ) -> Vec<u32> {
+    if batch.candidate_count <= PLANNING_FIRST_CANDIDATE_COUNT && batch.density_model_count <= 4 {
+        return (0..request.candidate_count)
+            .flat_map(|local_candidate| {
+                (0..batch.samples_per_candidate)
+                    .map(move |sample| local_candidate * batch.samples_per_candidate + sample)
+            })
+            .collect();
+    }
     let model_stride = PLANNING_REFERENCE_MODEL_STRIDE.min((batch.density_model_count / 4).max(1));
-    if !request.density_model.is_multiple_of(model_stride) {
+    let model_hash = request
+        .density_model
+        .wrapping_mul(0x9e37_79b9)
+        .wrapping_add(batch.density_seed as u32);
+    let selected_model = request.density_model == 0
+        || request.density_model + 1 == batch.density_model_count
+        || request.density_model.is_multiple_of(model_stride)
+        || model_hash.is_multiple_of(batch.density_model_count.max(1));
+    if !selected_model {
         return Vec::new();
     }
     let candidate_stride =
         PLANNING_REFERENCE_CANDIDATE_STRIDE.min((batch.candidate_count / 8).max(1));
-    let mut targets = Vec::new();
+    let samples = batch.samples_per_candidate as usize;
+    let global_max_transverse_candidate = batch
+        .states
+        .chunks_exact(samples)
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.iter()
+                .map(|state| state.velocity_distance[3])
+                .fold(0.0_f32, f32::max)
+                .total_cmp(
+                    &right
+                        .iter()
+                        .map(|state| state.velocity_distance[3])
+                        .fold(0.0_f32, f32::max),
+                )
+        })
+        .map_or(0_u32, |(candidate, _)| candidate as u32);
+    let mut targets = BTreeSet::new();
     for local_candidate in 0..request.candidate_count {
         let candidate = request.candidate_start + local_candidate;
-        if !candidate.is_multiple_of(candidate_stride) {
-            continue;
-        }
+        let stratified_candidate = candidate == 0
+            || candidate + 1 == batch.candidate_count
+            || candidate == global_max_transverse_candidate
+            || candidate.is_multiple_of(candidate_stride);
         for sample in 0..batch.samples_per_candidate {
-            if sample.is_multiple_of(PLANNING_REFERENCE_STRIDE)
-                || sample.abs_diff(batch.samples_per_candidate / 2) <= 1
+            let local_target = local_candidate * batch.samples_per_candidate + sample;
+            let global_target = candidate * batch.samples_per_candidate + sample;
+            let state_index = global_target as usize;
+            let segment = batch.states[state_index].identity[2];
+            let segment_boundary = sample == 0
+                || sample + 1 == batch.samples_per_candidate
+                || (state_index > candidate as usize * samples
+                    && batch.states[state_index - 1].identity[2] != segment)
+                || (sample + 1 < batch.samples_per_candidate
+                    && batch.states[state_index + 1].identity[2] != segment);
+            let random_hash = global_target
+                .wrapping_mul(0x85eb_ca6b)
+                .wrapping_add(request.density_model.wrapping_mul(0xc2b2_ae35))
+                ^ batch.density_seed as u32;
+            if (stratified_candidate
+                && (sample.is_multiple_of(PLANNING_REFERENCE_STRIDE)
+                    || sample.abs_diff(batch.samples_per_candidate / 2) <= 1
+                    || segment_boundary))
+                || random_hash.is_multiple_of(16_384)
             {
-                targets.push(local_candidate * batch.samples_per_candidate + sample);
+                targets.insert(local_target);
             }
         }
     }
-    targets
+    targets.into_iter().collect()
 }
 
 #[derive(Resource)]

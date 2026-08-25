@@ -19,8 +19,8 @@ use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-        BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding,
-        BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferSize, BufferUsages,
+        BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor,
+        BufferInitDescriptor, BufferUsages,
         CachedComputePipelineId, CachedPipelineState,
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, MapMode,
         PipelineCache, ShaderStages,
@@ -28,21 +28,25 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
 };
 use bevy::shader::ShaderCacheError;
+use bevy::log::{debug, error, info, trace};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use wgpu29::{ComputePassTimestampWrites, QuerySet};
 
 const HALF_COUNT: u32 = 64;
 const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
 const QUADRATURE_COUNT: u32 = 64;
-const TAYLOR_MAX_ORDER: u32 = 4;
-const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 15;
+const TAYLOR_MAX_ORDER: u32 = 8;
+const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 45;
 const DUAL_CERTIFICATE_CADENCE: u32 = 30;
-const OUTPUT_ROWS_PER_BLOCK: u64 = 9;
+const OUTPUT_ROWS_PER_BLOCK: u64 = 11;
 const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
 const TAYLOR_REMAINDER_TARGET: f32 = 1.0e-3;
+const TAYLOR_GRADIENT_REMAINDER_TARGET: f32 = 1.0e-2;
 const TIMESTAMP_BYTES: u64 = 8;
 const TARGET_DISPATCH_WIDTH: u32 = 65_535;
+const EQ106_GPU_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const fn eq106_sensitivity_configuration_hash() -> u64 {
     (FREQUENCY_COUNT as u64) << 32
@@ -129,14 +133,25 @@ struct Eq106BatchElement {
     line_direction: Vec3,
     line_limit: f32,
     taylor_order: u32,
+    /// One-based slot in the spectrum buffer. Multiple candidate evaluators
+    /// may deliberately reference the same canonical slot.
+    spectrum_index: u32,
 }
 
 fn select_batch_taylor_order(epsilon: f32) -> Option<u32> {
     if !epsilon.is_finite() || !(0.0..1.0).contains(&epsilon) {
         return None;
     }
-    (1..=TAYLOR_MAX_ORDER)
-        .find(|order| epsilon.powi(*order as i32 + 1) / (1.0 - epsilon) <= TAYLOR_REMAINDER_TARGET)
+    (1..=TAYLOR_MAX_ORDER).find(|order| {
+        let field_bound = epsilon.powi(*order as i32 + 1) / (1.0 - epsilon);
+        // Differentiating the Taylor tail amplifies both its leading power and
+        // the geometric-series denominator. A field-only certificate allowed
+        // gradients that were visibly outside the planning tolerance.
+        let gradient_bound = (*order as f32 + 1.0) * epsilon.powi(*order as i32)
+            / (1.0 - epsilon).powi(2);
+        field_bound <= TAYLOR_REMAINDER_TARGET
+            && gradient_bound <= TAYLOR_GRADIENT_REMAINDER_TARGET
+    })
 }
 
 fn build_trajectory_batch_elements(
@@ -145,6 +160,42 @@ fn build_trajectory_batch_elements(
     times: &[f32],
     source_radius: f32,
     certified_line_limit: f32,
+) -> Vec<Eq106BatchElement> {
+    build_tube_batch_elements(
+        positions,
+        velocities,
+        times,
+        source_radius,
+        certified_line_limit,
+        0.0,
+    )
+}
+
+fn build_canonical_tube_elements(
+    positions: &[Vec3],
+    velocities: &[Vec3],
+    times: &[f32],
+    source_radius: f32,
+    certified_line_limit: f32,
+    tube_radius: f32,
+) -> Vec<Eq106BatchElement> {
+    build_tube_batch_elements(
+        positions,
+        velocities,
+        times,
+        source_radius,
+        certified_line_limit,
+        tube_radius.max(0.0),
+    )
+}
+
+fn build_tube_batch_elements(
+    positions: &[Vec3],
+    velocities: &[Vec3],
+    times: &[f32],
+    source_radius: f32,
+    certified_line_limit: f32,
+    tube_radius: f32,
 ) -> Vec<Eq106BatchElement> {
     if positions.is_empty()
         || positions.len() != velocities.len()
@@ -158,16 +209,20 @@ fn build_trajectory_batch_elements(
     let mut elements = Vec::new();
     let mut start = 0;
     while start < positions.len() {
-        let origin = positions[start];
+        let anchor = positions[start];
         let mut direction = velocities[start].normalize_or_zero();
         if direction == Vec3::ZERO
             && let Some(next) = positions.get(start + 1)
         {
-            direction = (*next - origin).normalize_or_zero();
+            direction = (*next - anchor).normalize_or_zero();
         }
         if direction == Vec3::ZERO {
             break;
         }
+        // Shift the line backwards by the full tube radius. Any candidate
+        // offset can therefore project at most to h=0 at the first sample;
+        // evaluate_field never needs to clamp a genuinely negative query.
+        let origin = anchor - tube_radius * direction;
         let mut maximum_h = 0.0_f32;
         let mut maximum_offset = 0.0_f32;
         let mut minimum_line_radius = f32::INFINITY;
@@ -189,7 +244,8 @@ fn build_trajectory_batch_elements(
                 break;
             }
             let line_point = origin + h.max(0.0) * direction;
-            let next_maximum_offset = maximum_offset.max(position.distance(line_point));
+            let next_maximum_offset =
+                maximum_offset.max(position.distance(line_point) + tube_radius);
             let next_minimum_line_radius = minimum_line_radius.min(line_point.length());
             let distance_lower_bound = next_minimum_line_radius - source_radius;
             if distance_lower_bound <= 0.0 {
@@ -199,7 +255,7 @@ fn build_trajectory_batch_elements(
             let Some(order) = select_batch_taylor_order(epsilon) else {
                 break;
             };
-            maximum_h = maximum_h.max(h);
+            maximum_h = maximum_h.max(h + tube_radius);
             maximum_offset = next_maximum_offset;
             minimum_line_radius = next_minimum_line_radius;
             best_count = (end - start + 1) as u32;
@@ -219,6 +275,7 @@ fn build_trajectory_batch_elements(
                 .min(maximum_line_limit)
                 .max(1.0),
             taylor_order: best_order,
+            spectrum_index: elements.len() as u32 + 1,
         });
         start += best_count as usize;
     }
@@ -292,6 +349,11 @@ struct Eq106ComputePipeline {
     assemble_id: CachedComputePipelineId,
     analytic_id: CachedComputePipelineId,
     evaluate_id: CachedComputePipelineId,
+    planning_voxel_line_samples_id: CachedComputePipelineId,
+    planning_voxel_spectrum_id: CachedComputePipelineId,
+    planning_voxel_analytic_id: CachedComputePipelineId,
+    planning_combine_spectrum_id: CachedComputePipelineId,
+    planning_evaluate_id: CachedComputePipelineId,
 }
 
 pub struct Eq106GpuComputePlugin;
@@ -331,20 +393,24 @@ impl Plugin for Eq106GpuComputePlugin {
         let channel = app.world().resource::<Eq106GpuReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
+        // Queue all four shaders during application startup. This keeps the
+        // first Eq.106 selection and the First benchmark free of compile time.
+        render_app.init_resource::<Eq106ComputePipeline>();
     }
 }
 
 impl FromWorld for Eq106ComputePipeline {
     fn from_world(world: &mut World) -> Self {
+        log_eq106_wgsl_source();
         let entries = [
-            uniform_entry(0),
+            storage_ro_entry(0),
             storage_ro_entry(1),
             storage_ro_entry(2),
             storage_rw_entry(3),
             storage_rw_entry(4),
-            storage_ro_entry(5),
+            uniform_entry(5),
             storage_rw_entry(6),
-            storage_ro_entry(7),
+            uniform_entry(7),
             storage_ro_entry(8),
             storage_ro_entry(9),
         ];
@@ -384,6 +450,64 @@ impl FromWorld for Eq106ComputePipeline {
             label: Some("eq106_evaluate_field".into()),
             layout: vec![layout],
             immediate_size: 0,
+            shader: shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("evaluate_field".into()),
+            zero_initialize_workgroup_memory: false,
+        });
+        let planning_layout = BindGroupLayoutDescriptor::new(
+            "eq106_planning_voxel_bgl",
+            &[
+                storage_ro_entry(0), storage_ro_entry(1), storage_ro_entry(2),
+                storage_rw_entry(3), storage_rw_entry(4), uniform_entry(5),
+                storage_rw_entry(6), uniform_entry(7), storage_ro_entry(8),
+                storage_ro_entry(9),
+            ],
+        );
+        let planning_voxel_line_samples_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_voxel_line_samples".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("assemble_voxel_line_samples".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_voxel_spectrum_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_voxel_spectrum".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("assemble_voxel_spectrum".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_voxel_analytic_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_voxel_analytic_spectrum".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("assemble_voxel_analytic_spectrum".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_combine_spectrum_id =
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("eq106_planning_combine_spectrum".into()),
+                layout: vec![planning_layout.clone()],
+                immediate_size: 0,
+                shader: shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("combine_voxel_spectrum".into()),
+                zero_initialize_workgroup_memory: false,
+            });
+        let planning_evaluate_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("eq106_planning_evaluate_field".into()),
+            layout: vec![planning_layout],
+            immediate_size: 0,
             shader,
             shader_defs: vec![],
             entry_point: Some("evaluate_field".into()),
@@ -394,7 +518,25 @@ impl FromWorld for Eq106ComputePipeline {
             assemble_id,
             analytic_id,
             evaluate_id,
+            planning_voxel_line_samples_id,
+            planning_voxel_spectrum_id,
+            planning_voxel_analytic_id,
+            planning_combine_spectrum_id,
+            planning_evaluate_id,
         }
+    }
+}
+
+fn log_eq106_wgsl_source() {
+    let source = include_str!("../../../assets/shaders/eq106_complex.wgsl");
+    debug!(
+        target: "wgsl::eq106",
+        bytes = source.len(),
+        lines = source.lines().count(),
+        "loading Eq.106 WGSL source"
+    );
+    for (line_number, line) in source.lines().enumerate() {
+        trace!(target: "wgsl::eq106", line = line_number + 1, "WGSL {line}");
     }
 }
 
@@ -413,8 +555,21 @@ fn poll_eq106_readback(
     mut batch_result: ResMut<Eq106TrajectoryBatchResult>,
     mut sensitivity: ResMut<Eq106SensitivityMatrix>,
     mut performance: ResMut<Eq106PerformanceMetrics>,
+    mut planner: ResMut<CurvedArcPlannerState>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
+    if channel.in_flight.load(Ordering::Acquire)
+        && let Ok(mut submitted_at) = channel.submitted_at.try_lock()
+        && submitted_at
+            .as_ref()
+            .is_some_and(|started| started.elapsed() > EQ106_GPU_TIMEOUT)
+    {
+        submitted_at.take();
+        runtime_error.raise(
+            "Equation (106) GPU request exceeded 10 seconds; possible shader hang or device loss.",
+        );
+        return;
+    }
     if let Ok(mut error) = channel.pipeline_error.try_lock()
         && let Some(message) = error.take()
     {
@@ -489,15 +644,35 @@ fn poll_eq106_readback(
     }
     let decoded = match decode_eq106_packet(&packet, angular_velocity_world) {
         Ok(decoded) => decoded,
-        Err(Eq106DecodeError::Incomplete) => {
-            runtime_error.raise("Equation (106) batch readback is incomplete.");
+        Err(Eq106DecodeError::Incomplete { actual, expected }) => {
+            runtime_error.raise(format!(
+                "Equation (106) batch readback is incomplete: {actual} rows, expected {expected}."
+            ));
             return;
         }
-        Err(Eq106DecodeError::InvalidSample) => {
-            channel.rebuild_requested.store(true, Ordering::Release);
+        Err(Eq106DecodeError::Rejected { sample, reason }) => {
+            planner.consecutive_rejections = planner.consecutive_rejections.saturating_add(1);
+            let retry = planner.consecutive_rejections;
+            let message = format!(
+                "Eq.106 waiting: {} at sample {}; retry {retry}/4, Taylor order {}.",
+                reason.message(),
+                sample + 1,
+                planner.taylor_order,
+            );
+            planner.reject_status = Some(message.clone());
+            warn!(target: "eq106::certificate", %message, "Eq.106 sample rejected");
+            if retry >= 4 {
+                runtime_error.raise(format!(
+                    "Equation (106) stopped after four consecutive certificate failures. {message}"
+                ));
+            } else {
+                channel.rebuild_requested.store(true, Ordering::Release);
+            }
             return;
         }
     };
+    planner.consecutive_rejections = 0;
+    planner.reject_status = None;
 
     if let Some(capture_id) = packet.batch_capture_id {
         batch_result.capture_id = Some(capture_id);
@@ -507,10 +682,41 @@ fn poll_eq106_readback(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Eq106DecodeError {
-    Incomplete,
-    InvalidSample,
+    Incomplete { actual: usize, expected: usize },
+    Rejected { sample: usize, reason: Eq106RejectReason },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Eq106RejectReason {
+    TaylorField { value: f32, limit: f32 },
+    ImaginaryResidual { value: f32, limit: f32 },
+    SpectralTail { value: f32, limit: f32 },
+    TransverseRatio { value: f32, limit: f32 },
+    NonFinite,
+    NonPhysical,
+}
+
+impl Eq106RejectReason {
+    fn message(self) -> String {
+        match self {
+            Self::TaylorField { value, limit } => {
+                format!("field-tail certificate {value:.3e} > {limit:.3e}")
+            }
+            Self::ImaginaryResidual { value, limit } => {
+                format!("imaginary residual {value:.3e} > {limit:.3e}")
+            }
+            Self::SpectralTail { value, limit } => {
+                format!("spectral-tail certificate {value:.3e} > {limit:.3e}")
+            }
+            Self::TransverseRatio { value, limit } => {
+                format!("transverse ratio {value:.3e} > {limit:.3e}")
+            }
+            Self::NonFinite => "non-finite field, certificate, or Jacobian".into(),
+            Self::NonPhysical => "non-physical potential or field magnitude".into(),
+        }
+    }
 }
 
 fn decode_eq106_packet(
@@ -519,7 +725,10 @@ fn decode_eq106_packet(
 ) -> Result<Vec<GravityFieldSample>, Eq106DecodeError> {
     let expected_rows = packet.snapshots.len() * OUTPUT_ROWS_PER_BLOCK as usize;
     if packet.partial_sums.len() != expected_rows {
-        return Err(Eq106DecodeError::Incomplete);
+        return Err(Eq106DecodeError::Incomplete {
+            actual: packet.partial_sums.len(),
+            expected: expected_rows,
+        });
     }
     packet
         .snapshots
@@ -532,7 +741,10 @@ fn decode_eq106_packet(
                 snapshot,
                 angular_velocity_world,
             )
-            .ok_or(Eq106DecodeError::InvalidSample)
+            .map_err(|reason| Eq106DecodeError::Rejected {
+                sample: index,
+                reason,
+            })
         })
         .collect()
 }
@@ -541,15 +753,52 @@ fn decode_eq106_sample(
     rows: &[[f32; 4]],
     base_snapshot: &GravityRequestSnapshot,
     angular_velocity_world: Vec3,
-) -> Option<GravityFieldSample> {
+) -> Result<GravityFieldSample, Eq106RejectReason> {
     let field = rows[0];
     let certificate = rows[1];
-    if certificate[0] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-        || certificate[1] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-        || certificate[2] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
-        || certificate[3] > 0.30
-    {
-        return None;
+    for (value, reason) in [
+        (
+            certificate[0],
+            Eq106RejectReason::TaylorField {
+                value: certificate[0],
+                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+            },
+        ),
+        (
+            certificate[1],
+            Eq106RejectReason::ImaginaryResidual {
+                value: certificate[1],
+                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+            },
+        ),
+        (
+            certificate[2],
+            Eq106RejectReason::SpectralTail {
+                value: certificate[2],
+                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+            },
+        ),
+        (
+            certificate[3],
+            Eq106RejectReason::TransverseRatio {
+                value: certificate[3],
+                limit: 0.30,
+            },
+        ),
+    ] {
+        if !value.is_finite() {
+            return Err(Eq106RejectReason::NonFinite);
+        }
+        let limit = match reason {
+            Eq106RejectReason::TransverseRatio { limit, .. }
+            | Eq106RejectReason::TaylorField { limit, .. }
+            | Eq106RejectReason::ImaginaryResidual { limit, .. }
+            | Eq106RejectReason::SpectralTail { limit, .. } => limit,
+            _ => unreachable!(),
+        };
+        if value > limit {
+            return Err(reason);
+        }
     }
     let potentials = rows[6];
     let anchor_row = rows[7];
@@ -577,7 +826,18 @@ fn decode_eq106_sample(
         || !local_coordinates.iter().all(|value| value.is_finite())
         || !jacobian.is_finite()
     {
-        return None;
+        return Err(if !acceleration.is_finite()
+            || !positive_potential.is_finite()
+            || independent_potential.is_some_and(|potential| !potential.is_finite())
+            || !anchor_position.is_finite()
+            || !line_origin.is_finite()
+            || !local_coordinates.iter().all(|value| value.is_finite())
+            || !jacobian.is_finite()
+        {
+            Eq106RejectReason::NonFinite
+        } else {
+            Eq106RejectReason::NonPhysical
+        });
     }
 
     let mut snapshot = base_snapshot.clone();
@@ -591,7 +851,7 @@ fn decode_eq106_sample(
     snapshot.probe_position =
         snapshot.ryugu_transform.translation + future_rotation * anchor_position;
 
-    Some(GravityFieldSample {
+    Ok(GravityFieldSample {
         snapshot,
         predictive: false,
         body_acceleration: acceleration,

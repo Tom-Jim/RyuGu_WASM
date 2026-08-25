@@ -4,9 +4,12 @@ pub const PLANNING_TRAJECTORY_TUBE_RADIUS_METERS: f32 = 15.0;
 pub const PLANNING_GPU_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
-pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 1;
-pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 1;
-pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 8;
+// Stress uses the same candidate-tile range for all three GPU backends.  A
+// method-specific tile width changes request counts and hides dispatch/readback
+// overhead inside what is meant to be a shared-workload robustness run.
+pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 8;
+pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
+pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
 pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 8;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
@@ -59,15 +62,33 @@ pub struct PlanningCandidateBatch {
     pub capture_id: u64,
     pub capture_epoch: u64,
     pub source_hash: u64,
+    pub source_count: u32,
     pub candidate_count: u32,
     pub density_model_count: u32,
     pub samples_per_candidate: u32,
     pub body_radius: f32,
+    /// Exact enclosing radius of the spatially refined quadrature sources.
+    /// Eq.106 convergence bounds must use this value, not the radius of the
+    /// pre-refinement 1024-source aggregate.
+    pub eq106_source_radius: f32,
+    /// Frozen centre arc in body-fixed coordinates. Eq.106 builds one
+    /// canonical spectrum from this arc and shares it across every candidate
+    /// trajectory in the certified tube.
+    pub reference_states: Arc<[PlanningCandidateState]>,
     pub states: Arc<[PlanningCandidateState]>,
     pub gpu_position_bytes: Arc<[u8]>,
     /// Row-major `K x 56` density matrix. Every row has identical total mass.
     pub density_models: Arc<[f32]>,
+    /// Auditable f64 mass reconstructed from every randomized density row.
+    pub density_model_masses: Arc<[f64]>,
+    pub density_seed: u64,
+    pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
+    /// Eq.106 geometry-only source records `(x,y,z,volume)`. Unlike the
+    /// per-method payload this buffer is invariant across density models.
+    pub eq106_volume_source_bytes: Arc<[u8]>,
+    /// Contiguous `(start,count)` ranges for the 56 density voxels.
+    pub eq106_voxel_source_ranges: Arc<[[u32; 2]]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,
@@ -80,11 +101,23 @@ impl PlanningCandidateBatch {
         self.candidate_count as usize * self.samples_per_candidate as usize
     }
 
+    pub fn density_mass_is_conserved(&self) -> bool {
+        self.density_seed != 0
+            && self.target_mass.is_finite()
+            && self.target_mass > 0.0
+            && self.density_model_masses.len() == self.density_model_count as usize
+            && self.density_model_masses.iter().all(|mass| {
+                mass.is_finite()
+                    && ((mass - self.target_mass) / self.target_mass).abs() <= 2.0e-7
+            })
+    }
+
     pub fn workload_identity(&self) -> PlanningWorkloadIdentity {
         PlanningWorkloadIdentity {
             reference_capture_id: self.capture_id,
             reference_capture_epoch: self.capture_epoch,
             source_hash: self.source_hash,
+            source_count: self.source_count,
             basis_hash: self.basis_hash,
             reference_arc_hash: self.reference_arc_hash,
             candidate_hash: self.candidate_hash,
@@ -108,6 +141,12 @@ pub struct PlanningGpuRequest {
     pub candidate_start: u32,
     pub candidate_count: u32,
     pub warm_repetition: bool,
+    /// Eq.106 only: enable independent certificate and five-step self-FD.
+    /// The raw path still computes the complete field and 3x3 Jacobian.
+    pub eq106_certified: bool,
+    /// First and Interactive Stress both use the fairness-oriented fixed
+    /// schedule; the latter remains interactive through progress rendering.
+    pub compute_benchmark: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,6 +159,10 @@ pub struct PlanningGpuTiming {
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,
+    /// Eq.106 analytic transverse Jacobian versus a same-field central finite
+    /// difference. Other backends report zero because this diagnostic is
+    /// specific to the cached Taylor reconstruction.
+    pub gradient_self_fd_relative_error: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +172,19 @@ pub struct PlanningGpuPacket {
     pub state_indices: Vec<u32>,
     /// Four rows per target: acceleration/potential and three Jacobian columns.
     pub rows: Vec<[f32; 4]>,
+    /// Unmodified method output before certificate failures are converted to
+    /// common full-penalty rows.
+    pub raw_rows: Vec<[f32; 4]>,
+    /// Taylor, imaginary, spectral, transverse, self-FD, and non-finite
+    /// rejection counts. Non-Eq.106 methods leave these at zero.
+    pub rejection_counts: [u64; 6],
+    /// Validation rows charged the full penalty after candidate-level gating.
+    pub rejected_sample_count: u64,
+    /// Maximum self-FD mismatch at 0.25, 0.5, 1, 2, and 4 metres.
+    pub self_fd_step_maxima: [f32; 5],
+    /// First certificate rejection as density, global candidate, sample,
+    /// Taylor segment, and reason index. Self-FD warnings do not reject.
+    pub first_rejection: Option<[u32; 5]>,
     /// One GPU-reduced row per candidate: field separation, baseline energy,
     /// minimum altitude, and Jacobian energy.
     pub candidate_metrics: Vec<[f32; 4]>,
@@ -168,5 +224,8 @@ pub struct PlanningMethodPayload {
     pub grid_sizes: [u32; 2],
     pub half_extents: [f32; 2],
     pub total_mass: f32,
+    /// Program-lifetime setup excluded symmetrically from repeated-workload
+    /// totals (for example FFT plans/static Newton kernel or Eq operator table).
+    pub one_time_preparation_ms: f64,
     pub preparation_ms: f64,
 }

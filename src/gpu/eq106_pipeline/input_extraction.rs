@@ -3,6 +3,7 @@ fn extract_eq106_input(
     source: Extract<Option<Res<AggregatedGravitySource>>>,
     operator_tensor: Extract<Option<Res<Eq106OperatorTensorResource>>>,
     active: Extract<Res<ActiveGravityMethod>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     clock: Extract<Res<SimulationClock>>,
     planner: Extract<Res<CurvedArcPlannerState>>,
     benchmark: Extract<Res<GravityBenchmarkTrajectory>>,
@@ -14,9 +15,13 @@ fn extract_eq106_input(
 ) {
     // Selection alone is insufficient: an uncertified segment must never be
     // submitted after adaptive splitting leaves the Taylor convergence disk.
+    // Bootstrap the first Eq.106 sample before the adaptive planner has a
+    // trajectory window. The planner itself is fed by completed GPU snapshots;
+    // requiring `kernel_ready` here creates a circular wait after switching
+    // methods because the switch clears both the orbit history and planner.
     extracted.enabled = **active == ActiveGravityMethod::CurvedArcEq106
-        && planner.kernel_ready
-        && planner.mode != crate::cpu::curved_arc::CurvedArcMode::Error;
+        && planner.mode != crate::cpu::curved_arc::CurvedArcMode::Error
+        && !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }
@@ -318,7 +323,6 @@ fn dispatch_eq106_single_target(
     inner: &mut Eq106GpuBuffersInner,
     line_samples: &wgpu29::ComputePipeline,
     assemble: &wgpu29::ComputePipeline,
-    analytic: &wgpu29::ComputePipeline,
     evaluate: &wgpu29::ComputePipeline,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
@@ -404,7 +408,7 @@ fn dispatch_eq106_single_target(
         longitudinal_limit,
         extracted.taylor_order,
         extracted.density_mode_count,
-        inner.segment_id,
+        1,
         evaluate_dual_certificate,
         false,
         inner.target_count,
@@ -432,11 +436,11 @@ fn dispatch_eq106_single_target(
         });
         pass.set_pipeline(line_samples);
         pass.set_bind_group(0, &inner.bind_group, &[]);
-        pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups(QUADRATURE_COUNT, 1, 1);
         drop(pass);
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("eq106_assemble_pass"),
-            timestamp_writes: None,
+            timestamp_writes: timestamp_writes(query_set, None, build_end),
         });
         pass.set_pipeline(assemble);
         pass.set_bind_group(0, &inner.bind_group, &[]);
@@ -446,18 +450,9 @@ fn dispatch_eq106_single_target(
             1,
         );
         drop(pass);
-        // Replace the zeroth (on-line) coefficient with Eqs. (47),(68)-(70)
-        // evaluated from the certified complex Psi/Psi_x operator. Higher
-        // coefficients remain the exact local Newton Taylor continuation of
-        // Eq. (118), and vanish at the reference line itself.
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("eq106_analytic_spectrum_pass"),
-            timestamp_writes: timestamp_writes(query_set, None, build_end),
-        });
-        pass.set_pipeline(analytic);
-        pass.set_bind_group(0, &inner.bind_group, &[]);
-        pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), 1, 1);
-        drop(pass);
+        // Coefficient zero and all transverse coefficients come from the same
+        // sampled spectrum. This is intentionally identical to planning and
+        // avoids mixing an analytic c00 with sampled c10/c01 derivatives.
         inner.spectrum_ready = true;
     }
     let (evaluation_begin, evaluation_end) = if query_set.is_some() {
@@ -505,6 +500,9 @@ fn dispatch_eq106_single_target(
 
     let shared = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
+    let submitted_at = Arc::clone(&channel.submitted_at);
+    let error_slot = Arc::clone(&channel.pipeline_error);
+    let rebuild_requested = Arc::clone(&channel.rebuild_requested);
     let staging = inner.staging.clone();
     let map_staging = staging.clone();
     let snapshots = extracted.target_snapshots.clone();
@@ -513,46 +511,64 @@ fn dispatch_eq106_single_target(
     let target_count = inner.target_count;
     let timestamp_period_ns = render_queue.get_timestamp_period();
     let readback_started = Instant::now();
+    if let Ok(mut submitted) = channel.submitted_at.lock() {
+        *submitted = Some(readback_started);
+    }
     map_staging
         .slice(..)
         .map_async(MapMode::Read, move |result| {
-            if result.is_ok() {
-                let view = staging.slice(..).get_mapped_range();
-                let values = bytes_to_f32x4(&view[..output_size]);
-                let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
-                let timings = if timing_layout.query_count > 0 {
-                    let end =
-                        output_size + timing_layout.query_count as usize * TIMESTAMP_BYTES as usize;
-                    decode_gpu_timings(
-                        &view[output_size..end],
-                        timestamp_period_ns,
-                        &timing_layout,
-                        cpu_readback_wait_ms,
-                        target_count,
-                        1,
-                    )
-                } else {
-                    Eq106TimingSample {
-                        cpu_readback_wait_ms,
-                        target_count,
-                        spectral_element_count: 1,
-                        ..default()
+            match result {
+                Ok(()) => {
+                    let view = staging.slice(..).get_mapped_range();
+                    let values = bytes_to_f32x4(&view[..output_size]);
+                    let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
+                    let timings = if timing_layout.query_count > 0 {
+                        let end = output_size
+                            + timing_layout.query_count as usize * TIMESTAMP_BYTES as usize;
+                        decode_gpu_timings(
+                            &view[output_size..end],
+                            timestamp_period_ns,
+                            &timing_layout,
+                            cpu_readback_wait_ms,
+                            target_count,
+                            1,
+                        )
+                    } else {
+                        Eq106TimingSample {
+                            cpu_readback_wait_ms,
+                            target_count,
+                            spectral_element_count: 1,
+                            ..default()
+                        }
+                    };
+                    if let Ok(mut guard) = shared.lock() {
+                        *guard = Some(Eq106ReadbackPacket {
+                            partial_sums: values,
+                            snapshots,
+                            batch_capture_id,
+                            sensitivity_column_count: 0,
+                            sensitivity_source_hash: 0,
+                            sensitivity_basis_hash: 0,
+                            sensitivity_configuration_hash: 0,
+                            timings,
+                        });
                     }
-                };
-                if let Ok(mut guard) = shared.lock() {
-                    *guard = Some(Eq106ReadbackPacket {
-                        partial_sums: values,
-                        snapshots,
-                        batch_capture_id,
-                        sensitivity_column_count: 0,
-                        sensitivity_source_hash: 0,
-                        sensitivity_basis_hash: 0,
-                        sensitivity_configuration_hash: 0,
-                        timings,
-                    });
+                    drop(view);
+                    staging.unmap();
                 }
-                drop(view);
-                staging.unmap();
+                Err(error) => {
+                    rebuild_requested.store(true, Ordering::Release);
+                    if let Ok(mut slot) = error_slot.lock()
+                        && slot.is_none()
+                    {
+                        *slot = Some(format!(
+                            "Equation (106) GPU readback failed: {error:?}"
+                        ));
+                    }
+                }
+            }
+            if let Ok(mut submitted) = submitted_at.lock() {
+                submitted.take();
             }
             in_flight.store(false, Ordering::Release);
         });
@@ -568,6 +584,19 @@ fn report_eq106_pipeline_errors(
         ("sampled spectrum", pipelines.assemble_id),
         ("analytic Eq.70 spectrum", pipelines.analytic_id),
         ("inverse spectrum", pipelines.evaluate_id),
+        (
+            "planning voxel line samples",
+            pipelines.planning_voxel_line_samples_id,
+        ),
+        (
+            "planning voxel basis spectrum",
+            pipelines.planning_voxel_spectrum_id,
+        ),
+        (
+            "planning voxel spectrum combination",
+            pipelines.planning_combine_spectrum_id,
+        ),
+        ("planning inverse spectrum", pipelines.planning_evaluate_id),
     ] {
         match cache.get_compute_pipeline_state(id) {
             CachedPipelineState::Err(
@@ -575,6 +604,12 @@ fn report_eq106_pipeline_errors(
                 | ShaderCacheError::ShaderImportNotYetAvailable,
             ) => {}
             CachedPipelineState::Err(error) => {
+                error!(
+                    target: "wgsl::eq106",
+                    pipeline = name,
+                    error = ?error,
+                    "Eq.106 compute pipeline compilation failed"
+                );
                 if let Ok(mut slot) = channel.pipeline_error.try_lock()
                     && slot.is_none()
                 {

@@ -9,7 +9,9 @@
 // This is a truncated discrete operator: mode truncation, interval mapping,
 // coefficient quantization and GPU f32 arithmetic are reported explicitly.
 
-use crate::interface::components::{ActiveGravityMethod, GravityRuntimeError};
+use crate::interface::components::{
+    ActiveGravityMethod, GravityRuntimeError, PlanningComparisonState,
+};
 use crate::cpu::eq106_reference::{Complex64, Eq106Error};
 use bevy::prelude::*;
 #[cfg(any(test, feature = "regenerate-operators"))]
@@ -108,7 +110,7 @@ pub struct ToroidalOperatorTensor {
 }
 
 /// Piecewise-Chebyshev representation of
-/// `L(x)=∫_0^∞ exp(-x t)/sqrt(1+t²)dt = π/2 (H_0(x)-Y_0(x))`
+/// `L(x)=integral_0^infinity exp(-x t)/sqrt(1+t^2)dt = pi/2 (H_0(x)-Y_0(x))`
 /// and its complex derivative. Together with the finite-eta recurrence in the
 /// shader this is the certified `(x,eta)->(Psi,Psi_x)` map used by Eq. (70).
 #[derive(Clone, Debug, PartialEq)]
@@ -146,12 +148,13 @@ pub fn build_eq106_operator_tensor_system(
     attempted: Option<Res<Eq106OperatorBuildAttempted>>,
     source_data: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     active_method: Res<ActiveGravityMethod>,
+    planning: Res<PlanningComparisonState>,
     mut runtime_error: ResMut<GravityRuntimeError>,
 ) {
     if existing.is_some()
         || attempted.is_some()
         || source_data.is_none()
-        || *active_method != ActiveGravityMethod::CurvedArcEq106
+        || (*active_method != ActiveGravityMethod::CurvedArcEq106 && !planning.run_requested)
     {
         return;
     }

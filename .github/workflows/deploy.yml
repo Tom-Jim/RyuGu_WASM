@@ -39,7 +39,7 @@ jobs:
                   cp -r assets site/ 2>/dev/null || true
                   cp -r pkg site/ 2>/dev/null || true
 
-                  # 【双重保险】自动复制生成大小写两种文件名，彻底斩断 404 报错！
+                  #  Copy both filename cases to avoid case-sensitive 404 errors.
                   cd site/pkg
                   if [ -f ryugu_wasm.js ]; then cp ryugu_wasm.js Ryugu_wasm.js; fi
                   if [ -f ryugu_wasm_bg.wasm ]; then cp ryugu_wasm_bg.wasm Ryugu_wasm_bg.wasm; fi

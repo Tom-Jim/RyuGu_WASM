@@ -9,7 +9,7 @@ use bevy::input::{
 };
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::Checked;
+use bevy::ui::{Checked, FocusPolicy};
 use bevy::ui_widgets::{
     Checkbox, Slider, SliderDragState, SliderRange, SliderStep, SliderThumb, SliderValue,
     TrackClick, checkbox_self_update, observe, slider_self_update,
@@ -36,6 +36,19 @@ pub fn update_ui_scale_system(
     let scale = width_scale.min(height_scale);
     if scale.is_finite() && scale > 0.0 {
         ui_scale.0 = scale;
+    }
+}
+
+/// Text nodes sit above their parent widgets in the UI hit-test stack. Let
+/// pointer focus pass through them so clicks on button labels reach the button.
+pub fn ui_text_focus_pass_system(
+    mut commands: Commands,
+    text_nodes: Query<(Entity, Option<&FocusPolicy>), With<Text>>,
+) {
+    for (entity, focus_policy) in text_nodes.iter() {
+        if focus_policy.is_none() {
+            commands.entity(entity).insert(FocusPolicy::Pass);
+        }
     }
 }
 
@@ -182,6 +195,27 @@ pub(crate) struct DensityInversionTimingLabel(pub usize);
 
 #[derive(Component)]
 pub(crate) struct DensityInversionStatusLabel;
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveButton;
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveOverlay;
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveCloseButton;
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct SourceScaleCurveExportButton(pub bool);
+
+#[derive(Component)]
+pub(crate) struct SourceScaleCurveSummary;
+
+#[derive(Component, Clone, Copy)]
+pub(crate) struct SourceScaleCurveSegment {
+    pub method: usize,
+    pub index: usize,
+}
 
 #[derive(Component, Clone, Copy)]
 pub(crate) struct TrajectoryInversionField {

@@ -2,7 +2,6 @@ fn dispatch_eq106_sensitivity_matrix(
     inner: &mut Eq106GpuBuffersInner,
     line_samples_pipeline: &wgpu29::ComputePipeline,
     assemble_pipeline: &wgpu29::ComputePipeline,
-    analytic_pipeline: &wgpu29::ComputePipeline,
     evaluate_pipeline: &wgpu29::ComputePipeline,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
@@ -63,8 +62,8 @@ fn dispatch_eq106_sensitivity_matrix(
     let mut uniforms = Vec::with_capacity(resource_count);
     let mut bind_groups = Vec::with_capacity(resource_count);
     for (column, source) in source_buffers.iter().enumerate() {
-        for (element_index, element) in extracted.batch_elements.iter().enumerate() {
-            let bytes = uniform_bytes(
+        for element in &extracted.batch_elements {
+                let bytes = uniform_bytes(
                 element.line_origin,
                 element.line_origin,
                 element.line_direction,
@@ -73,9 +72,7 @@ fn dispatch_eq106_sensitivity_matrix(
                 element.line_limit,
                 element.taylor_order,
                 extracted.density_mode_count,
-                inner
-                    .segment_id
-                    .wrapping_add((column * extracted.batch_elements.len() + element_index) as u32 + 1),
+                    1,
                 false,
                 true,
                 element.target_count,
@@ -83,8 +80,12 @@ fn dispatch_eq106_sensitivity_matrix(
             );
             let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("eq106_sensitivity_element_uniform"),
-                contents: &bytes,
-                usage: BufferUsages::UNIFORM,
+                contents: &{
+                    let mut data = vec![0_u8; 96 * 256];
+                    data[..bytes.len()].copy_from_slice(&bytes);
+                    data
+                },
+                usage: BufferUsages::STORAGE,
             });
             let bind_group = render_device.create_bind_group(
                 "eq106_sensitivity_element_bg",
@@ -154,7 +155,7 @@ fn dispatch_eq106_sensitivity_matrix(
                 });
                 pass.set_pipeline(line_samples_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
+                pass.dispatch_workgroups(QUADRATURE_COUNT, 1, 1);
             }
             {
                 let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -168,15 +169,6 @@ fn dispatch_eq106_sensitivity_matrix(
                     1,
                     1,
                 );
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("eq106_sensitivity_analytic_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(analytic_pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(FREQUENCY_COUNT.div_ceil(64), 1, 1);
             }
             spectrum_encoding_ms += spectrum_encoding_started.elapsed().as_secs_f64() * 1.0e3;
             let evaluation_encoding_started = Instant::now();
@@ -206,6 +198,9 @@ fn dispatch_eq106_sensitivity_matrix(
 
     let shared = Arc::clone(&channel.data);
     let in_flight = Arc::clone(&channel.in_flight);
+    let submitted_at = Arc::clone(&channel.submitted_at);
+    let error_slot = Arc::clone(&channel.pipeline_error);
+    let rebuild_requested = Arc::clone(&channel.rebuild_requested);
     let mapped_staging = staging.clone();
     let snapshots = extracted.target_snapshots.clone();
     let element_count = extracted.batch_elements.len() as u32;
@@ -213,36 +208,55 @@ fn dispatch_eq106_sensitivity_matrix(
     let sensitivity_basis_hash = extracted.sensitivity_basis_hash;
     let sensitivity_configuration_hash = eq106_sensitivity_configuration_hash();
     let readback_started = Instant::now();
+    if let Ok(mut submitted) = channel.submitted_at.lock() {
+        *submitted = Some(readback_started);
+    }
     mapped_staging
         .slice(..)
         .map_async(MapMode::Read, move |result| {
-            if result.is_ok() {
-                let view = staging.slice(..).get_mapped_range();
-                let values = bytes_to_f32x4(&view);
-                let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
-                if let Ok(mut guard) = shared.lock() {
-                    *guard = Some(Eq106ReadbackPacket {
-                        partial_sums: values,
-                        snapshots,
-                        batch_capture_id: Some(capture_id),
-                        sensitivity_column_count: column_count as u32,
-                        sensitivity_source_hash,
-                        sensitivity_basis_hash,
-                        sensitivity_configuration_hash,
-                        timings: Eq106TimingSample {
-                            spectrum_build_ms: Some(spectrum_encoding_ms),
-                            target_evaluation_ms: Some(evaluation_encoding_ms),
-                            cpu_readback_wait_ms,
-                            target_count: target_count as u32,
-                            spectral_element_count: element_count,
-                            dispatch_count: 1,
-                            spectrum_rebuild_count: column_count as u32 * element_count,
-                            ..default()
-                        },
-                    });
+            match result {
+                Ok(()) => {
+                    let view = staging.slice(..).get_mapped_range();
+                    let values = bytes_to_f32x4(&view);
+                    let cpu_readback_wait_ms =
+                        readback_started.elapsed().as_secs_f64() * 1.0e3;
+                    if let Ok(mut guard) = shared.lock() {
+                        *guard = Some(Eq106ReadbackPacket {
+                            partial_sums: values,
+                            snapshots,
+                            batch_capture_id: Some(capture_id),
+                            sensitivity_column_count: column_count as u32,
+                            sensitivity_source_hash,
+                            sensitivity_basis_hash,
+                            sensitivity_configuration_hash,
+                            timings: Eq106TimingSample {
+                                spectrum_build_ms: Some(spectrum_encoding_ms),
+                                target_evaluation_ms: Some(evaluation_encoding_ms),
+                                cpu_readback_wait_ms,
+                                target_count: target_count as u32,
+                                spectral_element_count: element_count,
+                                dispatch_count: 1,
+                                spectrum_rebuild_count: column_count as u32 * element_count,
+                                ..default()
+                            },
+                        });
+                    }
+                    drop(view);
+                    staging.unmap();
                 }
-                drop(view);
-                staging.unmap();
+                Err(error) => {
+                    rebuild_requested.store(true, Ordering::Release);
+                    if let Ok(mut slot) = error_slot.lock()
+                        && slot.is_none()
+                    {
+                        *slot = Some(format!(
+                            "Equation (106) GPU sensitivity readback failed: {error:?}"
+                        ));
+                    }
+                }
+            }
+            if let Ok(mut submitted) = submitted_at.lock() {
+                submitted.take();
             }
             in_flight.store(false, Ordering::Release);
         });

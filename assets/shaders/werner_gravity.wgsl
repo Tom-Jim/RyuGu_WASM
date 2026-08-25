@@ -108,8 +108,8 @@ fn main(
     if index < params.face_count {
         face_sum = face_contribution(index, probe_pos);
     }
-    // ∇U for the conventional positive gravitational potential:
-    // -Gρ Σ(E r L) + Gρ Σ(F r ω).
+    // Gradient of U for the conventional positive gravitational potential:
+    // -Grho sum(E r L) + Grho sum(F r omega).
     shared_acc[lane] = vec4<f32>(-edge_sum.xyz + face_sum.xyz, 0.0);
     shared_potential[lane] = compensated_add(
         vec2<f32>(0.5 * edge_sum.w, 0.0),

@@ -111,11 +111,36 @@ fn comparison_metric_text(
     let total = result.total_ms;
     let value = match planning.selected_metric {
         ComparisonMetric::GravityRelativeError => {
+            let certificate = if result.method == ActiveGravityMethod::CurvedArcEq106 {
+                let first = result.first_rejection.map_or_else(
+                    || "none".to_string(),
+                    |failure| {
+                        format!(
+                            "density {} candidate {} sample {} segment {} reason {}",
+                            failure[0], failure[1], failure[2], failure[3], failure[4]
+                        )
+                    },
+                );
+                format!(
+                    " | raw {:.3e}, penalty {:.3e} | rejected samples {} | reject T/I/S/X/FDwarn/NF {:?} | first {first}",
+                    result.raw_relative_gravity_error,
+                    result.relative_gravity_error,
+                    result.rejected_sample_count,
+                    result.rejection_counts,
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{verification}gravity {:.3e} | valid {}/{} | common {:.2} excluded | CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
+                "{verification}gravity L2 {:.3e}, point p95/p99/max {:.3e}/{:.3e}/{:.3e}{certificate} | valid {}/{} | f64 stratified samples {} | one-time program {:.2} excluded | common {:.2} excluded | repeated CPU prep {:.2} + command submit {:.2} + CPU reduce {:.2} + paced GPU wall/copy/map {:.2} = {:.2} ms | direct f64 verify {:.2} excluded | warm tile {:.2} | BxKxH {} | requests {} | tile {}..{} | dispatch {} | kernels {}",
                 result.relative_gravity_error,
+                result.gravity_error_p95,
+                result.gravity_error_p99,
+                result.gravity_error_max,
                 result.valid_candidate_count,
                 result.workload.candidate_count,
+                result.verification_sample_count,
+                result.one_time_preparation_ms,
                 result.common_preparation_ms,
                 result.preprocessing_ms,
                 result.command_submission_ms,
@@ -133,7 +158,29 @@ fn comparison_metric_text(
             )
         }
         ComparisonMetric::GradientRelativeError => {
-            format!("{verification}gradient relative error {:.3e}", result.gradient_relative_error)
+            if result.method == ActiveGravityMethod::CurvedArcEq106 {
+                format!(
+                    "{verification}gradient raw {:.3e}, penalty {:.3e}, point p95/p99/max {:.3e}/{:.3e}/{:.3e} | certified L2 {:.3e}, coverage {}, rejected {} | self-FD max [0.25,0.5,1,2,4m] = [{:.3e}, {:.3e}, {:.3e}, {:.3e}, {:.3e}]",
+                    result.raw_gradient_relative_error,
+                    result.gradient_relative_error,
+                    result.gradient_error_p95,
+                    result.gradient_error_p99,
+                    result.gradient_error_max,
+                    result.certified_gradient_relative_error,
+                    result.certified_verification_sample_count,
+                    result.certified_rejected_sample_count,
+                    result.self_fd_step_maxima[0],
+                    result.self_fd_step_maxima[1],
+                    result.self_fd_step_maxima[2],
+                    result.self_fd_step_maxima[3],
+                    result.self_fd_step_maxima[4],
+                )
+            } else {
+                format!(
+                    "{verification}gradient relative error {:.3e}",
+                    result.gradient_relative_error
+                )
+            }
         }
         ComparisonMetric::PericenterError => {
             format!("{verification}pericenter error {:.4} m", result.pericenter_error_m)
@@ -198,11 +245,18 @@ fn comparison_metric_text(
                     }
                 };
                 format!(
-                    "{verification}Eq.106 {:.2} ms | {} | {} | requests {}/{}/{} | dispatch {}/{}/{}",
+                    "{verification}Eq.106 full forward raw {:.2} ms, certified estimate {:.2} ms (measured full hot pass {:.2} + reused geometry build) | warm raw/cert-tail {:.2}/{:.2} ms | build diagnostic {:.2} ms | hot {:.1} ns/target | {} | {} | raw/cert requests {}/{}; FFT/tree {}/{} | dispatch {}/{}/{}",
                     eq106.total_ms,
+                    eq106.certified_estimated_total_ms,
+                    eq106.certified_full_pass_ms,
+                    eq106.warm_evaluation_ms,
+                    eq106.certified_warm_evaluation_ms,
+                    eq106.build_ms,
+                    eq106.hot_query_ns_per_target,
                     relation("FFT", mmfft.total_ms),
                     relation("tree", fmm.total_ms),
                     eq106.gpu_request_count,
+                    eq106.certified_gpu_request_count,
                     mmfft.gpu_request_count,
                     fmm.gpu_request_count,
                     eq106.dispatch_count,
@@ -211,8 +265,10 @@ fn comparison_metric_text(
                 )
             } else {
                 format!(
-                    "{verification}completed | {:.2} ms | requests {} | dispatch {} | {}",
+                    "{verification}completed | {:.2} ms | build est. {:.2} ms | hot {:.1} ns/target | requests {} | dispatch {} | {}",
                     result.total_ms,
+                    result.build_ms,
+                    result.hot_query_ns_per_target,
                     result.gpu_request_count,
                     result.dispatch_count,
                     result.method.planning_label(),
@@ -220,12 +276,9 @@ fn comparison_metric_text(
             }
         }
         ComparisonMetric::ColdStartAmortization => {
-            if result.warm_evaluation_ms <= 0.0 {
-                return format!("{marker}{name:<12} N/A (cold/warm GPU timing pending)");
-            }
             format!(
-                "{verification}{} candidate-equivalents (diagnostic, run B={})",
-                result.cold_amortization_candidates, result.workload.candidate_count
+                "{verification}extrapolated Qcross disabled. Use only directly measured SxQ totals; legacy cold diagnostic {} candidate-equivalents is non-decisive.",
+                result.cold_amortization_candidates,
             )
         }
         ComparisonMetric::SegmentCount => "not applicable (no Eq.106 spectral segments)".into(),
@@ -242,10 +295,15 @@ fn update_planning_comparison_status(
     let (candidate_count, density_count, sample_count) = planning.workload_profile.dimensions();
     let evaluations = u64::from(candidate_count) * u64::from(density_count) * u64::from(sample_count);
     let prefix = format!(
-        "build v{} ({}) | {} | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
+        "build v{} ({}) | {} [{}] | B={} observation curves, K={} density models, H={} samples | {} evaluations\nperiod={:.3}h, a={:.1}m, e={:.6}, rp={:.1}m, ra={:.1}m\nfrozen arc {:.1}s, segment <= {:.0}s, order {}, trust {:.0}m, transverse <= {:.0}m, remainder <= {:.1e}\n",
         env!("CARGO_PKG_VERSION"),
         option_env!("RYUGU_GIT_SHA").unwrap_or("unknown"),
         planning.workload_profile.label(),
+        if planning.workload_profile.is_compute_benchmark() {
+            "compute benchmark"
+        } else {
+            "interactive wall"
+        },
         candidate_count,
         density_count,
         sample_count,
@@ -264,7 +322,7 @@ fn update_planning_comparison_status(
     );
     if planning.completed_workload().is_none() {
         **text = format!(
-            "{prefix}{}\nMetrics are shown from the completed shared BxKxH validation run. Fair verdict withheld until identical Eq.106 GPU spectral, CPU FFT-grid + GPU interpolation, and GPU order-2 treecode batches are verified; preprocessing must be included.",
+            "{prefix}{}\nThis is local observation-curve screening in a 15 m tube, not dynamically propagated orbit optimization. Metrics come from the identical shared BxKxH validation run. Eq.106 uses the sampled higher-order jet plus analytic coefficient-zero spectral correction and full field/gradient evaluation; preprocessing layers and eligibility must match before a fairness verdict.",
             planning.status,
         );
         color.0 = Color::srgb(1.0, 0.78, 0.25);

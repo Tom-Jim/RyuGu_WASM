@@ -12,7 +12,7 @@ use bevy::render::{
 };
 use std::sync::Arc;
 
-// ── Render-world: extracted bytes (Option → avoid Commands in render world) ──
+// -- Render-world: extracted bytes (Option -> avoid Commands in render world) --
 
 #[derive(Resource, Default)]
 struct ExtractedTopologyRaw(Option<ExtractedTopologyInner>);
@@ -24,7 +24,7 @@ struct ExtractedTopologyInner {
     idx_bytes: Vec<u8>,
 }
 
-// ── Render-world: GPU buffers ─────────────────────────────────────────────────
+// -- Render-world: GPU buffers -------------------------------------------------
 
 #[derive(Resource, Default)]
 struct NormalsGpuBuffers(Option<NormalsGpuBuffersInner>);
@@ -37,7 +37,7 @@ struct NormalsGpuBuffersInner {
     _staging: bevy::render::render_resource::Buffer,
 }
 
-// ── Render-world: pipeline + dispatch state ───────────────────────────────────
+// -- Render-world: pipeline + dispatch state -----------------------------------
 
 #[derive(Resource)]
 struct NormalsComputePipeline {
@@ -51,7 +51,7 @@ enum DispatchState {
     Done,
 }
 
-// ── Plugin ────────────────────────────────────────────────────────────────────
+// -- Plugin --------------------------------------------------------------------
 
 pub struct NormalsComputePlugin;
 
@@ -80,7 +80,7 @@ impl Plugin for NormalsComputePlugin {
     }
 }
 
-// ── FromWorld ─────────────────────────────────────────────────────────────────
+// -- FromWorld -----------------------------------------------------------------
 
 impl FromWorld for NormalsComputePipeline {
     fn from_world(world: &mut World) -> Self {
@@ -121,7 +121,7 @@ fn storage_entry(binding: u32, read_only: bool) -> BindGroupLayoutEntry {
     }
 }
 
-// ── Extract system — writes into pre-inserted Option, no Commands ─────────────
+// -- Extract system - writes into pre-inserted Option, no Commands -------------
 
 fn extract_topology_system(
     mut extracted: ResMut<ExtractedTopologyRaw>,
@@ -154,7 +154,7 @@ fn extract_topology_system(
     });
 }
 
-// ── Dispatch system — writes into pre-inserted Option, no Commands ────────────
+// -- Dispatch system - writes into pre-inserted Option, no Commands ------------
 
 fn dispatch_normals_system(
     mut state: ResMut<DispatchState>,
@@ -282,7 +282,7 @@ fn dispatch_normals_system(
     *state = DispatchState::Done;
 }
 
-// ── Main-world poll ───────────────────────────────────────────────────────────
+// -- Main-world poll -----------------------------------------------------------
 
 fn poll_normals_readback(
     mut commands: Commands,

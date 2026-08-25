@@ -138,6 +138,84 @@ impl MmfftLevelWorkspace {
         }
         &self.field
     }
+
+    fn build_from_stencils(
+        &mut self,
+        stencils: &[Vec<(usize, f64)>],
+        masses: &[f64],
+    ) -> &[[f32; 4]] {
+        debug_assert_eq!(stencils.len(), masses.len());
+        self.density.fill(Complex64::default());
+        for (stencil, mass) in stencils.iter().zip(masses.iter().copied()) {
+            for &(index, weight) in stencil {
+                self.density[index].re += mass * weight;
+            }
+        }
+        self.fft.transform(&mut self.density, false);
+        for (value, kernel) in self.density.iter_mut().zip(&self.kernel_spectrum) {
+            *value *= *kernel;
+        }
+        self.fft.transform(&mut self.density, true);
+        for z in 0..self.n {
+            for y in 0..self.n {
+                for x in 0..self.n {
+                    self.field[grid_index(x, y, z, self.n)][3] = (G as f64
+                        * self.density[grid_index(x, y, z, self.p)].re)
+                        as f32;
+                }
+            }
+        }
+        &self.field
+    }
+}
+
+fn deposition_stencils(
+    positions: &[DVec3],
+    half_extent: f64,
+    spacing: f64,
+    n: usize,
+    p: usize,
+) -> Vec<Vec<(usize, f64)>> {
+    positions
+        .iter()
+        .map(|position| {
+            let grid = (*position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
+            let base = grid.floor();
+            let fraction = grid - base;
+            let weights = [
+                [1.0 - fraction.x, fraction.x],
+                [1.0 - fraction.y, fraction.y],
+                [1.0 - fraction.z, fraction.z],
+            ];
+            let mut stencil = Vec::with_capacity(8);
+            for dz in 0..=1 {
+                for dy in 0..=1 {
+                    for dx in 0..=1 {
+                        let cell = [
+                            base.x as isize + dx,
+                            base.y as isize + dy,
+                            base.z as isize + dz,
+                        ];
+                        if cell.iter().any(|value| *value < 0 || *value >= n as isize) {
+                            continue;
+                        }
+                        stencil.push((
+                            grid_index(
+                                cell[0] as usize,
+                                cell[1] as usize,
+                                cell[2] as usize,
+                                p,
+                            ),
+                            weights[0][dx as usize]
+                                * weights[1][dy as usize]
+                                * weights[2][dz as usize],
+                        ));
+                    }
+                }
+            }
+            stencil
+        })
+        .collect()
 }
 
 fn deposit_density(

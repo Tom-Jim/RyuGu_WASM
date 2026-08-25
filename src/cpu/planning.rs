@@ -10,16 +10,22 @@ pub(crate) struct PlanningBatchBuilder {
     capture_id: u64,
     capture_epoch: u64,
     source_hash: u64,
+    source_count: u32,
     body_radius: f32,
+    eq106_source_radius: f32,
     candidate_count: u32,
     density_model_count: u32,
     samples_per_candidate: u32,
     next_candidate: u32,
     preparation_ms: f64,
     reference_samples: Vec<TrajectoryInversionKnot>,
+    reference_states: Vec<PlanningCandidateState>,
     states: Vec<PlanningCandidateState>,
     gpu_position_bytes: Vec<u8>,
     density_models: Vec<f32>,
+    density_model_masses: Vec<f64>,
+    density_seed: u64,
+    target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
 }
@@ -32,6 +38,8 @@ impl PlanningBatchBuilder {
         capture_id: u64,
         capture_epoch: u64,
         source_hash: u64,
+        requested_source_count: u32,
+        voxel_size: f32,
         reference_knots: &[TrajectoryInversionKnot],
         voxels: &[InvertedDensityVoxel],
         source: &AggregatedGravitySource,
@@ -42,17 +50,13 @@ impl PlanningBatchBuilder {
         {
             return None;
         }
-        let basis = build_voxel_basis_sources(voxels, source)?;
-        let reference = voxels
-            .iter()
-            .map(|voxel| voxel.reference_density)
-            .collect::<Vec<_>>();
-        let density_models = structured_equal_mass_models(voxels, &reference, density_model_count)?;
+        let basis = build_voxel_basis_sources(voxels, source, voxel_size)?;
         let reference_samples = crate::cpu::inversion::sample_frozen_trajectory_at_count(
             reference_knots,
             samples_per_candidate as usize,
         )?;
-        let basis_records = basis
+        let reference_states = central_reference_states(&reference_samples)?;
+        let mut canonical_basis_records = basis
             .columns
             .iter()
             .enumerate()
@@ -69,26 +73,86 @@ impl PlanningBatchBuilder {
                 })
             })
             .collect::<Vec<_>>();
+        // Every one of the 56 voxel columns must remain addressable for the
+        // basis-spectrum cache.  Empty voxels therefore contribute a single
+        // zero/nominal-volume representative, which can make the raw
+        // canonical list slightly larger than the requested 1K source
+        // capture.  Coalesce only records belonging to the same voxel before
+        // refinement so the requested source count remains exact while each
+        // voxel range is still present and its volume/centroid are conserved.
+        if canonical_basis_records.len() > requested_source_count as usize {
+            canonical_basis_records =
+                coalesce_basis_records(&canonical_basis_records, requested_source_count as usize)?;
+        }
+        let basis_records = spatially_refine_basis_records(
+            &canonical_basis_records,
+            voxels,
+            voxel_size,
+            source.radius as f32,
+            requested_source_count,
+        )?;
+        let eq106_source_radius = basis_records.iter().fold(0.0_f32, |radius, record| {
+            radius.max(
+                Vec3::new(
+                    record.position_volume[0],
+                    record.position_volume[1],
+                    record.position_volume[2],
+                )
+                .length(),
+            )
+        });
+        if !eq106_source_radius.is_finite() || eq106_source_radius <= 0.0 {
+            return None;
+        }
+        let basis_hash = basis_records.iter().fold(
+            mix_hash(basis.hash, u64::from(requested_source_count)),
+            |hash, record| {
+                let hash = record
+                    .position_volume
+                    .into_iter()
+                    .fold(hash, |hash, value| {
+                        mix_hash(hash, u64::from(value.to_bits()))
+                    });
+                mix_hash(hash, u64::from(record.voxel_index))
+            },
+        );
+        let density_seed = mix_hash(
+            mix_hash(source_hash, basis.hash),
+            mix_hash(capture_id, 0x1060_d315_7a11_5eed),
+        );
+        let target_mass = source.total_mass;
+        let (density_models, density_model_masses) = uniform_random_equal_mass_models(
+            voxels,
+            target_mass,
+            density_model_count,
+            density_seed,
+        )?;
         Some(Self {
             profile,
             run_id,
             capture_id,
             capture_epoch,
             source_hash,
+            source_count: requested_source_count,
             body_radius: source.radius as f32,
+            eq106_source_radius,
             candidate_count,
             density_model_count,
             samples_per_candidate,
             next_candidate: 0,
             preparation_ms: started.elapsed().as_secs_f64() * 1.0e3,
             reference_samples,
+            reference_states,
             states: Vec::with_capacity(candidate_count as usize * samples_per_candidate as usize),
             gpu_position_bytes: Vec::with_capacity(
                 candidate_count as usize * samples_per_candidate as usize * 16,
             ),
             density_models,
+            density_model_masses,
+            density_seed,
+            target_mass,
             basis_records,
-            basis_hash: basis.hash,
+            basis_hash,
         })
     }
 
@@ -98,11 +162,13 @@ impl PlanningBatchBuilder {
         run_id: u64,
         capture_id: u64,
         source_hash: u64,
+        requested_source_count: u32,
     ) -> bool {
         self.profile == profile
             && self.run_id == run_id
             && self.capture_id == capture_id
             && self.source_hash == source_hash
+            && self.source_count == requested_source_count
     }
 
     pub(crate) fn advance(&mut self, candidate_budget: u32) -> bool {
@@ -152,20 +218,44 @@ impl PlanningBatchBuilder {
             mix_hash(mix_hash(self.run_id, self.capture_id), self.capture_epoch),
             mix_hash(candidate_hash, density_model_hash),
         );
+        let maximum_relative_mass_error = self
+            .density_model_masses
+            .iter()
+            .map(|mass| ((mass - self.target_mass) / self.target_mass).abs())
+            .fold(0.0_f64, f64::max);
+        info!(
+            target: "planning::density",
+            seed = self.density_seed,
+            model_count = self.density_model_count,
+            voxel_count = 56,
+            target_mass = self.target_mass,
+            maximum_relative_mass_error,
+            "generated uniformly randomized positive voxel-density models with conserved asteroid mass"
+        );
+        let (eq106_volume_source_bytes, eq106_voxel_source_ranges) =
+            eq106_geometry_buffers(&self.basis_records)?;
         Some((
             PlanningCandidateBatch {
                 batch_id,
                 capture_id: self.capture_id,
                 capture_epoch: self.capture_epoch,
                 source_hash: self.source_hash,
+                source_count: self.source_count,
                 candidate_count: self.candidate_count,
                 density_model_count: self.density_model_count,
                 samples_per_candidate: self.samples_per_candidate,
                 body_radius: self.body_radius,
+                eq106_source_radius: self.eq106_source_radius,
+                reference_states: Arc::from(self.reference_states),
                 states: Arc::from(self.states),
                 gpu_position_bytes: Arc::from(self.gpu_position_bytes),
                 density_models: Arc::from(self.density_models),
+                density_model_masses: Arc::from(self.density_model_masses),
+                density_seed: self.density_seed,
+                target_mass: self.target_mass,
                 basis_records: Arc::from(self.basis_records),
+                eq106_volume_source_bytes,
+                eq106_voxel_source_ranges: Arc::from(eq106_voxel_source_ranges),
                 reference_arc_hash,
                 candidate_hash,
                 density_model_hash,
@@ -175,6 +265,236 @@ impl PlanningBatchBuilder {
             self.preparation_ms,
         ))
     }
+}
+
+fn coalesce_basis_records(
+    records: &[PlanningBasisRecord],
+    requested: usize,
+) -> Option<Vec<PlanningBasisRecord>> {
+    if records.is_empty() || requested == 0 || requested > records.len() {
+        return None;
+    }
+    let mut groups = std::collections::BTreeMap::<u32, Vec<PlanningBasisRecord>>::new();
+    for record in records.iter().copied() {
+        if !record.position_volume.iter().all(|value| value.is_finite())
+            || record.position_volume[3] <= 0.0
+        {
+            return None;
+        }
+        groups.entry(record.voxel_index).or_default().push(record);
+    }
+    if requested < groups.len() {
+        return None;
+    }
+    let mut total = records.len();
+    while total > requested {
+        let Some((voxel, group)) = groups
+            .iter_mut()
+            .filter(|(_, group)| group.len() > 1)
+            .max_by_key(|(_, group)| group.len())
+        else {
+            return None;
+        };
+        let right = group.pop()?;
+        let left = group.pop()?;
+        let left_volume = f64::from(left.position_volume[3]);
+        let right_volume = f64::from(right.position_volume[3]);
+        let volume = left_volume + right_volume;
+        if !volume.is_finite() || volume <= 0.0 {
+            return None;
+        }
+        let position = (Vec3::new(
+            left.position_volume[0],
+            left.position_volume[1],
+            left.position_volume[2],
+        ) * left_volume as f32
+            + Vec3::new(
+                right.position_volume[0],
+                right.position_volume[1],
+                right.position_volume[2],
+            ) * right_volume as f32)
+            / volume as f32;
+        group.push(PlanningBasisRecord {
+            position_volume: [position.x, position.y, position.z, volume as f32],
+            voxel_index: *voxel,
+            _padding: [0; 3],
+        });
+        total -= 1;
+    }
+    Some(groups.into_values().flatten().collect())
+}
+
+fn eq106_geometry_buffers(records: &[PlanningBasisRecord]) -> Option<(Arc<[u8]>, [[u32; 2]; 56])> {
+    if records.is_empty() || records.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(records.len() * 16);
+    let mut ranges = [[0_u32; 2]; 56];
+    let mut cursor = 0_usize;
+    for (voxel, range) in ranges.iter_mut().enumerate() {
+        let start = cursor;
+        while cursor < records.len() && records[cursor].voxel_index as usize == voxel {
+            for value in records[cursor].position_volume {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            cursor += 1;
+        }
+        *range = [start as u32, (cursor - start) as u32];
+    }
+    if cursor != records.len() || ranges.iter().any(|range| range[1] == 0) {
+        return None;
+    }
+    Some((Arc::from(bytes), ranges))
+}
+
+/// Deterministically replace every parent quadrature source with an
+/// antithetic cloud inside a representative micro-voxel centred on the
+/// original quadrature source. The micro-voxel side is bounded by both the
+/// density-grid voxel size and the cube root of the parent's volume. Each cloud
+/// preserves the parent's total volume and centre of mass, while additional
+/// pairs sample genuinely distinct spatial positions. All backends and the
+/// independent f64 reference consume this exact same refined point set.
+fn spatially_refine_basis_records(
+    canonical: &[PlanningBasisRecord],
+    voxels: &[InvertedDensityVoxel],
+    voxel_size: f32,
+    body_radius: f32,
+    requested: u32,
+) -> Option<Vec<PlanningBasisRecord>> {
+    let requested = requested as usize;
+    if canonical.is_empty()
+        || requested < canonical.len()
+        || voxels.is_empty()
+        || !voxel_size.is_finite()
+        || voxel_size <= 0.0
+        || !body_radius.is_finite()
+        || body_radius <= 0.0
+    {
+        return None;
+    }
+    let base = requested / canonical.len();
+    let remainder = requested % canonical.len();
+    let mut refined = Vec::with_capacity(requested);
+    for (index, record) in canonical.iter().copied().enumerate() {
+        let copies = base + usize::from(index < remainder);
+        let voxel = voxels.get(record.voxel_index as usize)?;
+        let parent_volume = record.position_volume[3];
+        if !parent_volume.is_finite() || parent_volume <= 0.0 {
+            return None;
+        }
+        let centre = Vec3::from_array(record.position_volume[..3].try_into().ok()?);
+        if !centre.is_finite() {
+            return None;
+        }
+        let micro_voxel_side = voxel_size.min(parent_volume.cbrt());
+        let safe_extent = 0.45 * micro_voxel_side;
+        let pair_count = copies / 2;
+        let has_centre = !copies.is_multiple_of(2);
+        let nominal_volume = f64::from(parent_volume) / copies as f64;
+        for pair in 0..pair_count {
+            let direction = refinement_direction(index, pair);
+            let radial_fraction = 0.35 + 0.55 * radical_inverse_vdc((pair + 1) as u32);
+            let requested_extent = safe_extent * radial_fraction;
+            let cell_min = Vec3::splat(-body_radius)
+                + Vec3::new(
+                    f32::from(voxel.grid[0]),
+                    f32::from(voxel.grid[1]),
+                    f32::from(voxel.grid[2]),
+                ) * voxel_size;
+            let cell_max = cell_min + Vec3::splat(voxel_size);
+            let cell_margin = (centre - cell_min).min(cell_max - centre).max(Vec3::ZERO);
+            let mut extent = requested_extent;
+            for (component, margin) in direction
+                .abs()
+                .to_array()
+                .into_iter()
+                .zip(cell_margin.to_array())
+            {
+                if component > 1.0e-6 {
+                    extent = extent.min(margin / component);
+                }
+            }
+            // Both antithetic children remain inside the conservative body
+            // sphere as well as the occupied density cell. The exact radius
+            // is nevertheless recomputed after refinement and used by every
+            // Eq.106 Taylor certificate.
+            let centre2 = centre.length_squared();
+            let projected = centre.dot(direction).abs();
+            let sphere_extent = (-projected
+                + (projected * projected + body_radius * body_radius - centre2)
+                    .max(0.0)
+                    .sqrt())
+            .max(0.0);
+            extent = extent.min(sphere_extent);
+            let offset = direction * extent;
+            let pair_volume = if !has_centre && pair + 1 == pair_count {
+                0.5 * (f64::from(parent_volume)
+                    - 2.0 * nominal_volume * (pair_count.saturating_sub(1)) as f64)
+            } else {
+                nominal_volume
+            } as f32;
+            for position in [centre + offset, centre - offset] {
+                let mut child = record;
+                child.position_volume = [position.x, position.y, position.z, pair_volume];
+                refined.push(child);
+            }
+        }
+        if has_centre {
+            let used = 2.0 * nominal_volume * pair_count as f64;
+            let mut child = record;
+            child.position_volume[3] = (f64::from(parent_volume) - used).max(0.0) as f32;
+            refined.push(child);
+        }
+    }
+    (refined.len() == requested).then_some(refined)
+}
+
+fn radical_inverse_vdc(value: u32) -> f32 {
+    value.reverse_bits() as f32 * 2.328_306_4e-10
+}
+
+fn refinement_direction(parent: usize, pair: usize) -> Vec3 {
+    let sequence = (parent as u32)
+        .wrapping_mul(0x9e37_79b9)
+        .wrapping_add(pair as u32 + 1);
+    let z = 1.0 - 2.0 * radical_inverse_vdc(sequence);
+    let azimuth = std::f32::consts::TAU * radical_inverse_vdc(sequence.wrapping_mul(0x85eb_ca6b));
+    let radius = (1.0 - z * z).max(0.0).sqrt();
+    Vec3::new(radius * azimuth.cos(), radius * azimuth.sin(), z).normalize_or_zero()
+}
+
+fn central_reference_states(
+    reference: &[TrajectoryInversionKnot],
+) -> Option<Vec<PlanningCandidateState>> {
+    let angular_velocity =
+        RYUGU_SPIN_AXIS.normalize_or_zero() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
+    reference
+        .iter()
+        .enumerate()
+        .map(|(sample, state)| {
+            if !state.position.is_finite()
+                || !state.velocity.is_finite()
+                || !state.body_rotation.is_finite()
+                || !state.simulation_time_seconds.is_finite()
+            {
+                return None;
+            }
+            let body_position = state.body_rotation.inverse() * state.position;
+            let body_velocity = state.body_rotation.inverse()
+                * (state.velocity - angular_velocity.cross(state.position));
+            Some(PlanningCandidateState {
+                position_time: [
+                    body_position.x,
+                    body_position.y,
+                    body_position.z,
+                    state.simulation_time_seconds as f32,
+                ],
+                velocity_distance: [body_velocity.x, body_velocity.y, body_velocity.z, 0.0],
+                body_rotation: state.body_rotation.to_array(),
+                identity: [u32::MAX, sample as u32, 0, 0],
+            })
+        })
+        .collect()
 }
 
 fn append_tube_candidate_states(
@@ -267,56 +587,55 @@ fn candidate_tube_parameters(candidate: u32, candidate_count: u32) -> (f32, f32,
     (radius, phase, harmonic, phase_rate)
 }
 
-fn structured_equal_mass_models(
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn uniform_unit_random(state: &mut u64) -> f64 {
+    (splitmix64(state) >> 11) as f64 * (1.0 / (1_u64 << 53) as f64)
+}
+
+/// Generates independent voxel densities from a uniform distribution and
+/// then applies one scalar normalization per model. The spatial randomness is
+/// therefore preserved while every row represents exactly the same asteroid
+/// mass to f32 storage precision.
+fn uniform_random_equal_mass_models(
     voxels: &[InvertedDensityVoxel],
-    reference: &[f32],
+    target_mass: f64,
     model_count: u32,
-) -> Option<Vec<f32>> {
-    let target_mass = voxels
-        .iter()
-        .zip(reference)
-        .map(|(voxel, density)| voxel.volume as f64 * f64::from(*density))
-        .sum::<f64>();
-    if !target_mass.is_finite() || target_mass <= 0.0 {
+    seed: u64,
+) -> Option<(Vec<f32>, Vec<f64>)> {
+    if voxels.is_empty()
+        || model_count == 0
+        || !target_mass.is_finite()
+        || target_mass <= 0.0
+        || voxels
+            .iter()
+            .any(|voxel| !voxel.volume.is_finite() || voxel.volume <= 0.0)
+    {
         return None;
     }
-    let radius = voxels
+    let total_volume = voxels
         .iter()
-        .map(|voxel| voxel.center.length())
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
+        .map(|voxel| f64::from(voxel.volume))
+        .sum::<f64>();
+    let mean_density = target_mass / total_volume;
+    let correction_index = voxels
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.volume.total_cmp(&right.volume))?
+        .0;
+    let mut random_state = seed;
     let mut models = Vec::with_capacity(model_count as usize * voxels.len());
-    for model in 0..model_count {
-        let phase = std::f32::consts::TAU * model as f32 / model_count.max(1) as f32;
-        let axis = Vec3::new(
-            (phase * 1.7).cos(),
-            (phase * 2.3).sin(),
-            (phase * 0.7 + 0.4).cos(),
-        )
-        .normalize_or_zero();
+    let mut masses = Vec::with_capacity(model_count as usize);
+    for _ in 0..model_count {
         let mut row = voxels
             .iter()
-            .zip(reference)
-            .map(|(voxel, base)| {
-                let position = voxel.center / radius;
-                let radial = position.length().clamp(0.0, 1.0);
-                let lobe = position.dot(axis);
-                let shell = (std::f32::consts::PI * radial).cos();
-                let rubble = (position.x * 17.0 + phase).sin()
-                    * (position.y * 13.0 - phase * 0.7).cos()
-                    * (position.z * 11.0 + phase * 1.3).sin();
-                let pattern = match model % 8 {
-                    0 => 0.0,
-                    1 => 0.28 * (1.0 - radial),
-                    2 => -0.24 * (1.0 - radial),
-                    3 => 0.22 * shell,
-                    4 => 0.26 * lobe,
-                    5 => 0.20 * (2.0 * lobe * lobe - 0.5),
-                    6 => 0.18 * rubble,
-                    _ => 0.14 * shell + 0.16 * lobe + 0.10 * rubble,
-                };
-                (*base * (1.0 + pattern)).max(250.0)
-            })
+            .map(|_| (mean_density * (0.35 + 1.30 * uniform_unit_random(&mut random_state))) as f32)
             .collect::<Vec<_>>();
         let mass = voxels
             .iter()
@@ -327,9 +646,34 @@ fn structured_equal_mass_models(
         for density in &mut row {
             *density = (f64::from(*density) * scale) as f32;
         }
+        // Correct the f32 rounding residual in the largest voxel. Two passes
+        // are enough to reach the representable mass nearest to target_mass.
+        for _ in 0..2 {
+            let corrected_mass = voxels
+                .iter()
+                .zip(&row)
+                .map(|(voxel, density)| voxel.volume as f64 * f64::from(*density))
+                .sum::<f64>();
+            let correction =
+                (target_mass - corrected_mass) / f64::from(voxels[correction_index].volume);
+            row[correction_index] = (f64::from(row[correction_index]) + correction) as f32;
+        }
+        let final_mass = voxels
+            .iter()
+            .zip(&row)
+            .map(|(voxel, density)| voxel.volume as f64 * f64::from(*density))
+            .sum::<f64>();
+        if row
+            .iter()
+            .any(|density| !density.is_finite() || *density <= 0.0)
+            || ((final_mass - target_mass) / target_mass).abs() > 2.0e-7
+        {
+            return None;
+        }
         models.extend(row);
+        masses.push(final_mass);
     }
-    Some(models)
+    Some((models, masses))
 }
 
 fn hash_reference_samples(samples: &[TrajectoryInversionKnot]) -> u64 {
@@ -377,4 +721,183 @@ fn hash_f32_iter(values: impl IntoIterator<Item = f32>) -> u64 {
 
 fn mix_hash(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::DVec3;
+
+    fn test_voxels() -> Vec<InvertedDensityVoxel> {
+        (0..56)
+            .map(|index| InvertedDensityVoxel {
+                center: Vec3::new(index as f32, 0.0, 0.0),
+                volume: 1_000.0 + 17.0 * index as f32,
+                density: 1_700.0,
+                baseline_density: 1_700.0,
+                reference_density: 1_700.0,
+                grid: [index as u8, 0, 0],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn randomized_density_rows_are_distinct_positive_and_mass_preserving() {
+        let voxels = test_voxels();
+        let target_mass = 2.45e8;
+        let (models, masses) =
+            uniform_random_equal_mass_models(&voxels, target_mass, 32, 0x1065).unwrap();
+        assert_eq!(models.len(), 32 * 56);
+        assert_eq!(masses.len(), 32);
+        assert!(
+            models
+                .iter()
+                .all(|density| density.is_finite() && *density > 0.0)
+        );
+        assert!(
+            masses
+                .iter()
+                .all(|mass| ((mass - target_mass) / target_mass).abs() <= 2.0e-7)
+        );
+        for pair in models.chunks_exact(56).collect::<Vec<_>>().windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn first_random_models_are_the_prefix_of_stress_for_the_same_capture() {
+        let voxels = test_voxels();
+        let (first, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 4, 7).unwrap();
+        let (stress, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 32, 7).unwrap();
+        assert_eq!(first, stress[..first.len()]);
+    }
+
+    #[test]
+    fn spatial_refinement_is_distinct_and_preserves_parent_mass_and_centroid() {
+        let voxels = vec![InvertedDensityVoxel {
+            center: Vec3::new(12.0, -4.0, 8.0),
+            volume: 1_000.0,
+            density: 1_700.0,
+            baseline_density: 1_700.0,
+            reference_density: 1_700.0,
+            grid: [2, 1, 2],
+        }];
+        let parent = PlanningBasisRecord {
+            position_volume: [12.0, -4.0, 8.0, 1_000.0],
+            voxel_index: 0,
+            _padding: [0; 3],
+        };
+        let refined = spatially_refine_basis_records(&[parent], &voxels, 20.0, 40.0, 8).unwrap();
+        assert_eq!(refined.len(), 8);
+
+        let mut positions = refined
+            .iter()
+            .map(|record| {
+                (
+                    record.position_volume[0].to_bits(),
+                    record.position_volume[1].to_bits(),
+                    record.position_volume[2].to_bits(),
+                )
+            })
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), refined.len());
+
+        let volume = refined
+            .iter()
+            .map(|record| f64::from(record.position_volume[3]))
+            .sum::<f64>();
+        let centroid = refined.iter().fold(DVec3::ZERO, |moment, record| {
+            moment
+                + DVec3::new(
+                    f64::from(record.position_volume[0]),
+                    f64::from(record.position_volume[1]),
+                    f64::from(record.position_volume[2]),
+                ) * f64::from(record.position_volume[3])
+        }) / volume;
+        assert!((volume - 1_000.0).abs() <= 1.0e-5);
+        assert!(centroid.distance(DVec3::new(12.0, -4.0, 8.0)) <= 1.0e-5);
+        assert!(refined.iter().all(|record| {
+            let position = Vec3::from_array(record.position_volume[..3].try_into().unwrap());
+            position.distance(Vec3::new(12.0, -4.0, 8.0)) < 9.0
+                && position.length() <= 40.0
+                && (0.0..=20.0).contains(&position.x)
+                && (-20.0..=0.0).contains(&position.y)
+                && (0.0..=20.0).contains(&position.z)
+        }));
+    }
+
+    #[test]
+    fn canonical_coalescing_hits_requested_count_per_voxel_and_preserves_moments() {
+        let records = vec![
+            PlanningBasisRecord {
+                position_volume: [0.0, 0.0, 0.0, 2.0],
+                voxel_index: 0,
+                _padding: [0; 3],
+            },
+            PlanningBasisRecord {
+                position_volume: [2.0, 0.0, 0.0, 3.0],
+                voxel_index: 0,
+                _padding: [0; 3],
+            },
+            PlanningBasisRecord {
+                position_volume: [10.0, 0.0, 0.0, 4.0],
+                voxel_index: 1,
+                _padding: [0; 3],
+            },
+        ];
+        let coalesced = coalesce_basis_records(&records, 2).unwrap();
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(
+            coalesced
+                .iter()
+                .map(|record| record.voxel_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let merged = coalesced[0];
+        assert!((merged.position_volume[0] - 1.2).abs() <= 1.0e-6);
+        assert!((merged.position_volume[3] - 5.0).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn spatial_refinement_supports_non_power_of_two_source_counts() {
+        let voxels = vec![InvertedDensityVoxel {
+            center: Vec3::ZERO,
+            volume: 2.0,
+            density: 1.0,
+            baseline_density: 1.0,
+            reference_density: 1.0,
+            grid: [0; 3],
+        }];
+        let parents = [
+            PlanningBasisRecord {
+                position_volume: [-2.0, 0.0, 0.0, 2.0],
+                voxel_index: 0,
+                _padding: [0; 3],
+            },
+            PlanningBasisRecord {
+                position_volume: [2.0, 0.0, 0.0, 3.0],
+                voxel_index: 0,
+                _padding: [0; 3],
+            },
+        ];
+        let refined = spatially_refine_basis_records(&parents, &voxels, 2.0, 4.0, 9).unwrap();
+        assert_eq!(refined.len(), 9);
+        for (parent_index, expected_volume) in [2.0_f64, 3.0].into_iter().enumerate() {
+            let actual = refined
+                .iter()
+                .filter(|record| {
+                    if parent_index == 0 {
+                        record.position_volume[0] < 0.0
+                    } else {
+                        record.position_volume[0] > 0.0
+                    }
+                })
+                .map(|record| f64::from(record.position_volume[3]))
+                .sum::<f64>();
+            assert!((actual - expected_volume).abs() <= 1.0e-6);
+        }
+    }
 }

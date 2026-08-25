@@ -18,6 +18,7 @@ const RADIAL_LAYER_COUNT: u32 = 4;
 
 #[derive(Resource, Default)]
 struct ExtractedGravityInput {
+    enabled: bool,
     probe: Vec3,
     snapshot: Option<GravityRequestSnapshot>,
     source_bytes: Option<Vec<u8>>,
@@ -170,7 +171,7 @@ pub fn build_radial_gravity_source_system(
     );
     if (solid_angle_sum - std::f64::consts::TAU * 2.0).abs() > 0.05 {
         warn!(
-            "[gravity] mesh subtends {:.6} sr instead of 4π; check that it is closed and star-shaped",
+            "[gravity] mesh subtends {:.6} sr instead of 4pi; check that it is closed and star-shaped",
             solid_angle_sum
         );
     }
@@ -204,7 +205,7 @@ fn angular_cell(p0: Vec3, p1: Vec3, p2: Vec3) -> Option<(Vec3, f32, f32)> {
     (radius > 0.0).then_some((direction, radius, solid_angle))
 }
 
-/// Integral of `r² ln(1+r/epsilon)`, evaluated in f64.  This primitive makes
+/// Integral of `r^2 ln(1+r/epsilon)`, evaluated in f64.  This primitive makes
 /// every radial layer exactly mass preserving for the shared logarithmic law.
 fn radial_density_integral(inner: f64, outer: f64, epsilon: f64) -> f64 {
     fn primitive(r: f64, epsilon: f64) -> f64 {
@@ -274,9 +275,14 @@ fn extract_gravity_input_system(
     mut extracted: ResMut<ExtractedGravityInput>,
     source: Extract<Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>>,
     clock: Extract<Res<SimulationClock>>,
+    planning: Extract<Res<PlanningComparisonState>>,
     cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
+    extracted.enabled = !planning.blocks_realtime_gpu();
+    if !extracted.enabled {
+        return;
+    }
     let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
@@ -325,7 +331,7 @@ fn dispatch_gravity_system(
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipeline_resource.pipeline_id) else {
         return;
     };
-    if extracted.source_count == 0 {
+    if !extracted.enabled || extracted.source_count == 0 {
         return;
     }
 
