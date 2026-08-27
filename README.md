@@ -13,7 +13,7 @@ The repository compares five forward models and contains a research implementati
 
 [Open the live WebGPU demo](https://tom-jim.github.io/RyuGu_WASM/)
 
-<img src="https://github.com/user-attachments/assets/2ce9f064-98bd-4658-8c0e-999abf0d0297" width="100%" alt="trajectory demonstration" />
+<img src="https://github.com/user-attachments/assets/e6f0435d-14c5-4218-aa1d-cd0ebd26684c" width="100%" alt="algorithm comparison" />
 
 | **Orbital Trajectory** | **ProbeView** |
 | :---: | :---: |
@@ -23,13 +23,31 @@ The repository compares five forward models and contains a research implementati
 
 ## What is implemented
 
-The simulator exposes five switchable gravity methods. Four use the same mass-normalized heterogeneous radial profile,
+The simulator exposes five switchable gravity methods. Four share the mass-normalized heterogeneous profile
+$\rho(r)=C\ln(1+r/10\,\mathrm m)$; Werner-Scheeres is the homogeneous reference.
 
-$$
-\rho(r)=C\ln\left(1+\frac{r}{10\,\mathrm m}\right),
-$$
+```mermaid
+flowchart LR
+    Mesh["Ryugu mesh"] --> Sources["Mass-preserving sources"]
+    Sources --> Radial["GPU Radial Analytic"]
+    Mesh --> Werner["GPU Werner Polyhedron"]
+    Sources --> Eq106["Eq.106 Adaptive Curved-Arc"]
+    Sources --> FFT["CPU FFT grid + GPU interpolation"]
+    Sources --> Tree["GPU order-2 octree treecode"]
+    Radial --> Compare["Common snapshots / error checks"]
+    Werner --> Compare
+    Eq106 --> Compare
+    FFT --> Compare
+    Tree --> Compare
+```
 
-while the Werner-Scheeres model is a homogeneous reference.
+| Method | Preparation | Runtime kernel | Scope |
+|---|---|---|---|
+| GPU Radial Analytic | Four equal-volume layers; analytic layer mass | 8-node Gauss-Legendre quadrature | Heterogeneous direct reference |
+| GPU Werner Polyhedron | Oriented faces, edges, dyads | Closed homogeneous polyhedron formula | Homogeneous only; invalid topology records are reported/skipped |
+| Eq.106 Adaptive Curved-Arc | Shared `4 × 8 × 32 = 1024` source tensor, tables, segments | Cached spectra, Bromwich inversion, acceleration/potential/Jacobian | Experimental near-straight segment reuse |
+| FFT-grid | CPU zero-padded Newton convolution on `64³` + `16³` grids | GPU tricubic sampling/differentiation | CPU preprocessing + GPU interpolation |
+| Order-2 treecode | Fixed-depth octree and multipoles | GPU traversal, multipole far cells, direct leaf P2P | Barnes-Hut-style treecode, not full FMM |
 
 | UI method | Source preparation | Runtime evaluation | Main qualification |
 |---|---|---|---|
@@ -41,6 +59,17 @@ while the Werner-Scheeres model is a homogeneous reference.
 | **GPU Order-2 Octree Treecode** | CPU builds a fixed-depth octree and order-two multipole hierarchy. | WebGPU traverses the tree; accepted far cells use multipoles, while non-separated leaves use direct P2P. | This is a Barnes-Hut-style treecode, not a complete P2M/M2M/M2L/L2L/L2P FMM. |
 
 ## Mathematical core of Equation (106)
+
+```mermaid
+flowchart TD
+    Newton["Newton volume integral"] --> Line["Straight reference line\nF(s;a,z') and endpoint term"]
+    Line --> Kernels["Dimensionless kernels\nK_V, K_H"]
+    Kernels --> Coeff["Transverse coefficients"]
+    Coeff --> Spectrum["129 signed complex-frequency bins"]
+    Spectrum --> Invert["Finite-band Bromwich sum"]
+    Invert --> Taylor["Adaptive transverse Taylor\norder 1..8 (3..45 coeffs)"]
+    Taylor --> Field["g, U, Jacobian, certificates"]
+```
 
 ### 1. Newtonian starting point
 
@@ -133,18 +162,18 @@ $$
 
 The production path uses a bivariate transverse Taylor polynomial with an adaptive order from **1 through 8** (`3` through `45` coefficients). The planner monitors a conservative distance ratio $\varepsilon$ and a geometric-series remainder estimate, selecting the lowest order that satisfies the configured remainder target. A segment must be rebuilt or rejected when its curvature or source proximity exceeds the configured guard.
 
-### 4. How the code realizes the formula
+### 4. Code realization and reuse contract
 
-The current shader is a hybrid analytical/numerical realization:
+| Stage | Operation | Reuse boundary |
+|---|---|---|
+| Sample | `64` half-line nodes traverse the discrete source tensor | Rebuilt only for a new segment |
+| Transform | Newton Taylor jet → `129` signed complex bins | Cached per spectral element |
+| Analytic correction | Replace zeroth coefficient with Eq.70/Eq.106 kernel from $\Psi,\partial_x\Psi$ tables | Shared tables |
+| Inversion | Finite-band Bromwich reconstruction | Reused for all targets on the segment |
+| Curved arc | Order `1..8` transverse polynomial | Guarded by curvature/distance certificates |
+| Output | Acceleration, potential, Jacobian, diagnostics | Async snapshot-tagged readback |
 
-1. A new line segment traverses the discrete source tensor at `64` half-line quadrature nodes.
-2. Direct Newton samples generate the transverse Taylor coefficients.
-3. Those coefficient samples are transformed numerically into `129` signed complex-frequency bins.
-4. The zeroth, reference-line coefficient is overwritten by the analytical Eq.70/Eq.106 kernel evaluated from precomputed $\Psi$ and $\partial_x\Psi$ tables.
-5. A finite-band Bromwich sum reconstructs the field, after which the transverse polynomial supplies the curved-arc correction.
-6. The resulting acceleration, potential, local Jacobian, and diagnostic values are read back asynchronously. CPU physics then advances the trajectory.
-
-Consequently, the implementation should not be described as an exact closed-form evaluation of every curved-trajectory coefficient. Its intended computational opportunity is **segment reuse**: building a new spectrum is expensive, but repeated evaluations on a valid cached segment avoid a fresh source traversal.
+This is a hybrid numerical realization, not an exact closed form for every curved-trajectory coefficient. The intended advantage is repeated target evaluation on a valid cached segment; a new segment still pays spectrum construction.
 
 ## Runtime architecture
 
@@ -256,35 +285,40 @@ Its relative drift is a consistency diagnostic for the coupled force, potential,
 
 ### Dual-representation residual
 
-Eq.106 also compares its curve-integrated potential change with a truncated Fourier-toroidal potential representation (`m = 0...16`). This is useful for detecting disagreement between two numerical representations, but the two paths share the same density model. The residual is therefore not an independent physical measurement or a proof of density identifiability.
+```mermaid
+flowchart LR
+    EqField["Eq.106 curve-integrated potential"] --> Residual["Residual"]
+    Toroidal["Fourier-toroidal potential\nm = 0..16"] --> Residual
+    Residual --> Meaning["Numerical disagreement diagnostic\nnot an independent physical measurement"]
+```
 
 ### Synthetic density inversion
 
-The interactive inversion freezes one immutable capture before comparing methods:
+```mermaid
+flowchart TD
+    Knots["16 editable knots"] --> Track["Quintic-Hermite track\n241 shared samples + capture_id"]
+    Source["786432 radial records"] --> Truth["Independent f64 order-2 tree\nopening 0.025"]
+    Track --> Truth
+    Sources1024["1024 aggregated sources"] --> Voxels["56 occupied voxels\n4³ grid, unit-density bases"]
+    Voxels --> Matrix["Common response matrix A\n723 acceleration components"]
+    Track --> Matrix
+    Truth --> Obs["Frozen observations\ncache by capture + source hash"]
+    Obs --> QP["Clarabel 56×56 QP\nmass equality + bounds + smoothness"]
+    Matrix --> QP
+    QP --> Holdout["Offset holdout validation"]
+```
 
-- `16` editable position, velocity, orientation, and time knots define a continuous quintic-Hermite track sampled at the same `241` points by every method;
-- one `capture_id` identifies that complete sample array, and the UI rejects result rows from a different capture;
-- the synthetic observation vector is generated at all 241 training states from all `786432` logarithmic-density radial records by an independent `f64` order-two tree with a strict `0.025` opening tolerance; the result is cached by `capture_id` and source hash, so every inverse backend receives identical observations without repeating the high-resolution build;
-- the Quintic Hermite sampler evaluates position, its analytic time derivative, and acceleration from the same polynomial; editing a knot changes the capture identity and regenerates both the matrix geometry and observations;
-- validation uses a separate body-frame-offset holdout arc that is never included in the QP; its predictions use unit-density bases assembled from the original radial records rather than voxel-centroid kernels;
-- the interior is represented by a `4^3` Cartesian grid (`56` occupied voxels for the bundled model);
-- the `1024` mass-preserving aggregated sources are assigned once to those 56 voxels and normalized to unit-density voxel volume; Eq.106, MMFFT, and the treecode consume the identical source positions, volumes, column ownership, and frozen target array;
-- each inverse backend supplies a unit-density response matrix `A` for the same 723-component acceleration vector; forward models never predict density directly, and Clarabel solves for the 56 density variables;
-- Eq.106 builds all 56 unit-density voxel columns in one GPU command encoder, submits once, and reads one compact acceleration-only matrix back once; Jacobian, residual, dual-certificate, and timestamp-query output is disabled for this inversion-only path;
-- the Eq.106 matrix cache identity combines the frozen `capture_id`, source geometry hash, shared basis hash, voxel/sample dimensions, and a frequency/quadrature/Taylor configuration signature; a density update reuses the geometry operator instead of rebuilding it;
-- MMFFT builds each column with its real CIC deposition, zero-padded FFT convolution, hierarchy selection, and tricubic derivative rather than a softened Newton substitute;
-- one cold MMFFT matrix build now creates each level's Newton kernel spectrum once, reuses cached forward/inverse RustFFT plans and scratch storage, performs the convolution in a reusable `Complex64` density buffer, and skips hierarchy levels unused by the frozen target array. The numerical precision and `64^3`/`16^3` grids are unchanged;
-- the third inversion row is explicitly a CPU `f64` quadrupole treecode using the shared distributed basis. It is distinct from the runtime GPU order-two treecode;
-- MMFFT and treecode matrices are cached by `capture_id`, source hash, shared basis hash, and sample count, matching the Eq.106 warm-reuse semantics;
-- Rust assembles the shared `56 x 56` convex QP and Clarabel solves it with exact total-mass equality, density bounds, spatial and radial smoothness, and a weak uniform prior.
-- the data term uses an explicit diagonal covariance (`0.1%` relative acceleration noise with an absolute floor) instead of implicit per-sample normalization; three reproducible seeded Gaussian realizations are solved and their density estimates are averaged, while holdout observations remain noiseless;
-- Radial is the forward-only truth generator for the shared long observation orbit; it is intentionally absent from the inversion button and fit history alongside Werner.
-- Werner remains a forward-only homogeneous polyhedron diagnostic and is intentionally absent from the inversion button and fit history.
-- switching methods retains every method's current and best result for the same frozen truth track, and restores the selected method's density view; editing the trajectory or changing the physical source invalidates the complete comparison history;
-- each history row shows the latest run beside the retained best fit, and reports common truth preparation separately from cold/warm matrix time, Clarabel time, verification, and method total. Common truth construction is excluded from method total, so the first selected algorithm no longer pays the shared-cache cost.
-- release and benchmark builds use `opt-level = 3`, LTO, and one codegen unit; the interactive timing comparison no longer uses the former size-optimized `opt-level = "z"` profile.
-- WGSL hot paths retain their existing `f32` formulas and output layouts while using more parallel work: Eq.106 reduces its 129 frequencies across a 64-lane workgroup per target, the FFT-grid interpolator maps its 64 tricubic corners to 64 lanes, the treecode shares per-level observer boxes inside each workgroup, and Werner reads edge lengths precomputed with the source geometry.
-- the Eq.106 status line separates source preparation, CPU spectrum/evaluation command encoding, asynchronous GPU batch completion plus mapped readback, design-matrix assembly, Clarabel solve, verification, total time, dispatch count, spectrum rebuild count, and cache hit/miss. A cache hit explicitly reports that GPU stages were skipped. Browser timestamp queries remain disabled on Dawn/Metal because query-set allocation can fail even when the feature bit is advertised.
+| Contract | Implementation |
+|---|---|
+| Shared input | Same capture, source geometry, voxel ownership, target array, and sample count for Eq.106/MMFFT/treecode |
+| Eq.106 matrix | 56 columns in one command encoder; acceleration-only readback; diagnostics disabled |
+| MMFFT matrix | Real CIC deposition, `64³`/`16³` zero-padded Newton FFT, cached plans/spectra/workspaces |
+| Tree matrix | CPU `f64` quadrupole treecode with the distributed shared basis (distinct from runtime GPU treecode) |
+| Noise model | Diagonal covariance: `0.1%` relative noise plus absolute floor; three seeded Gaussian solves averaged |
+| History/cache | Latest and best fit plus cold/warm matrix, Clarabel, verification, and total times; keys include capture/source/basis/config hashes |
+| Scope | Radial and Werner are forward-only; fit is a regularized synthetic score, not a posterior or uniqueness claim |
+
+The frozen capture, source hash, voxel basis, and target array are shared by every inverse backend; changing a knot or source invalidates all rows. Eq.106 builds 56 acceleration-only columns in one encoder, MMFFT uses real CIC deposition with cached `64³`/`16³` FFT plans and spectra, and the third row is a CPU `f64` quadrupole treecode. Clarabel solves the shared `56 × 56` constrained QP (mass equality, bounds, smoothness, weak prior) under diagonal `0.1%` noise; three seeded solves are averaged and checked on a separate offset holdout. Radial and Werner remain forward-only. History separates cold/warm matrix, solve, verification, and total times; cache keys include capture/source/basis/config hashes. Release builds use `opt-level = 3`, LTO, and one codegen unit. GPU hot paths use 64-lane reductions, and status telemetry reports preparation, paced GPU wall/copy/map, assembly, solve, verification, dispatches, rebuilds, and cache hits. Dawn/Metal timestamp queries remain disabled.
 
 The reported `fit` is a synthetic volume-weighted density score against the known reference model. It is not a posterior probability, confidence level, or real-observation accuracy. One external trajectory cannot uniquely recover an arbitrary three-dimensional density field without assumptions and regularization.
 
@@ -292,16 +326,52 @@ The reported `fit` is a synthetic volume-weighted density score against the know
 
 The probe controls retain the existing 620 m benchmark orbit and add a `Near-sync ellipse` preset. The preset starts at apocenter with position `(-1097.269, 51.622, 0) m`, uses Ryugu's spin axis as the orbit normal, and derives velocity from the existing circular-speed multiplier with `speed_factor = 0.82408`; the displayed velocity is therefore not an independently hard-coded state. The nominal two-body orbit has period `27495.468 s`, semimajor axis `831.624 m`, eccentricity `0.320889`, pericenter radius `564.765 m`, and apocenter radius `1098.483 m`.
 
-The planning contract is separate from the 56-variable Clarabel density inversion above. It resamples the current immutable trajectory capture with the same quintic-Hermite curve used by inversion and freezes that actual short arc. First generates 32 candidate observation curves and Stress generates 2048; both independently cover the complete Frenet-like transverse tube rather than making First a truncated inner subset. First directly validates every candidate/sample against the independent f64 reference; Stress uses a deterministic stratified subset. Every point carries body-fixed position and velocity, sample time, body rotation, candidate/sample identity, and measured transverse distance; generation fails if any point exceeds the shared `15 m` trust and transverse limit. These curves are benchmark inputs, not certified dynamically flyable trajectories: thrust, delta-v, and closed-loop navigation feasibility are not yet enforced. Eq.106 segments select Taylor order 1..8 independently, cap each element at `300 s`, and execute line sampling, spectrum assembly, analytic correction, and field evaluation as four batched dispatches over the segment dimension. The selectable workloads are:
+```mermaid
+flowchart LR
+    Capture["Immutable quintic capture"] --> Tube["Complete transverse tube\ntrust limit 15 m"]
+    Tube --> First["First\n32 × 4 × 241"]
+    Tube --> Stress["Interactive Stress\n2048 × 32 × 512"]
+    First --> Validate["f64 direct validation\nall candidates"]
+    Stress --> Stratified["Deterministic stratified validation"]
+    Validate --> Compare["Shared hashes + coverage"]
+    Stratified --> Compare
+    Compare --> Methods["Eq.106 | FFT-grid | treecode"]
+```
+
+The planning contract is separate from inversion. Every point stores body-fixed state, time, rotation, candidate/sample identity, and transverse distance. Eq.106 selects Taylor order `1..8`, caps elements at `300 s`, and runs line sampling, spectrum assembly, analytic correction, and target evaluation as four batched stages. These are benchmark curves, not certified flyable trajectories (thrust, delta-v, and closed-loop navigation are not enforced). The selectable workloads are:
 
 | Profile | Candidate trajectories | Density models | Samples per candidate | Evaluations |
 |---|---:|---:|---:|---:|
 | First | 32 | 4 | 241 | 30,848 |
 | Interactive Stress | 2,048 | 32 | 512 | 33,554,432 |
 
+```mermaid
+xychart-beta
+    title "Planning workload (evaluation count)"
+    x-axis [First, Interactive-Stress]
+    y-axis "Evaluations" 0 --> 33554432
+    bar [30848, 33554432]
+```
+
+Source-resolution experiments use the same mass-preserving spatial refinement for every method:
+
+```mermaid
+flowchart LR
+    S1["1,024"] --> S2["2,048"] --> S3["4,096"] --> S4["8,192"] --> S5["16,384"] --> S6["32,768"] --> S7["65,536"] --> S8["131,072"] --> S9["262,144"]
+    S9 --> Plot["Time vs source count\nEq.106 | FFT-grid | treecode"]
+```
+
 The upper-right comparison panel keeps `Density fit` and `Inversion time` and adds gravity error, gradient error, propagated pericenter error, minimum altitude, reference-model separation, the planning objective, Eq.106 segment count, speedup versus the GPU treecode, and cold-start amortization. It retains the five highest-scoring candidate curves for each method. The current separation metric compares every structured density model with model zero; it is not an all-pairs, covariance-weighted mission-information metric and is labelled accordingly. The `K x 56` density rows contain genuinely different center, shell, lobe, quadrupole, and rubble patterns and are normalized to the same total mass. Planning results are accepted only when Eq.106, the FFT-grid interpolator, and the treecode carry the same nonzero capture, source geometry, voxel basis, candidate-state, density-model, and sample-array hashes; use the selected `B x K x H` workload; and identify their actual backends. Missing, mismatched, or failed GPU results remain `N/A`, and speedup/winner fields stay locked until all three verified rows exist.
 
-A fair result must include preprocessing, retain the same nonzero number of fully covered candidates for all three methods, and satisfy relative gravity error `<= 1e-3`, relative gradient error `<= 1e-2`, predicted pericenter error `<= 1 m`, and no more than 10 Eq.106 segments for the target result (16 is the hard validity maximum). Every Eq.106 element is now explicitly limited to 300 seconds as well as its spatial and Taylor certificates; a candidate whose elements do not contiguously cover all samples is invalidated without poisoning the rest of its packet. Eq.106 counts as a useful engineering advantage only when it is at least `3x` faster than **both** fixed baselines, and as a strong advantage only at `>= 5x` both. Cold-start amortization remains visible as a diagnostic, but is not a verdict gate because it is not yet a rigorous static/per-batch/per-candidate decomposition. This verdict compares the three concrete fixed configurations in this repository; they have not yet been tuned into equal-error parameter envelopes, and it is not a claim against a mature FMM or a fully GPU-resident MMFFT library. The existing inversion button, frozen-trajectory contract, Clarabel solve, fit history, and density visualization remain independent and available.
+| Fairness gate | Required condition |
+|---|---|
+| Coverage | Same nonzero fully covered candidates; contiguous Eq.106 segments |
+| Accuracy | Gravity `≤ 1e-3`; gradient `≤ 1e-2`; pericenter error `≤ 1 m` |
+| Segments | Target `≤ 10`; hard maximum `16`; each element `≤ 300 s` |
+| Verdict | Eq.106 advantage `≥3×` faster than both baselines; strong at `≥5×` |
+| Timing | Include preprocessing; report cold-start amortization separately |
+
+The comparison covers this repository's fixed configurations only; it is not a claim against a tuned FMM or fully GPU-resident MMFFT. Inversion, fit history, and density visualization remain independent.
 
 `First` and `Interactive Stress` are two sizes of the same planning structure and the same three forward algorithms. Both use fixed candidate tiles, full Eq.106 stages per submission, the deterministic `Eq.106 -> FFT-grid -> treecode` order, and identical verification indices. `First` freezes simulation and realtime GPU work for its short exclusive timing run. `Interactive Stress` deliberately leaves the probe, realtime gravity, Eq.106 residual, and Jacobi histories running while asynchronous planning batches progress. Selecting any non-inversion metric starts the currently selected workload when it has no complete shared result; once that run completes, switching among planning metrics reuses its complete result instead of recomputing it. Changing the workload while a planning metric is selected starts a new run identity against the current frozen capture. `Density fit` and `Inversion time` are controlled only by the inversion button; choosing either cancels an unfinished planning queue, and the inversion button is hidden for planning metrics. Candidate positions and all structured density rows are uploaded once as immutable shared GPU buffers. Eq.106 runs its real line-sample, spectrum-assembly, and field-evaluation passes; the FFT method samples its real two-level zero-padded convolution hierarchy; the treecode evaluates its real order-two octree and exact leaf interactions. A common GPU reduction pass emits one compact metric row per candidate, while only deterministic direct-verification field rows are copied to mapped staging; no complete `B x K x H` result tensor is retained or read back.
 
