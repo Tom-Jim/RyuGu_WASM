@@ -60,9 +60,7 @@ fn uniform_bytes(
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
-    for (offset, value) in [(80, longitudinal_limit.max(1.0))] {
-        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
+    bytes[80..84].copy_from_slice(&longitudinal_limit.max(1.0).to_le_bytes());
     bytes[84..88].copy_from_slice(&target_offset.to_le_bytes());
     bytes[88..92].copy_from_slice(&u32::from(inversion_mode).to_le_bytes());
     bytes

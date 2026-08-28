@@ -9,10 +9,10 @@
 // This is a truncated discrete operator: mode truncation, interval mapping,
 // coefficient quantization and GPU f32 arithmetic are reported explicitly.
 
+use crate::cpu::eq106_reference::{Complex64, Eq106Error};
 use crate::interface::components::{
     ActiveGravityMethod, GravityRuntimeError, PlanningComparisonState,
 };
-use crate::cpu::eq106_reference::{Complex64, Eq106Error};
 use bevy::prelude::*;
 #[cfg(any(test, feature = "regenerate-operators"))]
 use std::f64::consts::PI;
@@ -65,7 +65,7 @@ const GL8_WEIGHTS: [f64; 8] = [
 const GL16_NODES: [f64; 16] = [
     0.087_649_410_478_927_84,
     0.462_696_328_915_080_8,
-    1.141_057_774_831_226_9,
+    1.141_057_774_831_227,
     2.129_283_645_098_380_6,
     3.437_086_633_893_206_6,
     5.078_018_614_549_768,
@@ -81,7 +81,7 @@ const GL16_NODES: [f64; 16] = [
     51.701_160_339_543_32,
 ];
 const GL16_WEIGHTS: [f64; 16] = [
-    2.061_517_149_578_009_9e-1,
+    2.061_517_149_578_01e-1,
     3.310_578_549_508_842e-1,
     2.657_957_776_442_141_5e-1,
     1.362_969_342_963_775_4e-1,
@@ -334,8 +334,10 @@ impl PsiOperatorTable {
             ));
         }
         let coefficients = BYTES[40..]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         let table = Self {
             coefficients,
@@ -364,11 +366,7 @@ impl PsiOperatorTable {
     }
 
     pub fn as_le_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.coefficients.len() * 4);
-        for value in &self.coefficients {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes
+        bytemuck::cast_slice(&self.coefficients).to_vec()
     }
 
     pub fn evaluate(
@@ -440,7 +438,7 @@ fn evaluate_psi_coefficients(
     let x1 = x0 + PSI_LOG_A_STEP;
     let t = ((2.0 * log_a - x0 - x1) / (x1 - x0)).clamp(-1.0, 1.0);
     let mut output = [Complex64::ZERO; 2];
-    for component in 0..2 {
+    for (component, value) in output.iter_mut().enumerate() {
         let component_offset = 2 * component;
         let mut b1 = Complex64::ZERO;
         let mut b2 = Complex64::ZERO;
@@ -459,7 +457,7 @@ fn evaluate_psi_coefficients(
             coefficients[base + component_offset] as f64,
             coefficients[base + component_offset + 1] as f64,
         );
-        output[component] = b1 * t - b2 + coefficient;
+        *value = b1 * t - b2 + coefficient;
     }
     output
 }

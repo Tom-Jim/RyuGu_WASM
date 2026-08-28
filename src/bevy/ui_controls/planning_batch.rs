@@ -22,7 +22,7 @@ pub fn planning_batch_evaluator_system(
         return;
     };
     if batch.batch_id == 0 || batch.batch_id != job.batch_id {
-        planning.status = "Planning is waiting for the frozen candidate buffers.".into();
+        planning.status = "Planning is waiting for the propagated candidate buffers.".into();
         planning.batch_job = Some(job);
         return;
     }
@@ -66,9 +66,7 @@ pub fn planning_batch_evaluator_system(
                 let repetition_ms = packet.timing.method_preprocess_ms
                     + packet.timing.command_submission_ms
                     + packet.timing.gpu_completion_map_ms;
-                if job.method == ActiveGravityMethod::CurvedArcEq106
-                    && !job.certified_repetition
-                {
+                if !job.certified_repetition {
                     job.warm_evaluation_ms = repetition_ms;
                     job.raw_gpu_request_count = job.gpu_request_count;
                     job.certified_repetition = true;
@@ -76,29 +74,22 @@ pub fn planning_batch_evaluator_system(
                     job.candidate_start = 0;
                     job.awaiting_gpu = false;
                     job.awaiting_gpu_frames = 0;
-                    planning.status = "Eq.106 full forward raw pass complete; starting full certified BxKxH pass over the common validation strata.".into();
+                    planning.status = format!(
+                        "{} raw pass complete; starting the full independently certified BxKxH pass over the common f64 validation strata.",
+                        job.method.planning_label()
+                    );
                     planning.batch_job = Some(job);
                     return;
                 }
-                if job.method == ActiveGravityMethod::CurvedArcEq106 {
-                    job.certified_warm_evaluation_ms = repetition_ms;
-                    job.certified_full_pass_ms += repetition_ms;
-                    reduce_certified_packet(
-                        &mut job,
-                        &batch,
-                        &packet,
-                        &mut reference_cache,
-                    );
-                    if !advance_certified_tile(&mut job, packet.request.candidate_count) {
-                        job.awaiting_gpu = false;
-                        job.awaiting_gpu_frames = 0;
-                        planning.status = planning_progress_text(&job);
-                        planning.batch_job = Some(job);
-                        return;
-                    }
-                } else {
-                    job.warm_evaluation_ms = repetition_ms;
-                    job.certified_warm_evaluation_ms = repetition_ms;
+                job.certified_warm_evaluation_ms = repetition_ms;
+                job.certified_full_pass_ms += repetition_ms;
+                reduce_certified_packet(&mut job, &batch, &packet, &mut reference_cache);
+                if !advance_certified_tile(&mut job, packet.request.candidate_count) {
+                    job.awaiting_gpu = false;
+                    job.awaiting_gpu_frames = 0;
+                    planning.status = planning_progress_text(&job);
+                    planning.batch_job = Some(job);
+                    return;
                 }
                 finish_planning_method(&job, &batch, packet.backend, &mut planning);
                 *request = PlanningGpuRequest::default();
@@ -107,7 +98,7 @@ pub fn planning_batch_evaluator_system(
                     if planning.source_curve_active {
                         let eq106 = planning.results[2].expect("completed Eq.106 curve result");
                         let mmfft = planning.results[3].expect("completed FFT curve result");
-                        let fmm = planning.results[4].expect("completed tree curve result");
+                        let fmm = planning.results[4].expect("completed FMM curve result");
                         let source_count = planning.requested_source_count;
                         planning.source_curve_samples.push(PlanningSourceCurveSample {
                             source_count,
@@ -115,7 +106,9 @@ pub fn planning_batch_evaluator_system(
                                 eq106.total_ms,
                                 eq106.certified_estimated_total_ms,
                                 mmfft.total_ms,
+                                mmfft.certified_estimated_total_ms,
                                 fmm.total_ms,
+                                fmm.certified_estimated_total_ms,
                             ],
                             build_ms: [eq106.build_ms, mmfft.build_ms, fmm.build_ms],
                             query_ns_per_target: [
@@ -127,7 +120,9 @@ pub fn planning_batch_evaluator_system(
                                 eq106.accuracy_eligible(),
                                 eq106.certified_accuracy_eligible(),
                                 mmfft.accuracy_eligible(),
+                                mmfft.certified_accuracy_eligible(),
                                 fmm.accuracy_eligible(),
+                                fmm.certified_accuracy_eligible(),
                             ],
                         });
                         persist_source_curve(&planning.source_curve_samples);
@@ -158,7 +153,7 @@ pub fn planning_batch_evaluator_system(
                     }
                     planning.run_requested = false;
                     planning.status = format!(
-                        "{} local observation-curve screening complete: all methods used the identical frozen 15 m geometric tube and density matrix; no dynamical orbit propagation is claimed.",
+                        "{} screening complete: all methods used identical nominal-density Volterra-propagated candidates inside the certified 15 m tube. Density rows share those trajectories; model-specific repropagation is not claimed.",
                         job.profile.label()
                     );
                     return;
@@ -531,12 +526,12 @@ fn reduce_certified_packet(
         }
     }
     for (local_candidate, metric) in packet.candidate_metrics.iter().enumerate() {
-        if metric[0] < 0.0 || metric.iter().any(|value| !value.is_finite()) {
-            if let Some(valid) = job.certified_candidate_valid.get_mut(
+        if (metric[0] < 0.0 || metric.iter().any(|value| !value.is_finite()))
+            && let Some(valid) = job.certified_candidate_valid.get_mut(
                 packet.request.candidate_start as usize + local_candidate,
-            ) {
-                *valid = false;
-            }
+            )
+        {
+            *valid = false;
         }
     }
     if !packet.readback_valid || packet.rows.len() != packet.state_indices.len() * 4 {
@@ -617,32 +612,12 @@ fn direct_planning_reference_cached(
     }
     let row_start = density_model as usize * 56;
     let densities = &batch.density_models[row_start..row_start + 56];
-    let mut acceleration = DVec3::ZERO;
-    let mut gradient = DMat3::ZERO;
-    for source in batch.basis_records.iter() {
-        let position = DVec3::new(
-            f64::from(source.position_volume[0]),
-            f64::from(source.position_volume[1]),
-            f64::from(source.position_volume[2]),
-        );
-        let displacement = position - target;
-        let radius2 = displacement.length_squared().max(1.0e-16);
-        let inverse_radius = radius2.sqrt().recip();
-        let inverse_radius3 = inverse_radius / radius2;
-        let mass = f64::from(source.position_volume[3])
-            * f64::from(densities[source.voxel_index as usize]);
-        acceleration += f64::from(G) * mass * displacement * inverse_radius3;
-        let outer = DMat3::from_cols(
-            displacement * displacement.x,
-            displacement * displacement.y,
-            displacement * displacement.z,
-        );
-        gradient += f64::from(G)
-            * mass
-            * (-DMat3::IDENTITY * inverse_radius3
-                + outer * (3.0 * inverse_radius3 / radius2));
-    }
-    let reference = (acceleration, gradient);
+    let reference = crate::cpu::planning::evaluate_planning_reference_field(
+        target,
+        &batch.basis_records,
+        densities,
+    )
+    .unwrap_or((DVec3::splat(f64::NAN), DMat3::NAN));
     cache.fields.insert(key, reference);
     reference
 }
@@ -759,7 +734,7 @@ fn top_candidate_scores(
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| right.objective.total_cmp(&left.objective));
     let mut top = [PlanningCandidateScore::default(); 5];
-    for (destination, score) in top.iter_mut().zip(scores.into_iter()) {
+    for (destination, score) in top.iter_mut().zip(scores) {
         *destination = score;
     }
     top
@@ -836,16 +811,9 @@ fn finish_planning_method(
         - job.warm_evaluation_ms * f64::from(job.density_model_count))
     .max(0.0);
     let build_ms = job.preprocessing_ms + gpu_build_ms;
-    let certified_estimated_total_ms = if job.method == ActiveGravityMethod::CurvedArcEq106 {
-        build_ms + job.certified_full_pass_ms + job.verification_ms
-    } else {
-        total_ms
-    };
-    let raw_gpu_request_count = if job.method == ActiveGravityMethod::CurvedArcEq106 {
-        job.raw_gpu_request_count
-    } else {
-        job.gpu_request_count
-    };
+    let certified_estimated_total_ms =
+        build_ms + job.certified_full_pass_ms + job.verification_ms;
+    let raw_gpu_request_count = job.raw_gpu_request_count;
     let certified_gpu_request_count = job.gpu_request_count.saturating_sub(raw_gpu_request_count);
     let certified_gravity_error = (job.certified_gravity_error_sum
         / job.certified_gravity_reference_sum.max(f64::MIN_POSITIVE))

@@ -1,6 +1,11 @@
-use crate::cpu::curved_arc::CurvedArcResidualHistory;
+use crate::cpu::curved_arc::{CurvedArcPlannerState, CurvedArcResidualHistory};
+use crate::cpu::volterra::{
+    VolterraConfig, VolterraError, VolterraForceInput, VolterraPropagationStatus,
+    propagate_reference_line_batched,
+};
 use crate::interface::components::*;
 use crate::interface::select_history;
+use bevy::math::DVec3;
 use bevy::prelude::*;
 
 const MAX_ACC: f32 = 1.5e-3;
@@ -149,6 +154,15 @@ fn eq106_local_body_acceleration(
     target_body_position: Vec3,
 ) -> Option<Vec3> {
     let (lower, upper) = history.bracketing(epoch, target_time)?;
+    eq106_local_body_acceleration_between(lower, upper, target_time, target_body_position)
+}
+
+fn eq106_local_body_acceleration_between(
+    lower: &GravityFieldSample,
+    upper: &GravityFieldSample,
+    target_time: f64,
+    target_body_position: Vec3,
+) -> Option<Vec3> {
     let evaluate = |sample: &GravityFieldSample| {
         let jacobian = sample.body_acceleration_jacobian?;
         let displacement = target_body_position - sample.snapshot.body_position;
@@ -173,6 +187,54 @@ fn eq106_local_body_acceleration(
     let weight =
         ((target_time - lower.snapshot.simulation_time_seconds) / interval).clamp(0.0, 1.0) as f32;
     Some(lower_acceleration.lerp(upper_acceleration, weight))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_eq106_world_residual_batch(
+    history: &GravitySampleHistory,
+    epoch: u64,
+    inputs: &[VolterraForceInput],
+    frame_start_time: f64,
+    stable_step_start: f64,
+    frame_start_translation: Vec3,
+    frame_start_rotation: Quat,
+    outputs: &mut [DVec3],
+) -> Option<()> {
+    if inputs.len() != outputs.len() {
+        return None;
+    }
+    let mut anchors = history
+        .samples
+        .iter()
+        .filter(|sample| sample.snapshot.epoch == epoch)
+        .peekable();
+    let mut lower = None;
+    for (input, output) in inputs.iter().zip(outputs) {
+        let target_time = stable_step_start + input.elapsed_seconds;
+        while anchors
+            .peek()
+            .is_some_and(|sample| sample.snapshot.simulation_time_seconds <= target_time + 1.0e-6)
+        {
+            lower = anchors.next();
+        }
+        let lower_sample = lower?;
+        let upper = anchors
+            .peek()
+            .copied()
+            .filter(|sample| sample.snapshot.simulation_time_seconds >= target_time - 1.0e-6)
+            .unwrap_or(lower_sample);
+        let rotation = rotation_after(frame_start_rotation, target_time - frame_start_time);
+        let target_body_position =
+            rotation.inverse() * (input.position.as_vec3() - frame_start_translation);
+        let body_acceleration = eq106_local_body_acceleration_between(
+            lower_sample,
+            upper,
+            target_time,
+            target_body_position,
+        )?;
+        *output = validate_acceleration(rotation * body_acceleration)?.as_dvec3();
+    }
+    Some(())
 }
 
 fn eq106_snapshot_matches_clock(sample: &GravityFieldSample, clock: &SimulationClock) -> bool {
@@ -221,8 +283,10 @@ pub fn physics_system(
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
     mut inversion: ResMut<TrajectoryInversionState>,
     time: Res<Time<Fixed>>,
-    active_method: Res<ActiveGravityMethod>,
-    (simulation_acceleration, planning): (
+    (active_method, curved_planner, mut volterra_status, simulation_acceleration, planning): (
+        Res<ActiveGravityMethod>,
+        Res<CurvedArcPlannerState>,
+        ResMut<VolterraPropagationStatus>,
         Res<SimulationAcceleration>,
         Res<PlanningComparisonState>,
     ),
@@ -325,7 +389,164 @@ pub fn physics_system(
             .ok_or("The selected gravity evaluator returned an invalid acceleration.")
     };
 
-    // Each acceleration step completes an unchanged 12-substep leapfrog frame.
+    if *active_method == ActiveGravityMethod::CurvedArcEq106 {
+        // Equations (27), (28), and (40): close position -> local Eq.106 field
+        // -> trajectory on each stable segment.  The old leapfrog path sampled
+        // a fixed local Hessian sequentially; this branch updates the complete
+        // segment by damped Picard sweeps and O(M) prefix integrals.
+        let certified_tube_radius = curved_planner
+            .active_segment
+            .as_ref()
+            .map(|segment| 0.8 * segment.distance_lower_bound)
+            .filter(|radius| radius.is_finite() && *radius > 0.0)
+            .unwrap_or(f64::from(PLANNING_TRAJECTORY_TUBE_RADIUS_METERS))
+            .min(f64::from(PLANNING_TRAJECTORY_TUBE_RADIUS_METERS));
+        let config = VolterraConfig {
+            // Keep the same authoritative 10 ms output cadence while solving
+            // the segment as one waveform rather than 100 dependent kicks.
+            node_count: PHYSICS_SUBSTEPS + 1,
+            maximum_picard_iterations: 10,
+            maximum_endpoint_iterations: 6,
+            damping: 0.75,
+            relative_tolerance: 2.0e-7,
+            minimum_longitudinal_speed: 1.0e-5,
+            maximum_transverse_distance: certified_tube_radius,
+        };
+
+        for stable_step in 0..stable_steps {
+            let stable_step_start = frame_start_time + stable_step as f64 * stable_frame_dt;
+            let initial_position = probe_transform.translation.as_dvec3();
+            let initial_velocity = probe_velocity.0.as_dvec3();
+            let solution = propagate_reference_line_batched(
+                initial_position,
+                initial_velocity,
+                initial_velocity,
+                stable_frame_dt,
+                config,
+                |inputs, accelerations| {
+                    let history = active_history
+                        .ok_or("The selected GPU gravity evaluator is not registered.")?;
+                    fill_eq106_world_residual_batch(
+                        history,
+                        clock.epoch,
+                        inputs,
+                        frame_start_time,
+                        stable_step_start,
+                        frame_start_translation,
+                        frame_start_rotation,
+                        accelerations,
+                    )
+                    .ok_or("Waiting for a valid gravity readback snapshot.")
+                },
+            );
+            let solution = match solution {
+                Ok(solution) => solution,
+                Err(VolterraError::Force("Waiting for a valid gravity readback snapshot."))
+                | Err(VolterraError::Force("Waiting for Equation (106) source quadrature.")) => {
+                    return;
+                }
+                Err(VolterraError::Force(message)) => {
+                    volterra_status.rejected_segments =
+                        volterra_status.rejected_segments.saturating_add(1);
+                    runtime_error.raise(message);
+                    return;
+                }
+                Err(VolterraError::NonMonotoneLongitudinalMotion) => {
+                    volterra_status.rejected_segments =
+                        volterra_status.rejected_segments.saturating_add(1);
+                    runtime_error.raise(
+                        "Eq.106 Volterra propagation reached a longitudinal turning point; split the reference arc before retrying.",
+                    );
+                    return;
+                }
+                Err(VolterraError::TaylorTubeExceeded) => {
+                    volterra_status.rejected_segments =
+                        volterra_status.rejected_segments.saturating_add(1);
+                    runtime_error.raise(
+                        "Eq.106 Volterra propagation left the certified Taylor tube; rebuild a shorter reference segment.",
+                    );
+                    return;
+                }
+                Err(VolterraError::PicardDidNotConverge)
+                | Err(VolterraError::EndpointDidNotConverge) => {
+                    volterra_status.rejected_segments =
+                        volterra_status.rejected_segments.saturating_add(1);
+                    runtime_error.raise(
+                        "Eq.106 Volterra/Picard propagation did not converge on the current segment.",
+                    );
+                    return;
+                }
+                Err(VolterraError::InvalidInput) => {
+                    volterra_status.rejected_segments =
+                        volterra_status.rejected_segments.saturating_add(1);
+                    runtime_error.raise("Eq.106 Volterra propagation received invalid state data.");
+                    return;
+                }
+            };
+            volterra_status.accepted_segments = volterra_status.accepted_segments.saturating_add(1);
+            volterra_status.latest = Some(solution.diagnostics);
+
+            let mut solution_cursor = 1;
+            for substep in 0..PHYSICS_SUBSTEPS {
+                let start_elapsed = substep as f64 * substep_dt;
+                let end_elapsed = (substep + 1) as f64 * substep_dt;
+                let Some(start) = solution.sample_at_ordered(start_elapsed, &mut solution_cursor)
+                else {
+                    runtime_error
+                        .raise("Eq.106 Volterra output did not cover the fixed-step interval.");
+                    return;
+                };
+                let Some(end) = solution.sample_at_ordered(end_elapsed, &mut solution_cursor)
+                else {
+                    runtime_error
+                        .raise("Eq.106 Volterra output did not cover the fixed-step interval.");
+                    return;
+                };
+                let start_time = stable_step_start + start_elapsed;
+                let end_time = stable_step_start + end_elapsed;
+                let start_rotation =
+                    rotation_after(frame_start_rotation, start_time - frame_start_time);
+                let end_rotation =
+                    rotation_after(frame_start_rotation, end_time - frame_start_time);
+                curved_residual.accumulate_curve_work(
+                    start_time,
+                    end_time,
+                    start_rotation.inverse() * (start.position.as_vec3() - frame_start_translation),
+                    end_rotation.inverse() * (end.position.as_vec3() - frame_start_translation),
+                    start_rotation.inverse() * start.acceleration.as_vec3(),
+                    end_rotation.inverse() * end.acceleration.as_vec3(),
+                );
+                if !benchmark.complete && end_time <= BENCHMARK_DURATION_SECONDS + 1.0e-9 {
+                    benchmark.samples.push(GravityBenchmarkSample {
+                        simulation_time_seconds: end_time,
+                        position: end.position.as_vec3(),
+                        velocity: end.velocity.as_vec3(),
+                        body_rotation: end_rotation,
+                    });
+                    if end_time + 1.0e-9 >= BENCHMARK_DURATION_SECONDS {
+                        benchmark.complete = true;
+                        benchmark.capture_id = Some(hash_benchmark_trajectory(&benchmark.samples));
+                    }
+                }
+            }
+
+            let endpoint = *solution
+                .samples
+                .last()
+                .expect("a successful Volterra solve has at least two samples");
+            probe_transform.translation = endpoint.position.as_vec3();
+            probe_velocity.0 = endpoint.velocity.as_vec3();
+            if orbit_history.0.len() >= ORBIT_HISTORY_LEN {
+                orbit_history.0.pop_front();
+            }
+            orbit_history.0.push_back(probe_transform.translation);
+        }
+
+        clock.advance(presented_frame_dt);
+        return;
+    }
+
+    // Non-Eq.106 evaluators retain the 100-substep leapfrog frame.
     // Intermediate states are retained in the orbit trail but are not presented,
     // which accelerates the visualization without enlarging the stable step size.
     for stable_step in 0..stable_steps {

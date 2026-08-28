@@ -171,8 +171,8 @@ fn solve_density_qp(
         for i in 0..n {
             let si = job.sensitivities[base + i];
             g[i] += si.dot(*observed) as f64 * weight;
-            for j in 0..=i {
-                h[j][i] += si.dot(job.sensitivities[base + j]) as f64 * weight;
+            for (j, sj) in job.sensitivities[base..base + i + 1].iter().enumerate() {
+                h[j][i] += si.dot(*sj) as f64 * weight;
             }
         }
     }
@@ -211,12 +211,12 @@ fn solve_density_qp(
     let mut p_rows = Vec::new();
     let mut p_cols = Vec::new();
     let mut p_vals = Vec::new();
-    for col in 0..n {
-        for row in 0..=col {
-            if h[row][col].abs() > 0.0 {
+    for (row, h_row) in h.iter().enumerate() {
+        for (col, value) in h_row.iter().enumerate().skip(row) {
+            if value.abs() > 0.0 {
                 p_rows.push(row);
                 p_cols.push(col);
-                p_vals.push(2.0 * h[row][col]);
+                p_vals.push(2.0 * value);
             }
         }
     }
@@ -251,9 +251,11 @@ fn solve_density_qp(
         NonnegativeConeT(2 * n),
         ZeroConeT(1 + homogeneous_equalities),
     ];
-    let mut settings = DefaultSettings::default();
-    settings.verbose = false;
-    settings.max_iter = 500;
+    let settings = DefaultSettings {
+        verbose: false,
+        max_iter: 500,
+        ..Default::default()
+    };
     let q = g.iter().map(|value| -2.0 * value).collect::<Vec<_>>();
     let mut solver = DefaultSolver::new(&p, &q, &a, &b, &cones, settings)
         .map_err(|error| format!("Clarabel rejected the 56x56 QP: {error}"))?;

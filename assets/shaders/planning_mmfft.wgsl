@@ -8,12 +8,13 @@ struct Params {
     half_extents: vec2<f32>,
     total_mass: f32,
     _derivative_step: f32,
+    grid_scales: vec2<f32>,
     gravity_constant: f32,
     _padding1: vec3<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> hierarchy: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> hierarchy: array<u32>;
 @group(0) @binding(2) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> densities: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output: array<vec4<f32>>;
@@ -43,6 +44,11 @@ fn linear_index(cell: vec3<u32>, level: u32) -> u32 {
         level == 0u,
     );
     return offset + (cell.z * n + cell.y) * n + cell.x;
+}
+
+fn potential_at(index: u32, level: u32) -> f32 {
+    let pair = unpack2x16float(hierarchy[index >> 1u]);
+    return select(pair.x, pair.y, (index & 1u) != 0u) * params.grid_scales[level];
 }
 
 fn cubic_weights(t: f32) -> vec4<f32> {
@@ -146,9 +152,10 @@ fn main(
         let dx = lane & 3u;
         let dy = (lane >> 2u) & 3u;
         let dz = lane >> 4u;
-        let potential = hierarchy[
-            linear_index(sample_base + vec3<u32>(dx, dy, dz), selected_level)
-        ].w;
+        let potential = potential_at(
+            linear_index(sample_base + vec3<u32>(dx, dy, dz), selected_level),
+            selected_level,
+        );
         let wx = weights_x[dx];
         let wy = weights_y[dy];
         let wz = weights_z[dz];

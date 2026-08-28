@@ -6,10 +6,10 @@ fn performance_time_axis_jacobi() -> impl Bundle {
     performance_time_axis_at(306.0, true)
 }
 
-fn performance_time_axis_text(value: &str, left: f32, jacobi: bool, slot: u8) -> impl Bundle {
+fn performance_time_axis_text(value: &str, left: f32, slot: u8) -> impl Bundle {
     (
         Text::new(value),
-        PerformanceTimeAxisLabel { jacobi, slot },
+        PerformanceTimeAxisLabel { slot },
         TextFont {
             font_size: bevy::text::FontSize::Px(9.0),
             ..default()
@@ -40,11 +40,11 @@ fn performance_time_axis_at(top: f32, jacobi: bool) -> impl Bundle {
             ..default()
         },
         children![
-            performance_time_axis_text("0", 0.0, jacobi, 0),
-            performance_time_axis_text("--", 252.0, jacobi, 1),
-            performance_time_axis_text("--", 512.0, jacobi, 2),
-            performance_time_axis_text("--", 772.0, jacobi, 3),
-            performance_time_axis_text("--", 1010.0, jacobi, 4),
+            performance_time_axis_text("0", 0.0, 0),
+            performance_time_axis_text("--", 252.0, 1),
+            performance_time_axis_text("--", 512.0, 2),
+            performance_time_axis_text("--", 772.0, 3),
+            performance_time_axis_text("--", 1010.0, 4),
             axis_text(label, 454.0, 11.0),
         ],
     )
@@ -141,11 +141,11 @@ pub fn setup_performance_controls(mut commands: Commands) {
             ),
             performance_method_row(
                 4,
-                "GPU Order-2 Octree Treecode: -- FPS",
+                "GPU Order-2 Target-Cell FMM: -- FPS",
                 Color::srgb(0.25, 0.9, 0.55),
             ),
             (
-                Text::new("Jacobi curves: radial | Werner | Eq.106 | FFT grid | treecode"),
+                Text::new("Jacobi curves: radial | Werner | Eq.106 | packed FFT | FMM"),
                 TextFont {
                     font_size: bevy::text::FontSize::Px(11.0),
                     ..default()
@@ -313,7 +313,7 @@ pub fn setup_performance_controls(mut commands: Commands) {
                         },
                     ),
                     (
-                        Text::new("Treecode"),
+                        Text::new("Target-cell FMM"),
                         TextFont {
                             font_size: bevy::text::FontSize::Px(11.0),
                             ..default()

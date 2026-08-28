@@ -230,7 +230,7 @@ pub fn update_gpu_memory_estimate_system(
             + 2 * timestamp_bytes;
     }
     if let Some(source) = mmfft {
-        bytes[3] = source.bytes.len() as u64 + 48 + 32;
+        bytes[3] = source.bytes.len() as u64 + 64 + 32;
     }
     if let Some(source) = fmm {
         bytes[4] = source.bytes.len() as u64

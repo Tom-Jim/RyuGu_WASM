@@ -1,17 +1,7 @@
+#[derive(Default)]
 pub(crate) struct PlanningMmfftWorkspace {
     batch_id: u64,
     levels: Vec<MmfftLevelWorkspace>,
-    stencils: Vec<Vec<Vec<(usize, f64)>>>,
-}
-
-impl Default for PlanningMmfftWorkspace {
-    fn default() -> Self {
-        Self {
-            batch_id: 0,
-            levels: Vec::new(),
-            stencils: Vec::new(),
-        }
-    }
 }
 
 pub(crate) fn build_planning_mmfft_payload(
@@ -24,21 +14,7 @@ pub(crate) fn build_planning_mmfft_payload(
     let mut one_time_preparation_ms = 0.0;
     let row_start = model as usize * 56;
     let densities = batch.density_models.get(row_start..row_start + 56)?;
-    let records = batch
-        .basis_records
-        .iter()
-        .filter_map(|record| {
-            let density = f64::from(*densities.get(record.voxel_index as usize)?);
-            let position = DVec3::new(
-                f64::from(record.position_volume[0]),
-                f64::from(record.position_volume[1]),
-                f64::from(record.position_volume[2]),
-            );
-            let mass = f64::from(record.position_volume[3]) * density;
-            (position.is_finite() && mass.is_finite() && mass > 0.0).then_some((position, mass))
-        })
-        .collect::<Vec<_>>();
-    if records.is_empty() {
+    if batch.basis_records.is_empty() {
         return None;
     }
     if cache.batch_id != batch.batch_id || cache.levels.len() != LEVEL_GRID_SIZES.len() {
@@ -50,40 +26,34 @@ pub(crate) fn build_planning_mmfft_payload(
             .map(|(n, half)| MmfftLevelWorkspace::new(n, half))
             .collect();
         one_time_preparation_ms = one_time_started.elapsed().as_secs_f64() * 1.0e3;
-        let positions = records.iter().map(|record| record.0).collect::<Vec<_>>();
-        cache.stencils = cache
-            .levels
-            .iter()
-            .map(|workspace| {
-                deposition_stencils(
-                    &positions,
-                    workspace.half_extent,
-                    workspace.spacing,
-                    workspace.n,
-                    workspace.p,
-                )
-            })
-            .collect();
     }
-    let masses = records.iter().map(|record| record.1).collect::<Vec<_>>();
-    let mut bytes =
-        Vec::with_capacity(LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() * 16);
-    for (workspace, stencils) in cache.levels.iter_mut().zip(&cache.stencils) {
-        for sample in workspace.build_from_stencils(stencils, &masses) {
-            for value in *sample {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-        }
+    // Compute deposition stencils directly into the fixed FFT workspaces.
+    // Caching eight heap records per quadrature point exceeded a gigabyte at
+    // the 8192K endpoint and provided no arithmetic reduction across grids.
+    let total_mass = batch.basis_records.iter().try_fold(0.0_f64, |sum, record| {
+        let density = f64::from(*densities.get(record.voxel_index as usize)?);
+        let mass = f64::from(record.position_volume[3]) * density;
+        (mass.is_finite() && mass > 0.0).then_some(sum + mass)
+    })?;
+    let sample_count = LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>();
+    let mut bytes = Vec::with_capacity(sample_count.div_ceil(2) * 4);
+    let mut grid_scales = [1.0_f32; 2];
+    for (level, workspace) in cache.levels.iter_mut().enumerate() {
+        grid_scales[level] = append_compressed_potential_level(
+            &mut bytes,
+            workspace.build_from_basis(&batch.basis_records, densities)?,
+        );
     }
     Some(PlanningMethodPayload {
         request_id,
         method: Some(ActiveGravityMethod::MmfftCompressed),
         density_model: model,
         primary: Arc::from(bytes),
-        item_count: LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() as u32,
+        item_count: sample_count as u32,
         grid_sizes: LEVEL_GRID_SIZES.map(|value| value as u32),
         half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
-        total_mass: records.iter().map(|record| record.1).sum::<f64>() as f32,
+        grid_scales,
+        total_mass: total_mass as f32,
         one_time_preparation_ms,
         preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3 - one_time_preparation_ms)
             .max(0.0),

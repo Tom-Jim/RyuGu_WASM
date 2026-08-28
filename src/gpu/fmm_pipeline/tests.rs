@@ -76,4 +76,26 @@ mod tests {
         assert!(acceleration_error < 1.0e-6, "{acceleration_error:.3e}");
         assert!(potential_error < 1.0e-7, "{potential_error:.3e}");
     }
+
+    #[test]
+    fn local_m2l_expansion_reuses_analytic_field_and_jacobian() {
+        let sources = [
+            (DVec3::new(-12.0, 3.0, 1.0), 2.0),
+            (DVec3::new(8.0, -4.0, 5.0), 3.0),
+            (DVec3::new(2.0, 7.0, -6.0), 4.0),
+        ];
+        let mut moment = MomentAccumulator::default();
+        for &(position, mass) in &sources {
+            moment.add(position, mass);
+        }
+        let center = DVec3::new(1_500.0, -900.0, 700.0);
+        let delta = DVec3::new(0.05, -0.03, 0.02);
+        let mut local = LocalExpansion::default();
+        accumulate_multipole(moment, center, &mut local).unwrap();
+        let translated = local.acceleration + local.jacobian * delta;
+        let (direct, _) = direct_field(center + delta, &sources);
+        let relative = (translated - direct).length() / direct.length();
+        assert!(relative < 2.0e-6, "local translation error {relative:.3e}");
+        assert!((local.jacobian - local.jacobian.transpose()).abs_diff_eq(bevy::math::DMat3::ZERO, 1.0e-12));
+    }
 }

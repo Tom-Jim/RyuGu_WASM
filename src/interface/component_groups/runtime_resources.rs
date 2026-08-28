@@ -126,6 +126,8 @@ pub struct MmfftCompressedSource {
     pub level_count: u32,
     /// Half-widths of the nested physical grids (metres).
     pub half_extents: [f32; 2],
+    /// Per-level scale used by the packed binary16 potential samples.
+    pub grid_scales: [f32; 2],
     pub total_mass: f32,
 }
 
@@ -198,10 +200,10 @@ pub enum ActiveGravityMethod {
     /// Eq. (106) adaptive curved-arc mode; it starts non-periodic and promotes
     /// itself to periodic only after the planner sees stable orbit closures.
     CurvedArcEq106,
-    /// Fourth method: CPU-preprocessed FFT grids with compressed GPU
-    /// interpolation records and a snapshot-tagged readback channel.
+    /// Fourth method: CPU-preprocessed FFT grids with scale-normalized packed
+    /// binary16 GPU potential samples and a snapshot-tagged readback channel.
     MmfftCompressed,
-    /// Fifth method: fixed-depth order-two GPU octree treecode evaluation.
+    /// Fifth method: order-two source/target-cell FMM with exact P2P near field.
     Fmm,
 }
 
@@ -357,16 +359,16 @@ impl ActiveGravityMethod {
             Self::RadialAnalytic => "GPU Radial Analytic",
             Self::HomogeneousWerner => "GPU Werner Polyhedron",
             Self::CurvedArcEq106 => "Eq.106 Adaptive Curved-Arc",
-            Self::MmfftCompressed => "CPU FFT Grid + GPU Interpolation",
-            Self::Fmm => "GPU Order-2 Octree Treecode",
+            Self::MmfftCompressed => "Packed MMFFT + GPU Interpolation",
+            Self::Fmm => "GPU Order-2 Target-Cell FMM",
         }
     }
 
     pub fn planning_label(self) -> &'static str {
         match self {
             Self::CurvedArcEq106 => "Eq.106 full forward",
-            Self::MmfftCompressed => "CPU FFT grid + GPU interpolation",
-            Self::Fmm => "GPU order-2 octree treecode",
+            Self::MmfftCompressed => "packed MMFFT + GPU interpolation",
+            Self::Fmm => "GPU order-2 target-cell FMM",
             _ => self.as_str(),
         }
     }

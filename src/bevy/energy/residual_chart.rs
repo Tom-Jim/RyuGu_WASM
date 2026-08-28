@@ -161,6 +161,7 @@ pub fn update_eq106_residual_chart_system(
     active_method: Res<ActiveGravityMethod>,
     history: Res<CurvedArcResidualHistory>,
     planner: Res<CurvedArcPlannerState>,
+    propagation: Res<VolterraPropagationStatus>,
     mut roots: Query<&mut Visibility, With<Eq106ResidualChartRoot>>,
     mut segments: Query<
         (&Eq106ResidualChartSegment, &mut Node, &mut UiTransform),
@@ -310,14 +311,29 @@ pub fn update_eq106_residual_chart_system(
                     .active_segment
                     .as_ref()
                     .map_or(f64::INFINITY, |segment| segment.remainder_bound);
-                format!(
-                    "{} A{} e={:.2} R={:.1e} seg={}",
-                    planner.mode.short_str(),
-                    order,
-                    epsilon,
-                    remainder,
-                    planner.segments.len(),
-                )
+                if let Some(solve) = propagation.latest {
+                    format!(
+                        "{} A{} e={:.2} R={:.1e} V{}/{} r={:.1e} y={:.1e} seg={}",
+                        planner.mode.short_str(),
+                        order,
+                        epsilon,
+                        remainder,
+                        solve.picard_iterations,
+                        solve.endpoint_iterations,
+                        solve.relative_residual,
+                        solve.maximum_transverse_distance,
+                        planner.segments.len(),
+                    )
+                } else {
+                    format!(
+                        "{} A{} e={:.2} R={:.1e} seg={}",
+                        planner.mode.short_str(),
+                        order,
+                        epsilon,
+                        remainder,
+                        planner.segments.len(),
+                    )
+                }
             }
             Eq106ResidualChartLabel::Minimum => format!("{minimum:.3e}"),
             Eq106ResidualChartLabel::Maximum => format!("{maximum:.3e}"),

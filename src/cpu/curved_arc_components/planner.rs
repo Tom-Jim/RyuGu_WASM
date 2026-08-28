@@ -252,7 +252,7 @@ pub fn build_aggregated_gravity_source_system(
     let mut bin_moments = [DVec3::ZERO; AGGREGATED_SOURCE_COUNT];
     let mut total_mass = 0.0;
     let mut radius = 0.0_f64;
-    for (record_index, chunk) in radial.bytes.chunks_exact(32).enumerate() {
+    for (record_index, chunk) in radial.bytes.as_chunks::<32>().0.iter().enumerate() {
         let direction = DVec3::new(
             read_f32_le(chunk, 0) as f64,
             read_f32_le(chunk, 4) as f64,

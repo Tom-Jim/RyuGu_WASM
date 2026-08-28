@@ -10,9 +10,10 @@
 // transverse Taylor jet. Runtime guards shorten and rebuild a segment when its
 // spectral or truncation certificate is rejected.
 
-use crate::interface::components::*;
 use crate::cpu::curved_arc::{AggregatedGravitySource, CurvedArcPlannerState};
 use crate::cpu::eq106_operator::Eq106OperatorTensorResource;
+use crate::interface::components::*;
+use bevy::log::{debug, error, info, trace};
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::render::{
@@ -20,15 +21,13 @@ use bevy::render::{
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
         BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor,
-        BufferInitDescriptor, BufferUsages,
-        CachedComputePipelineId, CachedPipelineState,
+        BufferInitDescriptor, BufferUsages, CachedComputePipelineId, CachedPipelineState,
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, MapMode,
         PipelineCache, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
 };
 use bevy::shader::ShaderCacheError;
-use bevy::log::{debug, error, info, trace};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -49,9 +48,7 @@ const TARGET_DISPATCH_WIDTH: u32 = 65_535;
 const EQ106_GPU_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const fn eq106_sensitivity_configuration_hash() -> u64 {
-    (FREQUENCY_COUNT as u64) << 32
-        ^ (TAYLOR_MAX_ORDER as u64) << 16
-        ^ QUADRATURE_COUNT as u64
+    (FREQUENCY_COUNT as u64) << 32 ^ (TAYLOR_MAX_ORDER as u64) << 16 ^ QUADRATURE_COUNT as u64
 }
 
 fn taylor_coefficient_count(order: u32) -> u32 {
@@ -61,7 +58,7 @@ fn taylor_coefficient_count(order: u32) -> u32 {
 
 fn target_dispatch_grid(target_count: u32) -> (u32, u32) {
     (
-        target_count.min(TARGET_DISPATCH_WIDTH).max(1),
+        target_count.clamp(1, TARGET_DISPATCH_WIDTH),
         target_count.div_ceil(TARGET_DISPATCH_WIDTH).max(1),
     )
 }
@@ -95,8 +92,10 @@ fn decode_gpu_timings(
     spectral_element_count: u32,
 ) -> Eq106TimingSample {
     let timestamps = bytes
-        .chunks_exact(TIMESTAMP_BYTES as usize)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<{ TIMESTAMP_BYTES as usize }>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     let elapsed_ms = |pairs: &[(u32, u32)]| {
         (!pairs.is_empty())
@@ -147,10 +146,9 @@ fn select_batch_taylor_order(epsilon: f32) -> Option<u32> {
         // Differentiating the Taylor tail amplifies both its leading power and
         // the geometric-series denominator. A field-only certificate allowed
         // gradients that were visibly outside the planning tolerance.
-        let gradient_bound = (*order as f32 + 1.0) * epsilon.powi(*order as i32)
-            / (1.0 - epsilon).powi(2);
-        field_bound <= TAYLOR_REMAINDER_TARGET
-            && gradient_bound <= TAYLOR_GRADIENT_REMAINDER_TARGET
+        let gradient_bound =
+            (*order as f32 + 1.0) * epsilon.powi(*order as i32) / (1.0 - epsilon).powi(2);
+        field_bound <= TAYLOR_REMAINDER_TARGET && gradient_bound <= TAYLOR_GRADIENT_REMAINDER_TARGET
     })
 }
 
@@ -197,9 +195,7 @@ fn build_tube_batch_elements(
     certified_line_limit: f32,
     tube_radius: f32,
 ) -> Vec<Eq106BatchElement> {
-    if positions.is_empty()
-        || positions.len() != velocities.len()
-        || positions.len() != times.len()
+    if positions.is_empty() || positions.len() != velocities.len() || positions.len() != times.len()
     {
         return Vec::new();
     }
@@ -231,10 +227,7 @@ fn build_tube_batch_elements(
         let mut end = start;
         while end < positions.len() {
             let elapsed = times[end] - times[start];
-            if !elapsed.is_finite()
-                || elapsed < 0.0
-                || elapsed > NEAR_SYNC_SEGMENT_MAX_SECONDS
-            {
+            if !elapsed.is_finite() || elapsed < 0.0 || elapsed > NEAR_SYNC_SEGMENT_MAX_SECONDS {
                 break;
             }
             let position = positions[end];
@@ -351,7 +344,6 @@ struct Eq106ComputePipeline {
     evaluate_id: CachedComputePipelineId,
     planning_voxel_line_samples_id: CachedComputePipelineId,
     planning_voxel_spectrum_id: CachedComputePipelineId,
-    planning_voxel_analytic_id: CachedComputePipelineId,
     planning_combine_spectrum_id: CachedComputePipelineId,
     planning_evaluate_id: CachedComputePipelineId,
 }
@@ -458,9 +450,15 @@ impl FromWorld for Eq106ComputePipeline {
         let planning_layout = BindGroupLayoutDescriptor::new(
             "eq106_planning_voxel_bgl",
             &[
-                storage_ro_entry(0), storage_ro_entry(1), storage_ro_entry(2),
-                storage_rw_entry(3), storage_rw_entry(4), uniform_entry(5),
-                storage_rw_entry(6), uniform_entry(7), storage_ro_entry(8),
+                storage_ro_entry(0),
+                storage_ro_entry(1),
+                storage_ro_entry(2),
+                storage_rw_entry(3),
+                storage_rw_entry(4),
+                uniform_entry(5),
+                storage_rw_entry(6),
+                uniform_entry(7),
+                storage_ro_entry(8),
                 storage_ro_entry(9),
             ],
         );
@@ -474,26 +472,15 @@ impl FromWorld for Eq106ComputePipeline {
                 entry_point: Some("assemble_voxel_line_samples".into()),
                 zero_initialize_workgroup_memory: false,
             });
-        let planning_voxel_spectrum_id =
-            cache.queue_compute_pipeline(ComputePipelineDescriptor {
-                label: Some("eq106_planning_voxel_spectrum".into()),
-                layout: vec![planning_layout.clone()],
-                immediate_size: 0,
-                shader: shader.clone(),
-                shader_defs: vec![],
-                entry_point: Some("assemble_voxel_spectrum".into()),
-                zero_initialize_workgroup_memory: false,
-            });
-        let planning_voxel_analytic_id =
-            cache.queue_compute_pipeline(ComputePipelineDescriptor {
-                label: Some("eq106_planning_voxel_analytic_spectrum".into()),
-                layout: vec![planning_layout.clone()],
-                immediate_size: 0,
-                shader: shader.clone(),
-                shader_defs: vec![],
-                entry_point: Some("assemble_voxel_analytic_spectrum".into()),
-                zero_initialize_workgroup_memory: false,
-            });
+        let planning_voxel_spectrum_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("eq106_planning_voxel_spectrum".into()),
+            layout: vec![planning_layout.clone()],
+            immediate_size: 0,
+            shader: shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("assemble_voxel_spectrum".into()),
+            zero_initialize_workgroup_memory: false,
+        });
         let planning_combine_spectrum_id =
             cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some("eq106_planning_combine_spectrum".into()),
@@ -520,7 +507,6 @@ impl FromWorld for Eq106ComputePipeline {
             evaluate_id,
             planning_voxel_line_samples_id,
             planning_voxel_spectrum_id,
-            planning_voxel_analytic_id,
             planning_combine_spectrum_id,
             planning_evaluate_id,
         }
@@ -615,8 +601,7 @@ fn poll_eq106_readback(
                     .iter()
                     .zip(&packet.snapshots)
                     .map(|(field, snapshot)| {
-                        snapshot.ryugu_transform.rotation
-                            * Vec3::new(field[0], field[1], field[2])
+                        snapshot.ryugu_transform.rotation * Vec3::new(field[0], field[1], field[2])
                     })
                     .collect::<Vec<_>>()
             })
@@ -684,8 +669,14 @@ fn poll_eq106_readback(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Eq106DecodeError {
-    Incomplete { actual: usize, expected: usize },
-    Rejected { sample: usize, reason: Eq106RejectReason },
+    Incomplete {
+        actual: usize,
+        expected: usize,
+    },
+    Rejected {
+        sample: usize,
+        reason: Eq106RejectReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -826,18 +817,20 @@ fn decode_eq106_sample(
         || !local_coordinates.iter().all(|value| value.is_finite())
         || !jacobian.is_finite()
     {
-        return Err(if !acceleration.is_finite()
-            || !positive_potential.is_finite()
-            || independent_potential.is_some_and(|potential| !potential.is_finite())
-            || !anchor_position.is_finite()
-            || !line_origin.is_finite()
-            || !local_coordinates.iter().all(|value| value.is_finite())
-            || !jacobian.is_finite()
-        {
-            Eq106RejectReason::NonFinite
-        } else {
-            Eq106RejectReason::NonPhysical
-        });
+        return Err(
+            if !acceleration.is_finite()
+                || !positive_potential.is_finite()
+                || independent_potential.is_some_and(|potential| !potential.is_finite())
+                || !anchor_position.is_finite()
+                || !line_origin.is_finite()
+                || !local_coordinates.iter().all(|value| value.is_finite())
+                || !jacobian.is_finite()
+            {
+                Eq106RejectReason::NonFinite
+            } else {
+                Eq106RejectReason::NonPhysical
+            },
+        );
     }
 
     let mut snapshot = base_snapshot.clone();

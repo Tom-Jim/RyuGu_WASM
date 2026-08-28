@@ -4,9 +4,15 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 fn validate_wgsl(source: &str) {
     let module = naga::front::wgsl::parse_str(source).expect("WGSL parsing failed");
-    Validator::new(ValidationFlags::all(), Capabilities::all())
-        .validate(&module)
-        .expect("WGSL validation failed");
+    // Browser WebGPU exposes the baseline capability set plus the standard
+    // pack/unpack-f16 builtins used by the compressed FFT. `all()` masked
+    // accidental use of unrelated native-only shader features.
+    Validator::new(
+        ValidationFlags::all(),
+        Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+    )
+    .validate(&module)
+    .expect("WGSL validation failed");
 }
 
 #[test]
@@ -39,7 +45,9 @@ fn fmm_shader_is_valid() {
 
 #[test]
 fn planning_fmm_shader_is_valid() {
-    validate_wgsl(include_str!("../../assets/shaders/planning_fmm.wgsl"));
+    let source = include_str!("../../assets/shaders/planning_fmm.wgsl");
+    validate_wgsl(source);
+    assert!(!source.contains("if local_index >= params.local_count"));
 }
 
 #[test]

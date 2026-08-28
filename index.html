@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
     <title>Ryugu WASM - WebGPU</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -105,7 +106,7 @@
                 const version = new URL(window.location.href).searchParams.get('v');
                 const suffix = version ? `?v=${encodeURIComponent(version)}` : '';
                 import(`./pkg/ryugu_wasm.js${suffix}`).then(({ default: init }) =>
-                    init(`./pkg/ryugu_wasm_bg.wasm${suffix}`)
+                    init({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` })
                 );
             }
         }

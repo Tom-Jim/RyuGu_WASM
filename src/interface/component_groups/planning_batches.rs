@@ -53,7 +53,6 @@ impl PlanningCandidateState {
 pub struct PlanningBasisRecord {
     pub position_volume: [f32; 4],
     pub voxel_index: u32,
-    pub _padding: [u32; 3],
 }
 
 #[derive(Resource, Clone, Debug, Default)]
@@ -71,9 +70,10 @@ pub struct PlanningCandidateBatch {
     /// Eq.106 convergence bounds must use this value, not the radius of the
     /// pre-refinement 1024-source aggregate.
     pub eq106_source_radius: f32,
-    /// Frozen centre arc in body-fixed coordinates. Eq.106 builds one
-    /// canonical spectrum from this arc and shares it across every candidate
-    /// trajectory in the certified tube.
+    /// Fixed captured centre arc in body-fixed coordinates. Candidate states
+    /// are dynamically propagated from perturbed initial conditions under the
+    /// nominal density's linearized reference field. Eq.106 builds one
+    /// canonical spectrum from this arc and shares it across the certified tube.
     pub reference_states: Arc<[PlanningCandidateState]>,
     pub states: Arc<[PlanningCandidateState]>,
     pub gpu_position_bytes: Arc<[u8]>,
@@ -141,8 +141,8 @@ pub struct PlanningGpuRequest {
     pub candidate_start: u32,
     pub candidate_count: u32,
     pub warm_repetition: bool,
-    /// Eq.106 only: enable independent certificate and five-step self-FD.
-    /// The raw path still computes the complete field and 3x3 Jacobian.
+    /// Eq.106-only internal Taylor/spectral certificate and five-step self-FD.
+    /// Every method also receives a separate full external f64-certified pass.
     pub eq106_certified: bool,
     /// First and Interactive Stress both use the fairness-oriented fixed
     /// schedule; the latter remains interactive through progress rendering.
@@ -223,6 +223,7 @@ pub struct PlanningMethodPayload {
     pub maximum_level: u32,
     pub grid_sizes: [u32; 2],
     pub half_extents: [f32; 2],
+    pub grid_scales: [f32; 2],
     pub total_mass: f32,
     /// Program-lifetime setup excluded symmetrically from repeated-workload
     /// totals (for example FFT plans/static Newton kernel or Eq operator table).

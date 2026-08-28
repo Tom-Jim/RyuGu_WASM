@@ -1,6 +1,7 @@
 use crate::interface::components::*;
 use crate::interface::select_history;
 use crate::cpu::curved_arc::{CurvedArcPlannerState, CurvedArcResidualHistory};
+use crate::cpu::volterra::VolterraPropagationStatus;
 use bevy::math::Rot2;
 use bevy::prelude::*;
 

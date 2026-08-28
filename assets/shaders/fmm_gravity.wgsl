@@ -82,26 +82,41 @@ fn direct_multipole(node: FmmNode, observer: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(acceleration, potential);
 }
 
+fn multipole_jacobian(node: FmmNode, observer: vec3<f32>) -> mat3x3<f32> {
+    let d = node.com_mass.xyz - observer;
+    let r2 = max(dot(d, d), 1.0e-8);
+    let inv_r = inverseSqrt(r2);
+    let inv_r3 = inv_r / r2;
+    let inv_r5 = inv_r3 / r2;
+    let inv_r7 = inv_r5 / r2;
+    let inv_r9 = inv_r7 / r2;
+    let qx = vec3<f32>(node.quadrupole0.x, node.quadrupole0.y, node.quadrupole0.z);
+    let qy = vec3<f32>(node.quadrupole0.y, node.quadrupole1.x, node.quadrupole1.y);
+    let qz = vec3<f32>(node.quadrupole0.z, node.quadrupole1.y, node.quadrupole1.z);
+    let qd = qx * d.x + qy * d.y + qz * d.z;
+    let scalar = dot(d, qd);
+    let diagonal = -node.com_mass.w * inv_r3 - 2.5 * scalar * inv_r7;
+    let outer_scale = 3.0 * node.com_mass.w * inv_r5 + 17.5 * scalar * inv_r9;
+    let mixed_scale = -5.0 * inv_r7;
+    return mat3x3<f32>(
+        vec3<f32>(diagonal, 0.0, 0.0) + outer_scale * d * d.x
+            + inv_r5 * qx + mixed_scale * (qd * d.x + d * qd.x),
+        vec3<f32>(0.0, diagonal, 0.0) + outer_scale * d * d.y
+            + inv_r5 * qy + mixed_scale * (qd * d.y + d * qd.y),
+        vec3<f32>(0.0, 0.0, diagonal) + outer_scale * d * d.z
+            + inv_r5 * qz + mixed_scale * (qd * d.z + d * qd.z),
+    );
+}
+
 fn m2l_then_l2l(node: FmmNode) -> vec4<f32> {
     let center = target_box(node.metadata.y).xyz;
-    // M2L: translate both monopole and quadrupole source moments into local
+    // M2L: translate both monopole and quadrupole source moments into analytic
     // potential, gradient, and Hessian coefficients at the target-box center.
-    // Centered differentiation is applied to the analytic source multipole,
-    // never to particles or to the final target value.
     let local = direct_multipole(node, center);
-    let derivative_step = max(0.01, 0.015625 * node.center_half.w);
-    let ex = vec3<f32>(derivative_step, 0.0, 0.0);
-    let ey = vec3<f32>(0.0, derivative_step, 0.0);
-    let ez = vec3<f32>(0.0, 0.0, derivative_step);
-    let h0 = (direct_multipole(node, center + ex).xyz - direct_multipole(node, center - ex).xyz)
-        / (2.0 * derivative_step);
-    let h1 = (direct_multipole(node, center + ey).xyz - direct_multipole(node, center - ey).xyz)
-        / (2.0 * derivative_step);
-    let h2 = (direct_multipole(node, center + ez).xyz - direct_multipole(node, center - ez).xyz)
-        / (2.0 * derivative_step);
+    let hessian = multipole_jacobian(node, center);
     let delta = params.probe_pos - center;
     // L2L: shift the local coefficients from the target box to the probe.
-    let hessian_delta = h0 * delta.x + h1 * delta.y + h2 * delta.z;
+    let hessian_delta = hessian * delta;
     let translated_gradient = local.xyz + hessian_delta;
     let translated_potential = local.w + dot(local.xyz, delta)
         + 0.5 * dot(delta, hessian_delta);

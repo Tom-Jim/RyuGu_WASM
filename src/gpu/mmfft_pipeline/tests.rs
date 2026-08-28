@@ -1,5 +1,4 @@
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -24,6 +23,30 @@ mod tests {
     fn zero_padding_prevents_circular_aliasing() {
         for grid_size in LEVEL_GRID_SIZES {
             assert!((2 * grid_size).is_power_of_two());
+        }
+    }
+
+    #[test]
+    fn potential_grid_is_packed_to_two_bytes_per_sample_with_bounded_error() {
+        let field = (0..257)
+            .map(|index| [0.0, 0.0, 0.0, (index as f32 - 128.0) * 0.001_25])
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        let scale = append_compressed_potential_level(&mut bytes, &field);
+        assert_eq!(bytes.len(), field.len().div_ceil(2) * 4);
+        for (index, sample) in field.iter().enumerate() {
+            let pair = u32::from_le_bytes(
+                bytes[index / 2 * 4..index / 2 * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let bits = if index.is_multiple_of(2) {
+                pair as u16
+            } else {
+                (pair >> 16) as u16
+            };
+            let decoded = half::f16::from_bits(bits).to_f32() * scale;
+            assert!((decoded - sample[3]).abs() <= scale * 5.0e-4);
         }
     }
 

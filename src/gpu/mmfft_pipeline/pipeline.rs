@@ -36,6 +36,7 @@ struct ExtractedMmfftInput {
     grid_sizes: [u32; 2],
     level_count: u32,
     half_extents: [f32; 2],
+    grid_scales: [f32; 2],
     total_mass: f32,
 }
 
@@ -192,7 +193,7 @@ pub(crate) fn voxel_basis_sensitivities(
         })
         .collect::<Vec<_>>();
     let used_levels = std::array::from_fn::<_, 2, _>(|level| {
-        sample_levels.iter().any(|sample| *sample == Some(level))
+        sample_levels.contains(&Some(level))
     });
     let mut workspaces = LEVEL_GRID_SIZES
         .into_iter()
@@ -270,14 +271,12 @@ pub fn build_mmfft_compressed_source_system(
         .zip(LEVEL_HALF_EXTENTS)
         .map(|(n, half)| MmfftLevelWorkspace::new(n, half))
         .collect::<Vec<_>>();
-    let mut bytes =
-        Vec::with_capacity(LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>() * 16);
-    for workspace in &mut workspaces {
-        for sample in workspace.build(&records) {
-            for value in *sample {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-        }
+    let sample_count = LEVEL_GRID_SIZES.iter().map(|n| n.pow(3)).sum::<usize>();
+    let mut bytes = Vec::with_capacity(sample_count.div_ceil(2) * 4);
+    let mut grid_scales = [1.0_f32; 2];
+    for (level, workspace) in workspaces.iter_mut().enumerate() {
+        grid_scales[level] =
+            append_compressed_potential_level(&mut bytes, workspace.build(&records));
     }
     info!(
         "[mmfft] {} common sources -> nested {:?} grids (zero-padded 3D FFT/IFFT, {} bytes)",
@@ -290,6 +289,7 @@ pub fn build_mmfft_compressed_source_system(
         grid_sizes: LEVEL_GRID_SIZES.map(|value| value as u32),
         level_count: LEVEL_HALF_EXTENTS.len() as u32,
         half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
+        grid_scales,
         total_mass: aggregated.total_mass as f32,
     });
 }
@@ -362,6 +362,7 @@ fn extract_mmfft_input_system(
     extracted.grid_sizes = source.grid_sizes;
     extracted.level_count = source.level_count;
     extracted.half_extents = source.half_extents;
+    extracted.grid_scales = source.grid_scales;
     extracted.total_mass = source.total_mass;
     if extracted.source_bytes.is_none() {
         extracted.source_bytes = Some(source.bytes.clone());
@@ -393,7 +394,7 @@ fn dispatch_mmfft_system(
         let output_size = 16;
         let uniform = render_device.create_buffer(&BufferDescriptor {
             label: Some("mmfft_compressed_uniform"),
-            size: 48,
+            size: 64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -467,6 +468,7 @@ fn dispatch_mmfft_system(
         extracted.grid_sizes,
         extracted.level_count,
         extracted.half_extents,
+        extracted.grid_scales,
         extracted.total_mass,
     );
     render_queue.write_buffer(&inner.uniform, 0, &uniform);
@@ -514,9 +516,10 @@ fn mmfft_uniform_bytes(
     grid_sizes: [u32; 2],
     level_count: u32,
     half_extents: [f32; 2],
+    grid_scales: [f32; 2],
     total_mass: f32,
-) -> [u8; 48] {
-    let mut bytes = [0_u8; 48];
+) -> [u8; 64] {
+    let mut bytes = [0_u8; 64];
     for (offset, value) in [(0, probe.x), (4, probe.y), (8, probe.z), (12, G)] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -531,6 +534,8 @@ fn mmfft_uniform_bytes(
         (32, half_extents[0]),
         (36, half_extents[1]),
         (40, total_mass),
+        (48, grid_scales[0]),
+        (52, grid_scales[1]),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }

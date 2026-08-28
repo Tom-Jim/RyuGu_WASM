@@ -25,8 +25,10 @@ pub const NORMAL_ARROW_LENGTH: f32 = 35.0;
 
 pub fn bytes_to_f32x4(bytes: &[u8]) -> Vec<[f32; 4]> {
     bytes
-        .chunks_exact(size_of::<[f32; 4]>())
-        .map(bytemuck::pod_read_unaligned)
+        .as_chunks::<{ size_of::<[f32; 4]>() }>()
+        .0
+        .iter()
+        .map(|chunk| bytemuck::pod_read_unaligned(&chunk[..]))
         .collect()
 }
 
@@ -514,8 +516,8 @@ pub struct GravityFieldSample {
     #[cfg(feature = "eq106-dual-certificate")]
     pub independent_positive_potential: Option<f32>,
     /// Optional body-frame Jacobian d(acceleration)/d(position). Eq.106
-    /// supplies a symmetric potential Hessian so fixed-update substeps can
-    /// evaluate the same conservative local field between GPU readbacks.
+    /// supplies a symmetric potential Hessian so the Volterra/Picard waveform
+    /// can close its position-field loop between GPU readbacks.
     pub body_acceleration_jacobian: Option<Mat3>,
     /// Runtime evidence needed to correlate Jacobi spikes with Eq.106 segment
     /// rebuilds and the four independent truncation/spectral certificates.
@@ -575,10 +577,8 @@ impl GravitySampleHistory {
         })
     }
 
-    /// Returns the temporal anchors surrounding a fixed-update substep. Eq.106
-    /// batches include one extra endpoint anchor so the CPU can blend two
-    /// conservative local Hessian models instead of extrapolating the entire
-    /// interval from its start.
+    /// Returns the temporal anchors surrounding a fixed-update interval. Eq.106
+    /// uses them while evaluating each Volterra/Picard waveform iterate.
     pub fn bracketing(
         &self,
         epoch: u64,

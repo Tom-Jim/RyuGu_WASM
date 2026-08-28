@@ -10,10 +10,13 @@ struct MmfftParams {
     _padding0: u32,
     half_extents: vec2<f32>,
     total_mass: f32,
+    _padding1: f32,
+    grid_scales: vec2<f32>,
+    _padding2: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: MmfftParams;
-@group(0) @binding(1) var<storage, read> hierarchy: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> hierarchy: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output_acc: array<vec4<f32>>;
 
 var<workgroup> sample_sum: array<vec4<f32>, 64>;
@@ -30,6 +33,11 @@ fn linear_index(cell: vec3<u32>, level: u32) -> u32 {
     let n = params.grid_sizes[level];
     let offset = select(params.grid_sizes.x * params.grid_sizes.x * params.grid_sizes.x, 0u, level == 0u);
     return offset + (cell.z * n + cell.y) * n + cell.x;
+}
+
+fn potential_at(index: u32, level: u32) -> f32 {
+    let pair = unpack2x16float(hierarchy[index >> 1u]);
+    return select(pair.x, pair.y, (index & 1u) != 0u) * params.grid_scales[level];
 }
 
 fn cubic_weights(t: f32) -> vec4<f32> {
@@ -102,9 +110,10 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
     let dx = lane & 3u;
     let dy = (lane >> 2u) & 3u;
     let dz = lane >> 4u;
-    let corner_potential = hierarchy[
-        linear_index(sample_base + vec3<u32>(dx, dy, dz), selected_level)
-    ].w;
+    let corner_potential = potential_at(
+        linear_index(sample_base + vec3<u32>(dx, dy, dz), selected_level),
+        selected_level,
+    );
     let wx = sample_wx[dx];
     let wy = sample_wy[dy];
     let wz = sample_wz[dz];

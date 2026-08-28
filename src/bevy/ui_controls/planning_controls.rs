@@ -65,16 +65,18 @@ unsafe extern "C" {
 #[cfg(target_arch = "wasm32")]
 fn source_curve_csv(samples: &[PlanningSourceCurveSample]) -> String {
     let mut text = String::from(
-        "source_count,eq106_raw_ms,eq106_certified_ms,fft_ms,tree_ms,eq_build_ms,fft_build_ms,tree_build_ms,eq_query_ns,fft_query_ns,tree_query_ns,eq_raw_eligible,eq_cert_eligible,fft_eligible,tree_eligible\n",
+        "source_count,eq106_raw_ms,eq106_certified_ms,fft_raw_ms,fft_certified_ms,fmm_raw_ms,fmm_certified_ms,eq_build_ms,fft_build_ms,fmm_build_ms,eq_query_ns,fft_query_ns,fmm_query_ns,eq_raw_eligible,eq_cert_eligible,fft_raw_eligible,fft_cert_eligible,fmm_raw_eligible,fmm_cert_eligible\n",
     );
     for sample in samples {
         text.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             sample.source_count,
             sample.times_ms[0], sample.times_ms[1], sample.times_ms[2], sample.times_ms[3],
+            sample.times_ms[4], sample.times_ms[5],
             sample.build_ms[0], sample.build_ms[1], sample.build_ms[2],
             sample.query_ns_per_target[0], sample.query_ns_per_target[1], sample.query_ns_per_target[2],
             sample.eligible[0], sample.eligible[1], sample.eligible[2], sample.eligible[3],
+            sample.eligible[4], sample.eligible[5],
         ));
     }
     text
@@ -91,7 +93,7 @@ fn source_curve_json(samples: &[PlanningSourceCurveSample]) -> String {
         ))
         .collect::<Vec<_>>()
         .join(",");
-    format!("{{\"schema\":2,\"samples\":[{rows}]}}")
+    format!("{{\"schema\":3,\"samples\":[{rows}]}}")
 }
 
 pub(crate) fn persist_source_curve(samples: &[PlanningSourceCurveSample]) {
@@ -108,7 +110,7 @@ pub fn restore_source_curve_system(mut planning: ResMut<PlanningComparisonState>
         let mut samples = Vec::new();
         for line in restored.lines().skip(1) {
             let fields = line.split(',').collect::<Vec<_>>();
-            if fields.len() != 15 {
+            if fields.len() != 19 && fields.len() != 15 {
                 continue;
             }
             let number = |index: usize| fields[index].parse::<f64>().ok();
@@ -116,13 +118,24 @@ pub fn restore_source_curve_system(mut planning: ResMut<PlanningComparisonState>
             let Some(source_count) = fields[0].parse::<u32>().ok() else {
                 continue;
             };
-            let Some(sample) = (|| Some(PlanningSourceCurveSample {
-                source_count,
-                times_ms: [number(1)?, number(2)?, number(3)?, number(4)?],
-                build_ms: [number(5)?, number(6)?, number(7)?],
-                query_ns_per_target: [number(8)?, number(9)?, number(10)?],
-                eligible: [boolean(11)?, boolean(12)?, boolean(13)?, boolean(14)?],
-            }))() else {
+            let Some(sample) = (if fields.len() == 19 {
+                (|| Some(PlanningSourceCurveSample {
+                    source_count,
+                    times_ms: [number(1)?, number(2)?, number(3)?, number(4)?, number(5)?, number(6)?],
+                    build_ms: [number(7)?, number(8)?, number(9)?],
+                    query_ns_per_target: [number(10)?, number(11)?, number(12)?],
+                    eligible: [boolean(13)?, boolean(14)?, boolean(15)?, boolean(16)?, boolean(17)?, boolean(18)?],
+                }))()
+            } else {
+                // Schema 2 had no independent FFT/FMM certified series.
+                (|| Some(PlanningSourceCurveSample {
+                    source_count,
+                    times_ms: [number(1)?, number(2)?, number(3)?, number(3)?, number(4)?, number(4)?],
+                    build_ms: [number(5)?, number(6)?, number(7)?],
+                    query_ns_per_target: [number(8)?, number(9)?, number(10)?],
+                    eligible: [boolean(11)?, boolean(12)?, boolean(13)?, boolean(13)?, boolean(14)?, boolean(14)?],
+                }))()
+            }) else {
                 continue;
             };
             samples.push(sample);
@@ -197,7 +210,7 @@ pub fn setup_density_inversion_timing_panel(
     let labels = [
         (2, "Eq.106 full forward"),
         (3, "FFT grid + GPU"),
-        (4, "GPU treecode"),
+        (4, "GPU target-cell FMM"),
     ];
     commands
         .spawn((
@@ -247,7 +260,7 @@ pub fn setup_density_inversion_timing_panel(
                         ));
                     }
                     row.spawn((
-                        selection_button("Quadrature sources 1K->262K", false, 235.0),
+                        selection_button("Quadrature sources 32K->8192K", false, 255.0),
                         SourceScaleCurveButton,
                     ));
                 });
@@ -378,7 +391,7 @@ pub fn setup_density_inversion_timing_panel(
                         },
                         BorderColor::all(Color::srgb(0.2, 0.38, 0.45)),
                     )).with_children(|plot| {
-                        for method in 0..4 {
+                        for method in 0..6 {
                             let color = source_curve_method_color(method);
                             for index in 0..(PLANNING_SOURCE_COUNTS.len() - 1) {
                                 plot.spawn((
@@ -414,8 +427,10 @@ pub fn setup_density_inversion_timing_panel(
                         for (method, label) in [
                             (0, "Eq.106 raw"),
                             (1, "Eq.106 certified"),
-                            (2, "FFT-grid"),
-                            (3, "Treecode"),
+                            (2, "Packed FFT raw"),
+                            (3, "Packed FFT certified"),
+                            (4, "FMM raw"),
+                            (5, "FMM certified"),
                         ] {
                             row.spawn((
                                 Text::new(label),
@@ -443,7 +458,9 @@ fn source_curve_method_color(method: usize) -> Color {
         0 => Color::srgb(0.2, 0.95, 1.0),
         1 => Color::srgb(0.65, 0.45, 1.0),
         2 => Color::srgb(1.0, 0.65, 0.2),
-        _ => Color::srgb(0.35, 0.95, 0.5),
+        3 => Color::srgb(1.0, 0.85, 0.35),
+        4 => Color::srgb(0.25, 0.9, 0.45),
+        _ => Color::srgb(0.65, 1.0, 0.72),
     }
 }
 
@@ -494,7 +511,10 @@ pub fn planning_comparison_control_system(
         *request = PlanningGpuRequest::default();
         *payload = PlanningMethodPayload::default();
         gpu_result.0 = None;
-        planning.status = "Quadrature-source crossover queued: 1024 distinct positions, fixed 56 density unknowns, repeat 1/10, Eq.106 full forward first.".into();
+        planning.status = format!(
+            "Quadrature-source crossover queued: {} distinct positions, fixed 56 density unknowns, repeat 1/{}, Eq.106 full forward first.",
+            PLANNING_SOURCE_COUNTS[0], PLANNING_SOURCE_REPEATS
+        );
     }
     if close_interactions
         .iter()
@@ -889,9 +909,9 @@ pub fn source_scale_curve_ui_system(
     if !planning.source_curve_visible {
         return;
     }
-    let mut points = [[None; PLANNING_SOURCE_COUNTS.len()]; 4];
-    let mut eligible_counts = [[0_u32; PLANNING_SOURCE_COUNTS.len()]; 4];
-    for method in 0..4 {
+    let mut points = [[None; PLANNING_SOURCE_COUNTS.len()]; 6];
+    let mut eligible_counts = [[0_u32; PLANNING_SOURCE_COUNTS.len()]; 6];
+    for method in 0..6 {
         for (source_index, source_count) in PLANNING_SOURCE_COUNTS.iter().copied().enumerate() {
             let values = planning
                 .source_curve_samples
@@ -946,8 +966,10 @@ pub fn source_scale_curve_ui_system(
     let names = [
         "Eq.106 full forward raw",
         "Eq.106 full forward certified",
-        "FFT-grid",
-        "treecode",
+        "packed FFT raw",
+        "packed FFT certified",
+        "FMM raw",
+        "FMM certified",
     ];
     let mut lines = vec![
         format!(
@@ -955,7 +977,7 @@ pub fn source_scale_curve_ui_system(
             planning.status
         ),
     ];
-    for method in 0..4 {
+    for method in 0..6 {
         let values = PLANNING_SOURCE_COUNTS
             .iter()
             .enumerate()
@@ -998,7 +1020,7 @@ pub fn source_scale_curve_ui_system(
             .unwrap_or(f64::NAN)
         });
         lines.push(format!(
-            "{} quadrature-point medians: diagnostic build allocation Eq/FFT/tree {:.2}/{:.2}/{:.2} ms; measured hot {:.1}/{:.1}/{:.1} ns/target. No extrapolated Qcross: only directly measured totals are admissible.",
+            "{} quadrature-point medians: diagnostic build allocation Eq/packed-FFT/FMM {:.2}/{:.2}/{:.2} ms; measured hot {:.1}/{:.1}/{:.1} ns/target. No extrapolated Qcross: only directly measured totals are admissible.",
             last.source_count, build[0], build[1], build[2], query[0], query[1], query[2],
         ));
     }

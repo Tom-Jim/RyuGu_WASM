@@ -119,7 +119,7 @@ pub fn build_radial_gravity_source_system(
     let mut density_integral = 0.0_f64;
     let mut solid_angle_sum = 0.0_f64;
 
-    for tri in topology.triangles.chunks_exact(3) {
+    for tri in topology.triangles.as_chunks::<3>().0 {
         let p0 = topology.positions[tri[0] as usize] * scale;
         let p1 = topology.positions[tri[1] as usize] * scale;
         let p2 = topology.positions[tri[2] as usize] * scale;

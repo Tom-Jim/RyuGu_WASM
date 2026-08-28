@@ -8,3 +8,4 @@ pub mod eq106_reference;
 pub(crate) mod inversion;
 pub(crate) mod physics;
 pub(crate) mod planning;
+pub(crate) mod volterra;

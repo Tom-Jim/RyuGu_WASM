@@ -52,7 +52,9 @@ pub(crate) fn build_density_voxels(
 ) -> Option<(Vec<InvertedDensityVoxel>, f32)> {
     let radius = source
         .bytes
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .map(|record| read_f32(record, 20))
         .filter(|radius| radius.is_finite())
         .fold(0.0_f32, f32::max);
@@ -61,7 +63,7 @@ pub(crate) fn build_density_voxels(
     }
     let voxel_size = 2.0 * radius / VOXEL_SIDE as f32;
     let mut bins = vec![VoxelAccumulator::default(); VOXEL_SIDE.pow(3)];
-    for record in source.bytes.chunks_exact(32) {
+    for record in source.bytes.as_chunks::<32>().0 {
         let direction = DVec3::new(
             read_f32(record, 0) as f64,
             read_f32(record, 4) as f64,

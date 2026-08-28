@@ -139,17 +139,35 @@ impl MmfftLevelWorkspace {
         &self.field
     }
 
-    fn build_from_stencils(
+    fn build_from_basis(
         &mut self,
-        stencils: &[Vec<(usize, f64)>],
-        masses: &[f64],
-    ) -> &[[f32; 4]] {
-        debug_assert_eq!(stencils.len(), masses.len());
+        records: &[PlanningBasisRecord],
+        densities: &[f32],
+    ) -> Option<&[[f32; 4]]> {
+        if densities.len() != 56 {
+            return None;
+        }
         self.density.fill(Complex64::default());
-        for (stencil, mass) in stencils.iter().zip(masses.iter().copied()) {
-            for &(index, weight) in stencil {
-                self.density[index].re += mass * weight;
+        for record in records {
+            let density = f64::from(*densities.get(record.voxel_index as usize)?);
+            let mass = f64::from(record.position_volume[3]) * density;
+            if !mass.is_finite() || mass <= 0.0 {
+                return None;
             }
+            let position = DVec3::new(
+                f64::from(record.position_volume[0]),
+                f64::from(record.position_volume[1]),
+                f64::from(record.position_volume[2]),
+            );
+            deposit_particle(
+                &mut self.density,
+                position,
+                mass,
+                self.half_extent,
+                self.spacing,
+                self.n,
+                self.p,
+            );
         }
         self.fft.transform(&mut self.density, false);
         for (value, kernel) in self.density.iter_mut().zip(&self.kernel_spectrum) {
@@ -165,57 +183,44 @@ impl MmfftLevelWorkspace {
                 }
             }
         }
-        &self.field
+        Some(&self.field)
     }
 }
 
-fn deposition_stencils(
-    positions: &[DVec3],
+fn deposit_particle(
+    density: &mut [Complex64],
+    position: DVec3,
+    mass: f64,
     half_extent: f64,
     spacing: f64,
     n: usize,
     p: usize,
-) -> Vec<Vec<(usize, f64)>> {
-    positions
-        .iter()
-        .map(|position| {
-            let grid = (*position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
-            let base = grid.floor();
-            let fraction = grid - base;
-            let weights = [
-                [1.0 - fraction.x, fraction.x],
-                [1.0 - fraction.y, fraction.y],
-                [1.0 - fraction.z, fraction.z],
-            ];
-            let mut stencil = Vec::with_capacity(8);
-            for dz in 0..=1 {
-                for dy in 0..=1 {
-                    for dx in 0..=1 {
-                        let cell = [
-                            base.x as isize + dx,
-                            base.y as isize + dy,
-                            base.z as isize + dz,
-                        ];
-                        if cell.iter().any(|value| *value < 0 || *value >= n as isize) {
-                            continue;
-                        }
-                        stencil.push((
-                            grid_index(
-                                cell[0] as usize,
-                                cell[1] as usize,
-                                cell[2] as usize,
-                                p,
-                            ),
-                            weights[0][dx as usize]
-                                * weights[1][dy as usize]
-                                * weights[2][dz as usize],
-                        ));
-                    }
+) {
+    let grid = (position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
+    let base = grid.floor();
+    let fraction = grid - base;
+    let weights = [
+        [1.0 - fraction.x, fraction.x],
+        [1.0 - fraction.y, fraction.y],
+        [1.0 - fraction.z, fraction.z],
+    ];
+    for dz in 0..=1 {
+        for dy in 0..=1 {
+            for dx in 0..=1 {
+                let cell = [
+                    base.x as isize + dx,
+                    base.y as isize + dy,
+                    base.z as isize + dz,
+                ];
+                if cell.iter().any(|value| *value < 0 || *value >= n as isize) {
+                    continue;
                 }
+                density[grid_index(cell[0] as usize, cell[1] as usize, cell[2] as usize, p)].re +=
+                    mass * weights[0][dx as usize] * weights[1][dy as usize]
+                        * weights[2][dz as usize];
             }
-            stencil
-        })
-        .collect()
+        }
+    }
 }
 
 fn deposit_density(
@@ -227,31 +232,7 @@ fn deposit_density(
     p: usize,
 ) {
     for &(position, mass) in records {
-        let grid = (position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
-        let base = grid.floor();
-        let fraction = grid - base;
-        let weights = [
-            [1.0 - fraction.x, fraction.x],
-            [1.0 - fraction.y, fraction.y],
-            [1.0 - fraction.z, fraction.z],
-        ];
-        for dz in 0..=1 {
-            for dy in 0..=1 {
-                for dx in 0..=1 {
-                    let cell = [
-                        base.x as isize + dx,
-                        base.y as isize + dy,
-                        base.z as isize + dz,
-                    ];
-                    if cell.iter().any(|value| *value < 0 || *value >= n as isize) {
-                        continue;
-                    }
-                    density[grid_index(cell[0] as usize, cell[1] as usize, cell[2] as usize, p)]
-                        .re += mass * weights[0][dx as usize] * weights[1][dy as usize]
-                        * weights[2][dz as usize];
-                }
-            }
-        }
+        deposit_particle(density, position, mass, half_extent, spacing, n, p);
     }
 }
 
@@ -272,6 +253,28 @@ fn process_fft_line_with_scratch(
 
 fn grid_index(x: usize, y: usize, z: usize, side: usize) -> usize {
     (z * side + y) * side + x
+}
+
+/// Appends one potential grid as two IEEE-754 binary16 values per `u32`.
+/// MMFFT interpolation only consumes this scalar; its field and Jacobian are
+/// derivatives of the same tricubic potential. A per-level scale preserves
+/// the binary16 mantissa across the different nested-grid ranges.
+fn append_compressed_potential_level(bytes: &mut Vec<u8>, field: &[[f32; 4]]) -> f32 {
+    let scale = field
+        .iter()
+        .map(|sample| sample[3].abs())
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, f32::max)
+        .max(f32::MIN_POSITIVE);
+    let mut samples = field.iter();
+    while let Some(first) = samples.next() {
+        let low = half::f16::from_f32((first[3] / scale).clamp(-1.0, 1.0)).to_bits();
+        let high = samples.next().map_or(0, |second| {
+            half::f16::from_f32((second[3] / scale).clamp(-1.0, 1.0)).to_bits()
+        });
+        bytes.extend_from_slice(&(u32::from(low) | (u32::from(high) << 16)).to_le_bytes());
+    }
+    scale
 }
 
 #[cfg(test)]

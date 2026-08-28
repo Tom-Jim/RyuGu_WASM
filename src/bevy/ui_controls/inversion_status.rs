@@ -13,7 +13,13 @@ pub fn density_inversion_timing_ui_system(
         ),
     >,
 ) {
-    let names = ["Radial", "Werner", "Eq.106 GPU", "FFT grid", "Treecode"];
+    let names = [
+        "Radial",
+        "Werner",
+        "Eq.106 GPU",
+        "Packed FFT",
+        "Target-cell FMM",
+    ];
     for (label, mut text) in timing_labels.iter_mut() {
         let marker = if label.0 == active_method.performance_index() {
             "*"
@@ -245,7 +251,7 @@ fn comparison_metric_text(
                     }
                 };
                 format!(
-                    "{verification}Eq.106 full forward raw {:.2} ms, certified estimate {:.2} ms (measured full hot pass {:.2} + reused geometry build) | warm raw/cert-tail {:.2}/{:.2} ms | build diagnostic {:.2} ms | hot {:.1} ns/target | {} | {} | raw/cert requests {}/{}; FFT/tree {}/{} | dispatch {}/{}/{}",
+                    "{verification}Eq.106 raw {:.2} ms, certified {:.2} ms (full certified hot pass {:.2} + reused build) | warm raw/cert-tail {:.2}/{:.2} ms | build diagnostic {:.2} ms | hot {:.1} ns/target | {} | {} | Eq raw/cert requests {}/{}; FFT/FMM raw {}/{} | dispatch {}/{}/{}",
                     eq106.total_ms,
                     eq106.certified_estimated_total_ms,
                     eq106.certified_full_pass_ms,
@@ -254,7 +260,7 @@ fn comparison_metric_text(
                     eq106.build_ms,
                     eq106.hot_query_ns_per_target,
                     relation("FFT", mmfft.total_ms),
-                    relation("tree", fmm.total_ms),
+                    relation("FMM", fmm.total_ms),
                     eq106.gpu_request_count,
                     eq106.certified_gpu_request_count,
                     mmfft.gpu_request_count,
@@ -265,11 +271,15 @@ fn comparison_metric_text(
                 )
             } else {
                 format!(
-                    "{verification}completed | {:.2} ms | build est. {:.2} ms | hot {:.1} ns/target | requests {} | dispatch {} | {}",
+                    "{verification}raw/certified {:.2}/{:.2} ms | certified L2 gravity/gradient {:.3e}/{:.3e} | build est. {:.2} ms | hot {:.1} ns/target | raw/cert requests {}/{} | dispatch {} | {}",
                     result.total_ms,
+                    result.certified_estimated_total_ms,
+                    result.certified_relative_gravity_error,
+                    result.certified_gradient_relative_error,
                     result.build_ms,
                     result.hot_query_ns_per_target,
                     result.gpu_request_count,
+                    result.certified_gpu_request_count,
                     result.dispatch_count,
                     result.method.planning_label(),
                 )

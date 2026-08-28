@@ -14,14 +14,12 @@ pub(crate) fn build_planning_eq106_payload(
         return None;
     }
     for range in batch.eq106_voxel_source_ranges.iter().copied() {
-        for value in [range[0] as f32, range[1] as f32, 0.0, 0.0] {
-            metadata.extend_from_slice(&value.to_le_bytes());
-        }
+        let record = [range[0] as f32, range[1] as f32, 0.0, 0.0];
+        metadata.extend_from_slice(bytemuck::cast_slice(&record));
     }
     for density in densities {
-        for value in [*density, 0.0, 0.0, 0.0] {
-            metadata.extend_from_slice(&value.to_le_bytes());
-        }
+        let record = [*density, 0.0, 0.0, 0.0];
+        metadata.extend_from_slice(bytemuck::cast_slice(&record));
     }
     let total_mass = *batch.density_model_masses.get(model as usize)?;
     if batch.eq106_volume_source_bytes.len() != batch.basis_records.len() * 16 {
@@ -59,7 +57,6 @@ mod planning_voxel_spectrum_payload_tests {
             .map(|voxel| PlanningBasisRecord {
                 position_volume: [voxel as f32, 0.0, 0.0, voxel as f32 + 1.0],
                 voxel_index: voxel,
-                _padding: [0; 3],
             })
             .collect::<Vec<_>>();
         let mut geometry = Vec::with_capacity(56 * 16);
@@ -70,11 +67,8 @@ mod planning_voxel_spectrum_payload_tests {
         }
         batch.basis_records = Arc::from(records);
         batch.eq106_volume_source_bytes = Arc::from(geometry);
-        batch.eq106_voxel_source_ranges = Arc::from(
-            (0..56)
-                .map(|voxel| [voxel, 1])
-                .collect::<Vec<[u32; 2]>>(),
-        );
+        batch.eq106_voxel_source_ranges =
+            Arc::from((0..56).map(|voxel| [voxel, 1]).collect::<Vec<[u32; 2]>>());
         batch.density_models = Arc::from(
             (0..112)
                 .map(|index| if index < 56 { 2.0 } else { 3.0 })

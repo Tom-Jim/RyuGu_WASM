@@ -123,8 +123,10 @@ impl ToroidalOperatorTensor {
         }
         let max_midpoint_error = f64::from_le_bytes(BYTES[8..16].try_into().unwrap_or([0; 8]));
         let coefficients = BYTES[16..]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         let table = Self {
             coefficients,
@@ -144,11 +146,7 @@ impl ToroidalOperatorTensor {
     }
 
     pub fn as_le_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.coefficients.len() * 4);
-        for value in &self.coefficients {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes
+        bytemuck::cast_slice(&self.coefficients).to_vec()
     }
 }
 
@@ -297,7 +295,8 @@ mod tests {
         let frequency =
             Complex64::new(2.0 / table.radius, signed_frequency as f64 * PSI_OMEGA_STEP);
         let direct =
-            crate::cpu::eq106_reference::eq106_kernel_sample(line, source, frequency, 2.0e-10).unwrap();
+            crate::cpu::eq106_reference::eq106_kernel_sample(line, source, frequency, 2.0e-10)
+                .unwrap();
         let x = frequency * a;
         let inverse_boundary = (1.0 + eta * eta).sqrt().recip();
         let direct_psi_x =

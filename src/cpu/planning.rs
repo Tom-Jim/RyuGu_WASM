@@ -1,8 +1,12 @@
 use crate::cpu::curved_arc::AggregatedGravitySource;
 use crate::cpu::inversion::build_voxel_basis_sources;
+use crate::cpu::volterra::{VolterraConfig, VolterraForceInput, propagate_reference_line_batched};
 use crate::interface::components::*;
+use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::*;
 use std::sync::Arc;
+
+const PLANNING_INITIAL_TUBE_FRACTION: f32 = 0.70;
 
 pub(crate) struct PlanningBatchBuilder {
     profile: PlanningWorkloadProfile,
@@ -28,6 +32,15 @@ pub(crate) struct PlanningBatchBuilder {
     target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
+    reference_jets: Vec<PlanningReferenceJet>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlanningReferenceJet {
+    simulation_time_seconds: f64,
+    world_position: DVec3,
+    world_acceleration: DVec3,
+    world_jacobian: DMat3,
 }
 
 impl PlanningBatchBuilder {
@@ -69,14 +82,13 @@ impl PlanningBatchBuilder {
                         source.volume as f32,
                     ],
                     voxel_index: voxel_index as u32,
-                    _padding: [0; 3],
                 })
             })
             .collect::<Vec<_>>();
         // Every one of the 56 voxel columns must remain addressable for the
         // basis-spectrum cache.  Empty voxels therefore contribute a single
         // zero/nominal-volume representative, which can make the raw
-        // canonical list slightly larger than the requested 1K source
+        // canonical list slightly larger than a requested low source count
         // capture.  Coalesce only records belonging to the same voxel before
         // refinement so the requested source count remains exact while each
         // voxel range is still present and its volume/centroid are conserved.
@@ -127,6 +139,11 @@ impl PlanningBatchBuilder {
             density_model_count,
             density_seed,
         )?;
+        let reference_jets = build_planning_reference_jets(
+            &reference_samples,
+            &basis_records,
+            density_models.get(..56)?,
+        )?;
         Some(Self {
             profile,
             run_id,
@@ -153,6 +170,7 @@ impl PlanningBatchBuilder {
             target_mass,
             basis_records,
             basis_hash,
+            reference_jets,
         })
     }
 
@@ -175,10 +193,11 @@ impl PlanningBatchBuilder {
         let started = bevy::platform::time::Instant::now();
         let end = (self.next_candidate + candidate_budget.max(1)).min(self.candidate_count);
         while self.next_candidate < end {
-            if append_tube_candidate_states(
+            if append_dynamical_candidate_states(
                 self.next_candidate,
                 self.candidate_count,
                 &self.reference_samples,
+                &self.reference_jets,
                 &mut self.states,
                 &mut self.gpu_position_bytes,
             )
@@ -288,13 +307,10 @@ fn coalesce_basis_records(
     }
     let mut total = records.len();
     while total > requested {
-        let Some((voxel, group)) = groups
+        let (voxel, group) = groups
             .iter_mut()
             .filter(|(_, group)| group.len() > 1)
-            .max_by_key(|(_, group)| group.len())
-        else {
-            return None;
-        };
+            .max_by_key(|(_, group)| group.len())?;
         let right = group.pop()?;
         let left = group.pop()?;
         let left_volume = f64::from(left.position_volume[3]);
@@ -317,7 +333,6 @@ fn coalesce_basis_records(
         group.push(PlanningBasisRecord {
             position_volume: [position.x, position.y, position.z, volume as f32],
             voxel_index: *voxel,
-            _padding: [0; 3],
         });
         total -= 1;
     }
@@ -334,9 +349,7 @@ fn eq106_geometry_buffers(records: &[PlanningBasisRecord]) -> Option<(Arc<[u8]>,
     for (voxel, range) in ranges.iter_mut().enumerate() {
         let start = cursor;
         while cursor < records.len() && records[cursor].voxel_index as usize == voxel {
-            for value in records[cursor].position_volume {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
+            bytes.extend_from_slice(bytemuck::cast_slice(&records[cursor].position_volume));
             cursor += 1;
         }
         *range = [start as u32, (cursor - start) as u32];
@@ -497,64 +510,125 @@ fn central_reference_states(
         .collect()
 }
 
-fn append_tube_candidate_states(
+fn append_dynamical_candidate_states(
     candidate: u32,
     candidate_count: u32,
     reference: &[TrajectoryInversionKnot],
+    reference_jets: &[PlanningReferenceJet],
     states: &mut Vec<PlanningCandidateState>,
     gpu_position_bytes: &mut Vec<u8>,
 ) -> Option<()> {
     let sample_count = reference.len() as u32;
-    if sample_count < 2 {
+    if sample_count < 2 || reference_jets.len() != reference.len() {
         return None;
     }
-    let mut world_positions = Vec::with_capacity(sample_count as usize);
-    let (radius, phase, harmonic, phase_rate) =
+    let (requested_radius, phase, harmonic, phase_rate) =
         candidate_tube_parameters(candidate, candidate_count);
-    for sample in 0..sample_count {
-        let reference_state = reference[sample as usize];
-        let tangent = reference_state.velocity.normalize_or_zero();
-        let normal_hint = RYUGU_SPIN_AXIS.normalize_or_zero();
-        let normal = (normal_hint - tangent * normal_hint.dot(tangent)).normalize_or_zero();
-        let binormal = tangent.cross(normal).normalize_or_zero();
-        if tangent == Vec3::ZERO || normal == Vec3::ZERO || binormal == Vec3::ZERO {
-            return None;
+    // A fixed initial offset can leave the 15 m Taylor tube on a captured arc
+    // whose transverse variational dynamics are locally unstable.  That is
+    // not a reason to cancel the entire quadrature sweep.  Contract only this
+    // candidate's initial perturbation, re-propagating it from scratch each
+    // time, until the complete Volterra trajectory is certified inside the
+    // same tube.  The zero-radius final attempt also distinguishes a bad
+    // perturbation from a genuinely unusable reference arc.
+    for contraction in [1.0_f32, 0.5, 0.25, 0.125, 0.0625, 0.0] {
+        let mut candidate_states = Vec::with_capacity(reference.len());
+        let mut candidate_bytes = Vec::with_capacity(reference.len() * 16);
+        if append_dynamical_candidate_at_radius(
+            candidate,
+            reference,
+            reference_jets,
+            requested_radius * contraction,
+            phase,
+            harmonic,
+            phase_rate,
+            &mut candidate_states,
+            &mut candidate_bytes,
+        )
+        .is_some()
+        {
+            states.extend(candidate_states);
+            gpu_position_bytes.extend(candidate_bytes);
+            return Some(());
         }
-        let normalized_time = sample as f32 / sample_count.saturating_sub(1) as f32 - 0.5;
-        let angle = phase + harmonic * std::f32::consts::TAU * normalized_time + phase_rate;
-        let envelope = 0.82 + 0.18 * (std::f32::consts::TAU * normalized_time + phase).cos();
-        let offset_radius = (radius * envelope).min(PLANNING_TRAJECTORY_TUBE_RADIUS_METERS);
-        let offset =
-            normal * (offset_radius * angle.cos()) + binormal * (offset_radius * angle.sin());
-        if offset.length() > PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-4 {
-            return None;
-        }
-        world_positions.push(reference_state.position + offset);
     }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_dynamical_candidate_at_radius(
+    candidate: u32,
+    reference: &[TrajectoryInversionKnot],
+    reference_jets: &[PlanningReferenceJet],
+    radius: f32,
+    phase: f32,
+    harmonic: f32,
+    phase_rate: f32,
+    states: &mut Vec<PlanningCandidateState>,
+    gpu_position_bytes: &mut Vec<u8>,
+) -> Option<()> {
+    let sample_count = reference.len() as u32;
+    let first = *reference.first()?;
+    let first_offset =
+        candidate_initial_offset(first, 0, sample_count, radius, phase, harmonic, phase_rate)?;
+    let initial_position = (first.position + first_offset).as_dvec3();
+    // Candidates differ through their initial transverse displacement.  The
+    // velocity is not differentiated from an arbitrary drawn tube; it is the
+    // captured physical velocity and the propagated field determines every
+    // subsequent state.
+    let initial_velocity = first.velocity.as_dvec3();
+    let final_time = reference.last()?.simulation_time_seconds;
+    let duration = final_time - first.simulation_time_seconds;
+    let solution = propagate_reference_line_batched(
+        initial_position,
+        initial_velocity,
+        initial_velocity,
+        duration,
+        VolterraConfig {
+            node_count: reference.len().max(33),
+            maximum_picard_iterations: 24,
+            maximum_endpoint_iterations: 8,
+            damping: 0.70,
+            relative_tolerance: 1.0e-6,
+            minimum_longitudinal_speed: 1.0e-5,
+            maximum_transverse_distance: f64::INFINITY,
+        },
+        |inputs, accelerations| {
+            fill_planning_reference_accelerations(
+                reference_jets,
+                first.simulation_time_seconds,
+                inputs,
+                accelerations,
+            )
+        },
+    )
+    .ok()?;
 
     let angular_velocity =
         RYUGU_SPIN_AXIS.normalize_or_zero() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
-    let first_time = reference.first()?.simulation_time_seconds;
+    let first_time = first.simulation_time_seconds;
+    let mut solution_cursor = 1;
     for sample in 0..sample_count {
-        let world_position = world_positions[sample as usize];
-        let previous = world_positions[sample.saturating_sub(1) as usize];
-        let next = world_positions[(sample + 1).min(sample_count - 1) as usize];
-        let previous_time = reference[sample.saturating_sub(1) as usize].simulation_time_seconds;
-        let next_time =
-            reference[(sample + 1).min(sample_count - 1) as usize].simulation_time_seconds;
-        let denominator = (next_time - previous_time) as f32;
-        let world_velocity = (next - previous) / denominator.max(f32::MIN_POSITIVE);
         let reference_state = reference[sample as usize];
+        let propagated = solution.sample_at_ordered(
+            reference_state.simulation_time_seconds - first.simulation_time_seconds,
+            &mut solution_cursor,
+        )?;
+        let world_position = propagated.position.as_vec3();
+        let world_velocity = propagated.velocity.as_vec3();
+        let transverse_distance = world_position.distance(reference_state.position);
+        if !transverse_distance.is_finite()
+            || transverse_distance > PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-3
+        {
+            return None;
+        }
         let time = reference_state.simulation_time_seconds as f32;
         let rotation = reference_state.body_rotation;
         let body_position = rotation.inverse() * world_position;
         let body_velocity =
             rotation.inverse() * (world_velocity - angular_velocity.cross(world_position));
-        let transverse_distance = world_position.distance(reference_state.position);
         let position_time = [body_position.x, body_position.y, body_position.z, time];
-        for value in position_time {
-            gpu_position_bytes.extend_from_slice(&value.to_le_bytes());
-        }
+        gpu_position_bytes.extend_from_slice(bytemuck::cast_slice(&position_time));
         states.push(PlanningCandidateState {
             position_time,
             velocity_distance: [
@@ -570,17 +644,158 @@ fn append_tube_candidate_states(
                 ((reference_state.simulation_time_seconds - first_time) as f32)
                     .max(0.0)
                     .div_euclid(NEAR_SYNC_SEGMENT_MAX_SECONDS) as u32,
-                0,
+                1,
             ],
         });
     }
     Some(())
 }
 
+fn candidate_initial_offset(
+    reference_state: TrajectoryInversionKnot,
+    sample: u32,
+    sample_count: u32,
+    radius: f32,
+    phase: f32,
+    harmonic: f32,
+    phase_rate: f32,
+) -> Option<Vec3> {
+    let tangent = reference_state.velocity.normalize_or_zero();
+    let normal_hint = RYUGU_SPIN_AXIS.normalize_or_zero();
+    let normal = (normal_hint - tangent * normal_hint.dot(tangent)).normalize_or_zero();
+    let binormal = tangent.cross(normal).normalize_or_zero();
+    if tangent == Vec3::ZERO || normal == Vec3::ZERO || binormal == Vec3::ZERO {
+        return None;
+    }
+    let normalized_time = sample as f32 / sample_count.saturating_sub(1) as f32 - 0.5;
+    let angle = phase + harmonic * std::f32::consts::TAU * normalized_time + phase_rate;
+    let envelope = 0.82 + 0.18 * (std::f32::consts::TAU * normalized_time + phase).cos();
+    let offset_radius = (radius * envelope).min(PLANNING_TRAJECTORY_TUBE_RADIUS_METERS);
+    Some(normal * (offset_radius * angle.cos()) + binormal * (offset_radius * angle.sin()))
+}
+
+fn fill_planning_reference_accelerations(
+    jets: &[PlanningReferenceJet],
+    start_time_seconds: f64,
+    inputs: &[VolterraForceInput],
+    accelerations: &mut [DVec3],
+) -> Result<(), ()> {
+    if inputs.len() != accelerations.len() || jets.is_empty() {
+        return Err(());
+    }
+    let first = jets[0];
+    let last = jets[jets.len() - 1];
+    let mut upper_index = usize::from(jets.len() > 1);
+    for (input, acceleration) in inputs.iter().zip(accelerations) {
+        let simulation_time_seconds = start_time_seconds + input.elapsed_seconds;
+        let jet = if simulation_time_seconds <= first.simulation_time_seconds {
+            first
+        } else if simulation_time_seconds >= last.simulation_time_seconds {
+            last
+        } else {
+            // Picard's h grid is monotone, so its elapsed times are monotone as
+            // well.  Advance one shared cursor for the whole sweep instead of
+            // performing M independent binary searches.
+            while upper_index + 1 < jets.len()
+                && jets[upper_index].simulation_time_seconds < simulation_time_seconds
+            {
+                upper_index += 1;
+            }
+            let lower = jets[upper_index - 1];
+            let upper = jets[upper_index];
+            let interval = (upper.simulation_time_seconds - lower.simulation_time_seconds)
+                .max(f64::MIN_POSITIVE);
+            let weight = ((simulation_time_seconds - lower.simulation_time_seconds) / interval)
+                .clamp(0.0, 1.0);
+            PlanningReferenceJet {
+                simulation_time_seconds,
+                world_position: lower.world_position.lerp(upper.world_position, weight),
+                world_acceleration: lower
+                    .world_acceleration
+                    .lerp(upper.world_acceleration, weight),
+                world_jacobian: lower.world_jacobian * (1.0 - weight)
+                    + upper.world_jacobian * weight,
+            }
+        };
+        *acceleration =
+            jet.world_acceleration + jet.world_jacobian * (input.position - jet.world_position);
+    }
+    Ok(())
+}
+
+fn build_planning_reference_jets(
+    reference: &[TrajectoryInversionKnot],
+    basis_records: &[PlanningBasisRecord],
+    densities: &[f32],
+) -> Option<Vec<PlanningReferenceJet>> {
+    reference
+        .iter()
+        .map(|state| {
+            let rotation = DQuat::from_xyzw(
+                f64::from(state.body_rotation.x),
+                f64::from(state.body_rotation.y),
+                f64::from(state.body_rotation.z),
+                f64::from(state.body_rotation.w),
+            )
+            .normalize();
+            let rotation_matrix = DMat3::from_quat(rotation);
+            let world_position = state.position.as_dvec3();
+            let body_position = rotation.inverse() * world_position;
+            let (body_acceleration, body_jacobian) =
+                evaluate_planning_reference_field(body_position, basis_records, densities)?;
+            Some(PlanningReferenceJet {
+                simulation_time_seconds: state.simulation_time_seconds,
+                world_position,
+                world_acceleration: rotation * body_acceleration,
+                world_jacobian: rotation_matrix * body_jacobian * rotation_matrix.transpose(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn evaluate_planning_reference_field(
+    target: DVec3,
+    basis_records: &[PlanningBasisRecord],
+    densities: &[f32],
+) -> Option<(DVec3, DMat3)> {
+    if densities.len() != 56 || !target.is_finite() {
+        return None;
+    }
+    let mut acceleration = DVec3::ZERO;
+    let mut gradient = DMat3::ZERO;
+    for source in basis_records {
+        let density = f64::from(*densities.get(source.voxel_index as usize)?);
+        let position = DVec3::new(
+            f64::from(source.position_volume[0]),
+            f64::from(source.position_volume[1]),
+            f64::from(source.position_volume[2]),
+        );
+        let displacement = position - target;
+        let radius2 = displacement.length_squared().max(1.0e-16);
+        let inverse_radius = radius2.sqrt().recip();
+        let inverse_radius3 = inverse_radius / radius2;
+        let mass = f64::from(source.position_volume[3]) * density;
+        acceleration += f64::from(G) * mass * displacement * inverse_radius3;
+        let outer = DMat3::from_cols(
+            displacement * displacement.x,
+            displacement * displacement.y,
+            displacement * displacement.z,
+        );
+        gradient += f64::from(G)
+            * mass
+            * (-DMat3::IDENTITY * inverse_radius3 + outer * (3.0 * inverse_radius3 / radius2));
+    }
+    (acceleration.is_finite() && gradient.is_finite()).then_some((acceleration, gradient))
+}
+
 fn candidate_tube_parameters(candidate: u32, candidate_count: u32) -> (f32, f32, f32, f32) {
     let golden = 0.618_033_95_f32;
     let radial_fraction = ((candidate as f32 + 0.5) / candidate_count.max(1) as f32).sqrt();
-    let radius = PLANNING_TRAJECTORY_TUBE_RADIUS_METERS * radial_fraction;
+    // Reserve part of the certified tube for differential-force drift over the
+    // complete propagated arc. Final states are still checked against the full
+    // 15 m trust radius before they enter any GPU batch.
+    let radius =
+        PLANNING_TRAJECTORY_TUBE_RADIUS_METERS * PLANNING_INITIAL_TUBE_FRACTION * radial_fraction;
     let phase = std::f32::consts::TAU * ((candidate as f32 * golden).fract());
     let harmonic = 1.0 + (candidate % 5) as f32;
     let phase_rate = ((candidate.wrapping_mul(747_796_405) ^ 2_891_336_453) as f32) * f32::EPSILON;
@@ -759,7 +974,7 @@ mod tests {
                 .iter()
                 .all(|mass| ((mass - target_mass) / target_mass).abs() <= 2.0e-7)
         );
-        for pair in models.chunks_exact(56).collect::<Vec<_>>().windows(2) {
+        for pair in models.as_chunks::<56>().0.windows(2) {
             assert_ne!(pair[0], pair[1]);
         }
     }
@@ -785,7 +1000,6 @@ mod tests {
         let parent = PlanningBasisRecord {
             position_volume: [12.0, -4.0, 8.0, 1_000.0],
             voxel_index: 0,
-            _padding: [0; 3],
         };
         let refined = spatially_refine_basis_records(&[parent], &voxels, 20.0, 40.0, 8).unwrap();
         assert_eq!(refined.len(), 8);
@@ -834,17 +1048,14 @@ mod tests {
             PlanningBasisRecord {
                 position_volume: [0.0, 0.0, 0.0, 2.0],
                 voxel_index: 0,
-                _padding: [0; 3],
             },
             PlanningBasisRecord {
                 position_volume: [2.0, 0.0, 0.0, 3.0],
                 voxel_index: 0,
-                _padding: [0; 3],
             },
             PlanningBasisRecord {
                 position_volume: [10.0, 0.0, 0.0, 4.0],
                 voxel_index: 1,
-                _padding: [0; 3],
             },
         ];
         let coalesced = coalesce_basis_records(&records, 2).unwrap();
@@ -875,12 +1086,10 @@ mod tests {
             PlanningBasisRecord {
                 position_volume: [-2.0, 0.0, 0.0, 2.0],
                 voxel_index: 0,
-                _padding: [0; 3],
             },
             PlanningBasisRecord {
                 position_volume: [2.0, 0.0, 0.0, 3.0],
                 voxel_index: 0,
-                _padding: [0; 3],
             },
         ];
         let refined = spatially_refine_basis_records(&parents, &voxels, 2.0, 4.0, 9).unwrap();
@@ -899,5 +1108,169 @@ mod tests {
                 .sum::<f64>();
             assert!((actual - expected_volume).abs() <= 1.0e-6);
         }
+    }
+
+    #[test]
+    fn planning_candidates_are_propagated_from_initial_conditions() {
+        let reference = [
+            TrajectoryInversionKnot {
+                position: Vec3::ZERO,
+                velocity: Vec3::X * 10.0,
+                simulation_time_seconds: 0.0,
+                baseline_acceleration: Vec3::ZERO,
+                body_rotation: Quat::IDENTITY,
+            },
+            TrajectoryInversionKnot {
+                position: Vec3::X * 10.0,
+                velocity: Vec3::X * 10.0,
+                simulation_time_seconds: 1.0,
+                baseline_acceleration: Vec3::ZERO,
+                body_rotation: Quat::IDENTITY,
+            },
+        ];
+        let jets = reference
+            .iter()
+            .map(|sample| PlanningReferenceJet {
+                simulation_time_seconds: sample.simulation_time_seconds,
+                world_position: sample.position.as_dvec3(),
+                world_acceleration: DVec3::ZERO,
+                world_jacobian: DMat3::ZERO,
+            })
+            .collect::<Vec<_>>();
+        let mut states = Vec::new();
+        let mut bytes = Vec::new();
+        append_dynamical_candidate_states(0, 32, &reference, &jets, &mut states, &mut bytes)
+            .unwrap();
+
+        assert_eq!(states.len(), reference.len());
+        assert_eq!(bytes.len(), reference.len() * 16);
+        assert!(states.iter().all(|state| state.identity[3] == 1));
+        let first_offset = states[0].body_position().distance(reference[0].position);
+        let last_offset = states[1].body_position().distance(reference[1].position);
+        assert!((first_offset - last_offset).abs() < 1.0e-5);
+        assert!(last_offset <= PLANNING_TRAJECTORY_TUBE_RADIUS_METERS);
+    }
+
+    #[test]
+    fn unstable_transverse_candidate_contracts_instead_of_cancelling_batch() {
+        let reference = (0..=2)
+            .map(|second| TrajectoryInversionKnot {
+                position: Vec3::X * (10.0 * second as f32),
+                velocity: Vec3::X * 10.0,
+                simulation_time_seconds: second as f64,
+                baseline_acceleration: Vec3::ZERO,
+                body_rotation: Quat::IDENTITY,
+            })
+            .collect::<Vec<_>>();
+        let jets = reference
+            .iter()
+            .map(|sample| PlanningReferenceJet {
+                simulation_time_seconds: sample.simulation_time_seconds,
+                world_position: sample.position.as_dvec3(),
+                world_acceleration: DVec3::ZERO,
+                // y'' = y and z'' = z amplify the requested outer offset
+                // beyond 15 m, forcing the adaptive contraction path.
+                world_jacobian: DMat3::from_diagonal(DVec3::new(0.0, 1.0, 1.0)),
+            })
+            .collect::<Vec<_>>();
+        let requested_radius = candidate_tube_parameters(31, 32).0;
+        let mut states = Vec::new();
+        let mut bytes = Vec::new();
+
+        append_dynamical_candidate_states(31, 32, &reference, &jets, &mut states, &mut bytes)
+            .expect("an unstable candidate should contract, not cancel the complete sweep");
+
+        assert_eq!(states.len(), reference.len());
+        assert_eq!(bytes.len(), reference.len() * 16);
+        assert!(states[0].velocity_distance[3] < requested_radius * 0.75);
+        assert!(states.iter().all(|state| {
+            state.velocity_distance[3].is_finite()
+                && state.velocity_distance[3] <= PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-3
+        }));
+    }
+
+    #[test]
+    fn long_arc_outer_candidate_remains_inside_the_certified_tube() {
+        let sample_count = 241;
+        let duration = BENCHMARK_DURATION_SECONDS;
+        let radius = 1_000.0_f64;
+        let gravitational_parameter = f64::from(G) * f64::from(RYUGU_MASS);
+        let angular_speed = (gravitational_parameter / radius.powi(3)).sqrt();
+        let normal = RYUGU_SPIN_AXIS.as_dvec3().normalize();
+        let axis_x = normal.cross(DVec3::X).normalize();
+        let axis_y = normal.cross(axis_x).normalize();
+        let mut reference = Vec::with_capacity(sample_count);
+        let mut jets = Vec::with_capacity(sample_count);
+        for index in 0..sample_count {
+            let time = duration * index as f64 / (sample_count - 1) as f64;
+            let angle = angular_speed * time;
+            let radial = axis_x * angle.cos() + axis_y * angle.sin();
+            let tangent = -axis_x * angle.sin() + axis_y * angle.cos();
+            let position = radial * radius;
+            let velocity = tangent * (radius * angular_speed);
+            let inverse_radius3 = radius.powi(-3);
+            let acceleration = -gravitational_parameter * position * inverse_radius3;
+            let outer = DMat3::from_cols(
+                position * position.x,
+                position * position.y,
+                position * position.z,
+            );
+            let jacobian = gravitational_parameter
+                * (outer * (3.0 / radius.powi(5)) - DMat3::IDENTITY * inverse_radius3);
+            reference.push(TrajectoryInversionKnot {
+                position: position.as_vec3(),
+                velocity: velocity.as_vec3(),
+                simulation_time_seconds: time,
+                baseline_acceleration: acceleration.as_vec3(),
+                body_rotation: Quat::IDENTITY,
+            });
+            jets.push(PlanningReferenceJet {
+                simulation_time_seconds: time,
+                world_position: position,
+                world_acceleration: acceleration,
+                world_jacobian: jacobian,
+            });
+        }
+
+        let (candidate_radius, phase, harmonic, phase_rate) = candidate_tube_parameters(31, 32);
+        let initial_offset = candidate_initial_offset(
+            reference[0],
+            0,
+            sample_count as u32,
+            candidate_radius,
+            phase,
+            harmonic,
+            phase_rate,
+        )
+        .unwrap();
+        let direct_solve = propagate_reference_line_batched(
+            (reference[0].position + initial_offset).as_dvec3(),
+            reference[0].velocity.as_dvec3(),
+            reference[0].velocity.as_dvec3(),
+            duration,
+            VolterraConfig {
+                node_count: sample_count,
+                maximum_picard_iterations: 24,
+                maximum_endpoint_iterations: 8,
+                damping: 0.70,
+                relative_tolerance: 1.0e-6,
+                minimum_longitudinal_speed: 1.0e-5,
+                maximum_transverse_distance: f64::INFINITY,
+            },
+            |inputs, accelerations| {
+                fill_planning_reference_accelerations(&jets, 0.0, inputs, accelerations)
+            },
+        );
+        assert!(direct_solve.is_ok(), "{direct_solve:?}");
+
+        let mut states = Vec::new();
+        let mut bytes = Vec::new();
+        append_dynamical_candidate_states(31, 32, &reference, &jets, &mut states, &mut bytes)
+            .unwrap();
+        assert_eq!(states.len(), sample_count);
+        assert!(states.iter().all(|state| {
+            state.velocity_distance[3].is_finite()
+                && state.velocity_distance[3] <= PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-3
+        }));
     }
 }

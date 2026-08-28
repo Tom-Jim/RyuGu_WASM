@@ -243,7 +243,6 @@ pub(crate) struct PerformanceJacobiAxisLabel(pub u8);
 
 #[derive(Component, Clone, Copy)]
 pub(crate) struct PerformanceTimeAxisLabel {
-    pub jacobi: bool,
     pub slot: u8,
 }
 

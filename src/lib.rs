@@ -60,6 +60,7 @@ use cpu::{
     eq106_operator::build_eq106_operator_tensor_system,
     inversion::{convex_optimization_system, start_density_inversion_system},
     physics::{physics_system, ryugu_rotation_system},
+    volterra::VolterraPropagationStatus,
 };
 use gpu::{
     eq106::Eq106GpuComputePlugin,
@@ -258,6 +259,7 @@ pub fn main() {
         .init_resource::<PerformanceComparisonState>()
         .init_resource::<CurvedArcPlannerState>()
         .init_resource::<CurvedArcResidualHistory>()
+        .init_resource::<VolterraPropagationStatus>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_secs_f64(1.0 / 60.0)),
@@ -265,13 +267,16 @@ pub fn main() {
         })
         .add_plugins(
             DefaultPlugins
+                .build()
+                // The application has no audio. Disabling the plugin avoids
+                // creating a browser AudioContext before a user gesture.
+                .disable::<bevy::audio::AudioPlugin>()
                 .set(LogPlugin {
-                    // Keep runtime output usable. WGSL source is still emitted
-                    // once by the Eq.106 pipeline loader at debug level, while
-                    // Naga's per-expression trace and per-frame pipeline state
-                    // logs are disabled because they can starve the simulation.
-                    level: Level::DEBUG,
-                    filter: "wgsl=debug,wgpu=warn,naga=warn,bevy_render=warn,bevy_shader=warn,ryugu_wasm=debug".into(),
+                    // Browser consoles should contain actionable failures,
+                    // not Bevy startup/debug telemetry. Numerical diagnostics
+                    // remain visible through the in-app status panels.
+                    level: Level::WARN,
+                    filter: "warn,wgpu=error,naga=error,bevy_render=error,bevy_shader=error,ryugu_wasm=warn".into(),
                     ..default()
                 })
                 .set(AssetPlugin {

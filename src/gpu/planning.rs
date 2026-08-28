@@ -121,7 +121,7 @@ impl FromWorld for PlanningMethodPipelines {
             immediate_size: 0,
             shader: server.load("shaders/planning_fmm.wgsl"),
             shader_defs: vec![],
-            entry_point: None,
+            entry_point: Some("main".into()),
             zero_initialize_workgroup_memory: false,
         });
         let mmfft = cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -139,7 +139,7 @@ impl FromWorld for PlanningMethodPipelines {
             immediate_size: 0,
             shader: server.load("shaders/planning_mmfft.wgsl"),
             shader_defs: vec![],
-            entry_point: None,
+            entry_point: Some("main".into()),
             zero_initialize_workgroup_memory: false,
         });
         Self { fmm, mmfft }
@@ -338,33 +338,23 @@ fn dispatch_planning_method(
             .clone()
     };
     let baseline_size = batch.state_count() as u64 * 16;
-    let baseline = if buffers.baseline_size != baseline_size || buffers.baseline.is_none() {
-        render_device.create_buffer(&BufferDescriptor {
+    let baseline = match (&buffers.baseline, buffers.baseline_size == baseline_size) {
+        (Some(buffer), true) => buffer.clone(),
+        _ => render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_method_baseline"),
             size: baseline_size,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
-        })
-    } else {
-        buffers
-            .baseline
-            .as_ref()
-            .expect("checked baseline buffer")
-            .clone()
+        }),
     };
-    let metrics = if buffers.metric_size != metric_size || buffers.metrics.is_none() {
-        render_device.create_buffer(&BufferDescriptor {
+    let metrics = match (&buffers.metrics, buffers.metric_size == metric_size) {
+        (Some(buffer), true) => buffer.clone(),
+        _ => render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_method_metrics"),
             size: metric_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
-        })
-    } else {
-        buffers
-            .metrics
-            .as_ref()
-            .expect("checked metric buffer")
-            .clone()
+        }),
     };
     let staging_changed = buffers.staging_size != staging_size || buffers.staging.is_none();
     let staging = if staging_changed {
@@ -522,7 +512,7 @@ fn dispatch_planning_method(
     } else {
         PlanningExecutionBackend::GpuMmfft
     };
-    let item_count = extracted.payload.item_count;
+    let average_fmm_interactions = extracted.payload.maximum_level;
     let state_indices = verification_targets;
     let request_candidate_count = request.candidate_count;
     let gpu_completion_started = bevy::platform::time::Instant::now();
@@ -542,7 +532,7 @@ fn dispatch_planning_method(
                 (Vec::new(), Vec::new())
             };
             let kernel_evaluations = if method == ActiveGravityMethod::Fmm {
-                u64::from(target_count) * u64::from(item_count)
+                u64::from(target_count) * u64::from(average_fmm_interactions.max(1))
             } else {
                 u64::from(target_count) * 64
             };
@@ -584,7 +574,7 @@ fn fmm_planning_uniform(
         request.candidate_start * batch.samples_per_candidate,
         request.candidate_count * batch.samples_per_candidate,
         payload.item_count,
-        payload.maximum_level,
+        batch.state_count() as u32,
         payload.secondary_count,
         request.density_model,
         batch.samples_per_candidate,
@@ -625,9 +615,9 @@ fn mmfft_planning_uniform(
         payload.half_extents[1],
         payload.total_mass,
         0.25,
+        payload.grid_scales[0],
+        payload.grid_scales[1],
         G,
-        0.0,
-        0.0,
         0.0,
     ] {
         bytes.extend_from_slice(&value.to_le_bytes());

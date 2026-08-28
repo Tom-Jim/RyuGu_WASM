@@ -128,7 +128,9 @@ fn evaluate_fmm(node: &FmmNode, target: DVec3, theta: f64) -> DVec3 {
 fn high_resolution_reference_tree(source: &RadialGravitySource) -> Option<FmmNode> {
     let points = source
         .bytes
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .filter_map(|record| {
             let direction = DVec3::new(
                 f64::from(read_f32(record, 0)),
@@ -165,7 +167,9 @@ fn high_resolution_reference_basis_trees(
 ) -> Option<Vec<FmmNode>> {
     let radius = source
         .bytes
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .map(|record| read_f32(record, 20))
         .filter(|value| value.is_finite())
         .fold(0.0_f32, f32::max);
@@ -179,7 +183,7 @@ fn high_resolution_reference_basis_trees(
         grid_lookup[(z * VOXEL_SIDE + y) * VOXEL_SIDE + x] = index;
     }
     let mut groups = vec![Vec::<(DVec3, f64)>::new(); voxels.len()];
-    for record in source.bytes.chunks_exact(32) {
+    for record in source.bytes.as_chunks::<32>().0 {
         let direction = DVec3::new(
             f64::from(read_f32(record, 0)),
             f64::from(read_f32(record, 4)),

@@ -230,11 +230,7 @@ pub fn performance_comparison_system(
     }
 
     for (label, mut text) in texts.p3().iter_mut() {
-        **text = if label.jacobi {
-            format!("{}%", label.slot as u32 * 25)
-        } else {
-            format!("{}%", label.slot as u32 * 25)
-        };
+        **text = format!("{}%", label.slot as u32 * 25);
     }
 
     update_performance_chart_segments(&state, &mut nodes.p4());

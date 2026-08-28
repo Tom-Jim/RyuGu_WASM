@@ -20,7 +20,8 @@ pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
 pub const PLANNING_SOURCE_COUNTS: [u32; 9] = [
-    1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
+    32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
+    8_388_608,
 ];
 pub const PLANNING_SOURCE_REPEATS: u32 = 10;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
@@ -435,8 +436,7 @@ impl PlanningMethodMetrics {
     }
 
     pub fn certified_accuracy_eligible(self) -> bool {
-        self.method == ActiveGravityMethod::CurvedArcEq106
-            && self.gpu_batch_verified
+        self.gpu_batch_verified
             && self.workload.is_complete()
             && self.certified_relative_gravity_error.is_finite()
             && self.certified_relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
@@ -445,7 +445,7 @@ impl PlanningMethodMetrics {
             // The certified pass must satisfy the same pointwise outlier
             // policy as the ordinary pass.  Until certified pointwise strata
             // are stored separately, the raw strata are the conservative
-            // common gate for both reported Eq.106 timings.
+            // common gate for both reported raw/certified timings.
             && self.gravity_error_p99.is_finite()
             && self.gravity_error_p99 <= 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
             && self.gravity_error_max.is_finite()
@@ -483,13 +483,13 @@ pub struct PlanningComparisonState {
 #[derive(Clone, Copy, Debug)]
 pub struct PlanningSourceCurveSample {
     pub source_count: u32,
-    /// Eq.106 raw, Eq.106 certified estimate, FFT-grid, treecode.
-    pub times_ms: [f64; 4],
-    /// Build/preprocess timing for Eq.106 raw, FFT-grid, treecode.
+    /// Eq.106 raw/certified, packed FFT raw/certified, FMM raw/certified.
+    pub times_ms: [f64; 6],
+    /// Build/preprocess timing for Eq.106, packed FFT, and target-cell FMM.
     pub build_ms: [f64; 3],
-    /// Warm-query nanoseconds per target for Eq.106 raw, FFT-grid, treecode.
+    /// Warm-query nanoseconds per target for Eq.106, packed FFT, and FMM.
     pub query_ns_per_target: [f64; 3],
-    pub eligible: [bool; 4],
+    pub eligible: [bool; 6],
 }
 
 #[derive(Resource, Debug, Default)]
@@ -571,8 +571,8 @@ impl PlanningComparisonState {
         let fmm = self.results[4]?;
         let methods = [
             ("Eq.106 full forward", eq106),
-            ("FFT-grid", mmfft),
-            ("treecode", fmm),
+            ("packed FFT", mmfft),
+            ("target-cell FMM", fmm),
         ];
         let common_samples = eq106.verification_sample_count > 0
             && eq106.verification_sample_count == mmfft.verification_sample_count
@@ -670,7 +670,7 @@ impl PlanningComparisonState {
 
 #[cfg(test)]
 mod planning_profile_tests {
-    use super::PlanningWorkloadProfile;
+    use super::{PLANNING_SOURCE_COUNTS, PlanningWorkloadProfile};
 
     #[test]
     fn both_visible_profiles_use_fixed_batch_scheduling() {
@@ -680,5 +680,13 @@ mod planning_profile_tests {
             PlanningWorkloadProfile::InteractiveStress.dimensions(),
             (2_048, 32, 512)
         );
+    }
+
+
+    #[test]
+    fn quadrature_curve_spans_32k_through_8192k() {
+        assert_eq!(PLANNING_SOURCE_COUNTS[0], 32 * 1_024);
+        assert_eq!(*PLANNING_SOURCE_COUNTS.last().unwrap(), 8_192 * 1_024);
+        assert!(PLANNING_SOURCE_COUNTS.windows(2).all(|pair| pair[1] == 2 * pair[0]));
     }
 }

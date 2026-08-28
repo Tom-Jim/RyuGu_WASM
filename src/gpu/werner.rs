@@ -163,7 +163,7 @@ fn build_werner_source_system(
     let mut volume = 0.0_f64;
     let mut face_count = 0_u32;
 
-    for triangle in topology.triangles.chunks_exact(3) {
+    for triangle in topology.triangles.as_chunks::<3>().0 {
         let mut indices = [triangle[0], triangle[1], triangle[2]];
         let mut points = [
             topology.positions[indices[0] as usize] * scale,
