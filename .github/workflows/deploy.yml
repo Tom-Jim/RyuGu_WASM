@@ -21,6 +21,14 @@ jobs:
             - name: Checkout
               uses: actions/checkout@v4
 
+            - name: Set up Bun
+              uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: 1.3.14
+
+            - name: Install web dependencies
+              run: bun install --frozen-lockfile
+
             - name: Install Rust Toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
@@ -29,20 +37,29 @@ jobs:
             - name: Install wasm-pack
               run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-            - name: Build WASM Release
-              run: wasm-pack build --release --target web --out-dir pkg
+            - name: Lint WASM without dead code
+              run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 
-            - name: Assemble Site Directory & Auto-Fix Case Sensitivity
+            - name: Build WASM Release
+              run: wasm-pack build --release --target web --out-dir pkg --out-name ryugu_wasm
+
+            - name: Build Tailwind stylesheet
+              run: bun run styles
+
+            - name: Verify browser sources
               run: |
-                  mkdir -p site
-                  cp index.html site/ 2>/dev/null || true
+                  node --check src/html/ui.js
+                  node --check src/html/app.js
+
+            - name: Assemble Site Directory
+              run: |
+                  mkdir -p site/src/html
+                  cp src/html/index.html site/index.html
+                  cp src/html/ui.css src/html/ui.js src/html/app.js src/html/tailwind.generated.css site/src/html/
+                  mkdir -p site/node_modules/vue/dist
+                  cp node_modules/vue/dist/vue.esm-browser.prod.js site/node_modules/vue/dist/
                   cp -r assets site/ 2>/dev/null || true
                   cp -r pkg site/ 2>/dev/null || true
-
-                  #  Copy both filename cases to avoid case-sensitive 404 errors.
-                  cd site/pkg
-                  if [ -f ryugu_wasm.js ]; then cp ryugu_wasm.js Ryugu_wasm.js; fi
-                  if [ -f ryugu_wasm_bg.wasm ]; then cp ryugu_wasm_bg.wasm Ryugu_wasm_bg.wasm; fi
 
             - name: Upload Pages Artifact
               uses: actions/upload-pages-artifact@v3

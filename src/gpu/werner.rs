@@ -117,9 +117,10 @@ impl FromWorld for WernerComputePipeline {
             storage_rw_entry(3),
         ];
         let layout = BindGroupLayoutDescriptor::new("werner_bgl", &entries);
-        let shader = world
-            .resource::<AssetServer>()
-            .load("shaders/werner_gravity.wgsl");
+        let shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Werner,
+        );
         let pipeline_id =
             world
                 .resource::<PipelineCache>()
@@ -517,7 +518,6 @@ fn poll_werner_readback(
             #[cfg(feature = "eq106-dual-certificate")]
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
-            eq106_diagnostics: None,
         });
     }
 }

@@ -101,7 +101,6 @@ mod tests {
             #[cfg(feature = "eq106-dual-certificate")]
             independent_positive_potential: Some(potential),
             body_acceleration_jacobian: None,
-            eq106_diagnostics: None,
         };
 
         assert_eq!(history.dual_residual_for(&sample(1, 0.0, 4.0)), Some(0.0));

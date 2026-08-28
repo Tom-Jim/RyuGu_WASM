@@ -4,7 +4,10 @@
 mod bevy_app;
 mod cpu;
 mod gpu;
+#[cfg(target_arch = "wasm32")]
+mod html;
 mod interface;
+mod wgsl;
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::log::{Level, LogPlugin};
@@ -17,35 +20,20 @@ use bevy::render::{
 use bevy::window::PresentMode;
 use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_app::{
-    energy::{
-        record_probe_jacobi_system, setup_eq106_residual_chart, setup_jacobi_chart,
-        update_eq106_residual_chart_system, update_jacobi_chart_system,
+    backend::{
+        apply_probe_input_system, clear_gpu_histories_on_method_change,
+        clear_inversion_request_on_probe_change, clear_runtime_error_on_probe_change,
+        method_selection_system, performance_comparison_system, planning_batch_evaluator_system,
+        probe_collision_system, reset_after_probe_crash_scene_system,
+        reset_after_probe_crash_state_system, reset_inversion_on_method_change,
+        update_gpu_memory_estimate_system, update_planning_results_from_inversion_system,
     },
+    energy::record_probe_jacobi_system,
     render::{
-        camera_follow_system, camera_switch_system, capture_trajectory_inversion_system,
-        render_gizmos_system, render_section_system, section_alpha_system, setup_scene, setup_ui,
+        camera_follow_system, capture_trajectory_inversion_system, render_gizmos_system,
+        render_section_system, section_alpha_system, setup_scene,
     },
     scale::{build_topology_system, normalize_model_scale_system},
-    ui::{
-        clear_gpu_histories_on_method_change, clear_runtime_error_on_probe_change,
-        density_inversion_timing_ui_system, fps_update_system, method_toggle_system,
-        normal_toggle_system, performance_button_system, performance_comparison_system,
-        performance_method_checkbox_system, planning_batch_evaluator_system,
-        planning_comparison_control_system, probe_collision_system, probe_crash_overlay_system,
-        probe_orbit_preset_style_system, probe_orbit_preset_system, probe_slider_system,
-        probe_slider_visual_system, reset_after_probe_crash_scene_system,
-        reset_after_probe_crash_state_system, reset_inversion_on_method_change,
-        restore_source_curve_system, runtime_error_overlay_system, runtime_error_reset_system,
-        section_toggle_system, setup_density_inversion_timing_panel, setup_fps_ui,
-        setup_performance_chart_segments, setup_performance_controls, setup_probe_controls,
-        setup_probe_crash_overlay, setup_runtime_error_overlay,
-        setup_simulation_acceleration_control, setup_trajectory_inversion_controls,
-        simulation_acceleration_slider_system, simulation_acceleration_slider_visual_system,
-        source_scale_curve_ui_system, trajectory_inversion_input_system,
-        trajectory_inversion_ui_system, ui_text_focus_pass_system,
-        update_gpu_memory_estimate_system, update_hint_on_mode_change,
-        update_planning_results_from_inversion_system, update_ui_scale_system,
-    },
 };
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
@@ -79,6 +67,17 @@ use interface::components::{
     ShowNormals, ShowSection, SimulationAcceleration, SimulationClock, TrajectoryInversionState,
 };
 use std::time::Duration;
+use wgsl::WgslPlugin;
+
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UiComputeOrdering {
+    BrowserActions,
+    MethodReset,
+    InversionAndPlanning,
+}
+
+#[cfg(target_arch = "wasm32")]
+use html::{browser_ui_action_system, browser_ui_publish_system};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -287,7 +286,10 @@ pub fn main() {
                     primary_window: Some(Window {
                         canvas: Some("#bevy".into()),
                         fit_canvas_to_parent: true,
-                        prevent_default_event_handling: false,
+                        // Keep browser selection/gesture handling out of the
+                        // canvas so PanOrbit receives left-drag and wheel
+                        // input whenever the pointer is not over a UI control.
+                        prevent_default_event_handling: true,
                         present_mode: PresentMode::AutoVsync,
                         ..default()
                     }),
@@ -304,6 +306,7 @@ pub fn main() {
                 }),
         )
         .add_plugins(PanOrbitCameraPlugin)
+        .add_plugins(WgslPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default());
 
     // Native builds use a precise sleep/spin limiter. Browsers already own the
@@ -329,40 +332,28 @@ pub fn main() {
         app.add_plugins(FmmComputePlugin);
     }
 
+    app.add_systems(Startup, setup_scene);
+
+    #[cfg(target_arch = "wasm32")]
     app.add_systems(
-        Startup,
-        (
-            setup_scene,
-            setup_ui,
-            setup_fps_ui,
-            setup_runtime_error_overlay,
-            setup_probe_crash_overlay,
-            setup_probe_controls,
-            setup_simulation_acceleration_control,
-            setup_jacobi_chart,
-            setup_eq106_residual_chart,
-        ),
-    )
-    .add_systems(
-        Startup,
-        (
-            setup_performance_controls,
-            setup_trajectory_inversion_controls,
-            setup_density_inversion_timing_panel,
-            setup_performance_chart_segments,
-            restore_source_curve_system,
-        )
-            .chain(),
+        Update,
+        browser_ui_action_system.in_set(UiComputeOrdering::BrowserActions),
     )
     .add_systems(
         Update,
+        browser_ui_publish_system.after(UiComputeOrdering::InversionAndPlanning),
+    );
+
+    app.configure_sets(
+        Update,
         (
-            normalize_model_scale_system,
-            build_topology_system,
-            camera_switch_system,
-            normal_toggle_system,
-        )
-            .chain(),
+            UiComputeOrdering::BrowserActions.before(UiComputeOrdering::MethodReset),
+            UiComputeOrdering::MethodReset.before(UiComputeOrdering::InversionAndPlanning),
+        ),
+    )
+    .add_systems(
+        Update,
+        (normalize_model_scale_system, build_topology_system).chain(),
     )
     .add_systems(
         Update,
@@ -372,50 +363,34 @@ pub fn main() {
         Update,
         build_eq106_operator_tensor_system.after(build_aggregated_gravity_source_system),
     )
-    .add_systems(Update, section_toggle_system)
     .add_systems(
         Update,
         (
-            performance_button_system,
-            performance_method_checkbox_system,
-            method_toggle_system,
+            method_selection_system,
             clear_gpu_histories_on_method_change,
             reset_inversion_on_method_change,
         )
-            .chain(),
+            .chain()
+            .in_set(UiComputeOrdering::MethodReset),
     )
     .add_systems(
         Update,
         (
             capture_trajectory_inversion_system,
-            trajectory_inversion_input_system,
             start_density_inversion_system,
             convex_optimization_system,
-            trajectory_inversion_ui_system,
-            planning_comparison_control_system,
             update_planning_results_from_inversion_system,
             planning_batch_evaluator_system,
-            density_inversion_timing_ui_system,
-            source_scale_curve_ui_system,
         )
-            .chain(),
+            .chain()
+            .in_set(UiComputeOrdering::InversionAndPlanning),
     )
+    .add_systems(Update, apply_probe_input_system)
+    .add_systems(Update, clear_inversion_request_on_probe_change)
+    .add_systems(Update, clear_runtime_error_on_probe_change)
     .add_systems(
         Update,
         (
-            probe_orbit_preset_system,
-            probe_slider_system,
-            runtime_error_reset_system,
-            clear_runtime_error_on_probe_change,
-            probe_slider_visual_system,
-            probe_orbit_preset_style_system,
-        )
-            .chain(),
-    )
-    .add_systems(
-        Update,
-        (
-            probe_crash_overlay_system,
             reset_after_probe_crash_scene_system,
             reset_after_probe_crash_state_system,
         )
@@ -424,18 +399,9 @@ pub fn main() {
     .add_systems(
         Update,
         (
-            update_ui_scale_system,
-            ui_text_focus_pass_system,
-            runtime_error_overlay_system,
-            simulation_acceleration_slider_system,
-            simulation_acceleration_slider_visual_system,
-            update_hint_on_mode_change,
             performance_comparison_system,
             camera_follow_system,
             update_gpu_memory_estimate_system,
-            fps_update_system,
-            update_jacobi_chart_system,
-            update_eq106_residual_chart_system,
             section_alpha_system,
         )
             .chain(),
@@ -454,8 +420,9 @@ pub fn main() {
             record_probe_jacobi_system,
         )
             .chain(),
-    )
-    .run();
+    );
+
+    app.run();
 }
 
 pub use cpu::benchmark::benchmark_gravity_algorithms;

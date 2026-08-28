@@ -88,6 +88,7 @@ pub struct VolterraSolution {
 }
 
 impl VolterraSolution {
+    #[cfg(test)]
     pub fn sample_at(&self, elapsed_seconds: f64) -> Option<VolterraSample> {
         let first = *self.samples.first()?;
         let last = *self.samples.last()?;
@@ -194,6 +195,7 @@ impl VolterraWorkspace {
 /// reference-line frame. `acceleration_at` is evaluated on every Picard iterate,
 /// closing the position -> field -> trajectory loop instead of freezing force
 /// samples on the initial geometric curve.
+#[cfg(test)]
 pub fn propagate_reference_line<E, F>(
     initial_position: DVec3,
     initial_velocity: DVec3,

@@ -1,12 +1,4 @@
 pub fn start_density_inversion_system(
-    interactions: Query<
-        &Interaction,
-        (
-            Changed<Interaction>,
-            With<Button>,
-            With<TrajectoryInversionButton>,
-        ),
-    >,
     active_method: Res<ActiveGravityMethod>,
     planning: Res<PlanningComparisonState>,
     radial_source: Option<Res<RadialGravitySource>>,
@@ -17,15 +9,13 @@ pub fn start_density_inversion_system(
     mut show_section: ResMut<ShowSection>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    let pressed = interactions
-        .iter()
-        .any(|interaction| *interaction == Interaction::Pressed);
     if !planning.selected_metric.is_inversion() {
         return;
     }
-    if !validate_inversion_request(pressed, *active_method, &mut inversion) {
+    if !validate_inversion_request(inversion.start_requested, *active_method, &mut inversion) {
         return;
     }
+    inversion.start_requested = false;
     let common_started = Instant::now();
     let Some(source) = radial_source else {
         inversion.error = Some("The asteroid volume source is not ready.".into());
@@ -75,10 +65,7 @@ pub fn start_density_inversion_system(
     }
     let truth_prepare_ms = common_started.elapsed().as_secs_f64() * 1.0e3;
     let method_started = Instant::now();
-    let mut timing = InversionTimingBreakdown {
-        truth_prepare_ms,
-        ..default()
-    };
+    let mut timing = InversionTimingBreakdown::default();
     let mut sensitivities = inversion.reference_training_sensitivities.clone();
     match method {
         ActiveGravityMethod::CurvedArcEq106 => {
@@ -130,8 +117,6 @@ pub fn start_density_inversion_system(
         method,
         capture_id,
         source_hash,
-        capture_epoch: inversion.capture_epoch,
-        problem_id: inversion_problem_id(capture_id, source_hash),
         neighbours: build_neighbours(&voxels),
         voxels,
         basis_sources,
@@ -144,7 +129,6 @@ pub fn start_density_inversion_system(
         best_densities: current_densities,
         initial_objective: f64::INFINITY,
         data_error_scale: 1.0,
-        iterations: QP_SOLVE_COUNT,
         voxel_size,
         started_at: method_started,
         source_preparation_ms: truth_prepare_ms,
@@ -161,11 +145,8 @@ pub fn start_density_inversion_system(
     inversion.displayed_density = Some(density_result_from_job(
         &job,
         &job.best_densities,
-        job.initial_objective,
         0.0,
     ));
-    inversion.selected = None;
-    inversion.edit_buffer.clear();
     inversion.error = None;
     inversion.optimizer = Some(job);
 }
@@ -273,12 +254,7 @@ fn prepare_eq106_cache(
     }
     performance.inversion = Some(Eq106InversionTiming {
         source_preparation_ms: truth_prepare_ms,
-        matrix_cache_hit: cache_hit,
         ..default()
     });
     cache_hit
-}
-
-fn inversion_problem_id(capture_id: u64, source_hash: u64) -> u64 {
-    0x9e37_79b9_7f4a_7c15_u64 ^ capture_id.rotate_left(17) ^ source_hash.rotate_right(11)
 }

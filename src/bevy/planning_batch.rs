@@ -10,6 +10,7 @@ pub(crate) struct PlanningReferenceCache {
 
 pub fn planning_batch_evaluator_system(
     batch: Res<PlanningCandidateBatch>,
+    channel: Res<PlanningGpuReadbackChannel>,
     mut request: ResMut<PlanningGpuRequest>,
     mut payload: ResMut<PlanningMethodPayload>,
     mut gpu_result: ResMut<PlanningGpuResult>,
@@ -21,6 +22,29 @@ pub fn planning_batch_evaluator_system(
     let Some(mut job) = planning.batch_job.take() else {
         return;
     };
+    let render_failure = channel
+        .error
+        .try_lock()
+        .ok()
+        .and_then(|mut error| error.take());
+    if let Some((failed_request_id, message)) = render_failure
+        && failed_request_id == job.request_id
+    {
+        planning.status = format!(
+            "{} stopped: {message}. The GPU lock was released; fix the reported pipeline error and click Quadrature again.",
+            job.method.planning_label(),
+        );
+        planning.run_requested = false;
+        planning.source_curve_active = false;
+        planning.batch_job = None;
+        *request = PlanningGpuRequest::default();
+        *payload = PlanningMethodPayload::default();
+        gpu_result.0 = None;
+        channel
+            .in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        return;
+    }
     if batch.batch_id == 0 || batch.batch_id != job.batch_id {
         planning.status = "Planning is waiting for the propagated candidate buffers.".into();
         planning.batch_job = Some(job);
@@ -110,12 +134,6 @@ pub fn planning_batch_evaluator_system(
                                 fmm.total_ms,
                                 fmm.certified_estimated_total_ms,
                             ],
-                            build_ms: [eq106.build_ms, mmfft.build_ms, fmm.build_ms],
-                            query_ns_per_target: [
-                                eq106.hot_query_ns_per_target,
-                                mmfft.hot_query_ns_per_target,
-                                fmm.hot_query_ns_per_target,
-                            ],
                             eligible: [
                                 eq106.accuracy_eligible(),
                                 eq106.certified_accuracy_eligible(),
@@ -125,7 +143,6 @@ pub fn planning_batch_evaluator_system(
                                 fmm.certified_accuracy_eligible(),
                             ],
                         });
-                        persist_source_curve(&planning.source_curve_samples);
                         planning.source_curve_repeat += 1;
                         if planning.source_curve_repeat >= PLANNING_SOURCE_REPEATS {
                             planning.source_curve_repeat = 0;
@@ -189,20 +206,14 @@ pub fn planning_batch_evaluator_system(
         return;
     }
     if rendering_needs_priority() {
-        if job.profile.is_compute_benchmark() {
-            // Fair benchmark timing must not include method-dependent
-            // render-priority gaps. The progress UI remains responsive because
-            // GPU submissions and readbacks are asynchronous.
-        } else {
-            planning.status = format!(
-                "{} planning yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
-                job.method.planning_label(),
-                crate::browser_frame_rate().unwrap_or(0.0),
-                crate::browser_recent_frame_ms().unwrap_or(0.0),
-            );
-            planning.batch_job = Some(job);
-            return;
-        }
+        planning.status = format!(
+            "{} planning yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
+            job.method.planning_label(),
+            crate::browser_frame_rate().unwrap_or(0.0),
+            crate::browser_recent_frame_ms().unwrap_or(0.0),
+        );
+        planning.batch_job = Some(job);
+        return;
     }
     let payload_key = job.run_id
         ^ (job.method.performance_index() as u64).rotate_left(17)
@@ -724,10 +735,6 @@ fn top_candidate_scores(
                 (job.candidate_gradient_sum[candidate_index] / normalization).sqrt() as f32;
             let objective = separation * gradient_information / accuracy_penalty;
             objective.is_finite().then_some(PlanningCandidateScore {
-                candidate_index: candidate_index as u32,
-                minimum_altitude_m: altitude,
-                reference_model_separation: separation,
-                gradient_information,
                 objective,
             })
         })
@@ -773,12 +780,6 @@ fn finish_planning_method(
     let gradient_error = (job.gradient_error_sum
         / job.gradient_reference_sum.max(f64::MIN_POSITIVE))
     .sqrt() as f32;
-    let raw_gravity_error = (job.raw_gravity_error_sum
-        / job.gravity_reference_sum.max(f64::MIN_POSITIVE))
-    .sqrt() as f32;
-    let raw_gradient_error = (job.raw_gradient_error_sum
-        / job.gradient_reference_sum.max(f64::MIN_POSITIVE))
-    .sqrt() as f32;
     let model_discrimination = (job.discrimination_sum
         / job
             .discrimination_reference_sum
@@ -804,9 +805,6 @@ fn finish_planning_method(
         job.warm_evaluation_ms / f64::from(job.last_request_candidate_count.max(1));
     let cold_amortization_candidates =
         (job.preprocessing_ms / warm_per_candidate.max(f64::MIN_POSITIVE)).ceil() as u32;
-    let warm_target_count = f64::from(job.last_request_candidate_count.max(1))
-        * f64::from(job.samples_per_candidate.max(1));
-    let hot_query_ns_per_target = job.warm_evaluation_ms / warm_target_count * 1.0e6;
     let gpu_build_ms = (job.first_tile_ms
         - job.warm_evaluation_ms * f64::from(job.density_model_count))
     .max(0.0);
@@ -846,36 +844,17 @@ fn finish_planning_method(
         backend,
         gpu_batch_verified: verified,
         workload: batch.workload_identity(),
-        common_preparation_ms: job.common_preparation_ms,
-        one_time_preparation_ms: job.one_time_preparation_ms,
-        preprocessing_ms: job.preprocessing_ms,
-        command_submission_ms: job.command_submission_ms,
-        reduction_ms: job.reduction_ms,
-        verification_ms: job.verification_ms,
-        gpu_completion_map_ms: job.gpu_completion_map_ms,
-        warm_evaluation_ms: job.warm_evaluation_ms,
-        certified_warm_evaluation_ms: job.certified_warm_evaluation_ms,
         certified_full_pass_ms: job.certified_full_pass_ms,
         certified_estimated_total_ms,
-        build_ms,
-        hot_query_ns_per_target,
         total_ms,
         relative_gravity_error: gravity_error,
         gradient_relative_error: gradient_error,
-        raw_relative_gravity_error: raw_gravity_error,
-        raw_gradient_relative_error: raw_gradient_error,
         certified_relative_gravity_error: certified_gravity_error,
         certified_gradient_relative_error: certified_gradient_error,
-        gravity_error_p95,
         gravity_error_p99,
         gravity_error_max,
-        gradient_error_p95,
         gradient_error_p99,
         gradient_error_max,
-        rejected_sample_count: job.rejected_sample_count,
-        rejection_counts: job.rejection_counts,
-        self_fd_step_maxima: job.self_fd_step_maxima,
-        first_rejection: job.first_rejection,
         pericenter_error_m: job.pericenter_error_m,
         minimum_altitude_m,
         model_discrimination,
@@ -895,15 +874,6 @@ fn finish_planning_method(
             .filter(|valid| **valid)
             .count() as u32,
         cold_amortization_candidates,
-        dispatch_count: job.dispatch_count,
-        forward_kernel_evaluations: job.forward_kernel_evaluations,
-        density_combinations: job.total_evaluations,
-        // Certified requests form a separate complete hot pass and are not
-        // folded into the raw fairness request count.
-        gpu_request_count: raw_gpu_request_count,
-        certified_gpu_request_count,
-        minimum_tile_candidates: job.minimum_tile_size_used.min(job.maximum_tile_size_used),
-        maximum_tile_candidates: job.maximum_tile_size_used,
         top_candidates,
     });
     info!(

@@ -109,16 +109,11 @@ fn decode_gpu_timings(
             .flatten()
             .map(|ticks| ticks * timestamp_period_ns as f64 / 1.0e6)
     };
-    let readback = layout
-        .readback_pair
-        .and_then(|(begin, end)| elapsed_ms(&[(begin, end)]));
     Eq106TimingSample {
         spectrum_build_ms: elapsed_ms(&layout.build_pairs),
         target_evaluation_ms: elapsed_ms(&layout.evaluation_pairs),
-        gpu_readback_copy_ms: readback,
         cpu_readback_wait_ms,
         target_count,
-        spectral_element_count,
         dispatch_count: 1,
         spectrum_rebuild_count: spectral_element_count,
     }
@@ -404,9 +399,10 @@ impl FromWorld for Eq106ComputePipeline {
             storage_ro_entry(9),
         ];
         let layout = BindGroupLayoutDescriptor::new("eq106_complex_bgl", &entries);
-        let shader = world
-            .resource::<AssetServer>()
-            .load("shaders/eq106_complex.wgsl");
+        let shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Eq106,
+        );
         let cache = world.resource::<PipelineCache>();
         let line_samples_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_assemble_line_samples".into()),
@@ -500,7 +496,7 @@ impl FromWorld for Eq106ComputePipeline {
 }
 
 fn log_eq106_wgsl_source() {
-    let source = include_str!("../../../assets/shaders/eq106_complex.wgsl");
+    let source = include_str!("../../wgsl/eq106_complex.wgsl");
     debug!(
         target: "wgsl::eq106",
         bytes = source.len(),
@@ -553,8 +549,6 @@ fn poll_eq106_readback(
     };
     let Some(packet) = guard.take() else { return };
     performance.latest = Some(packet.timings);
-    let angular_velocity_world =
-        RYUGU_SPIN_AXIS.normalize() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
     if packet.sensitivity_column_count > 0 {
         let Some(capture_id) = packet.batch_capture_id else {
             runtime_error.raise("Equation (106) sensitivity readback has no capture identity.");
@@ -613,7 +607,7 @@ fn poll_eq106_readback(
         inversion.target_evaluation_ms = packet.timings.target_evaluation_ms;
         return;
     }
-    let decoded = match decode_eq106_packet(&packet, angular_velocity_world) {
+    let decoded = match decode_eq106_packet(&packet) {
         Ok(decoded) => decoded,
         Err(Eq106DecodeError::Incomplete { actual, expected }) => {
             runtime_error.raise(format!(
@@ -696,10 +690,7 @@ impl Eq106RejectReason {
     }
 }
 
-fn decode_eq106_packet(
-    packet: &Eq106ReadbackPacket,
-    angular_velocity_world: Vec3,
-) -> Result<Vec<GravityFieldSample>, Eq106DecodeError> {
+fn decode_eq106_packet(packet: &Eq106ReadbackPacket) -> Result<Vec<GravityFieldSample>, Eq106DecodeError> {
     let expected_rows = packet.snapshots.len() * OUTPUT_ROWS_PER_BLOCK as usize;
     if packet.partial_sums.len() != expected_rows {
         return Err(Eq106DecodeError::Incomplete {
@@ -716,7 +707,6 @@ fn decode_eq106_packet(
             decode_eq106_sample(
                 &packet.partial_sums[start..start + OUTPUT_ROWS_PER_BLOCK as usize],
                 snapshot,
-                angular_velocity_world,
             )
             .map_err(|reason| Eq106DecodeError::Rejected {
                 sample: index,
@@ -729,7 +719,6 @@ fn decode_eq106_packet(
 fn decode_eq106_sample(
     rows: &[[f32; 4]],
     base_snapshot: &GravityRequestSnapshot,
-    angular_velocity_world: Vec3,
 ) -> Result<GravityFieldSample, Eq106RejectReason> {
     let field = rows[0];
     let certificate = rows[1];
@@ -838,19 +827,5 @@ fn decode_eq106_sample(
         #[cfg(feature = "eq106-dual-certificate")]
         independent_positive_potential: independent_potential,
         body_acceleration_jacobian: Some(jacobian),
-        eq106_diagnostics: Some(Eq106SampleDiagnostics {
-            segment_id: local_coordinates[3].round().max(0.0) as u64,
-            line_origin,
-            line_direction: (base_snapshot.ryugu_transform.rotation.inverse()
-                * (base_snapshot.probe_velocity
-                    - angular_velocity_world.cross(
-                        base_snapshot.probe_position - base_snapshot.ryugu_transform.translation,
-                    )))
-            .normalize_or_zero(),
-            h: local_coordinates[0],
-            u: local_coordinates[1],
-            v: local_coordinates[2],
-            certificates: certificate,
-        }),
     })
 }

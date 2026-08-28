@@ -111,6 +111,24 @@ fn dispatch_planning_eq106(
         );
         return;
     };
+    if let Some(message) = first_planning_pipeline_error(
+        &cache,
+        &[
+            ("voxel line samples", pipelines.planning_voxel_line_samples_id),
+            ("voxel basis spectrum", pipelines.planning_voxel_spectrum_id),
+            ("spectrum combination", pipelines.planning_combine_spectrum_id),
+            ("inverse spectrum", pipelines.planning_evaluate_id),
+            ("planning reduction", reduction.0),
+        ],
+    ) {
+        fail_planning_eq106(
+            &mut state,
+            &channel,
+            request.request_id,
+            message,
+        );
+        return;
+    }
     let (
         Some(voxel_line_samples_pipeline),
         Some(voxel_spectrum_pipeline),
@@ -994,6 +1012,41 @@ fn report_eq106_block(
     }
     state.last_block_key = Some((request_id, code));
     warn!(target: "planning::eq106", request_id, code, reason);
+}
+
+fn first_planning_pipeline_error(
+    cache: &PipelineCache,
+    pipelines: &[(&str, CachedComputePipelineId)],
+) -> Option<String> {
+    pipelines.iter().find_map(|(name, pipeline_id)| {
+        let CachedPipelineState::Err(error) = cache.get_compute_pipeline_state(*pipeline_id) else {
+            return None;
+        };
+        if matches!(
+            error,
+            ShaderCacheError::ShaderNotLoaded(_) | ShaderCacheError::ShaderImportNotYetAvailable
+        ) {
+            return None;
+        }
+        Some(format!("Eq.106 {name} GPU pipeline failed to compile: {error}"))
+    })
+}
+
+fn fail_planning_eq106(
+    state: &mut PlanningEq106DispatchState,
+    channel: &PlanningGpuReadbackChannel,
+    request_id: u64,
+    message: String,
+) {
+    error!(target: "planning::eq106", request_id, error = %message);
+    state.clear_active();
+    state.last_request_id = request_id;
+    channel.in_flight.store(false, Ordering::Release);
+    if let Ok(mut slot) = channel.error.try_lock()
+        && slot.is_none()
+    {
+        *slot = Some((request_id, message));
+    }
 }
 
 fn canonical_element_accepts(

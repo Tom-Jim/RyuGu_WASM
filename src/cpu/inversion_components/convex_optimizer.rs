@@ -89,7 +89,6 @@ pub fn convex_optimization_system(
         .collect::<Vec<_>>();
     job.best_densities.clone_from(&densities);
     job.current_densities.clone_from(&densities);
-    let best_objective = objective_for_densities(&job, &densities);
     for (voxel, density) in job.voxels.iter_mut().zip(&densities) {
         voxel.density = *density;
     }
@@ -100,7 +99,7 @@ pub fn convex_optimization_system(
     let inversion_time_ms = job.started_at.elapsed().as_secs_f64() * 1.0e3;
     job.timing.total_ms = inversion_time_ms;
     performance.full_inversion_iteration_ms = Some(inversion_time_ms);
-    let result = density_result_from_job(&job, &densities, best_objective, inversion_time_ms);
+    let result = density_result_from_job(&job, &densities, inversion_time_ms);
     if completed_method == ActiveGravityMethod::CurvedArcEq106 {
         let timing = performance.inversion.get_or_insert_default();
         timing.source_preparation_ms = job.source_preparation_ms;
@@ -287,10 +286,6 @@ fn solve_density_qp(
     Ok(densities)
 }
 
-fn objective_for_densities(job: &ConvexOptimizationJob, densities: &[f32]) -> f64 {
-    objective_for_density_slice(job, densities)
-}
-
 fn add_pair_penalty(h: &mut [Vec<f64>], left: usize, right: usize, weight: f64) {
     h[left][left] += weight;
     h[right][right] += weight;
@@ -322,14 +317,6 @@ fn radial_density_pairs(job: &ConvexOptimizationJob) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn inversion_problem_id_depends_only_on_frozen_data_and_source() {
-        let first = inversion_problem_id(0x1234, 0x5678);
-        assert_eq!(first, inversion_problem_id(0x1234, 0x5678));
-        assert_ne!(first, inversion_problem_id(0x1235, 0x5678));
-        assert_ne!(first, inversion_problem_id(0x1234, 0x5679));
-    }
 
     #[test]
     fn method_independent_reference_matrix_is_shared_before_backend_replacement() {

@@ -56,26 +56,6 @@ pub fn setup_scene(
     ));
 }
 
-pub fn setup_ui(mut commands: Commands) {
-    commands.spawn((
-        Text::new(
-            "Press 'S': View | Press 'F': Normals | Press 'D': Section | Mode: [Overview] | Normals: [OFF] | Section: [OFF]",
-        ),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(14.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.9, 0.9, 0.9)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(15.0),
-            left: Val::Px(15.0),
-            ..default()
-        },
-        UiTextMarker,
-    ));
-}
-
 /// Records only presentation states for five wall-clock seconds, then maps
 /// them to sixteen uniform knots.  This deliberately runs outside
 /// `FixedUpdate`: no captured value can affect force evaluation or integration.
@@ -84,11 +64,11 @@ pub fn capture_trajectory_inversion_system(
     clock: Res<SimulationClock>,
     active_method: Res<ActiveGravityMethod>,
     radial_history: Option<Res<RadialGravityHistory>>,
-    werner_history: Option<Res<WernerGravityHistory>>,
     eq106_source: Option<Res<AggregatedGravitySource>>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
     if inversion.runtime_epoch != clock.epoch {
+        let queued_inversion = inversion.start_requested;
         let preserve_truth_track = inversion.preserve_truth_track;
         inversion.preserve_truth_track = false;
         inversion.runtime_epoch = clock.epoch;
@@ -107,13 +87,9 @@ pub fn capture_trajectory_inversion_system(
         inversion.capture_id = None;
         inversion.capture_source_hash =
             eq106_source.as_ref().map_or(0, |source| source.source_hash);
-        inversion.certified_sample_streak = 0;
-        inversion.certified_segment_id = None;
         inversion.ready = false;
-        inversion.knots_edited = false;
         inversion.inverted = false;
-        inversion.selected = None;
-        inversion.edit_buffer.clear();
+        inversion.start_requested = queued_inversion;
         inversion.error = None;
         inversion.optimizer = None;
         if !preserve_truth_track {
@@ -141,17 +117,11 @@ pub fn capture_trajectory_inversion_system(
     if inversion.ready || clock.elapsed_seconds <= 0.0 {
         return;
     }
-    // The synthetic inverse observes the same logarithmic-density radial truth
-    // track for every non-Werner method. Werner remains forward-only.
-    let sample = if *active_method == ActiveGravityMethod::HomogeneousWerner {
-        werner_history
-            .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch))
-    } else {
-        radial_history
-            .as_ref()
-            .and_then(|history| history.0.latest_for_epoch(clock.epoch))
-    };
+    // Radial is the single authoritative observation producer. Eq.106,
+    // MMFFT, and FMM all invert this frozen radial trajectory.
+    let sample = radial_history
+        .as_ref()
+        .and_then(|history| history.0.latest_for_epoch(clock.epoch));
     let Some(sample) = sample else {
         return;
     };
@@ -159,42 +129,10 @@ pub fn capture_trajectory_inversion_system(
         // GPU readback can be visible for several presentation frames. Do not
         // duplicate one snapshot in the wall-time capture; repeated anchors
         // make the 16-knot resampling depend on browser scheduling jitter.
-        // Eq.106's 30-sample certification gate precedes the five-second
-        // capture. Counting warm-up frames here created an empty prefix that
-        // resampling filled with repeated copies of the first valid knot.
-        if capture_clock_can_advance(*active_method, inversion.certified_sample_streak) {
-            inversion.wall_elapsed_seconds += time.delta_secs_f64();
-        }
+        inversion.wall_elapsed_seconds += time.delta_secs_f64();
         return;
     }
     inversion.last_capture_request_id = Some(sample.snapshot.request_id);
-    if *active_method == ActiveGravityMethod::CurvedArcEq106 {
-        const REQUIRED_CERTIFIED_CAPTURE_SAMPLES: u32 = 30;
-        let Some(diagnostics) = sample.eq106_diagnostics else {
-            inversion.certified_sample_streak = 0;
-            inversion.certified_segment_id = None;
-            return;
-        };
-        let certified = diagnostics.certificates[0] <= 0.25
-            && diagnostics.certificates[1] <= 0.05
-            && diagnostics.certificates[2] <= 0.25
-            && diagnostics.certificates[3] <= 0.30;
-        if !certified {
-            inversion.certified_sample_streak = 0;
-            inversion.certified_segment_id = None;
-            return;
-        }
-        // Certification belongs to each completed force sample, not to one
-        // planner segment. Adaptive subdivision may legitimately change the
-        // segment id every few samples, especially at accelerated simulation
-        // rates; that must not restart the warm-up.
-        inversion.certified_segment_id = Some(diagnostics.segment_id);
-        inversion.certified_sample_streak =
-            next_certified_sample_streak(inversion.certified_sample_streak, certified);
-        if inversion.certified_sample_streak < REQUIRED_CERTIFIED_CAPTURE_SAMPLES {
-            return;
-        }
-    }
     let baseline_acceleration = sample.snapshot.ryugu_transform.rotation * sample.body_acceleration;
     if !baseline_acceleration.is_finite() {
         return;
@@ -245,34 +183,19 @@ pub fn capture_trajectory_inversion_system(
         });
     }
     inversion.knots = knots;
-    if *active_method != ActiveGravityMethod::HomogeneousWerner
-        && inversion.truth_knots.is_empty()
-    {
+    if inversion.truth_knots.is_empty() {
         inversion.truth_knots = inversion.knots.clone();
         inversion.truth_capture_id = Some(hash_trajectory_capture(&inversion.truth_knots));
         inversion.truth_capture_epoch = inversion.capture_epoch;
         inversion.truth_source_hash = inversion.capture_source_hash;
     }
-    if *active_method != ActiveGravityMethod::HomogeneousWerner
-        && !inversion.truth_knots.is_empty()
-    {
+    if !inversion.truth_knots.is_empty() {
         inversion.knots = inversion.truth_knots.clone();
     }
-    inversion.capture_id = Some(hash_trajectory_capture(&inversion.knots));
+    inversion.capture_id = inversion.truth_capture_id;
+    inversion.capture_epoch = inversion.truth_capture_epoch;
+    inversion.capture_source_hash = inversion.truth_source_hash;
     inversion.ready = true;
-    inversion.knots_edited = false;
-}
-
-fn capture_clock_can_advance(method: ActiveGravityMethod, certified_sample_streak: u32) -> bool {
-    method != ActiveGravityMethod::CurvedArcEq106 || certified_sample_streak >= 30
-}
-
-fn next_certified_sample_streak(current: u32, certified: bool) -> u32 {
-    if certified {
-        current.saturating_add(1)
-    } else {
-        0
-    }
 }
 
 pub(crate) fn hash_trajectory_capture(knots: &[TrajectoryInversionKnot]) -> u64 {
@@ -334,15 +257,6 @@ fn quintic_hermite_point(
         - (start.velocity + end.velocity) * (3.0 * h)
         - (start_acceleration - end_acceleration) * (0.5 * h2);
     ((((c5 * u + c4) * u + c3) * u + c2) * u + c1) * u + c0
-}
-
-pub fn camera_switch_system(keyboard: Res<ButtonInput<KeyCode>>, mut mode: ResMut<CameraMode>) {
-    if keyboard.just_pressed(KeyCode::KeyS) {
-        *mode = match *mode {
-            CameraMode::Overview => CameraMode::FollowCassini,
-            CameraMode::FollowCassini => CameraMode::Overview,
-        };
-    }
 }
 
 pub fn camera_follow_system(
@@ -426,12 +340,12 @@ pub fn render_gizmos_system(
     } else {
         &[]
     };
-    if display_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT {
+    if display_knots.len() >= 2 {
         let Some(accelerations) = quintic_knot_accelerations(display_knots) else {
             return;
         };
-        let mut curve = Vec::with_capacity((TRAJECTORY_INVERSION_SAMPLE_COUNT - 1) * 25 + 1);
-        for index in 0..TRAJECTORY_INVERSION_SAMPLE_COUNT - 1 {
+        let mut curve = Vec::with_capacity((display_knots.len() - 1) * 25 + 1);
+        for index in 0..display_knots.len() - 1 {
             let start = display_knots[index];
             let end = display_knots[index + 1];
             for substep in 0..25 {
@@ -450,9 +364,15 @@ pub fn render_gizmos_system(
                 curve.push(position);
             }
         }
-        gizmos.linestrip(curve, Color::srgb(1.0, 0.16, 0.72));
+        // A gizmo line strip can be dropped wholesale by some WebGPU/browser
+        // combinations when its backing transient buffer wraps.  Submit each
+        // segment explicitly: whenever two trajectory points are visible,
+        // their connecting polyline segment is visible as well.
+        for segment in curve.windows(2) {
+            gizmos.line(segment[0], segment[1], Color::srgb(1.0, 0.16, 0.72));
+        }
         for (index, knot) in display_knots.iter().enumerate() {
-            let hue = index as f32 / TRAJECTORY_INVERSION_SAMPLE_COUNT as f32;
+            let hue = index as f32 / display_knots.len() as f32;
             let color = Color::hsl(hue * 300.0 + 15.0, 0.9, 0.6);
             gizmos.sphere(knot.position, 16.0, color);
             gizmos.line(
@@ -486,7 +406,6 @@ pub fn render_gizmos_system(
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -504,34 +423,6 @@ mod tests {
         let mut changed = knot;
         changed.baseline_acceleration.x += 1.0e-6;
         assert_ne!(id, hash_trajectory_capture(&[changed]));
-    }
-
-    #[test]
-    fn eq106_warm_up_does_not_consume_capture_time() {
-        assert!(!capture_clock_can_advance(
-            ActiveGravityMethod::CurvedArcEq106,
-            29
-        ));
-        assert!(capture_clock_can_advance(
-            ActiveGravityMethod::CurvedArcEq106,
-            30
-        ));
-        assert!(capture_clock_can_advance(
-            ActiveGravityMethod::RadialAnalytic,
-            0
-        ));
-    }
-
-    #[test]
-    fn eq106_certified_samples_accumulate_across_segment_changes() {
-        let mut streak = 0;
-        // Segment identifiers are deliberately absent from this transition:
-        // only the per-sample certificate controls continuity.
-        for _segment_id in [1_u64, 1, 2, 3, 3, 8] {
-            streak = next_certified_sample_streak(streak, true);
-        }
-        assert_eq!(streak, 6);
-        assert_eq!(next_certified_sample_streak(streak, false), 0);
     }
 
     fn density_voxel(center: Vec3, density: f32) -> InvertedDensityVoxel {
@@ -577,26 +468,14 @@ mod tests {
     fn inverted_section_interpolates_between_neighbouring_voxels() {
         let result = DensityInversionResult {
             method: ActiveGravityMethod::RadialAnalytic,
-            capture_id: 1,
             source_hash: 2,
-            capture_epoch: 3,
-            problem_id: 4,
-            initial_objective: 1.0,
-            data_error_scale: 1.0,
             density: 2.0,
             density_scale: 1.0,
-            objective: 0.0,
             model_deviation: 0.0,
             model_fit: 1.0,
-            objective_improvement: 0.0,
             training_rmse: 0.0,
             holdout_rmse: 0.0,
-            observation_noise_fraction: 0.0,
-            observation_noise_realizations: 0,
             inversion_time_ms: 0.0,
-            timing: default(),
-            trajectory_samples: 17,
-            iterations: 1,
             voxel_size: 2.0,
             voxels: vec![
                 density_voxel(Vec3::new(-1.0, 0.0, 0.0), 1.0),

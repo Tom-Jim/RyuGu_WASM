@@ -5,11 +5,12 @@ use bevy::render::{
     render_resource::{
         BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, Buffer,
         BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
-        CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
-        ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
+        CachedComputePipelineId, CachedPipelineState, CommandEncoderDescriptor,
+        ComputePassDescriptor, ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
 };
+use bevy::shader::ShaderCacheError;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -118,7 +119,7 @@ impl FromWorld for PlanningMethodPipelines {
                 ],
             )],
             immediate_size: 0,
-            shader: server.load("shaders/planning_fmm.wgsl"),
+            shader: crate::wgsl::load(server, crate::wgsl::EmbeddedShader::PlanningFmm),
             shader_defs: vec![],
             entry_point: Some("main".into()),
             zero_initialize_workgroup_memory: false,
@@ -136,7 +137,7 @@ impl FromWorld for PlanningMethodPipelines {
                 ],
             )],
             immediate_size: 0,
-            shader: server.load("shaders/planning_mmfft.wgsl"),
+            shader: crate::wgsl::load(server, crate::wgsl::EmbeddedShader::PlanningMmfft),
             shader_defs: vec![],
             entry_point: Some("main".into()),
             zero_initialize_workgroup_memory: false,
@@ -264,9 +265,23 @@ fn dispatch_planning_method(
         pipelines.mmfft
     };
     let Some(pipeline) = cache.get_compute_pipeline(pipeline_id) else {
+        report_planning_pipeline_failure(
+            &cache,
+            pipeline_id,
+            request.request_id,
+            method.planning_label(),
+            &channel,
+        );
         return;
     };
     let Some(reduction_pipeline) = cache.get_compute_pipeline(reduction.0) else {
+        report_planning_pipeline_failure(
+            &cache,
+            reduction.0,
+            request.request_id,
+            "planning reduction",
+            &channel,
+        );
         return;
     };
     if buffers.request_id == request.request_id {
@@ -560,6 +575,32 @@ fn dispatch_planning_method(
             }
             in_flight.store(false, Ordering::Release);
         });
+}
+
+fn report_planning_pipeline_failure(
+    cache: &PipelineCache,
+    pipeline_id: CachedComputePipelineId,
+    request_id: u64,
+    label: &str,
+    channel: &PlanningGpuReadbackChannel,
+) {
+    let CachedPipelineState::Err(error) = cache.get_compute_pipeline_state(pipeline_id) else {
+        return;
+    };
+    if matches!(
+        error,
+        ShaderCacheError::ShaderNotLoaded(_) | ShaderCacheError::ShaderImportNotYetAvailable
+    ) {
+        return;
+    }
+    if let Ok(mut slot) = channel.error.try_lock()
+        && slot.is_none()
+    {
+        *slot = Some((
+            request_id,
+            format!("{label} GPU pipeline failed to compile: {error}"),
+        ));
+    }
 }
 
 fn fmm_planning_uniform(

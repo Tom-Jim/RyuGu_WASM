@@ -8,6 +8,9 @@ fn dispatch_eq106(
     channel: Res<Eq106GpuReadbackChannel>,
 ) {
     let Some(pipelines) = pipelines else { return };
+    if !extracted.enabled || extracted.source_count == 0 {
+        return;
+    }
     report_eq106_pipeline_errors(&cache, &pipelines, &channel);
     let (Some(line_samples), Some(assemble), Some(evaluate)) = (
         cache.get_compute_pipeline(pipelines.line_samples_id),
@@ -16,9 +19,6 @@ fn dispatch_eq106(
     ) else {
         return;
     };
-    if !extracted.enabled || extracted.source_count == 0 {
-        return;
-    }
     let buffer_taylor_order = extracted
         .batch_elements
         .iter()
@@ -414,7 +414,6 @@ fn dispatch_eq106(
                             Eq106TimingSample {
                                 cpu_readback_wait_ms,
                                 target_count,
-                                spectral_element_count: element_count,
                                 dispatch_count: 1,
                                 spectrum_rebuild_count: element_count,
                                 ..default()

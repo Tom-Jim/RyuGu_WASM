@@ -95,9 +95,10 @@ impl FromWorld for MmfftComputePipeline {
     fn from_world(world: &mut World) -> Self {
         let entries = [uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)];
         let layout = BindGroupLayoutDescriptor::new("mmfft_compressed_bgl", &entries);
-        let shader = world
-            .resource::<AssetServer>()
-            .load("shaders/mmfft_compressed.wgsl");
+        let shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Mmfft,
+        );
         let pipeline_id =
             world
                 .resource::<PipelineCache>()
@@ -323,7 +324,6 @@ fn poll_mmfft_readback(
             #[cfg(feature = "eq106-dual-certificate")]
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
-            eq106_diagnostics: None,
         });
     } else {
         warn!("[mmfft] discarded non-finite compressed GPU result");

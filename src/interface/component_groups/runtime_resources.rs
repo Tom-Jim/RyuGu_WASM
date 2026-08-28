@@ -18,8 +18,6 @@ pub struct VoxelBasisSources {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InversionTimingBreakdown {
-    /// Common high-resolution truth construction, excluded from method time.
-    pub truth_prepare_ms: f64,
     pub matrix_build_ms: f64,
     pub matrix_cache_hit: bool,
     pub convex_solve_ms: f64,
@@ -81,10 +79,8 @@ impl Default for Eq106GpuReadbackChannel {
 pub struct Eq106TimingSample {
     pub spectrum_build_ms: Option<f64>,
     pub target_evaluation_ms: Option<f64>,
-    pub gpu_readback_copy_ms: Option<f64>,
     pub cpu_readback_wait_ms: f64,
     pub target_count: u32,
-    pub spectral_element_count: u32,
     pub dispatch_count: u32,
     pub spectrum_rebuild_count: u32,
 }
@@ -101,7 +97,6 @@ pub struct Eq106InversionTiming {
     pub total_ms: f64,
     pub dispatch_count: u32,
     pub spectrum_rebuild_count: u32,
-    pub matrix_cache_hit: bool,
 }
 
 #[derive(Resource, Default)]
@@ -305,13 +300,6 @@ impl PerformanceComparisonState {
         self.start(self.return_method);
     }
 
-    pub fn first_enabled_method(&self) -> Option<(usize, ActiveGravityMethod)> {
-        (0..self.enabled_methods.len()).find_map(|index| {
-            self.enabled_methods[index]
-                .then(|| (index, ActiveGravityMethod::from_performance_index(index)))
-        })
-    }
-
     pub fn first_uncompleted_enabled_method(&self) -> Option<(usize, ActiveGravityMethod)> {
         (0..self.enabled_methods.len()).find_map(|index| {
             (self.enabled_methods[index] && !self.completed_methods[index])
@@ -433,10 +421,7 @@ mod probe_initial_condition_tests {
     fn performance_selection_defaults_to_all_methods() {
         let state = PerformanceComparisonState::default();
         assert_eq!(state.enabled_methods, [true; 5]);
-        assert_eq!(
-            state.first_enabled_method().map(|(index, _)| index),
-            Some(0)
-        );
+        assert!(state.enabled_methods[0]);
     }
 
     #[test]

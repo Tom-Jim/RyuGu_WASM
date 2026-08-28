@@ -76,7 +76,10 @@ impl FromWorld for GravityComputePipeline {
     fn from_world(world: &mut World) -> Self {
         let entries = [uniform_entry(0), storage_ro_entry(1), storage_rw_entry(2)];
         let layout = BindGroupLayoutDescriptor::new("radial_gravity_bgl", &entries);
-        let shader = world.resource::<AssetServer>().load("shaders/gravity.wgsl");
+        let shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Gravity,
+        );
         let pipeline_id =
             world
                 .resource::<PipelineCache>()
@@ -266,7 +269,6 @@ fn poll_gravity_readback(
             #[cfg(feature = "eq106-dual-certificate")]
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
-            eq106_diagnostics: None,
         });
     }
 }

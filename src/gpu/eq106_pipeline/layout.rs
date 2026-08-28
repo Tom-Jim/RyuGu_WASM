@@ -219,7 +219,7 @@ mod tests {
             timings: default(),
         };
 
-        let decoded = decode_eq106_packet(&packet, Vec3::ZERO).unwrap();
+        let decoded = decode_eq106_packet(&packet).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].snapshot.request_id, 0);
         assert_eq!(decoded[1].snapshot.request_id, 1);

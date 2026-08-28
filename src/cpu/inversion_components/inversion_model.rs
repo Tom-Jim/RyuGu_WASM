@@ -10,7 +10,6 @@
 // acceleration from a previously selected method is never an inverse input.
 
 use crate::interface::components::*;
-use crate::bevy_app::ui::TrajectoryInversionButton;
 use crate::cpu::curved_arc::AggregatedGravitySource;
 use bevy::math::DVec3;
 use bevy::platform::time::Instant;
@@ -26,7 +25,6 @@ const EXPECTED_VOXEL_COUNT: usize = 56;
 /// controls therefore produce 15 * 16 + 1 = 241 trajectory observations.
 const TRAJECTORY_SAMPLES_PER_SEGMENT: usize = 16;
 const HOLDOUT_SAMPLES_PER_SEGMENT: usize = 8;
-const QP_SOLVE_COUNT: u32 = 1;
 const MASS_WEIGHT: f64 = 25.0;
 const SMOOTHNESS_WEIGHT: f64 = 0.02;
 const RADIAL_SYMMETRY_WEIGHT: f64 = 0.15;
@@ -482,7 +480,6 @@ fn density_model_deviation(voxels: &[InvertedDensityVoxel]) -> f32 {
 fn density_result_from_job(
     job: &ConvexOptimizationJob,
     densities: &[f32],
-    objective: f64,
     inversion_time_ms: f64,
 ) -> DensityInversionResult {
     let mut voxels = job.voxels.clone();
@@ -501,31 +498,14 @@ fn density_result_from_job(
     let model_deviation = density_model_deviation(&voxels);
     DensityInversionResult {
         method: job.method,
-        capture_id: job.capture_id,
         source_hash: job.source_hash,
-        capture_epoch: job.capture_epoch,
-        problem_id: job.problem_id,
-        initial_objective: job.initial_objective,
-        data_error_scale: job.data_error_scale,
         density: (inferred_mass / total_volume.max(f64::MIN_POSITIVE)) as f32,
         density_scale: (inferred_mass / reference_mass.max(f64::MIN_POSITIVE)) as f32,
-        objective,
         model_deviation,
         model_fit: (1.0 - model_deviation).clamp(0.0, 1.0),
-        objective_improvement: ((job.initial_objective - objective)
-            / job.initial_objective.max(f64::MIN_POSITIVE))
-        .clamp(0.0, 1.0) as f32,
         training_rmse: density_data_error(job, densities).sqrt() as f32,
         holdout_rmse: holdout_data_error(job, densities).sqrt() as f32,
-        observation_noise_fraction: OBSERVATION_NOISE_FRACTION,
-        observation_noise_realizations: OBSERVATION_NOISE_REALIZATIONS,
         inversion_time_ms,
-        timing: InversionTimingBreakdown {
-            total_ms: inversion_time_ms,
-            ..job.timing
-        },
-        trajectory_samples: job.observed_accelerations.len(),
-        iterations: job.iterations,
         voxel_size: job.voxel_size,
         voxels,
     }

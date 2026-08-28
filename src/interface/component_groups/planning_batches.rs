@@ -10,7 +10,10 @@ pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
 pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
-pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 8;
+/// Candidate propagation is CPU work in the browser's WASM thread.  Keep it
+/// deliberately small so JS input, painting, and Rust simulation can all get
+/// a turn between Volterra solves.
+pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 1;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
 pub const PLANNING_MAX_REQUEST_MS: f64 = 34.0;
@@ -199,6 +202,11 @@ pub struct PlanningGpuResult(pub Option<PlanningGpuPacket>);
 #[derive(Resource, Clone)]
 pub struct PlanningGpuReadbackChannel {
     pub data: Arc<Mutex<Option<PlanningGpuPacket>>>,
+    /// Render-world failures are returned separately from numerical packets so
+    /// the main world can cancel the benchmark immediately and release its
+    /// exclusive GPU lock.  Keeping the request id prevents a stale compiler
+    /// error from cancelling a later retry.
+    pub error: Arc<Mutex<Option<(u64, String)>>>,
     pub in_flight: Arc<AtomicBool>,
 }
 
@@ -206,6 +214,7 @@ impl Default for PlanningGpuReadbackChannel {
     fn default() -> Self {
         Self {
             data: Arc::new(Mutex::new(None)),
+            error: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }

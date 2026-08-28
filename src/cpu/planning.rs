@@ -199,6 +199,27 @@ impl PlanningBatchBuilder {
     pub(crate) fn advance(&mut self, candidate_budget: u32) -> bool {
         let started = bevy::platform::time::Instant::now();
         let end = (self.next_candidate + candidate_budget.max(1)).min(self.candidate_count);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let generated = generate_candidate_range_parallel(
+                self.next_candidate,
+                end,
+                self.candidate_count,
+                &self.reference_samples,
+                &self.reference_jets,
+                &self.dynamics_tree,
+            );
+            let Some(mut generated) = generated else {
+                return false;
+            };
+            generated.sort_unstable_by_key(|(candidate, _, _)| *candidate);
+            for (_, states, bytes) in generated {
+                self.states.extend(states);
+                self.gpu_position_bytes.extend(bytes);
+            }
+            self.next_candidate = end;
+        }
+        #[cfg(target_arch = "wasm32")]
         while self.next_candidate < end {
             if append_dynamical_candidate_states(
                 self.next_candidate,
@@ -292,6 +313,75 @@ impl PlanningBatchBuilder {
             self.preparation_ms,
         ))
     }
+}
+
+/// Native planning uses a bounded work queue so trajectory propagation does
+/// not serialize behind GPU submission or UI rendering. Results are sorted by
+/// candidate index before they are appended, preserving the deterministic GPU
+/// buffer layout used by the WASM build. Browser WASM intentionally keeps the
+/// same algorithm cooperative: a web worker/atomics build is an opt-in deploy
+/// target, while the default page must remain responsive without it.
+#[cfg(not(target_arch = "wasm32"))]
+fn generate_candidate_range_parallel(
+    start: u32,
+    end: u32,
+    candidate_count: u32,
+    reference: &[TrajectoryInversionKnot],
+    reference_jets: &[PlanningReferenceJet],
+    dynamics_tree: &PlanningDynamicsTree,
+) -> Option<Vec<(u32, Vec<PlanningCandidateState>, Vec<u8>)>> {
+    use crossbeam_channel::bounded;
+
+    if start >= end {
+        return Some(Vec::new());
+    }
+    let worker_count = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min((end - start) as usize)
+        .max(1);
+    let (work_tx, work_rx) = bounded::<u32>(worker_count);
+    // Workers must never block publishing completion while the scheduler is
+    // still filling the bounded work queue; otherwise a full two-way queue
+    // can deadlock before the main thread begins collection.
+    let (result_tx, result_rx) =
+        crossbeam_channel::unbounded::<Option<(u32, Vec<PlanningCandidateState>, Vec<u8>)>>();
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let work_rx = work_rx.clone();
+            let result_tx = result_tx.clone();
+            scope.spawn(move || {
+                while let Ok(candidate) = work_rx.recv() {
+                    let mut states = Vec::with_capacity(reference.len());
+                    let mut bytes = Vec::with_capacity(reference.len() * 16);
+                    let result = append_dynamical_candidate_states(
+                        candidate,
+                        candidate_count,
+                        reference,
+                        reference_jets,
+                        Some(dynamics_tree),
+                        &mut states,
+                        &mut bytes,
+                    )
+                    .map(|()| (candidate, states, bytes));
+                    if result_tx.send(result).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(result_tx);
+        for candidate in start..end {
+            if work_tx.send(candidate).is_err() {
+                return None;
+            }
+        }
+        drop(work_tx);
+        let mut generated = Vec::with_capacity((end - start) as usize);
+        for _ in start..end {
+            generated.push(result_rx.recv().ok()??);
+        }
+        Some(generated)
+    })
 }
 
 fn coalesce_basis_records(

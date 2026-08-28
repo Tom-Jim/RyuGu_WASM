@@ -663,7 +663,6 @@ mod tests {
             #[cfg(feature = "eq106-dual-certificate")]
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
-            eq106_diagnostics: None,
         }
     }
 

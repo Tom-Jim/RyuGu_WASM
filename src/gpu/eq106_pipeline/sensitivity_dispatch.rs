@@ -230,10 +230,8 @@ fn dispatch_eq106_sensitivity_matrix(
                                 target_evaluation_ms: Some(evaluation_encoding_ms),
                                 cpu_readback_wait_ms,
                                 target_count: target_count as u32,
-                                spectral_element_count: element_count,
                                 dispatch_count: 1,
                                 spectrum_rebuild_count: column_count as u32 * element_count,
-                                ..default()
                             },
                         });
                     }

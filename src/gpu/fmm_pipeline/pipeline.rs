@@ -129,9 +129,10 @@ impl FromWorld for FmmComputePipeline {
             storage_ro_entry(3),
         ];
         let layout = BindGroupLayoutDescriptor::new("fmm_gravity_bgl", &entries);
-        let shader = world
-            .resource::<AssetServer>()
-            .load("shaders/fmm_gravity.wgsl");
+        let shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Fmm,
+        );
         let pipeline_id =
             world
                 .resource::<PipelineCache>()
@@ -363,7 +364,6 @@ fn poll_fmm_readback(channel: Res<FmmReadbackChannel>, mut history: ResMut<FmmGr
             #[cfg(feature = "eq106-dual-certificate")]
             independent_positive_potential: None,
             body_acceleration_jacobian: None,
-            eq106_diagnostics: None,
         });
     }
 }

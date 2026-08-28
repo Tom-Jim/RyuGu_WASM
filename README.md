@@ -380,7 +380,7 @@ The upper-right comparison panel keeps `Density fit` and `Inversion time` and ad
 
 The comparison covers this repository's fixed configurations only; it is not a claim against a tuned FMM or fully GPU-resident MMFFT. Inversion, fit history, and density visualization remain independent.
 
-`First` and `Interactive Stress` are two sizes of the same planning structure and the same three forward algorithms. Both use fixed candidate tiles, full Eq.106 stages per submission, rotating method order, and identical verification indices. Dynamically propagated candidate positions and all structured density rows are uploaded once as immutable shared GPU buffers. Eq.106 runs its line-sample, spectrum-assembly, and field-evaluation passes; packed MMFFT samples its real two-level convolution hierarchy; FMM evaluates cached target-cell local expansions and exact near interactions. A common GPU reduction emits one compact metric row per candidate, while only deterministic verification rows are copied to mapped staging.
+`First` and `Stress` are two sizes of the same planning structure and the same three forward algorithms. First uses fixed candidate tiles for repeatable comparisons; Stress adapts its tile budget and yields when a rendered frame exceeds the interactive budget. Dynamically propagated candidate positions and all structured density rows are uploaded once as immutable shared GPU buffers. Eq.106 runs its line-sample, spectrum-assembly, and field-evaluation passes; packed MMFFT samples its real two-level convolution hierarchy; FMM evaluates cached target-cell local expansions and exact near interactions. A common GPU reduction emits one compact metric row per candidate, while only deterministic verification rows are copied to mapped staging.
 
 A probe collision still resets the live flight scene after the three-second crash notice, but it does not reset the independent frozen planning job, its selected metric, or completed First/Interactive-Stress rows. Those rows remain tied to their original workload and capture hashes; starting a later planning run creates a new identity normally.
 
@@ -395,13 +395,16 @@ Common trajectory/density preparation is reported separately and excluded from e
 | `D` | Toggle the density section view. |
 | `G` | Cycle through the five gravity methods. |
 | `Invert trajectory` | Run the synthetic inversion after trajectory capture is complete. |
-| Position / velocity rows | Replace one quintic-Hermite control value with `x, y, z`. |
+| Trajectory point panel | Scroll through the 16 point/velocity pairs; replace one vector with `x, y, z`. |
 | `X`, `Y`, `Z`, `Speed` | Change the initial probe state. |
-| `Current orbit` / `Near-sync ellipse` | Select the original benchmark or robust-pericenter planning initial state. |
+| `First` / `Stress` / `Quadrature` | Run the compact, extended, or source-crossover planning workload; the UI reports truthful completion and verification progress. |
 | Simulation acceleration | Execute `1x`-`8x` complete fixed updates per rendered frame. |
-| Mouse drag / wheel | Orbit and zoom the camera. |
+| Panel heading drag / lower-right resize | Reposition or resize a work panel; the initial layout never overlaps panels. |
+| Left-drag / wheel on uncovered scene | Orbit and zoom the Bevy camera. HTML controls only capture input over their own visible bounds. |
 
 Changing the initial conditions or gravity method resets the trajectory and waits for a field sample associated with the new request.
+
+Closing the Quadrature page, selecting a density/inversion metric, or starting trajectory inversion cancels the active planning generation. No later planning GPU dispatch is submitted; an already submitted WebGPU command cannot be interrupted by the browser and is only allowed to drain. Native CPU candidate propagation uses a bounded `crossbeam-channel` worker queue and commits results in deterministic candidate order. The default WASM target keeps that same preparation phase cooperative, one bounded slice per frame, because browser worker/atomics support is deployment-specific.
 
 ## Build and run
 
@@ -415,9 +418,10 @@ Changing the initial conditions or gravity method resets the trajectory and wait
 ```sh
 rustup target add wasm32-unknown-unknown
 bun install
-bun run dev       # debug WASM build, then http://localhost:3000
-bun run build     # release WASM package in pkg/
-bun run preview   # release build, then local server
+bun run dev       # Tailwind + debug WASM build, then http://localhost:3000
+bun run build     # regenerate Tailwind and create the release WASM package in pkg/
+bun run styles    # regenerate src/html/tailwind.generated.css
+bun run preview   # Tailwind + release build, then local server
 bun run serve     # serve an existing build
 ```
 
@@ -428,9 +432,12 @@ The development server supplies the cross-origin isolation headers used by the a
 ```sh
 cargo fmt --all --check
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 cargo check --target wasm32-unknown-unknown
-wasm-pack build --target web
+node --check src/html/ui.js
+node --check src/html/app.js
+bun run styles
+wasm-pack build --target web --out-name ryugu_wasm
 ```
 
 Optional Python checks and the Wasmtime benchmark use `uv`:
@@ -458,7 +465,7 @@ flowchart TB
     CPU --> Eq106Cpu["eq106_reference.rs<br/>eq106_operator.rs<br/>curved_arc.rs"]
     GPU --> Eq106Gpu["eq106.rs"]
     GPU --> OtherGpu["radial.rs<br/>werner.rs<br/>mmfft.rs<br/>fmm.rs<br/>normals.rs"]
-    Root --> Shaders["assets/shaders/"]
+    Root --> Shaders["src/wgsl/"]
     Shaders --> EqShader["eq106_complex.wgsl"]
     Shaders --> OtherShaders["gravity.wgsl<br/>werner_gravity.wgsl<br/>mmfft_compressed.wgsl<br/>fmm_gravity.wgsl"]
     Root --> Operators["assets/operators/<br/>Eq.106 special-function tables"]
@@ -478,7 +485,7 @@ Key implementation entry points:
 | [`src/cpu/curved_arc.rs`](src/cpu/curved_arc.rs) | Eq.106 source discretization, trajectory planner, Fourier modes, and geometric guards. |
 | [`src/cpu/volterra.rs`](src/cpu/volterra.rs) | `f64` reference-line Volterra/Picard propagation, endpoint matching, prefix integration, and convergence guards. |
 | [`src/gpu/eq106.rs`](src/gpu/eq106.rs) | Eq.106 buffers, render-world dispatch, readback, and history management. |
-| [`assets/shaders/eq106_complex.wgsl`](assets/shaders/eq106_complex.wgsl) | Half-line sampling, complex spectrum assembly, analytical reference coefficient, Bromwich reconstruction, Taylor correction, and diagnostics. |
+| [`src/wgsl/eq106_complex.wgsl`](src/wgsl/eq106_complex.wgsl) | Half-line sampling, complex spectrum assembly, analytical reference coefficient, Bromwich reconstruction, Taylor correction, and diagnostics. |
 | [`src/cpu/physics.rs`](src/cpu/physics.rs) | CPU trajectory integration using snapshot-matched GPU field results. |
 | [`src/cpu/inversion.rs`](src/cpu/inversion.rs) | Quintic track construction and regularized synthetic voxel inversion. |
 | [`mathpub.pdf`](mathpub.pdf) | Full exploratory derivation and stated convergence conditions. |

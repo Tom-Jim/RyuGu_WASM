@@ -532,7 +532,6 @@ fn dispatch_eq106_single_target(
                         Eq106TimingSample {
                             cpu_readback_wait_ms,
                             target_count,
-                            spectral_element_count: 1,
                             ..default()
                         }
                     };
@@ -578,19 +577,6 @@ fn report_eq106_pipeline_errors(
         ("line samples", pipelines.line_samples_id),
         ("sampled spectrum", pipelines.assemble_id),
         ("inverse spectrum", pipelines.evaluate_id),
-        (
-            "planning voxel line samples",
-            pipelines.planning_voxel_line_samples_id,
-        ),
-        (
-            "planning voxel basis spectrum",
-            pipelines.planning_voxel_spectrum_id,
-        ),
-        (
-            "planning voxel spectrum combination",
-            pipelines.planning_combine_spectrum_id,
-        ),
-        ("planning inverse spectrum", pipelines.planning_evaluate_id),
     ] {
         match cache.get_compute_pipeline_state(id) {
             CachedPipelineState::Err(

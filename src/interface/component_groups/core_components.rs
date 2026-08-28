@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+
 use bevy::platform::time::Instant;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -54,12 +55,6 @@ pub struct TopologyBuilt;
 pub struct RyuguMarker;
 #[derive(Component)]
 pub struct CassiniMarker;
-#[derive(Component)]
-pub struct UiTextMarker;
-#[derive(Component)]
-pub struct FpsTextMarker;
-#[derive(Component)]
-pub struct VramTextMarker;
 #[derive(Component)]
 pub struct Velocity(pub Vec3);
 #[derive(Component)]
@@ -135,39 +130,23 @@ pub struct InvertedDensityVoxel {
 #[derive(Clone, Debug)]
 pub struct DensityInversionResult {
     pub method: ActiveGravityMethod,
-    /// Immutable identity of the sixteen trajectory states used by this run.
-    pub capture_id: u64,
+    /// Source identity is retained to reject stale results after a mesh rebuild.
     pub source_hash: u64,
-    pub capture_epoch: u64,
-    pub problem_id: u64,
-    pub initial_objective: f64,
-    pub data_error_scale: f64,
     pub density: f32,
     pub density_scale: f32,
-    pub objective: f64,
     /// Volume-weighted relative RMSE against the density law assumed by the
     /// selected forward model (uniform Werner, logarithmic for the others).
     pub model_deviation: f32,
     /// `1 - model_deviation`, clamped to [0, 1], for direct UI comparison.
     pub model_fit: f32,
-    /// Relative decrease of the trajectory objective from the uniform start.
-    pub objective_improvement: f32,
     /// Normalized acceleration residual on the same frozen trajectory used to
     /// assemble the QP. This is distinct from density model RMSE.
     pub training_rmse: f32,
     /// Relative acceleration residual on a deterministic held-out set of
     /// trajectory states evaluated with the independent reference operator.
     pub holdout_rmse: f32,
-    /// Relative diagonal observation-noise model used by the QP weighting.
-    pub observation_noise_fraction: f32,
-    pub observation_noise_realizations: usize,
     /// CPU time spent assembling and solving this convex QP.
     pub inversion_time_ms: f64,
-    pub timing: InversionTimingBreakdown,
-    /// Number of acceleration observations sampled along the complete dense
-    /// Quintic Hermite trajectory.
-    pub trajectory_samples: usize,
-    pub iterations: u32,
     pub voxel_size: f32,
     pub voxels: Vec<InvertedDensityVoxel>,
 }
@@ -176,8 +155,6 @@ pub struct ConvexOptimizationJob {
     pub method: ActiveGravityMethod,
     pub capture_id: u64,
     pub source_hash: u64,
-    pub capture_epoch: u64,
-    pub problem_id: u64,
     pub voxels: Vec<InvertedDensityVoxel>,
     pub basis_sources: VoxelBasisSources,
     pub frozen_samples: Vec<TrajectoryInversionKnot>,
@@ -193,7 +170,6 @@ pub struct ConvexOptimizationJob {
     /// prevents the regularizers from overwhelming the very small exterior
     /// gravity signature of an internal mass redistribution.
     pub data_error_scale: f64,
-    pub iterations: u32,
     pub voxel_size: f32,
     /// Wall-clock origin of the complete inversion, including method-specific
     /// sensitivity construction/readback and the final Clarabel solve.
@@ -202,13 +178,7 @@ pub struct ConvexOptimizationJob {
     pub timing: InversionTimingBreakdown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrajectoryVectorField {
-    Position,
-    Velocity,
-}
-
-/// UI and rendering state for the user-provided Quintic Hermite trajectory.
+/// Backend state for the frozen Quintic Hermite trajectory.
 /// `capture_epoch` keeps defaults tied to the currently running simulation;
 /// changing a probe parameter starts a fresh five-second capture automatically.
 #[derive(Resource)]
@@ -236,18 +206,12 @@ pub struct TrajectoryInversionState {
     pub preserve_truth_track: bool,
     pub capture_id: Option<u64>,
     pub capture_source_hash: u64,
-    /// Eq.106 capture does not begin until consecutive certified readbacks
-    /// have arrived; adaptive segment boundaries do not break the streak.
-    pub certified_sample_streak: u32,
-    pub certified_segment_id: Option<u64>,
     pub ready: bool,
-    /// True after a user edits any captured position or velocity. Captured
-    /// knots can use the forward evaluator's acceleration directly; edited
-    /// knots must derive observations from their user-provided velocities.
-    pub knots_edited: bool,
+    /// The browser frontend may request inversion before the five-second capture
+    /// is complete. Keep the request in the state machine until validation can
+    /// actually start the optimizer.
+    pub start_requested: bool,
     pub inverted: bool,
-    pub selected: Option<(usize, TrajectoryVectorField)>,
-    pub edit_buffer: String,
     pub error: Option<String>,
     pub optimizer: Option<ConvexOptimizationJob>,
     pub batch_capture_id: Option<u64>,
@@ -283,13 +247,9 @@ impl Default for TrajectoryInversionState {
             preserve_truth_track: false,
             capture_id: None,
             capture_source_hash: 0,
-            certified_sample_streak: 0,
-            certified_segment_id: None,
             ready: false,
-            knots_edited: false,
+            start_requested: false,
             inverted: false,
-            selected: None,
-            edit_buffer: String::new(),
             error: None,
             optimizer: None,
             batch_capture_id: None,
@@ -310,9 +270,6 @@ impl Default for TrajectoryInversionState {
 pub struct JacobiSample {
     pub simulation_time_seconds: f64,
     pub jacobi_constant: f64,
-    /// Eq.106 segment/certificate state associated with this physical sample.
-    /// Other gravity methods leave this empty.
-    pub eq106_diagnostics: Option<Eq106SampleDiagnostics>,
 }
 
 #[derive(Resource)]
@@ -463,12 +420,6 @@ pub struct GpuMemoryEstimate {
     pub bytes: [u64; 5],
 }
 
-impl GpuMemoryEstimate {
-    pub fn total_bytes(self) -> u64 {
-        self.bytes.iter().sum()
-    }
-}
-
 /// Main-world state captured when a render-world gravity dispatch is submitted.
 /// The returned acceleration and potential are only valid for this snapshot.
 #[derive(Clone, Debug)]
@@ -519,20 +470,6 @@ pub struct GravityFieldSample {
     /// supplies a symmetric potential Hessian so the Volterra/Picard waveform
     /// can close its position-field loop between GPU readbacks.
     pub body_acceleration_jacobian: Option<Mat3>,
-    /// Runtime evidence needed to correlate Jacobi spikes with Eq.106 segment
-    /// rebuilds and the four independent truncation/spectral certificates.
-    pub eq106_diagnostics: Option<Eq106SampleDiagnostics>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Eq106SampleDiagnostics {
-    pub segment_id: u64,
-    pub line_origin: Vec3,
-    pub line_direction: Vec3,
-    pub h: f32,
-    pub u: f32,
-    pub v: f32,
-    pub certificates: [f32; 4],
 }
 
 #[derive(Default)]

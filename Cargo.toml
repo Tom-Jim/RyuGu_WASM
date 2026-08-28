@@ -30,6 +30,12 @@ rand = { version = "0.10", default-features = false, features = ["std_rng"] }
 rand_distr = "0.6"
 wgpu29 = { package = "wgpu", version = "=29.0.4" }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+crossbeam-channel = "0.5"
+
 [dev-dependencies]
 # Keep shader validation on the same Naga generation as Bevy/wgpu so tests
 # reject WGSL that the browser runtime cannot compile.

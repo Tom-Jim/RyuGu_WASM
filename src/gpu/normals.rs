@@ -91,7 +91,10 @@ impl FromWorld for NormalsComputePipeline {
             storage_entry(3, false),
         ];
         let bgl = BindGroupLayoutDescriptor::new("normals_bgl", &entries);
-        let shader = world.resource::<AssetServer>().load("shaders/normals.wgsl");
+        let shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Normals,
+        );
         let pipeline_id =
             world
                 .resource::<PipelineCache>()

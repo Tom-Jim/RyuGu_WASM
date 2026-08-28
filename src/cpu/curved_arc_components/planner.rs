@@ -35,13 +35,6 @@ impl CurvedArcMode {
         }
     }
 
-    pub fn short_str(self) -> &'static str {
-        match self {
-            Self::Bootstrap => "Warm-up",
-            Self::NonPeriodic => "Non-periodic",
-            Self::Error => "Error",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

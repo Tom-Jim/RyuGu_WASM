@@ -2,18 +2,7 @@ pub const PROBE_R0: Vec3 = Vec3::new(-616.535, 0.0, -65.459);
 pub const PROBE_SPEED_FACTOR: f32 = 1.07;
 pub const PROBE_ORBIT_NORMAL: Vec3 = Vec3::new(0.037_806, -0.933_691, -0.356_079);
 
-pub const NEAR_SYNC_POSITION: Vec3 = Vec3::new(-1097.269, 51.622, 0.0);
-pub const NEAR_SYNC_SPEED_FACTOR: f32 = 0.824_08;
-pub const NEAR_SYNC_ORBIT_PERIOD_SECONDS: f64 = 27_495.468;
-pub const NEAR_SYNC_SEMIMAJOR_AXIS_METERS: f32 = 831.624;
-pub const NEAR_SYNC_PERICENTER_RADIUS_METERS: f32 = 564.765;
-pub const NEAR_SYNC_APOCENTER_RADIUS_METERS: f32 = 1_098.483;
-pub const NEAR_SYNC_ECCENTRICITY: f32 = 0.320_889;
 pub const NEAR_SYNC_SEGMENT_MAX_SECONDS: f32 = 300.0;
-pub const NEAR_SYNC_TAYLOR_ORDER: u32 = 4;
-pub const NEAR_SYNC_TRUST_RADIUS_METERS: f32 = PLANNING_TRAJECTORY_TUBE_RADIUS_METERS;
-pub const NEAR_SYNC_TRANSVERSE_LIMIT_METERS: f32 = PLANNING_TRAJECTORY_TUBE_RADIUS_METERS;
-pub const NEAR_SYNC_RELATIVE_REMAINDER_TARGET: f32 = 1.0e-3;
 
 pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
 pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
@@ -23,7 +12,7 @@ pub const PLANNING_SOURCE_COUNTS: [u32; 9] = [
     32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
     8_388_608,
 ];
-pub const PLANNING_SOURCE_REPEATS: u32 = 10;
+pub const PLANNING_SOURCE_REPEATS: u32 = 1;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
 pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
 
@@ -53,30 +42,7 @@ pub fn probe_initial_velocity(position: Vec3, speed_factor: f32) -> Vec3 {
 pub enum ProbeOrbitPreset {
     #[default]
     CurrentBenchmark,
-    NearSynchronousPlanning,
     Custom,
-}
-
-impl ProbeOrbitPreset {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CurrentBenchmark => "Current orbit",
-            Self::NearSynchronousPlanning => "Near-sync ellipse",
-            Self::Custom => "Custom",
-        }
-    }
-
-    pub fn conditions(self) -> ProbeInitialConditions {
-        match self {
-            Self::CurrentBenchmark | Self::Custom => ProbeInitialConditions::default(),
-            Self::NearSynchronousPlanning => ProbeInitialConditions {
-                position: NEAR_SYNC_POSITION,
-                speed_factor: NEAR_SYNC_SPEED_FACTOR,
-                orbit_normal: RYUGU_SPIN_AXIS,
-                preset: self,
-            },
-        }
-    }
 }
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
@@ -114,20 +80,17 @@ impl ProbeInitialConditions {
 pub enum PlanningWorkloadProfile {
     #[default]
     First,
+    /// Large, interruptible workload for exercising the planning pipelines
+    /// without taking ownership of the browser frame loop.
     InteractiveStress,
     /// Internal source-crossover workload: enough hot targets for stable GPU
-    /// timing without repeating the 33.5-million-query Stress matrix.
+    /// timing across the requested quadrature-source range.
     SourceCrossover,
 }
 
 impl PlanningWorkloadProfile {
     pub fn is_compute_benchmark(self) -> bool {
-        // Both visible workloads use the same fairness contract. "Interactive"
-        // describes the live progress UI, not adaptive benchmark scheduling.
-        matches!(
-            self,
-            Self::First | Self::InteractiveStress | Self::SourceCrossover
-        )
+        matches!(self, Self::First | Self::SourceCrossover)
     }
 
     pub fn dimensions(self) -> (u32, u32, u32) {
@@ -141,7 +104,7 @@ impl PlanningWorkloadProfile {
     pub fn label(self) -> &'static str {
         match self {
             Self::First => "First 32x4x241",
-            Self::InteractiveStress => "Interactive Stress 2048x32x512",
+            Self::InteractiveStress => "Stress 2048x32x512",
             Self::SourceCrossover => "Quadrature-source crossover 64x4x96",
         }
     }
@@ -164,36 +127,6 @@ pub enum ComparisonMetric {
 }
 
 impl ComparisonMetric {
-    pub const ALL: [Self; 11] = [
-        Self::DensityFit,
-        Self::InversionTime,
-        Self::GravityRelativeError,
-        Self::GradientRelativeError,
-        Self::PericenterError,
-        Self::MinimumAltitude,
-        Self::ModelDiscrimination,
-        Self::PlanningObjective,
-        Self::SegmentCount,
-        Self::SpeedupVsGpuFmm,
-        Self::ColdStartAmortization,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::DensityFit => "Density fit",
-            Self::InversionTime => "Inversion time",
-            Self::GravityRelativeError => "Gravity error",
-            Self::GradientRelativeError => "Gradient error",
-            Self::PericenterError => "Pericenter error",
-            Self::MinimumAltitude => "Minimum altitude",
-            Self::ModelDiscrimination => "Reference separation",
-            Self::PlanningObjective => "Planning objective",
-            Self::SegmentCount => "Segments",
-            Self::SpeedupVsGpuFmm => "Speedup / baselines",
-            Self::ColdStartAmortization => "Cold amortization",
-        }
-    }
-
     pub fn is_inversion(self) -> bool {
         matches!(self, Self::DensityFit | Self::InversionTime)
     }
@@ -247,20 +180,12 @@ pub enum PlanningExecutionBackend {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanningCandidateScore {
-    pub candidate_index: u32,
-    pub minimum_altitude_m: f32,
-    pub reference_model_separation: f32,
-    pub gradient_information: f32,
     pub objective: f32,
 }
 
 impl Default for PlanningCandidateScore {
     fn default() -> Self {
         Self {
-            candidate_index: 0,
-            minimum_altitude_m: f32::NAN,
-            reference_model_separation: f32::NAN,
-            gradient_information: f32::NAN,
             objective: f32::NAN,
         }
     }
@@ -275,40 +200,21 @@ pub struct PlanningMethodMetrics {
     /// GPU fairness verdict.
     pub gpu_batch_verified: bool,
     pub workload: PlanningWorkloadIdentity,
-    pub common_preparation_ms: f64,
-    pub one_time_preparation_ms: f64,
-    pub preprocessing_ms: f64,
-    pub command_submission_ms: f64,
-    pub reduction_ms: f64,
-    pub verification_ms: f64,
-    pub gpu_completion_map_ms: f64,
-    pub warm_evaluation_ms: f64,
-    pub certified_warm_evaluation_ms: f64,
     /// Measured certified hot pass over the complete BxKxH workload. The
     /// immutable geometry/basis build is reused and reported separately.
     pub certified_full_pass_ms: f64,
     pub certified_estimated_total_ms: f64,
-    pub build_ms: f64,
-    pub hot_query_ns_per_target: f64,
     pub total_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
-    pub raw_relative_gravity_error: f32,
-    pub raw_gradient_relative_error: f32,
     pub certified_relative_gravity_error: f32,
     pub certified_gradient_relative_error: f32,
     /// Pointwise relative-error strata. Unlike the global L2 metric these
     /// expose weak-field and boundary outliers.
-    pub gravity_error_p95: f32,
     pub gravity_error_p99: f32,
     pub gravity_error_max: f32,
-    pub gradient_error_p95: f32,
     pub gradient_error_p99: f32,
     pub gradient_error_max: f32,
-    pub rejected_sample_count: u64,
-    pub rejection_counts: [u64; 6],
-    pub self_fd_step_maxima: [f32; 5],
-    pub first_rejection: Option<[u32; 5]>,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
     pub model_discrimination: f32,
@@ -321,13 +227,6 @@ pub struct PlanningMethodMetrics {
     pub certified_rejected_sample_count: u64,
     pub certified_valid_candidate_count: u32,
     pub cold_amortization_candidates: u32,
-    pub dispatch_count: u32,
-    pub forward_kernel_evaluations: u64,
-    pub density_combinations: u64,
-    pub gpu_request_count: u32,
-    pub certified_gpu_request_count: u32,
-    pub minimum_tile_candidates: u32,
-    pub maximum_tile_candidates: u32,
     pub top_candidates: [PlanningCandidateScore; 5],
 }
 
@@ -395,7 +294,6 @@ pub struct PlanningBatchJob {
     pub candidate_gradient_sum: Vec<f64>,
     pub candidate_minimum_altitude_m: Vec<f32>,
     pub candidate_valid: Vec<bool>,
-    pub common_preparation_ms: f64,
     pub one_time_preparation_ms: f64,
     pub preprocessing_ms: f64,
     pub command_submission_ms: f64,
@@ -485,10 +383,6 @@ pub struct PlanningSourceCurveSample {
     pub source_count: u32,
     /// Eq.106 raw/certified, packed FFT raw/certified, FMM raw/certified.
     pub times_ms: [f64; 6],
-    /// Build/preprocess timing for Eq.106, packed FFT, and target-cell FMM.
-    pub build_ms: [f64; 3],
-    /// Warm-query nanoseconds per target for Eq.106, packed FFT, and FMM.
-    pub query_ns_per_target: [f64; 3],
     pub eligible: [bool; 6],
 }
 
@@ -538,11 +432,10 @@ impl Default for PlanningComparisonState {
 
 impl PlanningComparisonState {
     pub fn blocks_realtime_gpu(&self) -> bool {
-        // Interactive Stress must remain a live application mode: the probe,
-        // Eq.106 residual, and Jacobi histories continue advancing while its
-        // planning batches run. Only the short First benchmark owns the GPU
-        // and physics clock exclusively.
-        self.run_requested && self.workload_profile == PlanningWorkloadProfile::First
+        // All planning modes share the frame budget with the running scene.
+        // GPU submission/readback is asynchronous; freezing physics or UI for
+        // a benchmark makes the application appear hung.
+        false
     }
 
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
@@ -673,16 +566,9 @@ mod planning_profile_tests {
     use super::{PLANNING_SOURCE_COUNTS, PlanningWorkloadProfile};
 
     #[test]
-    fn both_visible_profiles_use_fixed_batch_scheduling() {
+    fn visible_profile_uses_fixed_batch_scheduling() {
         assert!(PlanningWorkloadProfile::First.is_compute_benchmark());
-        assert!(PlanningWorkloadProfile::InteractiveStress.is_compute_benchmark());
-        assert_eq!(
-            PlanningWorkloadProfile::InteractiveStress.dimensions(),
-            (2_048, 32, 512)
-        );
     }
-
-
     #[test]
     fn quadrature_curve_spans_32k_through_8192k() {
         assert_eq!(PLANNING_SOURCE_COUNTS[0], 32 * 1_024);

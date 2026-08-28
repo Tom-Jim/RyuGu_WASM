@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/src/html/ui.css" />
+    <link rel="stylesheet" href="/src/html/tailwind.generated.css" />
+    <title>Ryugu Dynamics Laboratory</title>
+</head>
+<body>
+    <main id="viewport-frame" data-quarter-turn="0">
+        <canvas id="bevy" aria-label="Ryugu 3D simulation"></canvas>
+        <section id="app-ui" aria-label="Simulation controls">
+            <header class="topbar glass">
+                <div class="brand"><span class="brand-mark"></span><div><strong>RYUGU</strong><small>DYNAMICS LAB</small></div></div>
+                <div class="method-picker" role="group" aria-label="Gravity method">
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="radial">Radial</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="werner">Werner</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="eq106">Eq.106</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="fft">Packed FFT</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="fmm">FMM</button>
+                </div>
+                <div class="health"><span id="health-dot"></span><span id="fps">FPS --</span></div>
+            </header>
+
+            <nav class="quick-actions" aria-label="Analysis tools">
+                <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-open">Performance comparison</button>
+                <button onclick="window.ryuguUi?.activate?.(this)" data-action="camera" data-value="overview">3D display</button>
+                <button onclick="window.ryuguUi?.activate?.(this)" data-action="rotate">Rotate 90°</button>
+                <button onclick="window.ryuguUi?.activate?.(this)" class="primary compact" data-action="inversion-start" hidden>Invert trajectory</button>
+                <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-repeat" id="repeat-benchmark">Repeat benchmark</button>
+            </nav>
+
+            <aside class="left-rail glass" data-float-panel>
+                <div class="panel-heading drag-handle"><span>Probe initial state</span><small>BODY FRAME · DRAG</small></div>
+                <div class="segmented">
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="camera" data-value="overview">Overview</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="camera" data-value="follow">Follow probe</button>
+                </div>
+                <label class="range-row"><span>X <output id="probe-x-out">--</output></span><input id="probe-x" data-probe="x" type="range" min="-1300" max="1300" step="1" /></label>
+                <label class="range-row"><span>Y <output id="probe-y-out">--</output></span><input id="probe-y" data-probe="y" type="range" min="-1300" max="1300" step="1" /></label>
+                <label class="range-row"><span>Z <output id="probe-z-out">--</output></span><input id="probe-z" data-probe="z" type="range" min="-1300" max="1300" step="1" /></label>
+                <label class="range-row"><span>Speed <output id="probe-speed-out">--</output></span><input id="probe-speed" data-probe="speed" type="range" min="0.2" max="1.8" step="0.001" /></label>
+                <div class="button-grid"><button onclick="window.ryuguUi?.activate?.(this)" data-action="normals">Normals</button><button onclick="window.ryuguUi?.activate?.(this)" data-action="section">Section</button></div>
+                <section id="trajectory-controls" class="trajectory-controls" hidden aria-label="Trajectory point editor">
+                    <div class="panel-heading"><span>Trajectory points</span><small>16 UNIFORM KNOTS</small></div>
+                    <p>Scroll to inspect all points. Change a vector, then press Enter or move focus away to apply it.</p>
+                    <div id="trajectory-fields" class="trajectory-fields"></div>
+                </section>
+            </aside>
+
+            <aside class="right-rail glass" data-float-panel>
+                <div class="panel-heading drag-handle"><span>Inversion &amp; planning</span><small id="method-label">INITIALIZING · DRAG</small></div>
+                <div class="metric-grid" role="group" aria-label="Planning comparison metric">
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="density">Density fit</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="inversion-time">Inversion time</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="gravity-error">Gravity error</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="gradient-error">Gradient error</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="pericenter">Pericenter error</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="altitude">Minimum altitude</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="separation">Reference separation</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="objective">Planning objective</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="segments">Segment count</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="speedup">Speedup / baselines</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="cold">Cold amortization</button>
+                </div>
+                <div class="workload-row" role="group" aria-label="Planning workload">
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-workload" data-value="first">First</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-workload" data-value="stress">Stress</button>
+                </div>
+                <div id="planning-progress"></div>
+                <div id="planning-result" class="result-strip">No comparison result yet.</div>
+                <div class="runtime-row">
+                    <label class="range-row accent"><span>Acceleration <output id="acceleration-out">1×</output></span><input id="acceleration" type="range" min="1" max="8" step="1" value="1" /></label>
+                    <div class="stat-grid"><div><small>Runtime VRAM</small><strong id="vram">--</strong></div><div><small>Quadrature</small><strong id="quadrature-state">IDLE</strong></div></div>
+                </div>
+                <button onclick="window.ryuguUi?.activate?.(this)" id="quadrature-start" data-action="quadrature-start">Run quadrature 32K → 8192K</button>
+                <div id="inversion-status" class="inversion-status">Trajectory inversion is ready when samples are captured.</div>
+                <p id="planning-status" class="status-text">Waiting for simulation state.</p>
+            </aside>
+
+            <section class="telemetry-stack" data-float-panel>
+                <article id="residual-card" class="chart-card glass" hidden>
+                    <div class="panel-heading"><span>Eq.106 residual estimate</span><small id="residual-order">WAITING</small></div>
+                    <svg id="residual-chart" role="img" aria-label="Eq.106 residual estimate over simulation time"></svg>
+                    <p id="residual-diagnostics" class="chart-diagnostics">Waiting for Volterra propagation.</p>
+                </article>
+                <article class="chart-card glass">
+                    <div class="panel-heading"><span>Rotating-frame Jacobi constant</span><small>LIVE</small></div>
+                    <svg id="jacobi-chart" role="img" aria-label="Jacobi constant over simulation time"></svg>
+                </article>
+            </section>
+        </section>
+
+        <section id="performance-page" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="performance-title">
+            <div class="performance-card glass">
+                <header>
+                    <div><small>REPEATABLE TEST PAGE</small><h1 id="performance-title">Gravity method performance</h1><p>Measured frame rate and Jacobi drift under the same trajectory.</p></div>
+                    <div class="header-actions"><button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-repeat">Repeat benchmark</button><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="performance-close" aria-label="Close performance page">×</button></div>
+                </header>
+                <div class="method-checks" role="group" aria-label="Methods included in benchmark">
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="0">Radial</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="1">Werner</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="2">Eq.106</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="3">Packed FFT</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="4">FMM</button>
+                </div>
+                <div class="performance-charts">
+                    <article><div class="panel-heading"><span>Frame rate</span><small>FPS</small></div><svg id="performance-fps-chart" role="img" aria-label="Frame rate by gravity method"></svg></article>
+                    <article><div class="panel-heading"><span>Relative Jacobi drift</span><small>|ΔCⱼ/Cⱼ₀|</small></div><svg id="performance-jacobi-chart" role="img" aria-label="Relative Jacobi drift by gravity method"></svg></article>
+                </div>
+                <footer><span id="performance-status">Preparing test…</span><div id="performance-summary" class="summary-row"></div></footer>
+            </div>
+        </section>
+
+        <section id="quadrature-modal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="quadrature-title">
+            <div class="modal-card glass">
+                <header><div><small>GPU COMPUTE BENCHMARK</small><h1 id="quadrature-title">Quadrature-source crossover</h1><p>Fixed 56 density unknowns · measured total time</p></div><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="quadrature-cancel" aria-label="Close quadrature benchmark">×</button></header>
+                <div class="chart-shell"><svg id="quadrature-chart" role="img" aria-label="Quadrature benchmark chart"></svg></div>
+                <div id="curve-legend" class="legend"></div>
+                <footer><div class="modal-progress"><span id="modal-status">Preparing workload…</span><div id="quadrature-progress"></div></div><button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-cancel">Cancel / close</button></footer>
+            </div>
+        </section>
+        <section id="runtime-modal" class="modal critical" aria-hidden="true" role="alertdialog" aria-modal="true"><div class="error-card glass"><small>GPU PIPELINE STOPPED</small><h1>Computation paused</h1><p id="runtime-message"></p><button onclick="window.ryuguUi?.activate?.(this)" class="primary" data-action="runtime-reset">Reset parameters</button></div></section>
+    </main>
+    <div id="no-webgpu"><h2>WebGPU unavailable</h2><p>This simulation requires a browser and GPU with WebGPU support.</p></div>
+    <script type="importmap">{"imports":{"vue":"/node_modules/vue/dist/vue.esm-browser.prod.js"}}</script>
+    <script src="/src/html/ui.js"></script>
+    <script type="module" src="/src/html/app.js"></script>
+    <script type="module">
+        const viewportFrame = document.getElementById('viewport-frame');
+        function updateViewportFrame() {
+            const aspect = 16 / 9;
+            const compactPortrait = innerWidth < 700 && innerHeight > innerWidth;
+            const width = compactPortrait ? innerWidth : Math.min(innerWidth, innerHeight * aspect);
+            const height = compactPortrait ? innerHeight : width / aspect;
+            const turn = Number(viewportFrame.dataset.quarterTurn ?? 0) % 4;
+            const rotatedWidth = turn % 2 === 0 ? width : height;
+            const rotatedHeight = turn % 2 === 0 ? height : width;
+            viewportFrame.style.width = `${width}px`;
+            viewportFrame.style.height = `${height}px`;
+            viewportFrame.style.setProperty('--display-scale', String(Math.min(innerWidth / rotatedWidth, innerHeight / rotatedHeight)));
+        }
+        window.setRyuguDisplayRotation = (turn) => {
+            const normalized = ((Number(turn) % 4) + 4) % 4;
+            viewportFrame.dataset.quarterTurn = normalized;
+            viewportFrame.style.setProperty('--quarter-turn', normalized);
+            updateViewportFrame();
+        };
+        addEventListener('resize', updateViewportFrame, { passive: true });
+        window.setRyuguDisplayRotation(0);
+        if (!navigator.gpu || !(await navigator.gpu.requestAdapter())) {
+            document.getElementById('viewport-frame').hidden = true;
+            document.getElementById('no-webgpu').style.display = 'grid';
+        } else {
+            const version = new URL(location.href).searchParams.get('v');
+            const suffix = version ? `?v=${encodeURIComponent(version)}` : '';
+            const wasm = await import(`/pkg/ryugu_wasm.js${suffix}`);
+            await wasm.default({ module_or_path: `/pkg/ryugu_wasm_bg.wasm${suffix}` });
+        }
+    </script>
+</body>
+</html>

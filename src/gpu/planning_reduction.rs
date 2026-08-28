@@ -120,7 +120,7 @@ impl FromWorld for PlanningReductionPipeline {
             label: Some("planning_reduction".into()),
             layout: vec![layout],
             immediate_size: 0,
-            shader: server.load("shaders/planning_metrics.wgsl"),
+            shader: crate::wgsl::load(server, crate::wgsl::EmbeddedShader::PlanningMetrics),
             shader_defs: vec![],
             entry_point: None,
             zero_initialize_workgroup_memory: false,

@@ -2,10 +2,18 @@
   "name": "ryugu-wasm",
   "version": "0.1.0",
   "scripts": {
-    "build:wasm": "wasm-pack build --dev --target web --out-dir pkg",
-    "build": "wasm-pack build --release --target web --out-dir pkg",
-    "dev": "bun run build:wasm && bun run server.ts",
+    "build:wasm": "wasm-pack build --dev --target web --out-dir pkg --out-name ryugu_wasm",
+    "build": "bun run styles && wasm-pack build --release --target web --out-dir pkg --out-name ryugu_wasm",
+    "styles": "bunx @tailwindcss/cli -i src/html/tailwind.css -o src/html/tailwind.generated.css --minify",
+    "dev": "bun run styles && bun run build:wasm && bun run server.ts",
     "preview": "bun run build && bun run server.ts",
     "serve": "bun run server.ts"
+  },
+  "dependencies": {
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.0.0",
+    "tailwindcss": "^4.0.0"
   }
 }
