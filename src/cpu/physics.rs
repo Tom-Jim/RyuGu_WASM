@@ -390,10 +390,12 @@ pub fn physics_system(
     };
 
     if *active_method == ActiveGravityMethod::CurvedArcEq106 {
-        // Equations (27), (28), and (40): close position -> local Eq.106 field
-        // -> trajectory on each stable segment.  The old leapfrog path sampled
-        // a fixed local Hessian sequentially; this branch updates the complete
-        // segment by damped Picard sweeps and O(M) prefix integrals.
+        // Equations (27), (28), and (40): close position -> conservative local
+        // Eq.106 Taylor field -> trajectory on each stable segment. The field
+        // value and Hessian come from the completed GPU sample; every Picard
+        // iterate reevaluates that first-order spatial model at all M updated
+        // positions in one batch. This is self-consistent inside the certified
+        // Taylor tube, not a claim of a fresh full source sum at every iterate.
         let certified_tube_radius = curved_planner
             .active_segment
             .as_ref()

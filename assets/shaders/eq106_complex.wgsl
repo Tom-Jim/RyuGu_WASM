@@ -55,7 +55,6 @@ struct SpectrumSample {
 @group(0) @binding(5) var<uniform> toroidal_tensor: ToroidalTensorBuffer;
 @group(0) @binding(6) var<storage, read_write> line_samples: array<vec4<f32>>;
 @group(0) @binding(7) var<uniform> density_modes: DensityModeBuffer;
-@group(0) @binding(8) var<storage, read> psi_operator: array<f32>;
 @group(0) @binding(9) var<storage, read> targets: array<vec4<f32>>;
 
 var<workgroup> eq_params: Eq106Params;
@@ -70,7 +69,10 @@ var<workgroup> evaluation_tail: array<vec4<f32>, 64>;
 var<workgroup> evaluation_edge: array<vec2<f32>, 64>;
 var<workgroup> evaluation_coarse: array<vec4<f32>, 64>;
 var<workgroup> evaluation_edge_coarse: array<vec2<f32>, 64>;
-var<workgroup> source_reduction: array<vec4<f32>, 64>;
+// Source accumulation uses twice the evaluator lane count.  Reducing two
+// Taylor coefficients together keeps total workgroup storage below the WebGPU
+// portable 16 KiB floor while cutting synchronization substantially.
+var<workgroup> source_reduction: array<vec4<f32>, 256>;
 
 const PI: f32 = 3.141592653589793;
 const TAYLOR_MAX_ORDER: u32 = 8u;
@@ -82,6 +84,41 @@ const SELF_FD_DELTAS = array<f32, 5>(0.25, 0.5, 1.0, 2.0, 4.0);
 const TARGET_DISPATCH_WIDTH: u32 = 65535u;
 const PLANNING_VOXEL_COUNT: u32 = 56u;
 const PLANNING_VOXEL_BANK_COUNT: u32 = 28u;
+const SOURCE_LANE_COUNT: u32 = 128u;
+const SOURCE_REDUCTION_CHUNK: u32 = 2u;
+const COEFFICIENT_A = array<u32, 45>(
+    0u,
+    1u, 0u,
+    2u, 1u, 0u,
+    3u, 2u, 1u, 0u,
+    4u, 3u, 2u, 1u, 0u,
+    5u, 4u, 3u, 2u, 1u, 0u,
+    6u, 5u, 4u, 3u, 2u, 1u, 0u,
+    7u, 6u, 5u, 4u, 3u, 2u, 1u, 0u,
+    8u, 7u, 6u, 5u, 4u, 3u, 2u, 1u, 0u,
+);
+const COEFFICIENT_B = array<u32, 45>(
+    0u,
+    0u, 1u,
+    0u, 1u, 2u,
+    0u, 1u, 2u, 3u,
+    0u, 1u, 2u, 3u, 4u,
+    0u, 1u, 2u, 3u, 4u, 5u,
+    0u, 1u, 2u, 3u, 4u, 5u, 6u,
+    0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u,
+    0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+);
+const COEFFICIENT_DEGREE = array<u32, 45>(
+    0u,
+    1u, 1u,
+    2u, 2u, 2u,
+    3u, 3u, 3u, 3u,
+    4u, 4u, 4u, 4u, 4u,
+    5u, 5u, 5u, 5u, 5u, 5u,
+    6u, 6u, 6u, 6u, 6u, 6u, 6u,
+    7u, 7u, 7u, 7u, 7u, 7u, 7u, 7u,
+    8u, 8u, 8u, 8u, 8u, 8u, 8u, 8u, 8u,
+);
 // 16 candidates * 512 samples * 11 vec4 output rows. Planning reserves this
 // prefix for evaluator output and stores the high voxel-spectrum bank after it.
 const PLANNING_OUTPUT_PREFIX_VEC4: u32 = 90112u;
@@ -91,262 +128,14 @@ const TOROIDAL_DEGREE: u32 = 12u;
 const TOROIDAL_X_MIN: f32 = -10.0;
 const TOROIDAL_X_MAX: f32 = 8.0;
 const TOROIDAL_SEGMENT_STEP: f32 = 1.5;
-const PSI_SEGMENT_COUNT: u32 = 16u;
-const PSI_DEGREE: u32 = 8u;
-const PSI_LOG_A_MIN: f32 = -3.2188758248682006;
-const PSI_LOG_A_MAX: f32 = 1.791759469228055;
-const PSI_LOG_A_STEP: f32 = (PSI_LOG_A_MAX - PSI_LOG_A_MIN) / f32(PSI_SEGMENT_COUNT);
-
-const GL8_NODES = array<f32, 8>(
-    -0.9602898564975363, -0.7966664774136267,
-    -0.5255324099163290, -0.1834346424956498,
-     0.1834346424956498,  0.5255324099163290,
-     0.7966664774136267,  0.9602898564975363,
-);
-const GL8_WEIGHTS = array<f32, 8>(
-    0.1012285362903763, 0.2223810344533745,
-    0.3137066458778873, 0.3626837833783620,
-    0.3626837833783620, 0.3137066458778873,
-    0.2223810344533745, 0.1012285362903763,
-);
-const GL16_NODES = array<f32, 16>(
-    0.08764941047892784, 0.4626963289150808,
-    1.1410577748312269, 2.1292836450983806,
-    3.4370866338932066, 5.078018614549768,
-    7.070338535048234, 9.438314336391938,
-    12.21422336886616, 15.44152736878162,
-    19.18015685675313, 23.51590569399191,
-    28.57872974288214, 34.58339870228663,
-    41.94045264768833, 51.70116033954332,
-);
-const GL16_WEIGHTS = array<f32, 16>(
-    2.0615171495780099e-1, 3.310578549508842e-1,
-    2.6579577764421415e-1, 1.3629693429637754e-1,
-    4.732892869412522e-2, 1.1299900080339454e-2,
-    1.84907094352631e-3, 2.0427191530827846e-4,
-    1.4844586873981299e-5, 6.8283193308712e-7,
-    1.88102484107967e-8, 2.86235024297388e-10,
-    2.1270790332241e-12, 6.29796700251788e-15,
-    5.05047370003551e-18, 4.16146237037285e-22,
-);
 
 fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-fn complex_exp(value: vec2<f32>) -> vec2<f32> {
-    let amplitude = exp(value.x);
-    return amplitude * vec2<f32>(cos(value.y), sin(value.y));
-}
-
-fn complex_inverse(value: vec2<f32>) -> vec2<f32> {
-    let norm_squared = max(dot(value, value), 1.0e-30);
-    return vec2<f32>(value.x, -value.y) / norm_squared;
-}
-
-struct PsiBase {
-    value: vec2<f32>,
-    derivative: vec2<f32>,
-};
-
-struct PsiPair {
-    value: vec2<f32>,
-    derivative: vec2<f32>,
-};
-
-fn psi_full_asymptotic(x: vec2<f32>, eta: f32) -> PsiPair {
-    let polynomial = array<f32, 3>(1.0 + eta * eta, -2.0 * eta, 1.0);
-    var coefficients: array<f32, 33>;
-    coefficients[0] = inverseSqrt(polynomial[0]);
-    let inverse_x = complex_inverse(x);
-    var inverse_power = inverse_x;
-    var factorial = 1.0;
-    var previous_term = 3.402823e38;
-    var result: PsiPair;
-    result.value = vec2<f32>(0.0);
-    result.derivative = vec2<f32>(0.0);
-    for (var order = 0u; order < 33u; order += 1u) {
-        if order > 0u {
-            var numerator = 0.0;
-            for (var degree = 1u; degree <= min(2u, order); degree += 1u) {
-                numerator += ((0.5 * f32(degree)) - f32(order))
-                    * polynomial[degree] * coefficients[order - degree];
-            }
-            coefficients[order] = numerator / (f32(order) * polynomial[0]);
-            factorial *= f32(order);
-        }
-        let term = inverse_power * (factorial * coefficients[order]);
-        let magnitude = length(term);
-        if magnitude > 0.0 {
-            if magnitude >= previous_term {
-                break;
-            }
-            previous_term = magnitude;
-        }
-        result.value += term;
-        result.derivative -= complex_mul(term, inverse_x) * f32(order + 1u);
-        inverse_power = complex_mul(inverse_power, inverse_x);
-    }
-    return result;
-}
-
-fn psi_table_component(frequency: u32, segment: u32, t: f32, component: u32) -> f32 {
-    let coefficient_count = PSI_DEGREE + 1u;
-    let base = ((frequency * PSI_SEGMENT_COUNT + segment) * coefficient_count) * 4u + component;
-    var b1 = 0.0;
-    var b2 = 0.0;
-    var degree = PSI_DEGREE;
-    loop {
-        let coefficient = psi_operator[base + degree * 4u];
-        let b = 2.0 * t * b1 - b2 + coefficient;
-        b2 = b1;
-        b1 = b;
-        if degree == 1u {
-            break;
-        }
-        degree -= 1u;
-    }
-    return t * b1 - b2 + psi_operator[base];
-}
-
-// Certified complex Chebyshev lookup for the Struve--Neumann half-axis term
-// L(x)=pi/2(H_0(x)-Y_0(x)) and L_x.  The table stores non-negative frequency
-// rays; real source data gives the negative rays by complex conjugation.
-fn psi_base(signed_frequency: i32, normalized_a: f32) -> PsiBase {
-    let log_a = clamp(log(normalized_a), PSI_LOG_A_MIN, PSI_LOG_A_MAX);
-    let segment = min(
-        u32(floor((log_a - PSI_LOG_A_MIN) / PSI_LOG_A_STEP)),
-        PSI_SEGMENT_COUNT - 1u,
-    );
-    let x0 = PSI_LOG_A_MIN + f32(segment) * PSI_LOG_A_STEP;
-    let x1 = x0 + PSI_LOG_A_STEP;
-    let t = clamp((2.0 * log_a - x0 - x1) / (x1 - x0), -1.0, 1.0);
-    let frequency = u32(abs(signed_frequency));
-    var result: PsiBase;
-    result.value = vec2<f32>(
-        psi_table_component(frequency, segment, t, 0u),
-        psi_table_component(frequency, segment, t, 1u),
-    );
-    result.derivative = vec2<f32>(
-        psi_table_component(frequency, segment, t, 2u),
-        psi_table_component(frequency, segment, t, 3u),
-    );
-    if signed_frequency < 0 {
-        result.value.y = -result.value.y;
-        result.derivative.y = -result.derivative.y;
-    }
-    return result;
-}
-
-// Analytic finite-eta continuation of the incomplete Struve term. Inside the
-// convergence disk it uses the coefficient recurrence implied by
-// (1+eta^2) f'=[x(1+eta^2)-eta]f. Outside, an 8-node real-path rule avoids
-// extending that Taylor series across its eta=+-i singularities.
-fn finite_eta_correction(x: vec2<f32>, eta: f32) -> PsiPair {
-    var result: PsiPair;
-    result.value = vec2<f32>(0.0);
-    result.derivative = vec2<f32>(0.0);
-    if abs(eta) <= 0.72 && length(x) * abs(eta) <= 4.0 {
-        var c_minus_two = vec2<f32>(0.0);
-        var c_minus_one = vec2<f32>(0.0);
-        var c = vec2<f32>(1.0, 0.0);
-        var dc_minus_two = vec2<f32>(0.0);
-        var dc_minus_one = vec2<f32>(0.0);
-        var dc = vec2<f32>(0.0);
-        var eta_power = eta;
-        for (var order = 0u; order <= 36u; order += 1u) {
-            let denominator = f32(order + 1u);
-            result.value += c * (eta_power / denominator);
-            result.derivative += dc * (eta_power / denominator);
-            let next = (
-                complex_mul(x, c) + complex_mul(x, c_minus_two)
-                - f32(order) * c_minus_one
-            ) / denominator;
-            let next_derivative = (
-                c + complex_mul(x, dc) + c_minus_two
-                + complex_mul(x, dc_minus_two) - f32(order) * dc_minus_one
-            ) / denominator;
-            c_minus_two = c_minus_one;
-            c_minus_one = c;
-            c = next;
-            dc_minus_two = dc_minus_one;
-            dc_minus_one = dc;
-            dc = next_derivative;
-            eta_power *= eta;
-        }
-        let phase = complex_exp(-x * eta);
-        let j = result.value;
-        result.value = complex_mul(phase, j);
-        result.derivative = complex_mul(phase, result.derivative - eta * j);
-        return result;
-    }
-
-    // Return the already scaled quantities exp(-x eta)J and
-    // d/dx[exp(-x eta)J], which avoids a large intermediate for eta<0.
-    let segment_count = clamp(u32(ceil(length(x) * abs(eta) / 2.0)), 1u, 12u);
-    for (var segment = 0u; segment < segment_count; segment += 1u) {
-        let start = eta * f32(segment) / f32(segment_count);
-        let end = eta * f32(segment + 1u) / f32(segment_count);
-        let midpoint = 0.5 * (start + end);
-        let half_width = 0.5 * (end - start);
-        for (var node = 0u; node < 8u; node += 1u) {
-            let v = midpoint + half_width * GL8_NODES[node];
-            let weight = half_width * GL8_WEIGHTS[node] / sqrt(1.0 + v * v);
-            let phase = complex_exp(-x * (eta - v));
-            result.value += phase * weight;
-            result.derivative += phase * (weight * (v - eta));
-        }
-    }
-    return result;
-}
-
-// a->0, z'<0: exp(-s z') E1(-s z') = integral_0^infinity
-// exp(-t)/(t-s z') dt. Gauss--Laguerre makes this an explicit rational limit.
-fn scaled_e1_axis_limit(w: vec2<f32>) -> vec2<f32> {
-    if length(w) < 4.0 {
-        let logarithm = vec2<f32>(log(length(w)), atan2(w.y, w.x));
-        var e1 = -logarithm - vec2<f32>(0.5772156649015329, 0.0);
-        var power = vec2<f32>(1.0, 0.0);
-        var factorial = 1.0;
-        for (var order = 1u; order <= 36u; order += 1u) {
-            power = complex_mul(power, -w);
-            factorial *= f32(order);
-            e1 -= power / (f32(order) * factorial);
-        }
-        return complex_mul(complex_exp(w), e1);
-    }
-    var result = vec2<f32>(0.0);
-    for (var node = 0u; node < 16u; node += 1u) {
-        result += GL16_WEIGHTS[node]
-            * complex_inverse(w + vec2<f32>(GL16_NODES[node], 0.0));
-    }
-    return result;
-}
-
-fn laplace_phase(omega: f32, h: f32) -> vec2<f32> {
-    let attenuation = exp(-eq_params.sigma * h);
-    let angle = -omega * h;
-    return attenuation * vec2<f32>(cos(angle), sin(angle));
-}
-
 fn coefficient_index(a: u32, b: u32) -> u32 {
     let degree = a + b;
     return degree * (degree + 1u) / 2u + b;
-}
-
-fn coefficient_degree(index: u32) -> u32 {
-    return u32(floor((sqrt(8.0 * f32(index) + 1.0) - 1.0) * 0.5));
-}
-
-fn coefficient_a(index: u32) -> u32 {
-    let degree = coefficient_degree(index);
-    let b = index - degree * (degree + 1u) / 2u;
-    return degree - b;
-}
-
-fn coefficient_b(index: u32) -> u32 {
-    let degree = coefficient_degree(index);
-    return index - degree * (degree + 1u) / 2u;
 }
 
 fn active_coefficient_count() -> u32 {
@@ -382,12 +171,13 @@ fn build_radial_power_series(
     x10: f32,
     x01: f32,
     alpha: f32,
+    initial: f32,
 ) -> array<f32, 45> {
     var result: array<f32, 45>;
     for (var index = 0u; index < active_coefficient_count(); index += 1u) {
         result[index] = 0.0;
     }
-    result[0] = pow(x0, alpha);
+    result[0] = initial;
     for (var degree = 1u; degree <= min(eq_params.taylor_order, TAYLOR_MAX_ORDER); degree += 1u) {
         for (var b = 0u; b <= degree; b += 1u) {
             let a = degree - b;
@@ -426,27 +216,32 @@ fn accumulate_source_range(
     // summing metre^-8 values in f32. Evaluation applies u/d and v/d below.
     let source_radius = 2.0 / max(eq_params.sigma, 1.0e-12);
     let transverse_scale = max(length(eq_params.line_origin) - source_radius, 1.0);
+    var transverse_powers: array<f32, 9>;
+    transverse_powers[0] = 1.0;
+    for (var degree = 1u; degree <= TAYLOR_MAX_ORDER; degree += 1u) {
+        transverse_powers[degree] = transverse_powers[degree - 1u] * transverse_scale;
+    }
     var packed: array<vec4<f32>, 45>;
     for (var index = 0u; index < MAX_TAYLOR_COEFFICIENT_COUNT; index += 1u) {
         packed[index] = vec4<f32>(0.0);
     }
-    for (var source_index = source_begin + lane; source_index < source_end; source_index += 64u) {
+    for (var source_index = source_begin + lane; source_index < source_end; source_index += SOURCE_LANE_COUNT) {
         let source = sources[source_index];
         let r0 = source.xyz - observer;
         let x0 = max(dot(r0, r0), 1.0e-8);
         let x10 = -2.0 * dot(r0, normal);
         let x01 = -2.0 * dot(r0, binormal);
-        let inverse_r = build_radial_power_series(x0, x10, x01, -0.5);
-        let inverse_r3 = build_radial_power_series(x0, x10, x01, -1.5);
+        let inverse_radius = inverseSqrt(x0);
+        let inverse_r = build_radial_power_series(x0, x10, x01, -0.5, inverse_radius);
+        let inverse_r3 = build_radial_power_series(
+            x0, x10, x01, -1.5, inverse_radius / x0,
+        );
         let source_scale = eq_params.g_const * source.w;
 
         for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
-            let a = coefficient_a(coefficient);
-            let b = coefficient_b(coefficient);
-            var coordinate_scale = 1.0;
-            for (var degree = 0u; degree < a + b; degree += 1u) {
-                coordinate_scale *= transverse_scale;
-            }
+            let a = COEFFICIENT_A[coefficient];
+            let b = COEFFICIENT_B[coefficient];
+            let coordinate_scale = transverse_powers[COEFFICIENT_DEGREE[coefficient]];
             var previous_u = 0.0;
             var previous_v = 0.0;
             if a > 0u {
@@ -464,7 +259,48 @@ fn accumulate_source_range(
     return packed;
 }
 
-@compute @workgroup_size(64, 1, 1)
+fn reduce_and_store_taylor_jet(
+    packed: ptr<function, array<vec4<f32>, 45>>,
+    coefficient_count: u32,
+    lane: u32,
+    destination_base: u32,
+    quadrature_weight: f32,
+) {
+    for (var chunk = 0u; chunk < MAX_TAYLOR_COEFFICIENT_COUNT; chunk += SOURCE_REDUCTION_CHUNK) {
+        for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+            let coefficient = chunk + slot;
+            var value = vec4<f32>(0.0);
+            if coefficient < MAX_TAYLOR_COEFFICIENT_COUNT {
+                value = (*packed)[coefficient];
+            }
+            source_reduction[slot * SOURCE_LANE_COUNT + lane] = value;
+        }
+        workgroupBarrier();
+        var stride = SOURCE_LANE_COUNT / 2u;
+        loop {
+            if stride == 0u { break; }
+            if lane < stride {
+                for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                    let base = slot * SOURCE_LANE_COUNT;
+                    source_reduction[base + lane] += source_reduction[base + lane + stride];
+                }
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if lane == 0u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let coefficient = chunk + slot;
+                if coefficient < coefficient_count {
+                    line_samples[destination_base + coefficient * QUADRATURE_CAPACITY] =
+                        source_reduction[slot * SOURCE_LANE_COUNT] * quadrature_weight;
+                }
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(128, 1, 1)
 fn assemble_line_samples(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
@@ -478,36 +314,23 @@ fn assemble_line_samples(
     let sample = quadrature[quadrature_index];
     let basis = transverse_basis(eq_params.line_direction);
     let observer = eq_params.line_origin + sample.x * basis[0];
-    let packed = accumulate_source_range(
+    var packed = accumulate_source_range(
         observer, basis[1], basis[2], 0u, eq_params.source_count, local_index,
     );
     let coefficient_count = active_coefficient_count();
 
-    for (var coefficient = 0u; coefficient < MAX_TAYLOR_COEFFICIENT_COUNT; coefficient += 1u) {
-        source_reduction[local_index] = packed[coefficient];
-        workgroupBarrier();
-        var stride = 32u;
-        loop {
-            if stride == 0u { break; }
-            if local_index < stride {
-                source_reduction[local_index] += source_reduction[local_index + stride];
-            }
-            workgroupBarrier();
-            stride = stride >> 1u;
-        }
-        if local_index == 0u && coefficient < coefficient_count {
-            let destination = (eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * QUADRATURE_CAPACITY
-                + coefficient * QUADRATURE_CAPACITY + quadrature_index;
-            line_samples[destination] = source_reduction[0] * sample.y;
-        }
-    }
+    let destination_base = (eq_params.segment_id - 1u)
+        * MAX_TAYLOR_COEFFICIENT_COUNT * QUADRATURE_CAPACITY + quadrature_index;
+    reduce_and_store_taylor_jet(
+        &packed, coefficient_count, local_index, destination_base, sample.y,
+    );
 }
 
 // Planning density inversion: one workgroup owns a
-// (canonical segment, density voxel, quadrature point) tuple. Its 64 lanes
+// (canonical segment, density voxel, quadrature point) tuple. Its 128 lanes
 // traverse the voxel's source range in parallel and reduce the complete
 // transverse Taylor jet without atomics.
-@compute @workgroup_size(64, 1, 1)
+@compute @workgroup_size(128, 1, 1)
 fn assemble_voxel_line_samples(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
@@ -525,29 +348,15 @@ fn assemble_voxel_line_samples(
     let sample = quadrature[quadrature_index];
     let basis = transverse_basis(eq_params.line_direction);
     let observer = eq_params.line_origin + sample.x * basis[0];
-    let packed = accumulate_source_range(
+    var packed = accumulate_source_range(
         observer, basis[1], basis[2], source_begin, source_end, local_index,
     );
     let coefficient_count = active_coefficient_count();
-    for (var coefficient = 0u; coefficient < MAX_TAYLOR_COEFFICIENT_COUNT; coefficient += 1u) {
-        source_reduction[local_index] = packed[coefficient];
-        workgroupBarrier();
-        var stride = 32u;
-        loop {
-            if stride == 0u { break; }
-            if local_index < stride {
-                source_reduction[local_index] += source_reduction[local_index + stride];
-            }
-            workgroupBarrier();
-            stride = stride >> 1u;
-        }
-        if local_index == 0u && coefficient < coefficient_count {
-            let destination = (((eq_params.segment_id - 1u) * PLANNING_VOXEL_COUNT + voxel_index)
-                * MAX_TAYLOR_COEFFICIENT_COUNT + coefficient) * QUADRATURE_CAPACITY
-                + quadrature_index;
-            line_samples[destination] = source_reduction[0] * sample.y;
-        }
-    }
+    let destination_base = ((eq_params.segment_id - 1u) * PLANNING_VOXEL_COUNT + voxel_index)
+        * MAX_TAYLOR_COEFFICIENT_COUNT * QUADRATURE_CAPACITY + quadrature_index;
+    reduce_and_store_taylor_jet(
+        &packed, coefficient_count, local_index, destination_base, sample.y,
+    );
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -568,8 +377,6 @@ fn assemble_spectrum(
     }
     let coefficient = flat_index / frequency_count;
     let frequency_index = flat_index % frequency_count;
-    let signed_index = i32(frequency_index) - i32(eq_params.half_count);
-    let omega = f32(signed_index) * eq_params.omega_step;
     var result: SpectrumSample;
     result.acceleration_x = vec2<f32>(0.0);
     result.acceleration_y = vec2<f32>(0.0);
@@ -577,10 +384,10 @@ fn assemble_spectrum(
     result.potential = vec2<f32>(0.0);
 
     for (var quadrature_index = 0u; quadrature_index < eq_params.quadrature_count; quadrature_index += 1u) {
-        let quadrature_sample = quadrature[quadrature_index];
         let packed = line_samples[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * QUADRATURE_CAPACITY
             + coefficient * QUADRATURE_CAPACITY + quadrature_index];
-        let phase = laplace_phase(omega, quadrature_sample.x);
+        let phase = quadrature[QUADRATURE_CAPACITY
+            + frequency_index * QUADRATURE_CAPACITY + quadrature_index];
         result.acceleration_x += phase * packed.x;
         result.acceleration_y += phase * packed.y;
         result.acceleration_z += phase * packed.z;
@@ -609,19 +416,17 @@ fn assemble_voxel_spectrum(
     }
     let coefficient = flat_index / frequency_count;
     let frequency_index = flat_index % frequency_count;
-    let signed_index = i32(frequency_index) - i32(eq_params.half_count);
-    let omega = f32(signed_index) * eq_params.omega_step;
     var result: SpectrumSample;
     result.acceleration_x = vec2<f32>(0.0);
     result.acceleration_y = vec2<f32>(0.0);
     result.acceleration_z = vec2<f32>(0.0);
     result.potential = vec2<f32>(0.0);
     for (var quadrature_index = 0u; quadrature_index < eq_params.quadrature_count; quadrature_index += 1u) {
-        let sample = quadrature[quadrature_index];
         let packed = line_samples[(((eq_params.segment_id - 1u) * PLANNING_VOXEL_COUNT + voxel_index)
             * MAX_TAYLOR_COEFFICIENT_COUNT + coefficient) * QUADRATURE_CAPACITY
             + quadrature_index];
-        let phase = laplace_phase(omega, sample.x);
+        let phase = quadrature[QUADRATURE_CAPACITY
+            + frequency_index * QUADRATURE_CAPACITY + quadrature_index];
         result.acceleration_x += phase * packed.x;
         result.acceleration_y += phase * packed.y;
         result.acceleration_z += phase * packed.z;
@@ -694,120 +499,6 @@ fn combine_voxel_spectrum(
         * SPECTRUM_FREQUENCY_CAPACITY + flat_index] = result;
 }
 
-// Eqs. (47),(68)-(70): source-summed transformed field on the reference line.
-// This pass overwrites coefficient zero after the sampled higher-order Taylor
-// jet has been assembled. It performs no half-line quadrature and its cost is
-// O(N_source N_frequency) table/recurrence work per new spectral element.
-@compute @workgroup_size(64, 1, 1)
-fn assemble_analytic_spectrum(
-    @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_index) local_index: u32,
-) {
-    let segment_index = global_id.y;
-    if local_index == 0u {
-        eq_params = segment_params[segment_index];
-    }
-    workgroupBarrier();
-    let frequency_index = global_id.x;
-    let frequency_count = 2u * eq_params.half_count + 1u;
-    if frequency_index >= frequency_count {
-        return;
-    }
-    let signed_index = i32(frequency_index) - i32(eq_params.half_count);
-    let omega = f32(signed_index) * eq_params.omega_step;
-    let s = vec2<f32>(eq_params.sigma, omega);
-    let radius = 2.0 / max(eq_params.sigma, 1.0e-12);
-    let basis = transverse_basis(eq_params.line_direction);
-    let tangent = basis[0];
-    var result: SpectrumSample;
-    result.acceleration_x = vec2<f32>(0.0);
-    result.acceleration_y = vec2<f32>(0.0);
-    result.acceleration_z = vec2<f32>(0.0);
-    result.potential = vec2<f32>(0.0);
-    var valid = true;
-
-    for (var source_index = 0u; source_index < eq_params.source_count; source_index += 1u) {
-        let source = sources[source_index];
-        let relative = source.xyz - eq_params.line_origin;
-        let z_prime = dot(relative, tangent);
-        let transverse = relative - z_prime * tangent;
-        let a = length(transverse);
-        let normalized_a = a / radius;
-        let scale = eq_params.g_const * source.w;
-
-        if normalized_a < exp(PSI_LOG_A_MIN) {
-            // The point-source line transform is singular when a=0 and the
-            // source lies on the forward half-line. A valid exterior element
-            // can only approach the regular z'<0 axis limit.
-            if z_prime >= -1.0e-5 * radius {
-                valid = false;
-                continue;
-            }
-            let w = -s * z_prime;
-            let psi = scaled_e1_axis_limit(w);
-            let vertical = complex_mul(s, psi)
-                - vec2<f32>(1.0 / abs(z_prime), 0.0);
-            result.acceleration_x += vertical * (scale * tangent.x);
-            result.acceleration_y += vertical * (scale * tangent.y);
-            result.acceleration_z += vertical * (scale * tangent.z);
-            result.potential += psi * scale;
-            continue;
-        }
-        if normalized_a > exp(PSI_LOG_A_MAX) {
-            valid = false;
-            continue;
-        }
-
-        let eta = z_prime / a;
-        let x = s * a;
-        var psi = vec2<f32>(0.0);
-        var psi_x = vec2<f32>(0.0);
-        if length(x) >= 16.0 || -x.x * eta >= 6.0 {
-            let full = psi_full_asymptotic(x, eta);
-            psi = full.value;
-            psi_x = full.derivative;
-        } else {
-            let base = psi_base(signed_index, normalized_a);
-            let correction = finite_eta_correction(x, eta);
-            let phase = complex_exp(-x * eta);
-            psi = complex_mul(phase, base.value) + correction.value;
-            psi_x = complex_mul(
-                phase,
-                base.derivative - eta * base.value,
-            ) + correction.derivative;
-        }
-        let inverse_boundary = inverseSqrt(1.0 + eta * eta);
-        let x_psi = complex_mul(x, psi);
-        let k_v = x_psi - vec2<f32>(inverse_boundary, 0.0);
-        let k_h = complex_mul(x, psi_x) + eta * x_psi
-            - vec2<f32>(eta * inverse_boundary, 0.0);
-        let horizontal_direction = transverse / a;
-        let horizontal = k_h * (-scale / a);
-        let vertical = k_v * (scale / a);
-        result.acceleration_x += horizontal * horizontal_direction.x + vertical * tangent.x;
-        result.acceleration_y += horizontal * horizontal_direction.y + vertical * tangent.y;
-        result.acceleration_z += horizontal * horizontal_direction.z + vertical * tangent.z;
-        result.potential += psi * scale;
-    }
-
-    if valid {
-        spectrum[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY
-            + frequency_index] = result;
-    } else {
-        // A rejected operator-domain query must not silently fall back to a
-        // different force law. Chrome's WebGPU validator rejects a literal
-        // NaN in WGSL, so use a finite out-of-domain sentinel; the CPU gate
-        // rejects magnitudes above the physical bound and rebuilds the line.
-        let invalid = 3.0e30;
-        result.acceleration_x = vec2<f32>(invalid);
-        result.acceleration_y = vec2<f32>(invalid);
-        result.acceleration_z = vec2<f32>(invalid);
-        result.potential = vec2<f32>(invalid);
-        spectrum[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY
-            + frequency_index] = result;
-    }
-}
-
 fn integer_power(value: f32, exponent: u32) -> f32 {
     var result = 1.0;
     for (var index = 0u; index < exponent; index += 1u) {
@@ -849,7 +540,7 @@ fn toroidal_q(mode: u32, chi: f32) -> f32 {
 
 // Eq. (79)-(83): independent Fourier-toroidal potential. The ring-major
 // density buffer stores m=0..16 for every (r',z') ring. This is deliberately
-// independent of the Eq. (70) Bromwich/Taylor path used for acceleration.
+// independent of the sampled Bromwich/Taylor path used for acceleration.
 fn fourier_toroidal_potential(position: vec3<f32>) -> f32 {
     let rho = length(position.xy);
     if rho <= 1.0e-4 {
@@ -1098,9 +789,9 @@ fn evaluate_field(
         }
 
         if lane == 0u && coefficient < coefficient_count {
-            let a = coefficient_a(coefficient);
-            let b = coefficient_b(coefficient);
-            let degree = a + b;
+            let a = COEFFICIENT_A[coefficient];
+            let b = COEFFICIENT_B[coefficient];
+            let degree = COEFFICIENT_DEGREE[coefficient];
             let raw = evaluation_sum[0] * inversion_scale;
             let reconstructed = raw.xyz / edge_response;
             let reconstructed_potential = raw.w / edge_response;

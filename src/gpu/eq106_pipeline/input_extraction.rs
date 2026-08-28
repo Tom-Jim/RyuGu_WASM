@@ -298,11 +298,6 @@ fn extract_eq106_input(
             .as_ref()
             .map(|resource| resource.tensor.as_le_bytes());
     }
-    if extracted.psi_operator.is_none() {
-        extracted.psi_operator = operator_tensor
-            .as_ref()
-            .map(|resource| resource.psi.as_le_bytes());
-    }
 }
 
 fn initialize_eq106_pipeline(world: &mut World) {
@@ -582,7 +577,6 @@ fn report_eq106_pipeline_errors(
     for (name, id) in [
         ("line samples", pipelines.line_samples_id),
         ("sampled spectrum", pipelines.assemble_id),
-        ("analytic Eq.70 spectrum", pipelines.analytic_id),
         ("inverse spectrum", pipelines.evaluate_id),
         (
             "planning voxel line samples",

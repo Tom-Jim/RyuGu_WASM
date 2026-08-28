@@ -25,7 +25,6 @@ struct PlanningEq106DispatchState {
     sources: Option<Buffer>,
     quadrature: Option<Buffer>,
     operator: Option<Buffer>,
-    psi: Option<Buffer>,
     dummy_modes: Option<Buffer>,
     spectrum: Option<Buffer>,
     line_samples: Option<Buffer>,
@@ -142,7 +141,6 @@ fn dispatch_planning_eq106(
         return;
     };
     if planning.eq106_operator.is_empty()
-        || planning.eq106_psi.is_empty()
         || planning.source_radius <= 0.0
         || planning.payload.primary.is_empty()
         || planning.payload.secondary.len() != 112 * 16
@@ -283,7 +281,6 @@ fn dispatch_planning_eq106(
     let common_changed = batch_changed
         || state.quadrature.is_none()
         || state.operator.is_none()
-        || state.psi.is_none()
         || state.dummy_modes.is_none();
     if common_changed {
         state.batch_id = batch.batch_id;
@@ -299,13 +296,6 @@ fn dispatch_planning_eq106(
                 label: Some("planning_eq106_operator"),
                 contents: &planning.eq106_operator,
                 usage: BufferUsages::UNIFORM,
-            }),
-        );
-        state.psi = Some(
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("planning_eq106_psi"),
-                contents: &planning.eq106_psi,
-                usage: BufferUsages::STORAGE,
             }),
         );
         state.dummy_modes = Some(
@@ -436,7 +426,6 @@ fn dispatch_planning_eq106(
         .as_ref()
         .expect("planning Eq.106 operator")
         .clone();
-    let psi = state.psi.as_ref().expect("planning Eq.106 psi").clone();
     let spectrum = state
         .spectrum
         .as_ref()
@@ -484,7 +473,6 @@ fn dispatch_planning_eq106(
                 uniform_entry(5),
                 storage_rw_entry(6),
                 uniform_entry(7),
-                storage_ro_entry(8),
                 storage_ro_entry(9),
             ],
         ));
@@ -570,10 +558,6 @@ fn dispatch_planning_eq106(
                 BindGroupEntry {
                     binding: 7,
                     resource: source_groups.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 8,
-                    resource: psi.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding: 9,
@@ -739,9 +723,8 @@ fn dispatch_planning_eq106(
     // allocations and the target buffer shared by all planning methods are not
     // observable here and are intentionally excluded.
     let estimated_gpu_buffer_bytes = planning.payload.primary.len() as u64
-        + QUADRATURE_COUNT as u64 * 8
+        + QUADRATURE_COUNT as u64 * (FREQUENCY_COUNT as u64 + 1) * 8
         + planning.eq106_operator.len() as u64
-        + planning.eq106_psi.len() as u64
         + 2 * 544 * 16
         + coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count
         + coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56
@@ -760,7 +743,7 @@ fn dispatch_planning_eq106(
         evaluator_elements = evaluator_element_count,
         spectrum_cache_hit = !build_spectrum,
         voxel_basis_cache_hit = !build_basis_spectrum,
-        source_parallel_lanes = 64,
+        source_parallel_lanes = 128,
         voxel_basis_count = 56,
         analytic_zero_correction = false,
         estimated_gpu_buffer_bytes,

@@ -19,7 +19,6 @@ pub(crate) struct ExtractedPlanningInput {
     pub request: PlanningGpuRequest,
     pub payload: PlanningMethodPayload,
     pub eq106_operator: Arc<[u8]>,
-    pub eq106_psi: Arc<[u8]>,
     pub source_radius: f32,
 }
 
@@ -184,7 +183,6 @@ fn extract_planning_input(
         && let Some(operator) = operator.as_ref()
     {
         extracted.eq106_operator = Arc::from(operator.tensor.as_le_bytes());
-        extracted.eq106_psi = Arc::from(operator.psi.as_le_bytes());
     }
     extracted.source_radius = batch.eq106_source_radius;
 }

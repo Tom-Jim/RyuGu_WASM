@@ -124,10 +124,6 @@ fn dispatch_eq106_sensitivity_matrix(
                         resource: inner.density_modes.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 8,
-                        resource: inner.psi_operator.as_entire_binding(),
-                    },
-                    BindGroupEntry {
                         binding: 9,
                         resource: inner.targets.as_entire_binding(),
                     },

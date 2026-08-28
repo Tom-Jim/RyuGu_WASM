@@ -1,5 +1,7 @@
 use crate::cpu::curved_arc::AggregatedGravitySource;
-use crate::cpu::inversion::build_voxel_basis_sources;
+use crate::cpu::inversion::{
+    PlanningDynamicsTree, build_planning_dynamics_tree, build_voxel_basis_sources,
+};
 use crate::cpu::volterra::{VolterraConfig, VolterraForceInput, propagate_reference_line_batched};
 use crate::interface::components::*;
 use bevy::math::{DMat3, DQuat, DVec3};
@@ -33,11 +35,13 @@ pub(crate) struct PlanningBatchBuilder {
     basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
     reference_jets: Vec<PlanningReferenceJet>,
+    dynamics_tree: PlanningDynamicsTree,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PlanningReferenceJet {
     simulation_time_seconds: f64,
+    body_rotation: DQuat,
     world_position: DVec3,
     world_acceleration: DVec3,
     world_jacobian: DMat3,
@@ -139,11 +143,13 @@ impl PlanningBatchBuilder {
             density_model_count,
             density_seed,
         )?;
-        let reference_jets = build_planning_reference_jets(
-            &reference_samples,
-            &basis_records,
-            density_models.get(..56)?,
-        )?;
+        // Candidate dynamics must not change merely because the crossover
+        // benchmark refines the same mass distribution from 32K to 8192K
+        // quadrature records. Build one nonlinear FMM field from the canonical
+        // mass/centroid representation and close every Picard sweep against it.
+        let dynamics_tree =
+            build_planning_dynamics_tree(&canonical_basis_records, density_models.get(..56)?)?;
+        let reference_jets = build_planning_reference_jets(&reference_samples);
         Some(Self {
             profile,
             run_id,
@@ -171,6 +177,7 @@ impl PlanningBatchBuilder {
             basis_records,
             basis_hash,
             reference_jets,
+            dynamics_tree,
         })
     }
 
@@ -198,6 +205,7 @@ impl PlanningBatchBuilder {
                 self.candidate_count,
                 &self.reference_samples,
                 &self.reference_jets,
+                Some(&self.dynamics_tree),
                 &mut self.states,
                 &mut self.gpu_position_bytes,
             )
@@ -515,6 +523,7 @@ fn append_dynamical_candidate_states(
     candidate_count: u32,
     reference: &[TrajectoryInversionKnot],
     reference_jets: &[PlanningReferenceJet],
+    dynamics_tree: Option<&PlanningDynamicsTree>,
     states: &mut Vec<PlanningCandidateState>,
     gpu_position_bytes: &mut Vec<u8>,
 ) -> Option<()> {
@@ -538,6 +547,7 @@ fn append_dynamical_candidate_states(
             candidate,
             reference,
             reference_jets,
+            dynamics_tree,
             requested_radius * contraction,
             phase,
             harmonic,
@@ -560,6 +570,7 @@ fn append_dynamical_candidate_at_radius(
     candidate: u32,
     reference: &[TrajectoryInversionKnot],
     reference_jets: &[PlanningReferenceJet],
+    dynamics_tree: Option<&PlanningDynamicsTree>,
     radius: f32,
     phase: f32,
     harmonic: f32,
@@ -596,6 +607,7 @@ fn append_dynamical_candidate_at_radius(
         |inputs, accelerations| {
             fill_planning_reference_accelerations(
                 reference_jets,
+                dynamics_tree,
                 first.simulation_time_seconds,
                 inputs,
                 accelerations,
@@ -676,6 +688,7 @@ fn candidate_initial_offset(
 
 fn fill_planning_reference_accelerations(
     jets: &[PlanningReferenceJet],
+    dynamics_tree: Option<&PlanningDynamicsTree>,
     start_time_seconds: f64,
     inputs: &[VolterraForceInput],
     accelerations: &mut [DVec3],
@@ -709,6 +722,7 @@ fn fill_planning_reference_accelerations(
                 .clamp(0.0, 1.0);
             PlanningReferenceJet {
                 simulation_time_seconds,
+                body_rotation: lower.body_rotation.slerp(upper.body_rotation, weight),
                 world_position: lower.world_position.lerp(upper.world_position, weight),
                 world_acceleration: lower
                     .world_acceleration
@@ -717,17 +731,23 @@ fn fill_planning_reference_accelerations(
                     + upper.world_jacobian * weight,
             }
         };
-        *acceleration =
-            jet.world_acceleration + jet.world_jacobian * (input.position - jet.world_position);
+        *acceleration = if let Some(tree) = dynamics_tree {
+            // Nonlinear Picard closure: every updated world position is
+            // transformed into the rotating density frame and reevaluated by
+            // the FMM field, rather than being frozen to a+J*delta_r.
+            let body_position = jet.body_rotation.inverse() * input.position;
+            jet.body_rotation * tree.acceleration(body_position).ok_or(())?
+        } else {
+            // Retained only for focused affine-field unit tests.
+            jet.world_acceleration + jet.world_jacobian * (input.position - jet.world_position)
+        };
     }
     Ok(())
 }
 
 fn build_planning_reference_jets(
     reference: &[TrajectoryInversionKnot],
-    basis_records: &[PlanningBasisRecord],
-    densities: &[f32],
-) -> Option<Vec<PlanningReferenceJet>> {
+) -> Vec<PlanningReferenceJet> {
     reference
         .iter()
         .map(|state| {
@@ -738,21 +758,22 @@ fn build_planning_reference_jets(
                 f64::from(state.body_rotation.w),
             )
             .normalize();
-            let rotation_matrix = DMat3::from_quat(rotation);
             let world_position = state.position.as_dvec3();
-            let body_position = rotation.inverse() * world_position;
-            let (body_acceleration, body_jacobian) =
-                evaluate_planning_reference_field(body_position, basis_records, densities)?;
-            Some(PlanningReferenceJet {
+            PlanningReferenceJet {
                 simulation_time_seconds: state.simulation_time_seconds,
+                body_rotation: rotation,
                 world_position,
-                world_acceleration: rotation * body_acceleration,
-                world_jacobian: rotation_matrix * body_jacobian * rotation_matrix.transpose(),
-            })
+                world_acceleration: state.baseline_acceleration.as_dvec3(),
+                world_jacobian: DMat3::ZERO,
+            }
         })
         .collect()
 }
 
+/// Direct source sum retained as the independent certified reference.  It is
+/// intentionally not used by Picard propagation: certification needs an
+/// exact, method-independent field/gradient, while candidate dynamics use the
+/// source-count-independent FMM tree and reevaluate every updated position.
 pub(crate) fn evaluate_planning_reference_field(
     target: DVec3,
     basis_records: &[PlanningBasisRecord],
@@ -771,11 +792,11 @@ pub(crate) fn evaluate_planning_reference_field(
             f64::from(source.position_volume[2]),
         );
         let displacement = position - target;
-        let radius2 = displacement.length_squared().max(1.0e-16);
-        let inverse_radius = radius2.sqrt().recip();
-        let inverse_radius3 = inverse_radius / radius2;
+        let radius_squared = displacement.length_squared().max(1.0e-16);
+        let inverse_radius = radius_squared.sqrt().recip();
+        let inverse_radius_cubed = inverse_radius / radius_squared;
         let mass = f64::from(source.position_volume[3]) * density;
-        acceleration += f64::from(G) * mass * displacement * inverse_radius3;
+        acceleration += f64::from(G) * mass * displacement * inverse_radius_cubed;
         let outer = DMat3::from_cols(
             displacement * displacement.x,
             displacement * displacement.y,
@@ -783,7 +804,8 @@ pub(crate) fn evaluate_planning_reference_field(
         );
         gradient += f64::from(G)
             * mass
-            * (-DMat3::IDENTITY * inverse_radius3 + outer * (3.0 * inverse_radius3 / radius2));
+            * (-DMat3::IDENTITY * inverse_radius_cubed
+                + outer * (3.0 * inverse_radius_cubed / radius_squared));
     }
     (acceleration.is_finite() && gradient.is_finite()).then_some((acceleration, gradient))
 }
@@ -1132,6 +1154,7 @@ mod tests {
             .iter()
             .map(|sample| PlanningReferenceJet {
                 simulation_time_seconds: sample.simulation_time_seconds,
+                body_rotation: DQuat::IDENTITY,
                 world_position: sample.position.as_dvec3(),
                 world_acceleration: DVec3::ZERO,
                 world_jacobian: DMat3::ZERO,
@@ -1139,7 +1162,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut states = Vec::new();
         let mut bytes = Vec::new();
-        append_dynamical_candidate_states(0, 32, &reference, &jets, &mut states, &mut bytes)
+        append_dynamical_candidate_states(0, 32, &reference, &jets, None, &mut states, &mut bytes)
             .unwrap();
 
         assert_eq!(states.len(), reference.len());
@@ -1166,6 +1189,7 @@ mod tests {
             .iter()
             .map(|sample| PlanningReferenceJet {
                 simulation_time_seconds: sample.simulation_time_seconds,
+                body_rotation: DQuat::IDENTITY,
                 world_position: sample.position.as_dvec3(),
                 world_acceleration: DVec3::ZERO,
                 // y'' = y and z'' = z amplify the requested outer offset
@@ -1177,7 +1201,7 @@ mod tests {
         let mut states = Vec::new();
         let mut bytes = Vec::new();
 
-        append_dynamical_candidate_states(31, 32, &reference, &jets, &mut states, &mut bytes)
+        append_dynamical_candidate_states(31, 32, &reference, &jets, None, &mut states, &mut bytes)
             .expect("an unstable candidate should contract, not cancel the complete sweep");
 
         assert_eq!(states.len(), reference.len());
@@ -1226,6 +1250,7 @@ mod tests {
             });
             jets.push(PlanningReferenceJet {
                 simulation_time_seconds: time,
+                body_rotation: DQuat::IDENTITY,
                 world_position: position,
                 world_acceleration: acceleration,
                 world_jacobian: jacobian,
@@ -1258,14 +1283,14 @@ mod tests {
                 maximum_transverse_distance: f64::INFINITY,
             },
             |inputs, accelerations| {
-                fill_planning_reference_accelerations(&jets, 0.0, inputs, accelerations)
+                fill_planning_reference_accelerations(&jets, None, 0.0, inputs, accelerations)
             },
         );
         assert!(direct_solve.is_ok(), "{direct_solve:?}");
 
         let mut states = Vec::new();
         let mut bytes = Vec::new();
-        append_dynamical_candidate_states(31, 32, &reference, &jets, &mut states, &mut bytes)
+        append_dynamical_candidate_states(31, 32, &reference, &jets, None, &mut states, &mut bytes)
             .unwrap();
         assert_eq!(states.len(), sample_count);
         assert!(states.iter().all(|state| {

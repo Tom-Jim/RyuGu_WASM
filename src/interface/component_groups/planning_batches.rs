@@ -72,8 +72,8 @@ pub struct PlanningCandidateBatch {
     pub eq106_source_radius: f32,
     /// Fixed captured centre arc in body-fixed coordinates. Candidate states
     /// are dynamically propagated from perturbed initial conditions under the
-    /// nominal density's linearized reference field. Eq.106 builds one
-    /// canonical spectrum from this arc and shares it across the certified tube.
+    /// nominal density's nonlinear FMM field. Eq.106 builds one canonical
+    /// spectrum from this arc and shares it across the certified tube.
     pub reference_states: Arc<[PlanningCandidateState]>,
     pub states: Arc<[PlanningCandidateState]>,
     pub gpu_position_bytes: Arc<[u8]>,

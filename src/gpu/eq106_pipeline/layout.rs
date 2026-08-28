@@ -1,5 +1,6 @@
 fn half_line_quadrature_bytes(length_scale: f32) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(QUADRATURE_COUNT as usize * 8);
+    let record_count = QUADRATURE_COUNT as usize * (FREQUENCY_COUNT as usize + 1);
+    let mut records = Vec::with_capacity(record_count);
     let du = 1.0 / QUADRATURE_COUNT as f32;
     let length_scale = length_scale.max(1.0);
     for index in 0..QUADRATURE_COUNT {
@@ -10,10 +11,24 @@ fn half_line_quadrature_bytes(length_scale: f32) -> Vec<u8> {
         // nearly every node inside the first few metres.
         let h = length_scale * u / denominator;
         let weight = length_scale * du / (denominator * denominator);
-        bytes.extend_from_slice(&h.to_le_bytes());
-        bytes.extend_from_slice(&weight.to_le_bytes());
+        records.push([h, weight]);
     }
-    bytes
+    // The same nonuniform Laplace phase was previously recomputed inside every
+    // coefficient/voxel/segment invocation.  Cache its 129x64 matrix once;
+    // ordinary FFT is not applicable because h=L*u/(1-u) is nonuniform.
+    let sigma = length_scale.recip();
+    for frequency_index in 0..FREQUENCY_COUNT {
+        let signed_frequency = frequency_index as i32 - HALF_COUNT as i32;
+        let omega = signed_frequency as f32 * 0.002;
+        for quadrature_index in 0..QUADRATURE_COUNT as usize {
+            let h = records[quadrature_index][0];
+            let attenuation = (-sigma * h).exp();
+            let angle = -omega * h;
+            let (sine, cosine) = angle.sin_cos();
+            records.push([attenuation * cosine, attenuation * sine]);
+        }
+    }
+    bytemuck::cast_slice(&records).to_vec()
 }
 
 fn uniform_bytes(
@@ -95,6 +110,25 @@ mod tests {
 
     fn read_u32(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn quadrature_lut_contains_nodes_and_cached_nonuniform_phases() {
+        let length_scale = 17.0_f32;
+        let bytes = half_line_quadrature_bytes(length_scale);
+        let records = bytemuck::cast_slice::<u8, [f32; 2]>(&bytes);
+        assert_eq!(
+            records.len(),
+            QUADRATURE_COUNT as usize * (FREQUENCY_COUNT as usize + 1)
+        );
+
+        let zero_frequency_phase = records[QUADRATURE_COUNT as usize
+            + HALF_COUNT as usize * QUADRATURE_COUNT as usize];
+        let first_height = records[0][0];
+        let expected_attenuation = (-first_height / length_scale).exp();
+        assert!((zero_frequency_phase[0] - expected_attenuation).abs() <= 2.0e-7);
+        assert_eq!(zero_frequency_phase[1], 0.0);
+        assert!(records.iter().flatten().all(|value| value.is_finite()));
     }
 
     fn snapshot(request_id: u64, body_position: Vec3) -> GravityRequestSnapshot {

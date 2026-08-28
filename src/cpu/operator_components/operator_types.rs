@@ -133,7 +133,6 @@ pub struct PsiMapSample {
 #[derive(Resource, Clone, Debug)]
 pub struct Eq106OperatorTensorResource {
     pub tensor: ToroidalOperatorTensor,
-    pub psi: PsiOperatorTable,
 }
 
 #[derive(Resource)]
@@ -159,22 +158,18 @@ pub fn build_eq106_operator_tensor_system(
         return;
     }
     // A failed immutable-table certificate is terminal for this app build.
-    // Retrying both operator assemblies every frame would freeze the browser
-    // and hide the actual error overlay.
+    // Retrying the immutable operator assembly every frame would freeze the
+    // browser and hide the actual error overlay.
     commands.insert_resource(Eq106OperatorBuildAttempted);
-    let radius = source_data.as_ref().map_or(0.0, |source| source.radius);
-    match (
-        ToroidalOperatorTensor::embedded(),
-        PsiOperatorTable::embedded(radius),
-    ) {
-        (Ok(tensor), Ok(psi)) if tensor.validate(2.0e-4) && psi.validate(3.0e-3) => {
-            commands.insert_resource(Eq106OperatorTensorResource { tensor, psi });
+    match ToroidalOperatorTensor::embedded() {
+        Ok(tensor) if tensor.validate(2.0e-4) => {
+            commands.insert_resource(Eq106OperatorTensorResource { tensor });
         }
-        (Ok(tensor), Ok(psi)) => runtime_error.raise(format!(
-            "Equation (106) operator certification failed (toroidal {:.3e}, complex Psi {:.3e}).",
-            tensor.max_midpoint_error, psi.max_validation_error
+        Ok(tensor) => runtime_error.raise(format!(
+            "Equation (106) toroidal operator certification failed ({:.3e}).",
+            tensor.max_midpoint_error
         )),
-        (Err(error), _) | (_, Err(error)) => runtime_error.raise(format!(
+        Err(error) => runtime_error.raise(format!(
             "Equation (106) operator tensor assembly failed: {error}"
         )),
     }

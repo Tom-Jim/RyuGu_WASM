@@ -32,8 +32,51 @@ impl FmmMoment {
 struct FmmNode {
     half_width: f64,
     moment: FmmMoment,
+    center_of_mass: DVec3,
     children: Vec<FmmNode>,
     points: Vec<(DVec3, f64)>,
+}
+
+/// Source-count-independent nonlinear field used to close planning Picard
+/// trajectories.  It reuses the same quadrupole FMM implementation as the FMM
+/// sensitivity path instead of maintaining another hand-written tree.
+pub(crate) struct PlanningDynamicsTree(FmmNode);
+
+impl PlanningDynamicsTree {
+    pub(crate) fn acceleration(&self, body_position: DVec3) -> Option<DVec3> {
+        // Candidate generation needs a closed nonlinear field, but it is not
+        // the independent certification oracle below.  Use the production FMM
+        // opening criterion here; the stricter reference criterion would
+        // collapse most near-body nodes to direct sums on every Picard sweep.
+        let acceleration = evaluate_fmm(&self.0, body_position, FMM_THETA) * f64::from(G);
+        acceleration.is_finite().then_some(acceleration)
+    }
+}
+
+pub(crate) fn build_planning_dynamics_tree(
+    records: &[PlanningBasisRecord],
+    densities: &[f32],
+) -> Option<PlanningDynamicsTree> {
+    if records.is_empty() || densities.len() != EXPECTED_VOXEL_COUNT {
+        return None;
+    }
+    let points = records
+        .iter()
+        .filter_map(|record| {
+            let density = f64::from(*densities.get(record.voxel_index as usize)?);
+            let mass = f64::from(record.position_volume[3]) * density;
+            let position = DVec3::new(
+                f64::from(record.position_volume[0]),
+                f64::from(record.position_volume[1]),
+                f64::from(record.position_volume[2]),
+            );
+            (position.is_finite() && mass.is_finite() && mass > 0.0)
+                .then_some((position, mass))
+        })
+        .collect::<Vec<_>>();
+    (!points.is_empty()).then(|| {
+        PlanningDynamicsTree(build_fmm_node(points, 0, REFERENCE_MAX_DEPTH))
+    })
 }
 
 fn build_fmm_node(points: Vec<(DVec3, f64)>, depth: u8, maximum_depth: u8) -> FmmNode {
@@ -47,10 +90,12 @@ fn build_fmm_node(points: Vec<(DVec3, f64)>, depth: u8, maximum_depth: u8) -> Fm
     }
     let extent = (max - min).abs().max_element().max(1.0e-6);
     let center = (min + max) * 0.5;
+    let center_of_mass = moment.center();
     if points.len() <= FMM_LEAF_CAPACITY || depth >= maximum_depth || extent <= 1.0e-6 {
         return FmmNode {
             half_width: extent * 0.5,
             moment,
+            center_of_mass,
             children: Vec::new(),
             points,
         };
@@ -71,19 +116,19 @@ fn build_fmm_node(points: Vec<(DVec3, f64)>, depth: u8, maximum_depth: u8) -> Fm
     FmmNode {
         half_width: extent * 0.5,
         moment,
+        center_of_mass,
         children,
         points: Vec::new(),
     }
 }
 
-fn multipole_acceleration(moment: FmmMoment, target: DVec3) -> DVec3 {
-    let displacement = moment.center() - target;
+fn multipole_acceleration(moment: FmmMoment, center_of_mass: DVec3, target: DVec3) -> DVec3 {
+    let displacement = center_of_mass - target;
     let radius_squared = displacement.length_squared().max(1.0e-18);
     let inverse_radius = radius_squared.sqrt().recip();
     let inverse_radius_cubed = inverse_radius / radius_squared;
     let central = moment.second;
-    let center = moment.center();
-    let [x, y, z] = center.to_array();
+    let [x, y, z] = center_of_mass.to_array();
     let central = [
         central[0] - moment.mass * x * x,
         central[1] - moment.mass * x * y,
@@ -108,17 +153,18 @@ fn multipole_acceleration(moment: FmmMoment, target: DVec3) -> DVec3 {
 }
 
 fn evaluate_fmm(node: &FmmNode, target: DVec3, theta: f64) -> DVec3 {
-    let distance = (node.moment.center() - target).length().max(1.0e-9);
+    let distance = (node.center_of_mass - target).length().max(1.0e-9);
     let opening = (3.0_f64).sqrt() * node.half_width / distance;
     if node.children.is_empty() || opening < theta {
         if node.children.is_empty() {
             return node.points.iter().fold(DVec3::ZERO, |sum, &(position, mass)| {
                 let displacement = position - target;
                 let radius_squared = displacement.length_squared().max(1.0e-18);
-                sum + mass * displacement / radius_squared.powf(1.5)
+                let inverse_radius = radius_squared.sqrt().recip();
+                sum + mass * displacement * (inverse_radius / radius_squared)
             });
         }
-        return multipole_acceleration(node.moment, target);
+        return multipole_acceleration(node.moment, node.center_of_mass, target);
     }
     node.children
         .iter()

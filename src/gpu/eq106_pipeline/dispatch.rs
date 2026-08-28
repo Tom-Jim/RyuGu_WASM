@@ -37,10 +37,9 @@ fn dispatch_eq106(
         buffers.0 = None;
     }
     if buffers.0.is_none() {
-        let (Some(source_bytes), Some(operator_bytes), Some(psi_bytes), Some(mode_bytes)) = (
+        let (Some(source_bytes), Some(operator_bytes), Some(mode_bytes)) = (
             extracted.sources.as_ref(),
             extracted.operator_tensor.as_ref(),
-            extracted.psi_operator.as_ref(),
             extracted.fourier_modes.as_ref(),
         ) else {
             return;
@@ -66,11 +65,6 @@ fn dispatch_eq106(
             label: Some("eq106_toroidal_operator_tensor"),
             contents: operator_bytes,
             usage: BufferUsages::UNIFORM,
-        });
-        let psi_operator = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("eq106_complex_psi_operator"),
-            contents: psi_bytes,
-            usage: BufferUsages::STORAGE,
         });
         let mut density_mode_bytes = vec![0_u8; 544 * 16];
         density_mode_bytes[..mode_bytes.len()].copy_from_slice(mode_bytes);
@@ -133,7 +127,6 @@ fn dispatch_eq106(
                 uniform_entry(5),
                 storage_rw_entry(6),
                 uniform_entry(7),
-                storage_ro_entry(8),
                 storage_ro_entry(9),
             ],
         );
@@ -174,10 +167,6 @@ fn dispatch_eq106(
                     resource: density_modes.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 8,
-                    resource: psi_operator.as_entire_binding(),
-                },
-                BindGroupEntry {
                     binding: 9,
                     resource: targets.as_entire_binding(),
                 },
@@ -197,7 +186,6 @@ fn dispatch_eq106(
             operator_tensor,
             line_samples,
             density_modes,
-            psi_operator,
             timing_query_set,
             timing_resolve,
             source_count: extracted.source_count,
@@ -318,7 +306,6 @@ fn dispatch_eq106(
                 BindGroupEntry { binding: 5, resource: inner.operator_tensor.as_entire_binding() },
                 BindGroupEntry { binding: 6, resource: inner.line_samples.as_entire_binding() },
                 BindGroupEntry { binding: 7, resource: inner.density_modes.as_entire_binding() },
-                BindGroupEntry { binding: 8, resource: inner.psi_operator.as_entire_binding() },
                 BindGroupEntry { binding: 9, resource: inner.targets.as_entire_binding() },
             ],
         );

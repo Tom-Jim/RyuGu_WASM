@@ -219,9 +219,8 @@ pub fn update_gpu_memory_estimate_system(
         let timestamp_bytes = 0_u64;
         bytes[2] = source.sources.len() as u64 * 16
             + source.fourier_modes.len() as u64 * 16
-            + 64 * 8
+            + 64 * (129 + 1) * 8
             + tensor.tensor.coefficients.len() as u64 * 4
-            + tensor.psi.coefficients.len() as u64 * 4
             + 96 * 256
             + 45 * 64 * 16
             + 45 * 129 * 32

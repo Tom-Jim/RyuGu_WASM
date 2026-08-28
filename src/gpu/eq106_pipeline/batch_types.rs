@@ -292,7 +292,6 @@ struct ExtractedEq106Input {
     sources: Option<Vec<u8>>,
     fourier_modes: Option<Vec<u8>>,
     operator_tensor: Option<Vec<u8>>,
-    psi_operator: Option<Vec<u8>>,
     source_count: u32,
     density_mode_count: u32,
     radius: f32,
@@ -318,7 +317,6 @@ struct Eq106GpuBuffersInner {
     operator_tensor: Buffer,
     line_samples: Buffer,
     density_modes: Buffer,
-    psi_operator: Buffer,
     timing_query_set: Option<QuerySet>,
     timing_resolve: Option<Buffer>,
     source_count: u32,
@@ -340,7 +338,6 @@ struct Eq106GpuBuffersInner {
 struct Eq106ComputePipeline {
     line_samples_id: CachedComputePipelineId,
     assemble_id: CachedComputePipelineId,
-    analytic_id: CachedComputePipelineId,
     evaluate_id: CachedComputePipelineId,
     planning_voxel_line_samples_id: CachedComputePipelineId,
     planning_voxel_spectrum_id: CachedComputePipelineId,
@@ -385,8 +382,9 @@ impl Plugin for Eq106GpuComputePlugin {
         let channel = app.world().resource::<Eq106GpuReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        // Queue all four shaders during application startup. This keeps the
-        // first Eq.106 selection and the First benchmark free of compile time.
+        // Queue every active entry point during application startup. This
+        // keeps the first Eq.106 selection and First benchmark free of compile
+        // time without retaining the unused analytic-spectrum pipeline.
         render_app.init_resource::<Eq106ComputePipeline>();
     }
 }
@@ -403,7 +401,6 @@ impl FromWorld for Eq106ComputePipeline {
             uniform_entry(5),
             storage_rw_entry(6),
             uniform_entry(7),
-            storage_ro_entry(8),
             storage_ro_entry(9),
         ];
         let layout = BindGroupLayoutDescriptor::new("eq106_complex_bgl", &entries);
@@ -429,15 +426,6 @@ impl FromWorld for Eq106ComputePipeline {
             entry_point: Some("assemble_spectrum".into()),
             zero_initialize_workgroup_memory: false,
         });
-        let analytic_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("eq106_assemble_analytic_spectrum".into()),
-            layout: vec![layout.clone()],
-            immediate_size: 0,
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Some("assemble_analytic_spectrum".into()),
-            zero_initialize_workgroup_memory: false,
-        });
         let evaluate_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_evaluate_field".into()),
             layout: vec![layout],
@@ -458,7 +446,6 @@ impl FromWorld for Eq106ComputePipeline {
                 uniform_entry(5),
                 storage_rw_entry(6),
                 uniform_entry(7),
-                storage_ro_entry(8),
                 storage_ro_entry(9),
             ],
         );
@@ -503,7 +490,6 @@ impl FromWorld for Eq106ComputePipeline {
         Self {
             line_samples_id,
             assemble_id,
-            analytic_id,
             evaluate_id,
             planning_voxel_line_samples_id,
             planning_voxel_spectrum_id,
