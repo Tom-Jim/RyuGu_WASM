@@ -87,15 +87,6 @@ pub struct PlanningCandidateBatch {
     pub density_seed: u64,
     pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
-    /// Eq.106 geometry-only source records `(x,y,z,volume)`. The planning
-    /// benchmark uses the same refined basis records as packed FFT and FMM;
-    /// this legacy buffer remains only for non-benchmark callers.
-    pub eq106_volume_source_bytes: Arc<[u8]>,
-    /// Contiguous `(start,count)` ranges for the 56 density voxels.
-    pub eq106_voxel_source_ranges: Arc<[[u32; 2]]>,
-    /// Legacy sigma-compression certificate coefficients retained with the
-    /// batch, but ignored by the fair planning benchmark.
-    pub eq106_compression_acceleration_coefficients: Arc<[f64]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,

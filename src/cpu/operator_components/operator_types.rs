@@ -14,7 +14,7 @@ use crate::interface::components::{
     ActiveGravityMethod, GravityRuntimeError, PlanningComparisonState,
 };
 use bevy::prelude::*;
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 use std::f64::consts::PI;
 
 pub const TOROIDAL_MAX_MODE: usize = 16;
@@ -22,11 +22,11 @@ pub const TOROIDAL_MODE_COUNT: usize = TOROIDAL_MAX_MODE + 1;
 pub const TOROIDAL_SEGMENT_COUNT: usize = 12;
 pub const TOROIDAL_DEGREE: usize = 12;
 pub const TOROIDAL_COEFFICIENT_COUNT: usize = TOROIDAL_DEGREE + 1;
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 pub const TOROIDAL_X_MIN: f64 = -10.0;
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 pub const TOROIDAL_X_MAX: f64 = 8.0;
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 pub const TOROIDAL_SEGMENT_STEP: f64 =
     (TOROIDAL_X_MAX - TOROIDAL_X_MIN) / TOROIDAL_SEGMENT_COUNT as f64;
 
@@ -98,9 +98,9 @@ const GL16_WEIGHTS: [f64; 16] = [
     5.050_473_700_035_51e-18,
     4.161_462_370_372_85e-22,
 ];
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 const MAX_ADAPTIVE_DEPTH: u8 = 20;
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 const QUADRATURE_TOLERANCE: f64 = 2.0e-11;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -180,7 +180,7 @@ impl PsiOperatorTable {
         PSI_FREQUENCY_COUNT * PSI_SEGMENT_COUNT * PSI_COEFFICIENT_COUNT * 4
     }
 
-    #[cfg(any(test, feature = "regenerate-operators"))]
+    #[cfg(feature = "regenerate-operators")]
     pub fn build(radius: f64) -> Result<Self, String> {
         if !radius.is_finite() || radius <= 0.0 {
             return Err("invalid radius for complex Psi operator".into());
@@ -597,7 +597,7 @@ fn scaled_e1_gauss_laguerre(w: Complex64) -> Complex64 {
         })
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn scaled_e1_reference(w: Complex64) -> Result<Complex64, String> {
     let mapped = |u: f64| {
         let denominator = 1.0 - u;
@@ -611,7 +611,7 @@ fn scaled_e1_reference(w: Complex64) -> Result<Complex64, String> {
         .map_err(|_| "axis-limit reference quadrature did not converge".into())
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn struve_neumann_pair(x: Complex64) -> Result<([Complex64; 2], f64), String> {
     if !x.is_finite() || x.re <= 0.0 {
         return Err("complex Psi table requires Re(x)>0".into());
@@ -624,7 +624,7 @@ fn struve_neumann_pair(x: Complex64) -> Result<([Complex64; 2], f64), String> {
         .map_err(|_| "complex Struve--Neumann quadrature did not converge".into())
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn struve_neumann_asymptotic(x: Complex64) -> ([Complex64; 2], f64) {
     let inverse = x.reciprocal().unwrap_or(Complex64::ZERO);
     let inverse_squared = inverse * inverse;

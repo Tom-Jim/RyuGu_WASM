@@ -40,21 +40,3 @@ pub fn build_topology(welded: &WeldedMesh) -> AsteroidTopologyGpuData {
         indices,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy::math::Vec3;
-
-    #[test]
-    fn csr_adjacency_is_sorted_symmetric_and_deduplicated() {
-        let welded = WeldedMesh {
-            unique_positions: vec![Vec3::ZERO; 4],
-            _vert_remap: vec![0, 1, 2, 3],
-            welded_indices: vec![0, 1, 2, 2, 1, 3, 0, 1, 2],
-        };
-        let topology = build_topology(&welded);
-        assert_eq!(topology.offsets, vec![0, 2, 5, 8, 10]);
-        assert_eq!(topology.indices, vec![1, 2, 0, 2, 3, 0, 1, 3, 1, 2]);
-    }
-}

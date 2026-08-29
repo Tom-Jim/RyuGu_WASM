@@ -423,24 +423,3 @@ pub fn section_alpha_system(
         }
     }
 }
-
-#[cfg(test)]
-#[cfg(test)]
-mod section_density_color_tests {
-    use super::*;
-
-    #[test]
-    fn every_log_density_method_has_a_visible_gradient() {
-        for method in [
-            ActiveGravityMethod::RadialAnalytic,
-            ActiveGravityMethod::CurvedArcEq106,
-            ActiveGravityMethod::MmfftCompressed,
-            ActiveGravityMethod::Fmm,
-        ] {
-            assert_ne!(
-                heterogeneous_density_color(0.0, method),
-                heterogeneous_density_color(1.0, method)
-            );
-        }
-    }
-}

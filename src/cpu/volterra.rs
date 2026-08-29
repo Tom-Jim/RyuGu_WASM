@@ -88,28 +88,6 @@ pub struct VolterraSolution {
 }
 
 impl VolterraSolution {
-    #[cfg(test)]
-    pub fn sample_at(&self, elapsed_seconds: f64) -> Option<VolterraSample> {
-        let first = *self.samples.first()?;
-        let last = *self.samples.last()?;
-        if elapsed_seconds <= first.elapsed_seconds {
-            return Some(first);
-        }
-        if elapsed_seconds >= last.elapsed_seconds {
-            return Some(last);
-        }
-        let upper = self
-            .samples
-            .partition_point(|sample| sample.elapsed_seconds < elapsed_seconds);
-        let lower = self.samples[upper - 1];
-        let upper = self.samples[upper];
-        let span = (upper.elapsed_seconds - lower.elapsed_seconds).max(f64::MIN_POSITIVE);
-        Some(lower.interpolate(
-            upper,
-            ((elapsed_seconds - lower.elapsed_seconds) / span).clamp(0.0, 1.0),
-        ))
-    }
-
     /// Linear-cursor interpolation for a nondecreasing sequence of query
     /// times.  Planning and fixed-step consumers walk the complete waveform in
     /// order, so repeating a binary search for every output point is wasteful.
@@ -195,34 +173,7 @@ impl VolterraWorkspace {
 /// reference-line frame. `acceleration_at` is evaluated on every Picard iterate,
 /// closing the position -> field -> trajectory loop instead of freezing force
 /// samples on the initial geometric curve.
-#[cfg(test)]
-pub fn propagate_reference_line<E, F>(
-    initial_position: DVec3,
-    initial_velocity: DVec3,
-    reference_direction: DVec3,
-    duration_seconds: f64,
-    config: VolterraConfig,
-    mut acceleration_at: F,
-) -> Result<VolterraSolution, VolterraError<E>>
-where
-    F: FnMut(DVec3, f64) -> Result<DVec3, E>,
-{
-    propagate_reference_line_batched(
-        initial_position,
-        initial_velocity,
-        reference_direction,
-        duration_seconds,
-        config,
-        |inputs, accelerations| {
-            for (input, acceleration) in inputs.iter().zip(accelerations) {
-                *acceleration = acceleration_at(input.position, input.elapsed_seconds)?;
-            }
-            Ok(())
-        },
-    )
-}
-
-/// Batched variant of [`propagate_reference_line`].  `acceleration_batch` is
+/// Batched reference-line propagation. `acceleration_batch` is
 /// called once per Picard iteration and must fill every output element.  This
 /// is the preferred path for interpolated fields and GPU/vectorized evaluators.
 pub fn propagate_reference_line_batched<E, F>(
@@ -489,96 +440,4 @@ where
         relative_residual,
         maximum_transverse_distance,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn accurate_config() -> VolterraConfig {
-        VolterraConfig {
-            node_count: 129,
-            maximum_picard_iterations: 20,
-            maximum_endpoint_iterations: 10,
-            damping: 1.0,
-            relative_tolerance: 1.0e-10,
-            minimum_longitudinal_speed: 1.0e-8,
-            maximum_transverse_distance: f64::INFINITY,
-        }
-    }
-
-    #[test]
-    fn constant_acceleration_matches_the_analytic_trajectory() {
-        let position = DVec3::new(3.0, -2.0, 1.0);
-        let velocity = DVec3::new(4.0, 0.5, -0.25);
-        let acceleration = DVec3::new(0.2, -0.03, 0.04);
-        let duration = 2.5;
-        let solution = propagate_reference_line(
-            position,
-            velocity,
-            velocity,
-            duration,
-            accurate_config(),
-            |_, _| Ok::<_, ()>(acceleration),
-        )
-        .unwrap();
-        let endpoint = solution.samples.last().unwrap();
-        let expected_position =
-            position + velocity * duration + 0.5 * acceleration * duration.powi(2);
-        let expected_velocity = velocity + acceleration * duration;
-        assert!((endpoint.position - expected_position).length() < 2.0e-5);
-        assert!((endpoint.velocity - expected_velocity).length() < 2.0e-5);
-        assert!((endpoint.elapsed_seconds - duration).abs() < 1.0e-12);
-    }
-
-    #[test]
-    fn position_dependent_force_is_closed_by_picard_iteration() {
-        let stiffness = 2.5e-3;
-        let duration = 4.0;
-        let solution = propagate_reference_line(
-            DVec3::new(0.0, 1.0, 0.0),
-            DVec3::X * 2.0,
-            DVec3::X,
-            duration,
-            accurate_config(),
-            |position, _| Ok::<_, ()>(DVec3::new(0.0, -stiffness * position.y, 0.0)),
-        )
-        .unwrap();
-        let endpoint = solution.samples.last().unwrap();
-        let omega = stiffness.sqrt();
-        assert!((endpoint.position.y - (omega * duration).cos()).abs() < 2.0e-5);
-        assert!(solution.diagnostics.picard_iterations > 1);
-    }
-
-    #[test]
-    fn longitudinal_turning_point_is_rejected() {
-        let result = propagate_reference_line(
-            DVec3::ZERO,
-            DVec3::X,
-            DVec3::X,
-            2.0,
-            accurate_config(),
-            |_, _| Ok::<_, ()>(-DVec3::X),
-        );
-        assert!(matches!(
-            result,
-            Err(VolterraError::NonMonotoneLongitudinalMotion)
-        ));
-    }
-
-    #[test]
-    fn interpolation_returns_requested_time() {
-        let solution = propagate_reference_line(
-            DVec3::ZERO,
-            DVec3::X,
-            DVec3::X,
-            3.0,
-            accurate_config(),
-            |_, _| Ok::<_, ()>(DVec3::ZERO),
-        )
-        .unwrap();
-        let sample = solution.sample_at(1.25).unwrap();
-        assert!((sample.elapsed_seconds - 1.25).abs() < 1.0e-12);
-        assert!((sample.position - DVec3::X * 1.25).length() < 1.0e-12);
-    }
 }

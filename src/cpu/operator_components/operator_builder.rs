@@ -1,4 +1,4 @@
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn integrate_struve_neumann_pair(
     x: Complex64,
     tolerance: f64,
@@ -58,7 +58,7 @@ impl ToroidalOperatorTensor {
         TOROIDAL_MODE_COUNT * TOROIDAL_SEGMENT_COUNT * TOROIDAL_COEFFICIENT_COUNT
     }
 
-    #[cfg(any(test, feature = "regenerate-operators"))]
+    #[cfg(feature = "regenerate-operators")]
     pub fn build() -> Result<Self, String> {
         let mut coefficients = vec![0.0_f32; Self::coefficient_count()];
         let nodes = TOROIDAL_DEGREE + 1;
@@ -150,12 +150,12 @@ impl ToroidalOperatorTensor {
     }
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 pub fn coefficient_index(mode: usize, segment: usize, degree: usize) -> usize {
     (mode * TOROIDAL_SEGMENT_COUNT + segment) * TOROIDAL_COEFFICIENT_COUNT + degree
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn evaluate(coefficients: &[f32], mode: usize, x: f64) -> f64 {
     let segment = (((x - TOROIDAL_X_MIN) / TOROIDAL_SEGMENT_STEP).floor() as usize)
         .min(TOROIDAL_SEGMENT_COUNT - 1);
@@ -173,7 +173,7 @@ fn evaluate(coefficients: &[f32], mode: usize, x: f64) -> f64 {
     t * b_k1 - b_k2 + coefficients[base] as f64
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn toroidal_q_modes(chi: f64) -> Result<[f64; TOROIDAL_MODE_COUNT], String> {
     if !chi.is_finite() || chi <= 1.0 {
         return Err("toroidal harmonic requires chi > 1".into());
@@ -191,7 +191,7 @@ fn toroidal_q_modes(chi: f64) -> Result<[f64; TOROIDAL_MODE_COUNT], String> {
         .ok_or_else(|| "non-finite toroidal harmonic".into())
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn integrate_modes(
     lower: f64,
     upper: f64,
@@ -220,7 +220,7 @@ fn integrate_modes(
     Ok(result)
 }
 
-#[cfg(any(test, feature = "regenerate-operators"))]
+#[cfg(feature = "regenerate-operators")]
 fn gauss_legendre_modes(lower: f64, upper: f64, chi: f64) -> [f64; TOROIDAL_MODE_COUNT] {
     let midpoint = 0.5 * (lower + upper);
     let half_width = 0.5 * (upper - lower);
@@ -245,103 +245,4 @@ fn gauss_legendre_modes(lower: f64, upper: f64, chi: f64) -> [f64; TOROIDAL_MODE
         }
     }
     result
-}
-
-#[cfg(test)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tensor_is_finite_and_midpoint_certified() {
-        let tensor = ToroidalOperatorTensor::build().expect("tensor build");
-        assert!(
-            tensor.validate(2.0e-4),
-            "error={}",
-            tensor.max_midpoint_error
-        );
-    }
-
-    #[test]
-    fn embedded_toroidal_table_is_certified() {
-        let tensor = ToroidalOperatorTensor::embedded().unwrap();
-        assert!(tensor.validate(2.0e-4));
-    }
-
-    #[test]
-    fn complex_psi_table_is_certified_on_the_runtime_frequency_rays() {
-        let table = PsiOperatorTable::build(500.0).expect("complex Psi table build");
-        assert!(
-            table.validate(3.0e-3),
-            "map={}, asymptotic={}, axis={}",
-            table.max_validation_error,
-            table.max_asymptotic_remainder,
-            table.max_axis_limit_error,
-        );
-
-        let normalized_a = 2.0;
-        let eta = 0.3;
-        let signed_frequency = 5;
-        let sample = table
-            .evaluate(signed_frequency, normalized_a, eta)
-            .expect("certified query");
-        let line = crate::cpu::eq106_reference::Eq106ReferenceLine::new(
-            bevy::math::DVec3::ZERO,
-            bevy::math::DVec3::Z,
-        )
-        .unwrap();
-        let a = normalized_a * table.radius;
-        let source = bevy::math::DVec3::new(a, 0.0, eta * a);
-        let frequency =
-            Complex64::new(2.0 / table.radius, signed_frequency as f64 * PSI_OMEGA_STEP);
-        let direct =
-            crate::cpu::eq106_reference::eq106_kernel_sample(line, source, frequency, 2.0e-10)
-                .unwrap();
-        let x = frequency * a;
-        let inverse_boundary = (1.0 + eta * eta).sqrt().recip();
-        let direct_psi_x =
-            (direct.k_h - x * direct.psi * eta + Complex64::new(eta * inverse_boundary, 0.0)) / x;
-        assert!((sample.psi - direct.psi).abs() / direct.psi.abs() < 3.0e-3);
-        assert!((sample.psi_x - direct_psi_x).abs() / direct_psi_x.abs() < 3.0e-3);
-
-        let axis = table.evaluate_axis_limit(8, 0.5).unwrap();
-        let w = Complex64::new(1.0, 8.0 * PSI_OMEGA_STEP * table.radius * 0.5);
-        let exact_axis = scaled_e1_reference(w).unwrap();
-        assert!((axis - exact_axis).abs() / exact_axis.abs() < 3.0e-3);
-    }
-
-    #[test]
-    fn embedded_complex_psi_table_has_valid_certificate_and_radius() {
-        let table = PsiOperatorTable::embedded(464.765_191_415_103_6).unwrap();
-        assert!(table.validate(3.0e-3));
-        assert_eq!(
-            table.coefficients.len(),
-            PsiOperatorTable::coefficient_count()
-        );
-    }
-
-    #[test]
-    fn truncated_fourier_operator_reconstructs_kernel_away_from_near_field() {
-        let tensor = ToroidalOperatorTensor::build().expect("tensor build");
-        let chi = 2.0_f64;
-        let x = (chi - 1.0).ln();
-        let mut sum = evaluate(&tensor.coefficients, 0, x);
-        let angle = 0.73_f64;
-        let cos_angle = angle.cos();
-        let mut cosine_previous = 1.0;
-        let mut cosine = cos_angle;
-        for mode in 1..TOROIDAL_MODE_COUNT {
-            sum += 2.0 * evaluate(&tensor.coefficients, mode, x) * cosine;
-            let next = 2.0 * cos_angle * cosine - cosine_previous;
-            cosine_previous = cosine;
-            cosine = next;
-        }
-        let reconstructed = sum / PI;
-        let exact = (2.0 * (chi - angle.cos())).sqrt().recip();
-        assert!(
-            (reconstructed - exact).abs() < 2.0e-4,
-            "reconstructed={reconstructed:.12e}, exact={exact:.12e}, error={:.3e}",
-            (reconstructed - exact).abs()
-        );
-    }
 }

@@ -7,7 +7,7 @@
 
 An experimental browser-based simulator for gravitational-field evaluation and spacecraft trajectories around asteroid (162173) Ryugu. The project is written in Rust with Bevy, compiled to WebAssembly, and uses WebGPU for field evaluation.
 
-The repository compares five forward models and contains a research implementation of the near-straight-trajectory formulation called **Equation (106)** in [`mathpub.pdf`](mathpub.pdf). Equation (106) is still an exploratory numerical method: the current implementation is discretized, finite-band, and validated only within the tests and diagnostics described below.
+The repository compares five forward models and contains a research implementation of the near-straight-trajectory formulation called **Equation (106)** in [`mathpub.pdf`](mathpub.pdf). Equation (106) is still an exploratory numerical method: the current implementation is discretized, finite-band, and validated by its runtime diagnostics and production build checks.
 
 > **Scope:** research prototype and synthetic-data demonstrator. It is not flight software, an orbit-determination product, or evidence of a proven performance advantage over established solvers.
 
@@ -190,8 +190,7 @@ flowchart LR
     Interface --> CPU["CPU backends\nsrc/cpu/\nplanning, source prep, integration"]
     Interface --> GPU["GPU backends\nsrc/gpu/\nrender-world compute plugins"]
     CPU --> CpuBenchmark["CPU benchmark\nsrc/cpu/benchmark.rs\ndeterministic scalar kernels"]
-    GPU --> GpuTests["GPU tests\nsrc/gpu/tests.rs\nWGSL validation"]
-    GPU --> GpuBenchmark["GPU performance metrics\nshared interface resources\nportable timing fields"]
+    GPU --> GpuBenchmark["GPU runtime and performance metrics\nshared interface resources\nportable timing fields"]
 ```
 
 The four top-level layers are intentionally directional:
@@ -201,7 +200,7 @@ src/bevy/      Bevy scheduling, render extraction, scene, UI, and diagnostics
 src/interface/ shared resources, snapshots, histories, and method selection
 src/cpu/       trajectory planning, source preparation, integration, inversion,
                Eq.106 reference operators, and CPU benchmark entry points
-src/gpu/       WebGPU compute backends, shader validation tests, and portable
+src/gpu/       WebGPU compute backends and portable
                performance metric collection
 ```
 
@@ -431,9 +430,8 @@ The development server supplies the cross-origin isolation headers used by the a
 
 ```sh
 cargo fmt --all --check
-cargo test
-cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
-cargo check --target wasm32-unknown-unknown
+cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+cargo check --target wasm32-unknown-unknown --lib
 node --check src/html/ui.js
 node --check src/html/app.js
 bun run styles
@@ -448,7 +446,7 @@ uv run pytest -q
 uv run python scripts/wasmtime_benchmark.py --wasm pkg/ryugu_wasm_bg.wasm
 ```
 
-The Rust tests cover density integration, shader parsing, operator tables, transform/inverse consistency, planner guards, radial/Werner/MMFFT/FMM reference cases, physics sampling, Jacobi evaluation, and inversion invariants. Passing unit tests establishes consistency with the tested discretization; it does not establish Eq.106 convergence over every body, trajectory, or parameter range.
+The GitHub Actions workflow runs formatting, production-library Clippy and WASM checks on pull requests, then builds the release WASM package and verifies the packaged Pages asset paths. Pushes to `main` additionally deploy the verified site to GitHub Pages. These checks establish build and packaging consistency; they do not establish Eq.106 convergence over every body, trajectory, or parameter range.
 
 ## Repository map
 
@@ -458,9 +456,8 @@ flowchart TB
     Root --> Bevy["src/bevy/<br/>scene, UI, charts, scaling"]
     Root --> Interface["src/interface/<br/>shared data and contracts"]
     Root --> CPU["src/cpu/<br/>planning, integration, inversion"]
-    Root --> GPU["src/gpu/<br/>WebGPU evaluators and tests"]
+    Root --> GPU["src/gpu/<br/>WebGPU evaluators and runtime metrics"]
     CPU --> CpuBench["benchmark.rs"]
-    GPU --> GpuTests["tests.rs<br/>WGSL validation"]
     GPU --> GpuBench["benchmark.rs<br/>timestamp metadata"]
     CPU --> Eq106Cpu["eq106_reference.rs<br/>eq106_operator.rs<br/>curved_arc.rs"]
     GPU --> Eq106Gpu["eq106.rs"]

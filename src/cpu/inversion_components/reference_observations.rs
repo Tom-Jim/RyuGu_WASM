@@ -1,34 +1,3 @@
-#[cfg(test)]
-fn build_observations_and_sensitivities(
-    knots: &[TrajectoryInversionKnot],
-    voxels: &[InvertedDensityVoxel],
-    radial_source: &RadialGravitySource,
-) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
-    if knots.len() < 2 {
-        return None;
-    }
-    let sample_count = (knots.len() - 1) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1;
-    let samples = sample_frozen_trajectory(knots)?;
-    let result = reference_observations_and_sensitivities(&samples, voxels, radial_source)?;
-    (result.0.len() == sample_count).then_some(result)
-}
-
-#[cfg(test)]
-fn reference_observations_and_sensitivities(
-    samples: &[TrajectoryInversionKnot],
-    voxels: &[InvertedDensityVoxel],
-    radial_source: &RadialGravitySource,
-) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
-    if samples.is_empty() {
-        return None;
-    }
-    let tree = high_resolution_reference_tree(radial_source)?;
-    let basis_trees = high_resolution_reference_basis_trees(voxels, radial_source)?;
-    let observations = reference_observations(samples, &tree)?;
-    let sensitivities = evaluate_reference_basis(&basis_trees, samples);
-    Some((observations, sensitivities))
-}
-
 fn training_and_holdout_reference(
     knots: &[TrajectoryInversionKnot],
     training_samples: &[TrajectoryInversionKnot],

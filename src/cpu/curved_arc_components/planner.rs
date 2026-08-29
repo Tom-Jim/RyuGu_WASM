@@ -1,10 +1,5 @@
 use crate::interface::components::*;
 use crate::cpu::eq106_reference::Eq106PointSource;
-#[cfg(test)]
-use crate::cpu::eq106_reference::{
-    self as eq106, Eq106Certificate, Eq106Error, Eq106FrequencyGrid, Eq106ReferenceLine,
-    Eq106TransformSample,
-};
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use std::collections::VecDeque;
@@ -360,36 +355,6 @@ fn hash_source_bytes(bytes: &[u8]) -> u64 {
     bytes.iter().fold(1469598103934665603_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(1099511628211_u64)
     })
-}
-
-#[cfg(test)]
-fn certify_runtime_line(
-    line: Eq106ReferenceLine,
-    sources: &[Eq106PointSource],
-    radius: f64,
-) -> Result<(Vec<Eq106TransformSample>, Eq106Certificate), Eq106Error> {
-    let scale = radius.max(1.0);
-    let grid = Eq106FrequencyGrid {
-        sigma: 2.0 / scale,
-        omega_step: 0.002,
-        half_count: 128,
-    };
-    let h_values = [0.0, (0.01 * scale).min(25.0), 50.0, 100.0];
-    let (samples, certificate) =
-        eq106::certify_eq106_line(line, sources, grid, G as f64, &h_values, 10.0)?;
-    if certificate.max_acceleration_relative_error > 0.2
-        || certificate.max_potential_relative_error > 0.2
-        || certificate.max_boundary_identity_error > 2.0e-6
-    {
-        warn!(
-            "[eq106] rejected certificate: acceleration={:.3e}, potential={:.3e}, boundary={:.3e}",
-            certificate.max_acceleration_relative_error,
-            certificate.max_potential_relative_error,
-            certificate.max_boundary_identity_error
-        );
-        return Err(Eq106Error::CertificationFailed);
-    }
-    Ok((samples, certificate))
 }
 
 /// Plans the finite non-periodic Eq. (106) arc using convergent Taylor transport.

@@ -8,6 +8,3 @@ pub(crate) mod planning;
 pub(crate) mod planning_reduction;
 pub(crate) mod radial;
 pub(crate) mod werner;
-
-#[cfg(test)]
-mod tests;

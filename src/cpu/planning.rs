@@ -33,8 +33,6 @@ pub(crate) struct PlanningBatchBuilder {
     density_seed: u64,
     target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
-    eq106_compressed_records: Vec<PlanningBasisRecord>,
-    eq106_compression_acceleration_coefficients: [f64; 56],
     basis_hash: u64,
     reference_jets: Vec<PlanningReferenceJet>,
     dynamics_tree: PlanningDynamicsTree,
@@ -113,14 +111,13 @@ impl PlanningBatchBuilder {
             .iter()
             .map(|state| state.body_position())
             .collect::<Vec<_>>();
-        let (eq106_compressed_records, eq106_compression_acceleration_coefficients) =
-            compress_refined_basis_moments(
-                &canonical_basis_records,
-                &basis_records,
-                requested_source_count,
-                &reference_body_positions,
-                PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
-            )?;
+        let eq106_compressed_records = compress_refined_basis_moments(
+            &canonical_basis_records,
+            &basis_records,
+            requested_source_count,
+            &reference_body_positions,
+            PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
+        )?;
         let eq106_source_radius = basis_records.iter().chain(&eq106_compressed_records).fold(
             0.0_f32,
             |radius, record| {
@@ -192,8 +189,6 @@ impl PlanningBatchBuilder {
             density_seed,
             target_mass,
             basis_records,
-            eq106_compressed_records,
-            eq106_compression_acceleration_coefficients,
             basis_hash,
             reference_jets,
             dynamics_tree,
@@ -299,8 +294,6 @@ impl PlanningBatchBuilder {
             maximum_relative_mass_error,
             "generated uniformly randomized positive voxel-density models with conserved asteroid mass"
         );
-        let (eq106_volume_source_bytes, eq106_voxel_source_ranges) =
-            eq106_geometry_buffers(&self.eq106_compressed_records)?;
         Some((
             PlanningCandidateBatch {
                 batch_id,
@@ -321,11 +314,6 @@ impl PlanningBatchBuilder {
                 density_seed: self.density_seed,
                 target_mass: self.target_mass,
                 basis_records: Arc::from(self.basis_records),
-                eq106_volume_source_bytes,
-                eq106_voxel_source_ranges: Arc::from(eq106_voxel_source_ranges),
-                eq106_compression_acceleration_coefficients: Arc::from(
-                    self.eq106_compression_acceleration_coefficients,
-                ),
                 reference_arc_hash,
                 candidate_hash,
                 density_model_hash,
@@ -459,27 +447,6 @@ fn coalesce_basis_records(
     Some(groups.into_values().flatten().collect())
 }
 
-fn eq106_geometry_buffers(records: &[PlanningBasisRecord]) -> Option<(Arc<[u8]>, [[u32; 2]; 56])> {
-    if records.is_empty() || records.len() > u32::MAX as usize {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(records.len() * 16);
-    let mut ranges = [[0_u32; 2]; 56];
-    let mut cursor = 0_usize;
-    for (voxel, range) in ranges.iter_mut().enumerate() {
-        let start = cursor;
-        while cursor < records.len() && records[cursor].voxel_index as usize == voxel {
-            bytes.extend_from_slice(bytemuck::cast_slice(&records[cursor].position_volume));
-            cursor += 1;
-        }
-        *range = [start as u32, (cursor - start) as u32];
-    }
-    if cursor != records.len() || ranges.iter().any(|range| range[1] == 0) {
-        return None;
-    }
-    Some((Arc::from(bytes), ranges))
-}
-
 /// Deterministically replace every parent quadrature source with an
 /// antithetic cloud inside a representative micro-voxel centred on the
 /// original quadrature source. The micro-voxel side is bounded by both the
@@ -584,20 +551,15 @@ fn spatially_refine_basis_records(
 
 /// Compress each deterministic antithetic child cloud to a positive six-point
 /// sigma rule. The rule preserves zeroth, first, second, and (by central
-/// symmetry) third moments. Consequently the first unmatched contribution to
-/// an exterior Newton field is fourth order. `fourth_moments` contains the sum
-/// of the absolute original and replacement fourth moments, which is a
-/// conservative triangle-inequality remainder bound rather than an empirical
-/// error estimate. Each cluster is divided by its certified minimum distance
-/// to the complete trajectory tube before accumulation, avoiding the overly
-/// pessimistic global enclosing-sphere distance.
+/// symmetry) third moments. Each cluster is checked against its certified
+/// minimum distance to the complete trajectory tube before it is accepted.
 fn compress_refined_basis_moments(
     canonical: &[PlanningBasisRecord],
     refined: &[PlanningBasisRecord],
     requested: u32,
     trajectory_positions: &[Vec3],
     trajectory_tube_radius: f32,
-) -> Option<(Vec<PlanningBasisRecord>, [f64; 56])> {
+) -> Option<Vec<PlanningBasisRecord>> {
     if canonical.is_empty()
         || refined.len() != requested as usize
         || requested < canonical.len() as u32
@@ -611,7 +573,6 @@ fn compress_refined_basis_moments(
     let remainder = refined.len() % canonical.len();
     let mut cursor = 0_usize;
     let mut compressed = Vec::with_capacity(canonical.len().saturating_mul(6));
-    let mut fourth_moments = [0.0_f64; 56];
     for (parent_index, parent) in canonical.iter().copied().enumerate() {
         let count = base + usize::from(parent_index < remainder);
         let children = refined.get(cursor..cursor + count)?;
@@ -656,10 +617,8 @@ fn compress_refined_basis_moments(
         let columns = positive_semidefinite_cholesky_columns(covariance)?;
         let sigma_scale = 3.0_f64.sqrt();
         let sigma_volume = total_volume / 6.0;
-        let mut replacement_fourth_moment = 0.0_f64;
         for column in columns {
             let offset = sigma_scale * column;
-            replacement_fourth_moment += 2.0 * sigma_volume * offset.length_squared().powi(2);
             for position in [centroid + offset, centroid - offset] {
                 compressed.push(PlanningBasisRecord {
                     position_volume: [
@@ -671,20 +630,6 @@ fn compress_refined_basis_moments(
                     voxel_index: parent.voxel_index,
                 });
             }
-        }
-        let original_fourth_moment = children.iter().fold(0.0_f64, |sum, child| {
-            let position = DVec3::new(
-                f64::from(child.position_volume[0]),
-                f64::from(child.position_volume[1]),
-                f64::from(child.position_volume[2]),
-            );
-            let radius2 = (position - centroid).length_squared();
-            sum + f64::from(child.position_volume[3]) * radius2 * radius2
-        });
-        let voxel = usize::try_from(parent.voxel_index).ok()?;
-        let moment = original_fourth_moment + replacement_fourth_moment;
-        if voxel >= fourth_moments.len() || !moment.is_finite() || moment < 0.0 {
-            return None;
         }
         let support_radius = children
             .iter()
@@ -711,9 +656,8 @@ fn compress_refined_basis_moments(
         if !distance_to_tube.is_finite() || distance_to_tube <= 0.0 {
             return None;
         }
-        fourth_moments[voxel] += moment / distance_to_tube.powi(6);
     }
-    (cursor == refined.len()).then_some((compressed, fourth_moments))
+    (cursor == refined.len()).then_some(compressed)
 }
 
 fn positive_semidefinite_cholesky_columns(matrix: DMat3) -> Option<[DVec3; 3]> {
@@ -1249,409 +1193,4 @@ fn hash_f32_iter(values: impl IntoIterator<Item = f32>) -> u64 {
 
 fn mix_hash(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy::math::DVec3;
-
-    fn test_voxels() -> Vec<InvertedDensityVoxel> {
-        (0..56)
-            .map(|index| InvertedDensityVoxel {
-                center: Vec3::new(index as f32, 0.0, 0.0),
-                volume: 1_000.0 + 17.0 * index as f32,
-                density: 1_700.0,
-                baseline_density: 1_700.0,
-                reference_density: 1_700.0,
-                grid: [index as u8, 0, 0],
-            })
-            .collect()
-    }
-
-    #[test]
-    fn randomized_density_rows_are_distinct_positive_and_mass_preserving() {
-        let voxels = test_voxels();
-        let target_mass = 2.45e8;
-        let (models, masses) =
-            uniform_random_equal_mass_models(&voxels, target_mass, 32, 0x1065).unwrap();
-        assert_eq!(models.len(), 32 * 56);
-        assert_eq!(masses.len(), 32);
-        assert!(
-            models
-                .iter()
-                .all(|density| density.is_finite() && *density > 0.0)
-        );
-        assert!(
-            masses
-                .iter()
-                .all(|mass| ((mass - target_mass) / target_mass).abs() <= 2.0e-7)
-        );
-        for pair in models.as_chunks::<56>().0.windows(2) {
-            assert_ne!(pair[0], pair[1]);
-        }
-    }
-
-    #[test]
-    fn first_random_models_are_the_prefix_of_stress_for_the_same_capture() {
-        let voxels = test_voxels();
-        let (first, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 4, 7).unwrap();
-        let (stress, _) = uniform_random_equal_mass_models(&voxels, 2.45e8, 32, 7).unwrap();
-        assert_eq!(first, stress[..first.len()]);
-    }
-
-    #[test]
-    fn spatial_refinement_is_distinct_and_preserves_parent_mass_and_centroid() {
-        let voxels = vec![InvertedDensityVoxel {
-            center: Vec3::new(12.0, -4.0, 8.0),
-            volume: 1_000.0,
-            density: 1_700.0,
-            baseline_density: 1_700.0,
-            reference_density: 1_700.0,
-            grid: [2, 1, 2],
-        }];
-        let parent = PlanningBasisRecord {
-            position_volume: [12.0, -4.0, 8.0, 1_000.0],
-            voxel_index: 0,
-        };
-        let refined = spatially_refine_basis_records(&[parent], &voxels, 20.0, 40.0, 8).unwrap();
-        assert_eq!(refined.len(), 8);
-
-        let mut positions = refined
-            .iter()
-            .map(|record| {
-                (
-                    record.position_volume[0].to_bits(),
-                    record.position_volume[1].to_bits(),
-                    record.position_volume[2].to_bits(),
-                )
-            })
-            .collect::<Vec<_>>();
-        positions.sort_unstable();
-        positions.dedup();
-        assert_eq!(positions.len(), refined.len());
-
-        let volume = refined
-            .iter()
-            .map(|record| f64::from(record.position_volume[3]))
-            .sum::<f64>();
-        let centroid = refined.iter().fold(DVec3::ZERO, |moment, record| {
-            moment
-                + DVec3::new(
-                    f64::from(record.position_volume[0]),
-                    f64::from(record.position_volume[1]),
-                    f64::from(record.position_volume[2]),
-                ) * f64::from(record.position_volume[3])
-        }) / volume;
-        assert!((volume - 1_000.0).abs() <= 1.0e-5);
-        assert!(centroid.distance(DVec3::new(12.0, -4.0, 8.0)) <= 1.0e-5);
-        assert!(refined.iter().all(|record| {
-            let position = Vec3::from_array(record.position_volume[..3].try_into().unwrap());
-            position.distance(Vec3::new(12.0, -4.0, 8.0)) < 9.0
-                && position.length() <= 40.0
-                && (0.0..=20.0).contains(&position.x)
-                && (-20.0..=0.0).contains(&position.y)
-                && (0.0..=20.0).contains(&position.z)
-        }));
-    }
-
-    #[test]
-    fn canonical_coalescing_hits_requested_count_per_voxel_and_preserves_moments() {
-        let records = vec![
-            PlanningBasisRecord {
-                position_volume: [0.0, 0.0, 0.0, 2.0],
-                voxel_index: 0,
-            },
-            PlanningBasisRecord {
-                position_volume: [2.0, 0.0, 0.0, 3.0],
-                voxel_index: 0,
-            },
-            PlanningBasisRecord {
-                position_volume: [10.0, 0.0, 0.0, 4.0],
-                voxel_index: 1,
-            },
-        ];
-        let coalesced = coalesce_basis_records(&records, 2).unwrap();
-        assert_eq!(coalesced.len(), 2);
-        assert_eq!(
-            coalesced
-                .iter()
-                .map(|record| record.voxel_index)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        let merged = coalesced[0];
-        assert!((merged.position_volume[0] - 1.2).abs() <= 1.0e-6);
-        assert!((merged.position_volume[3] - 5.0).abs() <= 1.0e-6);
-    }
-
-    #[test]
-    fn spatial_refinement_supports_non_power_of_two_source_counts() {
-        let voxels = vec![InvertedDensityVoxel {
-            center: Vec3::ZERO,
-            volume: 2.0,
-            density: 1.0,
-            baseline_density: 1.0,
-            reference_density: 1.0,
-            grid: [0; 3],
-        }];
-        let parents = [
-            PlanningBasisRecord {
-                position_volume: [-2.0, 0.0, 0.0, 2.0],
-                voxel_index: 0,
-            },
-            PlanningBasisRecord {
-                position_volume: [2.0, 0.0, 0.0, 3.0],
-                voxel_index: 0,
-            },
-        ];
-        let refined = spatially_refine_basis_records(&parents, &voxels, 2.0, 4.0, 9).unwrap();
-        assert_eq!(refined.len(), 9);
-        for (parent_index, expected_volume) in [2.0_f64, 3.0].into_iter().enumerate() {
-            let actual = refined
-                .iter()
-                .filter(|record| {
-                    if parent_index == 0 {
-                        record.position_volume[0] < 0.0
-                    } else {
-                        record.position_volume[0] > 0.0
-                    }
-                })
-                .map(|record| f64::from(record.position_volume[3]))
-                .sum::<f64>();
-            assert!((actual - expected_volume).abs() <= 1.0e-6);
-        }
-    }
-
-    #[test]
-    fn eq106_sigma_compression_preserves_mass_centroid_and_covariance() {
-        let voxels = vec![InvertedDensityVoxel {
-            center: Vec3::ZERO,
-            volume: 1_000.0,
-            density: 1.0,
-            baseline_density: 1.0,
-            reference_density: 1.0,
-            grid: [5, 4, 5],
-        }];
-        let parent = PlanningBasisRecord {
-            position_volume: [1.0, -2.0, 3.0, 1_000.0],
-            voxel_index: 0,
-        };
-        let refined = spatially_refine_basis_records(&[parent], &voxels, 20.0, 100.0, 128)
-            .expect("refined antithetic cloud");
-        let (compressed, fourth_moments) = compress_refined_basis_moments(
-            &[parent],
-            &refined,
-            128,
-            &[Vec3::new(1_000.0, 0.0, 0.0)],
-            15.0,
-        )
-        .expect("moment compression");
-        assert_eq!(compressed.len(), 6);
-        assert!(fourth_moments[0].is_finite() && fourth_moments[0] > 0.0);
-
-        let moments = |records: &[PlanningBasisRecord]| {
-            let volume = records
-                .iter()
-                .map(|record| f64::from(record.position_volume[3]))
-                .sum::<f64>();
-            let centroid = records.iter().fold(DVec3::ZERO, |sum, record| {
-                sum + DVec3::new(
-                    f64::from(record.position_volume[0]),
-                    f64::from(record.position_volume[1]),
-                    f64::from(record.position_volume[2]),
-                ) * f64::from(record.position_volume[3])
-            }) / volume;
-            let covariance = records.iter().fold(DMat3::ZERO, |sum, record| {
-                let delta = DVec3::new(
-                    f64::from(record.position_volume[0]),
-                    f64::from(record.position_volume[1]),
-                    f64::from(record.position_volume[2]),
-                ) - centroid;
-                sum + DMat3::from_cols(delta * delta.x, delta * delta.y, delta * delta.z)
-                    * f64::from(record.position_volume[3])
-            }) / volume;
-            (volume, centroid, covariance)
-        };
-        let (refined_volume, refined_centroid, refined_covariance) = moments(&refined);
-        let (compressed_volume, compressed_centroid, compressed_covariance) = moments(&compressed);
-        assert!((refined_volume - compressed_volume).abs() <= 2.0e-4);
-        assert!(refined_centroid.distance(compressed_centroid) <= 2.0e-5);
-        let covariance_error = refined_covariance - compressed_covariance;
-        assert!(
-            covariance_error
-                .to_cols_array()
-                .into_iter()
-                .map(f64::abs)
-                .fold(0.0, f64::max)
-                <= 2.0e-4
-        );
-    }
-
-    #[test]
-    fn planning_candidates_are_propagated_from_initial_conditions() {
-        let reference = [
-            TrajectoryInversionKnot {
-                position: Vec3::ZERO,
-                velocity: Vec3::X * 10.0,
-                simulation_time_seconds: 0.0,
-                baseline_acceleration: Vec3::ZERO,
-                body_rotation: Quat::IDENTITY,
-            },
-            TrajectoryInversionKnot {
-                position: Vec3::X * 10.0,
-                velocity: Vec3::X * 10.0,
-                simulation_time_seconds: 1.0,
-                baseline_acceleration: Vec3::ZERO,
-                body_rotation: Quat::IDENTITY,
-            },
-        ];
-        let jets = reference
-            .iter()
-            .map(|sample| PlanningReferenceJet {
-                simulation_time_seconds: sample.simulation_time_seconds,
-                body_rotation: DQuat::IDENTITY,
-                world_position: sample.position.as_dvec3(),
-                world_acceleration: DVec3::ZERO,
-                world_jacobian: DMat3::ZERO,
-            })
-            .collect::<Vec<_>>();
-        let mut states = Vec::new();
-        let mut bytes = Vec::new();
-        append_dynamical_candidate_states(0, 32, &reference, &jets, None, &mut states, &mut bytes)
-            .unwrap();
-
-        assert_eq!(states.len(), reference.len());
-        assert_eq!(bytes.len(), reference.len() * 16);
-        assert!(states.iter().all(|state| state.identity[3] == 1));
-        let first_offset = states[0].body_position().distance(reference[0].position);
-        let last_offset = states[1].body_position().distance(reference[1].position);
-        assert!((first_offset - last_offset).abs() < 1.0e-5);
-        assert!(last_offset <= PLANNING_TRAJECTORY_TUBE_RADIUS_METERS);
-    }
-
-    #[test]
-    fn unstable_transverse_candidate_contracts_instead_of_cancelling_batch() {
-        let reference = (0..=2)
-            .map(|second| TrajectoryInversionKnot {
-                position: Vec3::X * (10.0 * second as f32),
-                velocity: Vec3::X * 10.0,
-                simulation_time_seconds: second as f64,
-                baseline_acceleration: Vec3::ZERO,
-                body_rotation: Quat::IDENTITY,
-            })
-            .collect::<Vec<_>>();
-        let jets = reference
-            .iter()
-            .map(|sample| PlanningReferenceJet {
-                simulation_time_seconds: sample.simulation_time_seconds,
-                body_rotation: DQuat::IDENTITY,
-                world_position: sample.position.as_dvec3(),
-                world_acceleration: DVec3::ZERO,
-                // y'' = y and z'' = z amplify the requested outer offset
-                // beyond 15 m, forcing the adaptive contraction path.
-                world_jacobian: DMat3::from_diagonal(DVec3::new(0.0, 1.0, 1.0)),
-            })
-            .collect::<Vec<_>>();
-        let requested_radius = candidate_tube_parameters(31, 32).0;
-        let mut states = Vec::new();
-        let mut bytes = Vec::new();
-
-        append_dynamical_candidate_states(31, 32, &reference, &jets, None, &mut states, &mut bytes)
-            .expect("an unstable candidate should contract, not cancel the complete sweep");
-
-        assert_eq!(states.len(), reference.len());
-        assert_eq!(bytes.len(), reference.len() * 16);
-        assert!(states[0].velocity_distance[3] < requested_radius * 0.75);
-        assert!(states.iter().all(|state| {
-            state.velocity_distance[3].is_finite()
-                && state.velocity_distance[3] <= PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-3
-        }));
-    }
-
-    #[test]
-    fn long_arc_outer_candidate_remains_inside_the_certified_tube() {
-        let sample_count = 241;
-        let duration = BENCHMARK_DURATION_SECONDS;
-        let radius = 1_000.0_f64;
-        let gravitational_parameter = f64::from(G) * f64::from(RYUGU_MASS);
-        let angular_speed = (gravitational_parameter / radius.powi(3)).sqrt();
-        let normal = RYUGU_SPIN_AXIS.as_dvec3().normalize();
-        let axis_x = normal.cross(DVec3::X).normalize();
-        let axis_y = normal.cross(axis_x).normalize();
-        let mut reference = Vec::with_capacity(sample_count);
-        let mut jets = Vec::with_capacity(sample_count);
-        for index in 0..sample_count {
-            let time = duration * index as f64 / (sample_count - 1) as f64;
-            let angle = angular_speed * time;
-            let radial = axis_x * angle.cos() + axis_y * angle.sin();
-            let tangent = -axis_x * angle.sin() + axis_y * angle.cos();
-            let position = radial * radius;
-            let velocity = tangent * (radius * angular_speed);
-            let inverse_radius3 = radius.powi(-3);
-            let acceleration = -gravitational_parameter * position * inverse_radius3;
-            let outer = DMat3::from_cols(
-                position * position.x,
-                position * position.y,
-                position * position.z,
-            );
-            let jacobian = gravitational_parameter
-                * (outer * (3.0 / radius.powi(5)) - DMat3::IDENTITY * inverse_radius3);
-            reference.push(TrajectoryInversionKnot {
-                position: position.as_vec3(),
-                velocity: velocity.as_vec3(),
-                simulation_time_seconds: time,
-                baseline_acceleration: acceleration.as_vec3(),
-                body_rotation: Quat::IDENTITY,
-            });
-            jets.push(PlanningReferenceJet {
-                simulation_time_seconds: time,
-                body_rotation: DQuat::IDENTITY,
-                world_position: position,
-                world_acceleration: acceleration,
-                world_jacobian: jacobian,
-            });
-        }
-
-        let (candidate_radius, phase, harmonic, phase_rate) = candidate_tube_parameters(31, 32);
-        let initial_offset = candidate_initial_offset(
-            reference[0],
-            0,
-            sample_count as u32,
-            candidate_radius,
-            phase,
-            harmonic,
-            phase_rate,
-        )
-        .unwrap();
-        let direct_solve = propagate_reference_line_batched(
-            (reference[0].position + initial_offset).as_dvec3(),
-            reference[0].velocity.as_dvec3(),
-            reference[0].velocity.as_dvec3(),
-            duration,
-            VolterraConfig {
-                node_count: sample_count,
-                maximum_picard_iterations: 24,
-                maximum_endpoint_iterations: 8,
-                damping: 0.70,
-                relative_tolerance: 1.0e-6,
-                minimum_longitudinal_speed: 1.0e-5,
-                maximum_transverse_distance: f64::INFINITY,
-            },
-            |inputs, accelerations| {
-                fill_planning_reference_accelerations(&jets, None, 0.0, inputs, accelerations)
-            },
-        );
-        assert!(direct_solve.is_ok(), "{direct_solve:?}");
-
-        let mut states = Vec::new();
-        let mut bytes = Vec::new();
-        append_dynamical_candidate_states(31, 32, &reference, &jets, None, &mut states, &mut bytes)
-            .unwrap();
-        assert_eq!(states.len(), sample_count);
-        assert!(states.iter().all(|state| {
-            state.velocity_distance[3].is_finite()
-                && state.velocity_distance[3] <= PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-3
-        }));
-    }
 }

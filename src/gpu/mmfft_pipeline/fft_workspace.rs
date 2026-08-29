@@ -276,22 +276,3 @@ fn append_compressed_potential_level(bytes: &mut Vec<u8>, field: &[[f32; 4]]) ->
     }
     scale
 }
-
-#[cfg(test)]
-fn fft_1d(values: &mut [Complex64], inverse: bool) {
-    let mut planner = FftPlanner::<f64>::new();
-    let transform = if inverse {
-        planner.plan_fft_inverse(values.len())
-    } else {
-        planner.plan_fft_forward(values.len())
-    };
-    let mut scratch = vec![Complex64::default(); transform.get_inplace_scratch_len()];
-    process_fft_line_with_scratch(values, transform.as_ref(), inverse, &mut scratch);
-}
-
-#[cfg(test)]
-fn build_level(records: &[(DVec3, f64)], half_extent: f64, n: usize) -> Vec<[f32; 4]> {
-    MmfftLevelWorkspace::new(n, half_extent)
-        .build(records)
-        .to_vec()
-}

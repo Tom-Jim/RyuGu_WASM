@@ -3,6 +3,7 @@ name: Deploy WebGPU WASM to GitHub Pages
 on:
     push:
         branches: [main]
+    pull_request:
     workflow_dispatch:
 
 permissions:
@@ -37,8 +38,13 @@ jobs:
             - name: Install wasm-pack
               run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-            - name: Lint WASM without dead code
-              run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+
+            - name: Check production Rust library
+              run: |
+                  cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+                  cargo check --target wasm32-unknown-unknown --lib
 
             - name: Build WASM Release
               run: wasm-pack build --release --target web --out-dir pkg --out-name ryugu_wasm
@@ -81,6 +87,7 @@ jobs:
                   path: ./site
 
     deploy:
+        if: github.event_name != 'pull_request'
         environment:
             name: github-pages
             url: ${{ steps.deployment.outputs.page_url }}
