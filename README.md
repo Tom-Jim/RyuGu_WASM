@@ -13,7 +13,7 @@ The repository compares five forward models and contains a research implementati
 
 [Open the live WebGPU demo](https://tom-jim.github.io/RyuGu_WASM/)
 
-<img src="https://github.com/Tom-Jim/RyuGu_WASM/issues/4#issuecomment-5462988147" width="100%" alt="algorithm comparison" />
+<img src="https://github.com/user-attachments/assets/349552a7-04a2-4c42-913a-7ed955eb6e6a" width="100%" alt="algorithm comparison" />
 
 | **Orbital Trajectory** | **ProbeView** |
 | :---: | :---: |
