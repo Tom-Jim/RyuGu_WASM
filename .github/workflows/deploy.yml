@@ -72,6 +72,8 @@ jobs:
                   test -f site/pkg/ryugu_wasm.js
                   test -f site/pkg/ryugu_wasm_bg.wasm
                   ! grep -Eq '="/(src/html|pkg|node_modules)/' site/index.html
+                  grep -Fq '"vue":"./node_modules/vue/dist/vue.esm-browser.prod.js"' site/index.html
+                  grep -Fq 'import(`./pkg/ryugu_wasm.js' site/index.html
 
             - name: Upload Pages Artifact
               uses: actions/upload-pages-artifact@v3
