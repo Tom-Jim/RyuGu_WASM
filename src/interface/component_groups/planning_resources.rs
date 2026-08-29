@@ -9,8 +9,8 @@ pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
 pub const PLANNING_SOURCE_COUNTS: [u32; 9] = [
-    32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
-    8_388_608,
+    32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000,
+    8_192_000,
 ];
 pub const PLANNING_SOURCE_REPEATS: u32 = 1;
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
@@ -309,6 +309,31 @@ pub struct PlanningBatchJob {
     pub spectral_element_count: u32,
 }
 
+impl PlanningBatchJob {
+    /// Fraction of GPU evaluation work that has actually completed for this
+    /// method. The denominator covers the full raw pass, its measured warm
+    /// tile, and the full independently certified pass.
+    pub fn completion_fraction(&self) -> f64 {
+        let pass_work = u64::from(self.candidate_count) * u64::from(self.density_model_count);
+        let warm_work = u64::from(self.candidate_tile_size.min(self.candidate_count));
+        let total_work = pass_work.saturating_mul(2).saturating_add(warm_work).max(1);
+        let current_pass_work = u64::from(self.density_model)
+            .saturating_mul(u64::from(self.candidate_count))
+            .saturating_add(u64::from(self.candidate_start))
+            .min(pass_work);
+        let completed = if !self.warm_repetition {
+            current_pass_work
+        } else if !self.certified_repetition {
+            pass_work
+        } else {
+            pass_work
+                .saturating_add(warm_work)
+                .saturating_add(current_pass_work)
+        };
+        completed.min(total_work) as f64 / total_work as f64
+    }
+}
+
 impl PlanningMethodMetrics {
     pub fn accuracy_eligible(self) -> bool {
         self.gpu_batch_verified
@@ -370,6 +395,9 @@ pub struct PlanningComparisonState {
     pub reference_duration_seconds: f32,
     pub status: String,
     pub batch_job: Option<PlanningBatchJob>,
+    /// Completed fraction of the CPU candidate-preparation stage for the
+    /// current workload/source count.
+    pub preparation_progress: f64,
     pub requested_source_count: u32,
     pub source_curve_active: bool,
     pub source_curve_visible: bool,
@@ -420,6 +448,7 @@ impl Default for PlanningComparisonState {
             reference_duration_seconds: 0.0,
             status: "Choose a planning metric to run First, or use inversion metrics with the inversion button.".into(),
             batch_job: None,
+            preparation_progress: 0.0,
             requested_source_count: PLANNING_SOURCE_COUNTS[0],
             source_curve_active: false,
             source_curve_visible: false,
@@ -431,6 +460,37 @@ impl Default for PlanningComparisonState {
 }
 
 impl PlanningComparisonState {
+    /// Monotonic end-to-end progress. Each source point consists of one CPU
+    /// preparation stage followed by the three GPU method stages.
+    pub fn progress_fraction(&self) -> f64 {
+        const STAGES_PER_SOURCE: f64 = 4.0;
+        let source_curve = self.workload_profile == PlanningWorkloadProfile::SourceCrossover
+            && (self.source_curve_active || self.source_curve_visible);
+        let source_count = if source_curve {
+            PLANNING_SOURCE_COUNTS.len()
+        } else {
+            1
+        };
+        let source_index = if source_curve {
+            self.source_curve_index.min(source_count)
+        } else {
+            0
+        };
+        if source_index == source_count
+            || (!source_curve && !self.run_requested && self.completed_workload().is_some())
+        {
+            return 1.0;
+        }
+        let within_source = self.batch_job.as_ref().map_or_else(
+            || self.preparation_progress.clamp(0.0, 1.0) / STAGES_PER_SOURCE,
+            |job| {
+                (1.0 + job.method_order_index as f64 + job.completion_fraction())
+                    / STAGES_PER_SOURCE
+            },
+        );
+        ((source_index as f64 + within_source) / source_count as f64).clamp(0.0, 1.0)
+    }
+
     pub fn blocks_realtime_gpu(&self) -> bool {
         // All planning modes share the frame budget with the running scene.
         // GPU submission/readback is asynchronous; freezing physics or UI for
@@ -563,7 +623,7 @@ impl PlanningComparisonState {
 
 #[cfg(test)]
 mod planning_profile_tests {
-    use super::{PLANNING_SOURCE_COUNTS, PlanningWorkloadProfile};
+    use super::{PLANNING_SOURCE_COUNTS, PlanningComparisonState, PlanningWorkloadProfile};
 
     #[test]
     fn visible_profile_uses_fixed_batch_scheduling() {
@@ -571,8 +631,30 @@ mod planning_profile_tests {
     }
     #[test]
     fn quadrature_curve_spans_32k_through_8192k() {
-        assert_eq!(PLANNING_SOURCE_COUNTS[0], 32 * 1_024);
-        assert_eq!(*PLANNING_SOURCE_COUNTS.last().unwrap(), 8_192 * 1_024);
+        assert_eq!(PLANNING_SOURCE_COUNTS[0], 32_000);
+        assert_eq!(*PLANNING_SOURCE_COUNTS.last().unwrap(), 8_192_000);
         assert!(PLANNING_SOURCE_COUNTS.windows(2).all(|pair| pair[1] == 2 * pair[0]));
+    }
+
+    #[test]
+    fn source_curve_progress_never_resets_between_source_counts() {
+        let mut state = PlanningComparisonState {
+            workload_profile: PlanningWorkloadProfile::SourceCrossover,
+            source_curve_active: true,
+            source_curve_visible: true,
+            run_requested: true,
+            preparation_progress: 1.0,
+            ..Default::default()
+        };
+        let first_source_prepared = state.progress_fraction();
+        state.source_curve_index = 1;
+        state.preparation_progress = 0.0;
+        let second_source_started = state.progress_fraction();
+        assert!((first_source_prepared - 1.0 / 36.0).abs() < f64::EPSILON);
+        assert!(second_source_started > first_source_prepared);
+
+        state.source_curve_index = PLANNING_SOURCE_COUNTS.len();
+        state.source_curve_active = false;
+        assert_eq!(state.progress_fraction(), 1.0);
     }
 }

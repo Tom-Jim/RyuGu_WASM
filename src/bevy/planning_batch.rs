@@ -151,6 +151,7 @@ pub fn planning_batch_evaluator_system(
                         if planning.source_curve_index < PLANNING_SOURCE_COUNTS.len() {
                             planning.requested_source_count =
                                 PLANNING_SOURCE_COUNTS[planning.source_curve_index];
+                            planning.preparation_progress = 0.0;
                             planning.results = std::array::from_fn(|_| None);
                             planning.run_id = planning.run_id.wrapping_add(1);
                             planning.status = format!(

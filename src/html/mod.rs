@@ -276,6 +276,7 @@ pub(crate) fn browser_ui_action_system(
                 planning.source_curve_samples.clear();
                 planning.results = std::array::from_fn(|_| None);
                 planning.batch_job = None;
+                planning.preparation_progress = 0.0;
                 planning.run_requested = true;
                 planning.run_id = planning.run_id.wrapping_add(1);
                 *request = PlanningGpuRequest::default();
@@ -333,6 +334,7 @@ fn queue_planning_run(
     planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
     planning.results = std::array::from_fn(|_| None);
     planning.batch_job = None;
+    planning.preparation_progress = 0.0;
     planning.reference_duration_seconds = 0.0;
     planning.run_requested = true;
     planning.run_id = planning.run_id.wrapping_add(1);
@@ -355,6 +357,7 @@ fn cancel_planning(
 ) {
     planning.run_requested = false;
     planning.batch_job = None;
+    planning.preparation_progress = 0.0;
     planning.source_curve_active = false;
     planning.source_curve_visible = false;
     // Bump the generation so any builder/readback from the old run is stale
@@ -533,28 +536,15 @@ pub(crate) fn browser_ui_publish_system(
         })
         .collect::<Vec<_>>();
     let solve = state.propagation.latest;
-    let (progress, accuracy) = state.planning.batch_job.as_ref().map_or((0.0, 0.0), |job| {
-        let completed = (u64::from(job.density_model) * u64::from(job.candidate_count)
-            + u64::from(job.candidate_start))
-            * u64::from(job.samples_per_candidate);
-        let method_progress = completed as f64 / job.total_evaluations.max(1) as f64;
-        let source_progress = if state.planning.source_curve_active {
-            (state.planning.source_curve_index as f64 + method_progress / 3.0)
-                / PLANNING_SOURCE_COUNTS.len() as f64
-        } else {
-            method_progress / 3.0
-        };
+    let progress = 100.0 * state.planning.progress_fraction();
+    let accuracy = state.planning.batch_job.as_ref().map_or(0.0, |job| {
         let checks = [
             job.gravity_samples > 0,
             job.gradient_samples > 0,
             job.certified_gravity_samples > 0,
             job.certified_gradient_samples > 0,
         ];
-        (
-            100.0 * source_progress.clamp(0.0, 1.0),
-            100.0 * checks.into_iter().filter(|passed| *passed).count() as f64
-                / checks.len() as f64,
-        )
+        100.0 * checks.into_iter().filter(|passed| *passed).count() as f64 / checks.len() as f64
     });
     let snapshot = json!({
         "fps": crate::browser_frame_rate().unwrap_or(0.0),
@@ -575,6 +565,7 @@ pub(crate) fn browser_ui_publish_system(
         "activeVramBytes": state.memory.bytes[state.active_method.performance_index()],
         "planning": {
             "running": state.planning.run_requested,
+            "runId": state.planning.run_id,
             "visible": state.planning.source_curve_visible,
             "status": state.planning.status,
             "sourceCount": state.planning.requested_source_count,

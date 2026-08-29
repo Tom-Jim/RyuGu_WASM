@@ -74,7 +74,7 @@ fn dispatch_eq106_sensitivity_matrix(
                 extracted.density_mode_count,
                     1,
                 false,
-                true,
+                1,
                 element.target_count,
                 element.target_offset,
             );

@@ -11,6 +11,12 @@ struct PlanningEq106DispatchState {
     active_maximum_elements_per_candidate: u32,
     active_build_spectrum: bool,
     active_build_basis_spectrum: bool,
+    active_build_nufft_grid: bool,
+    // A staged request owns the shared readback lock until either its map
+    // callback runs or, when no map was scheduled yet, the submitted stages
+    // have drained. Releasing it unconditionally on cancellation lets a new
+    // request reuse a staging buffer still referenced by the old callback.
+    active_map_scheduled: bool,
     active_verification_targets: Vec<u32>,
     active_uniform: Option<Buffer>,
     active_bind_groups: Vec<BindGroup>,
@@ -36,6 +42,7 @@ struct PlanningEq106DispatchState {
     canonical_elements: Vec<Eq106BatchElement>,
     spectrum_ready: bool,
     basis_spectrum_ready: bool,
+    nufft_grid_ready: bool,
     last_block_key: Option<(u64, u8)>,
 }
 
@@ -51,6 +58,8 @@ impl PlanningEq106DispatchState {
         self.active_maximum_elements_per_candidate = 0;
         self.active_build_spectrum = false;
         self.active_build_basis_spectrum = false;
+        self.active_build_nufft_grid = false;
+        self.active_map_scheduled = false;
         self.active_verification_targets.clear();
         self.active_uniform = None;
         self.active_bind_groups.clear();
@@ -75,11 +84,14 @@ fn dispatch_planning_eq106(
     if state.active_request_id != 0
         && (!request_matches || state.active_request_id != request.request_id)
     {
+        let map_scheduled = state.active_map_scheduled;
         state.clear_active();
-        let in_flight = Arc::clone(&channel.in_flight);
-        render_queue.on_submitted_work_done(move || {
-            in_flight.store(false, Ordering::Release);
-        });
+        if !map_scheduled {
+            let in_flight = Arc::clone(&channel.in_flight);
+            render_queue.on_submitted_work_done(move || {
+                in_flight.store(false, Ordering::Release);
+            });
+        }
         return;
     }
     if !request_matches || state.last_request_id == request.request_id {
@@ -117,6 +129,7 @@ fn dispatch_planning_eq106(
             ("voxel line samples", pipelines.planning_voxel_line_samples_id),
             ("voxel basis spectrum", pipelines.planning_voxel_spectrum_id),
             ("spectrum combination", pipelines.planning_combine_spectrum_id),
+            ("Type-2 NUFFT grid", pipelines.planning_nufft_grid_id),
             ("inverse spectrum", pipelines.planning_evaluate_id),
             ("planning reduction", reduction.0),
         ],
@@ -133,11 +146,13 @@ fn dispatch_planning_eq106(
         Some(voxel_line_samples_pipeline),
         Some(voxel_spectrum_pipeline),
         Some(combine_spectrum_pipeline),
+        Some(nufft_grid_pipeline),
         Some(evaluate_pipeline),
     ) = (
         cache.get_compute_pipeline(pipelines.planning_voxel_line_samples_id),
         cache.get_compute_pipeline(pipelines.planning_voxel_spectrum_id),
         cache.get_compute_pipeline(pipelines.planning_combine_spectrum_id),
+        cache.get_compute_pipeline(pipelines.planning_nufft_grid_id),
         cache.get_compute_pipeline(pipelines.planning_evaluate_id),
     )
     else {
@@ -161,7 +176,7 @@ fn dispatch_planning_eq106(
     if planning.eq106_operator.is_empty()
         || planning.source_radius <= 0.0
         || planning.payload.primary.is_empty()
-        || planning.payload.secondary.len() != 112 * 16
+        || planning.payload.secondary.len() != 113 * 16
         || planning.payload.secondary_count != 56
     {
         report_eq106_block(
@@ -244,6 +259,7 @@ fn dispatch_planning_eq106(
         state.source_groups = None;
         state.spectrum_ready = false;
         state.basis_spectrum_ready = false;
+        state.nufft_grid_ready = false;
     }
     let (elements, maximum_elements_per_candidate, invalid_candidates) = if !starting_request {
         (
@@ -334,17 +350,23 @@ fn dispatch_planning_eq106(
         );
         state.basis_spectrum_ready = false;
         state.spectrum_ready = false;
+        state.nufft_grid_ready = false;
     }
     let coefficient_count = taylor_coefficient_count(TAYLOR_MAX_ORDER) as u64;
     let canonical_count = state.canonical_elements.len().max(1) as u64;
     if state.payload_request_id != planning.payload.request_id || state.source_groups.is_none() {
         state.payload_request_id = planning.payload.request_id;
         state.spectrum_ready = false;
+        state.nufft_grid_ready = false;
         let mut metadata = vec![0_u8; 544 * 16];
         metadata[..planning.payload.secondary.len()].copy_from_slice(&planning.payload.secondary);
         let low_basis_offset_vec4 =
             (coefficient_count * QUADRATURE_COUNT as u64 * canonical_count * 56) as f32;
         metadata[112 * 16..112 * 16 + 4].copy_from_slice(&low_basis_offset_vec4.to_le_bytes());
+        let nufft_grid_offset_vec4 = low_basis_offset_vec4
+            + (coefficient_count * FREQUENCY_COUNT as u64 * 2 * canonical_count * 28) as f32;
+        metadata[112 * 16 + 8..112 * 16 + 12]
+            .copy_from_slice(&nufft_grid_offset_vec4.to_le_bytes());
         state.source_groups = Some(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("planning_eq106_source_groups_and_densities"),
@@ -366,9 +388,14 @@ fn dispatch_planning_eq106(
             coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56;
         let basis_bank_bytes =
             coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count * 28;
+        let nufft_grid_bytes = coefficient_count
+            * NUFFT_PAIR_COUNT as u64
+            * NUFFT_GRID_SIZE as u64
+            * 16
+            * canonical_count;
         state.line_samples = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_voxel_lines_and_low_basis"),
-            size: line_sample_bytes + basis_bank_bytes,
+            size: line_sample_bytes + basis_bank_bytes + nufft_grid_bytes,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -399,6 +426,7 @@ fn dispatch_planning_eq106(
         }));
         state.basis_spectrum_ready = false;
         state.spectrum_ready = false;
+        state.nufft_grid_ready = false;
     }
     state.output_size = output_size;
     let baseline_size = batch.state_count() as u64 * 16;
@@ -504,6 +532,7 @@ fn dispatch_planning_eq106(
     if starting_request {
         state.active_build_spectrum = !state.spectrum_ready;
         state.active_build_basis_spectrum = !state.basis_spectrum_ready;
+        state.active_build_nufft_grid = !state.nufft_grid_ready;
         let uniform_size = 96_u64;
         let mut uniform_data = vec![0_u8; uniform_size as usize * 256];
         if elements.len() > 256 {
@@ -528,7 +557,7 @@ fn dispatch_planning_eq106(
                 0,
                 element.spectrum_index,
                 request.eq106_certified,
-                false,
+                2,
                 element.target_count,
                 element.target_offset,
             );
@@ -588,13 +617,16 @@ fn dispatch_planning_eq106(
     }
     let build_spectrum = state.active_build_spectrum;
     let build_basis_spectrum = state.active_build_basis_spectrum;
+    let build_nufft_grid = state.active_build_nufft_grid;
     // The planning benchmark deliberately evaluates the coherent spectrum assembled from the
     // sampled line.  Mixing in the separate analytic zero-order correction makes coefficient 0
     // follow a different discretisation from coefficients 1..A, which is especially harmful for
     // the spatial derivative used by the gradient benchmark.
     let total_stages = if build_basis_spectrum {
-        4
+        5
     } else if build_spectrum {
+        3
+    } else if build_nufft_grid {
         2
     } else {
         1
@@ -625,12 +657,11 @@ fn dispatch_planning_eq106(
         .unwrap_or(1);
     for stage in state.next_stage..stage_end {
         let physical_stage = if build_basis_spectrum {
-            // The sampled coefficient-zero field and coefficients 1..A must
-            // share one quadrature discretisation.  The former analytic stage
-            // both overwrote c00 and traversed every source a second time.
-            if stage < 2 { stage } else { stage + 1 }
+            [0, 1, 3, 5, 4][stage]
         } else if build_spectrum {
-            stage + 3
+            [3, 5, 4][stage]
+        } else if build_nufft_grid {
+            [5, 4][stage]
         } else {
             4
         };
@@ -655,6 +686,13 @@ fn dispatch_planning_eq106(
                 (taylor_coefficient_count(TAYLOR_MAX_ORDER) * FREQUENCY_COUNT).div_ceil(64),
                 canonical_segment_count,
                 1,
+            ),
+            5 => (
+                "planning_eq106_type2_nufft_grid",
+                nufft_grid_pipeline,
+                taylor_coefficient_count(TAYLOR_MAX_ORDER),
+                canonical_segment_count,
+                NUFFT_PAIR_COUNT,
             ),
             _ => {
                 let (width, height) = target_dispatch_grid(max_targets);
@@ -717,6 +755,9 @@ fn dispatch_planning_eq106(
     if build_spectrum {
         state.spectrum_ready = true;
     }
+    if build_nufft_grid {
+        state.nufft_grid_ready = true;
+    }
     if build_basis_spectrum {
         state.basis_spectrum_ready = true;
     }
@@ -747,6 +788,11 @@ fn dispatch_planning_eq106(
         + coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count
         + coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56
         + basis_bank_size
+        + coefficient_count
+            * NUFFT_PAIR_COUNT as u64
+            * NUFFT_GRID_SIZE as u64
+            * 16
+            * canonical_count
         + output_storage_size
         + baseline_size
         + metric_size
@@ -762,13 +808,18 @@ fn dispatch_planning_eq106(
         spectrum_cache_hit = !build_spectrum,
         voxel_basis_cache_hit = !build_basis_spectrum,
         source_parallel_lanes = 128,
+        refined_source_count = batch.source_count,
+        compressed_source_count = source_count,
+        source_compression_ratio = f64::from(batch.source_count) / f64::from(source_count.max(1)),
         voxel_basis_count = 56,
+        type2_nufft_grid_size = NUFFT_GRID_SIZE,
         analytic_zero_correction = false,
         estimated_gpu_buffer_bytes,
         maximum_elements_per_candidate = reported_segment_count,
         "Eq.106 canonical centre-arc spectrum is shared across candidates and candidate tiles"
     );
     state.clear_active();
+    state.active_map_scheduled = true;
     mapped
         .slice(..staging_size)
         .map_async(MapMode::Read, move |result| {

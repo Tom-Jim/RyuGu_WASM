@@ -405,7 +405,7 @@ fn dispatch_eq106_single_target(
         extracted.density_mode_count,
         1,
         evaluate_dual_certificate,
-        false,
+        0,
         inner.target_count,
         0,
     );

@@ -261,7 +261,10 @@ pub fn main() {
         .init_resource::<VolterraPropagationStatus>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
-            focused_mode: UpdateMode::reactive(Duration::from_secs_f64(1.0 / 60.0)),
+            // In browsers, Continuous is driven by requestAnimationFrame.
+            // Adding a 16.7 ms reactive wait on top of VSync can miss every
+            // other presentation and produce an artificial ~30 FPS ceiling.
+            focused_mode: UpdateMode::Continuous,
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 30.0)),
         })
         .add_plugins(
@@ -309,8 +312,8 @@ pub fn main() {
         .add_plugins(WgslPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default());
 
-    // Native builds use a precise sleep/spin limiter. Browsers already own the
-    // animation clock, so the Winit 60 Hz reactive mode above is the cap there.
+    // Native builds use a precise sleep/spin limiter. Browsers use continuous
+    // requestAnimationFrame scheduling with VSync above.
     #[cfg(not(target_arch = "wasm32"))]
     {
         app.add_plugins(FramepacePlugin);

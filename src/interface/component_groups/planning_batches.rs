@@ -88,10 +88,16 @@ pub struct PlanningCandidateBatch {
     pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
     /// Eq.106 geometry-only source records `(x,y,z,volume)`. Unlike the
-    /// per-method payload this buffer is invariant across density models.
+    /// per-method payload this buffer is invariant across density models. The
+    /// refined antithetic clouds are moment-matched to at most six sigma
+    /// points per parent while preserving mass, centroid, and covariance.
     pub eq106_volume_source_bytes: Arc<[u8]>,
     /// Contiguous `(start,count)` ranges for the 56 density voxels.
     pub eq106_voxel_source_ranges: Arc<[[u32; 2]]>,
+    /// Per-voxel sum of `fourth central moment / distance_to_trajectory^6`.
+    /// Multiplication by density and the Newton-kernel derivative constant
+    /// gives a certified acceleration error for the complete trajectory tube.
+    pub eq106_compression_acceleration_coefficients: Arc<[f64]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
     pub density_model_hash: u64,

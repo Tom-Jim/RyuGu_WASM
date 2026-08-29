@@ -282,7 +282,7 @@ fn dispatch_eq106(
                 extracted.density_mode_count,
                 element_index as u32 + 1,
                 evaluate_dual_certificate && element.target_offset == 0,
-                false,
+                0,
                 element.target_count,
                 element.target_offset,
             );

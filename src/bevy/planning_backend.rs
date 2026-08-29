@@ -74,6 +74,7 @@ pub fn update_planning_results_from_inversion_system(
             return;
         };
         *batch_builder = Some(builder);
+        planning.preparation_progress = 0.0;
         planning.status = format!(
             "{} candidate preparation: 0 / {} trajectories ({} sources).",
             planning.workload_profile.label(),
@@ -111,6 +112,8 @@ pub fn update_planning_results_from_inversion_system(
         *batch_builder = None;
         return;
     }
+    planning.preparation_progress = f64::from(builder.completed_candidates())
+        / f64::from(dimensions.0.max(1));
     if !builder.is_complete() {
         planning.status = format!(
             "{} candidate preparation: {} / {} trajectories.",
@@ -127,6 +130,7 @@ pub fn update_planning_results_from_inversion_system(
         planning.run_requested = false;
         return;
     };
+    planning.preparation_progress = 1.0;
     planning.reference_duration_seconds = inversion
         .knots
         .first()

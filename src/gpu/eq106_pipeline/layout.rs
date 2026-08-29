@@ -42,7 +42,8 @@ fn uniform_bytes(
     density_mode_count: u32,
     segment_id: u32,
     evaluate_dual_certificate: bool,
-    inversion_mode: bool,
+    // 0 = direct signed-spectrum, 1 = potential-only, 2 = Type-2 NUFFT.
+    inversion_mode: u32,
     target_count: u32,
     target_offset: u32,
 ) -> [u8; 96] {
@@ -77,7 +78,7 @@ fn uniform_bytes(
     }
     bytes[80..84].copy_from_slice(&longitudinal_limit.max(1.0).to_le_bytes());
     bytes[84..88].copy_from_slice(&target_offset.to_le_bytes());
-    bytes[88..92].copy_from_slice(&u32::from(inversion_mode).to_le_bytes());
+    bytes[88..92].copy_from_slice(&inversion_mode.to_le_bytes());
     bytes
 }
 
@@ -131,6 +132,62 @@ mod tests {
         assert!(records.iter().flatten().all(|value| value.is_finite()));
     }
 
+    #[test]
+    fn oversampled_type2_grid_matches_direct_nonuniform_sum() {
+        use num_complex::Complex32;
+        use rustfft::FftPlanner;
+
+        let mut modes = vec![Complex32::new(0.0, 0.0); NUFFT_GRID_SIZE as usize];
+        for signed in -(HALF_COUNT as i32)..=HALF_COUNT as i32 {
+            let bin = signed.rem_euclid(NUFFT_GRID_SIZE as i32) as usize;
+            let decay = 1.0 / (1.0 + (signed as f32).abs()).powi(2);
+            modes[bin] = Complex32::new(
+                decay * (0.37 * signed as f32).cos(),
+                decay * (0.19 * signed as f32).sin(),
+            );
+        }
+        let original = modes.clone();
+        FftPlanner::<f32>::new()
+            .plan_fft_inverse(NUFFT_GRID_SIZE as usize)
+            .process(&mut modes);
+        let period = std::f32::consts::TAU / 0.002;
+        for h in [0.0_f32, 1.25, 17.0, 223.75, 901.125, 1_799.5] {
+            let coordinate = (h / period).fract() * NUFFT_GRID_SIZE as f32;
+            let index1 = coordinate.floor() as usize % NUFFT_GRID_SIZE as usize;
+            let index0 = (index1 + NUFFT_GRID_SIZE as usize - 1) % NUFFT_GRID_SIZE as usize;
+            let index2 = (index1 + 1) % NUFFT_GRID_SIZE as usize;
+            let index3 = (index1 + 2) % NUFFT_GRID_SIZE as usize;
+            let fraction = coordinate.fract();
+            let fraction2 = fraction * fraction;
+            let fraction3 = fraction2 * fraction;
+            let cubic = 0.5
+                * (2.0 * modes[index1]
+                    + (-modes[index0] + modes[index2]) * fraction
+                    + (2.0 * modes[index0] - 5.0 * modes[index1]
+                        + 4.0 * modes[index2]
+                        - modes[index3])
+                        * fraction2
+                    + (-modes[index0] + 3.0 * modes[index1] - 3.0 * modes[index2]
+                        + modes[index3])
+                        * fraction3);
+            let direct = original
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.norm_sqr() > 0.0)
+                .fold(Complex32::new(0.0, 0.0), |sum, (bin, value)| {
+                    let signed = if bin <= HALF_COUNT as usize {
+                        bin as i32
+                    } else {
+                        bin as i32 - NUFFT_GRID_SIZE as i32
+                    };
+                    let phase = Complex32::from_polar(1.0, signed as f32 * 0.002 * h);
+                    sum + *value * phase
+                });
+            let relative_error = (cubic - direct).norm() / direct.norm().max(1.0e-6);
+            assert!(relative_error <= 1.0e-3, "h={h}: {relative_error}");
+        }
+    }
+
     fn snapshot(request_id: u64, body_position: Vec3) -> GravityRequestSnapshot {
         GravityRequestSnapshot {
             request_id,
@@ -180,7 +237,7 @@ mod tests {
             544,
             9,
             false,
-            false,
+            0,
             90_166,
             0,
         );
@@ -192,6 +249,27 @@ mod tests {
         assert_eq!(read_u32(&bytes, 68), 9);
         assert_eq!(read_u32(&bytes, 72), 0);
         assert_eq!(read_u32(&bytes, 76), 90_166);
+        assert_eq!(read_u32(&bytes, 88), 0);
+    }
+
+    #[test]
+    fn uniform_layout_encodes_type2_nufft_mode_explicitly() {
+        let bytes = uniform_bytes(
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::X,
+            1,
+            1.0,
+            1.0,
+            1,
+            0,
+            1,
+            false,
+            2,
+            1,
+            0,
+        );
+        assert_eq!(read_u32(&bytes, 88), 2);
     }
 
     #[test]

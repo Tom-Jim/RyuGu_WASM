@@ -27,7 +27,7 @@ use bevy::render::{
     },
     renderer::{RenderDevice, RenderQueue},
 };
-use bevy::shader::ShaderCacheError;
+use bevy::shader::{ShaderCacheError, ShaderDefVal};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -38,6 +38,8 @@ const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
 const QUADRATURE_COUNT: u32 = 64;
 const TAYLOR_MAX_ORDER: u32 = 8;
 const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 45;
+const NUFFT_GRID_SIZE: u32 = 1024;
+const NUFFT_PAIR_COUNT: u32 = 6;
 const DUAL_CERTIFICATE_CADENCE: u32 = 30;
 const OUTPUT_ROWS_PER_BLOCK: u64 = 11;
 const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
@@ -337,6 +339,7 @@ struct Eq106ComputePipeline {
     planning_voxel_line_samples_id: CachedComputePipelineId,
     planning_voxel_spectrum_id: CachedComputePipelineId,
     planning_combine_spectrum_id: CachedComputePipelineId,
+    planning_nufft_grid_id: CachedComputePipelineId,
     planning_evaluate_id: CachedComputePipelineId,
 }
 
@@ -404,12 +407,15 @@ impl FromWorld for Eq106ComputePipeline {
             crate::wgsl::EmbeddedShader::Eq106,
         );
         let cache = world.resource::<PipelineCache>();
+        let source_shader_defs = vec![ShaderDefVal::from("EQ106_SOURCE")];
+        let spectrum_shader_defs = vec![ShaderDefVal::from("EQ106_SPECTRUM")];
+        let evaluator_shader_defs = vec![ShaderDefVal::from("EQ106_EVALUATOR")];
         let line_samples_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_assemble_line_samples".into()),
             layout: vec![layout.clone()],
             immediate_size: 0,
             shader: shader.clone(),
-            shader_defs: vec![],
+            shader_defs: source_shader_defs.clone(),
             entry_point: Some("assemble_line_samples".into()),
             zero_initialize_workgroup_memory: false,
         });
@@ -418,7 +424,7 @@ impl FromWorld for Eq106ComputePipeline {
             layout: vec![layout.clone()],
             immediate_size: 0,
             shader: shader.clone(),
-            shader_defs: vec![],
+            shader_defs: spectrum_shader_defs.clone(),
             entry_point: Some("assemble_spectrum".into()),
             zero_initialize_workgroup_memory: false,
         });
@@ -427,7 +433,7 @@ impl FromWorld for Eq106ComputePipeline {
             layout: vec![layout],
             immediate_size: 0,
             shader: shader.clone(),
-            shader_defs: vec![],
+            shader_defs: evaluator_shader_defs.clone(),
             entry_point: Some("evaluate_field".into()),
             zero_initialize_workgroup_memory: false,
         });
@@ -451,7 +457,7 @@ impl FromWorld for Eq106ComputePipeline {
                 layout: vec![planning_layout.clone()],
                 immediate_size: 0,
                 shader: shader.clone(),
-                shader_defs: vec![],
+                shader_defs: source_shader_defs.clone(),
                 entry_point: Some("assemble_voxel_line_samples".into()),
                 zero_initialize_workgroup_memory: false,
             });
@@ -460,7 +466,7 @@ impl FromWorld for Eq106ComputePipeline {
             layout: vec![planning_layout.clone()],
             immediate_size: 0,
             shader: shader.clone(),
-            shader_defs: vec![],
+            shader_defs: spectrum_shader_defs.clone(),
             entry_point: Some("assemble_voxel_spectrum".into()),
             zero_initialize_workgroup_memory: false,
         });
@@ -470,16 +476,29 @@ impl FromWorld for Eq106ComputePipeline {
                 layout: vec![planning_layout.clone()],
                 immediate_size: 0,
                 shader: shader.clone(),
-                shader_defs: vec![],
+                shader_defs: spectrum_shader_defs,
                 entry_point: Some("combine_voxel_spectrum".into()),
                 zero_initialize_workgroup_memory: false,
             });
+        let nufft_shader = crate::wgsl::load(
+            world.resource::<AssetServer>(),
+            crate::wgsl::EmbeddedShader::Eq106Nufft,
+        );
+        let planning_nufft_grid_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("eq106_planning_type2_nufft_grid".into()),
+            layout: vec![planning_layout.clone()],
+            immediate_size: 0,
+            shader: nufft_shader,
+            shader_defs: vec![],
+            entry_point: Some("build_type2_nufft_grid".into()),
+            zero_initialize_workgroup_memory: false,
+        });
         let planning_evaluate_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_planning_evaluate_field".into()),
             layout: vec![planning_layout],
             immediate_size: 0,
             shader,
-            shader_defs: vec![],
+            shader_defs: evaluator_shader_defs,
             entry_point: Some("evaluate_field".into()),
             zero_initialize_workgroup_memory: false,
         });
@@ -490,6 +509,7 @@ impl FromWorld for Eq106ComputePipeline {
             planning_voxel_line_samples_id,
             planning_voxel_spectrum_id,
             planning_combine_spectrum_id,
+            planning_nufft_grid_id,
             planning_evaluate_id,
         }
     }

@@ -59,20 +59,27 @@ struct SpectrumSample {
 
 var<workgroup> eq_params: Eq106Params;
 
+#ifdef EQ106_EVALUATOR
 var<workgroup> evaluation_phase: array<vec2<f32>, 129>;
 var<workgroup> evaluation_spectral_derivative: array<vec2<f32>, 129>;
 var<workgroup> evaluation_omega: array<f32, 129>;
-var<workgroup> evaluation_sum: array<vec4<f32>, 64>;
-var<workgroup> evaluation_derivative: array<vec4<f32>, 64>;
-var<workgroup> evaluation_imaginary: array<vec4<f32>, 64>;
-var<workgroup> evaluation_tail: array<vec4<f32>, 64>;
-var<workgroup> evaluation_edge: array<vec2<f32>, 64>;
-var<workgroup> evaluation_coarse: array<vec4<f32>, 64>;
-var<workgroup> evaluation_edge_coarse: array<vec2<f32>, 64>;
-// Source accumulation uses twice the evaluator lane count.  Reducing two
-// Taylor coefficients together keeps total workgroup storage below the WebGPU
-// portable 16 KiB floor while cutting synchronization substantially.
+// The evaluator deliberately uses 32 lanes.  Its five vec4 reductions, two
+// vec2 reductions, and phase tables then fit under the portable 16 KiB
+// workgroup-storage limit (including `eq_params`).
+var<workgroup> evaluation_sum: array<vec4<f32>, 32>;
+var<workgroup> evaluation_derivative: array<vec4<f32>, 32>;
+var<workgroup> evaluation_imaginary: array<vec4<f32>, 32>;
+var<workgroup> evaluation_tail: array<vec4<f32>, 32>;
+var<workgroup> evaluation_edge: array<vec2<f32>, 32>;
+var<workgroup> evaluation_coarse: array<vec4<f32>, 32>;
+var<workgroup> evaluation_edge_coarse: array<vec2<f32>, 32>;
+#endif
+#ifdef EQ106_SOURCE
+// Two 128-lane reductions occupy 4 KiB. Together with the evaluator scratch
+// and `eq_params`, the module stays below WebGPU's portable 16 KiB limit while
+// reducing two Taylor coefficients per barrier sequence.
 var<workgroup> source_reduction: array<vec4<f32>, 256>;
+#endif
 
 const PI: f32 = 3.141592653589793;
 const TAYLOR_MAX_ORDER: u32 = 8u;
@@ -86,6 +93,8 @@ const PLANNING_VOXEL_COUNT: u32 = 56u;
 const PLANNING_VOXEL_BANK_COUNT: u32 = 28u;
 const SOURCE_LANE_COUNT: u32 = 128u;
 const SOURCE_REDUCTION_CHUNK: u32 = 2u;
+const NUFFT_GRID_SIZE: u32 = 1024u;
+const NUFFT_PAIR_COUNT: u32 = 6u;
 const COEFFICIENT_A = array<u32, 45>(
     0u,
     1u, 0u,
@@ -133,6 +142,49 @@ fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
+#ifdef EQ106_EVALUATOR
+struct NufftInterpolation {
+    value: vec4<f32>,
+    error: vec4<f32>,
+};
+
+fn type2_nufft_interpolate(
+    coefficient: u32,
+    pair: u32,
+    h: f32,
+) -> NufftInterpolation {
+    let period = 2.0 * PI / max(eq_params.omega_step, 1.0e-12);
+    let coordinate = fract(max(h, 0.0) / period) * f32(NUFFT_GRID_SIZE);
+    let index1 = u32(floor(coordinate)) % NUFFT_GRID_SIZE;
+    let index0 = (index1 + NUFFT_GRID_SIZE - 1u) % NUFFT_GRID_SIZE;
+    let index2 = (index1 + 1u) % NUFFT_GRID_SIZE;
+    let index3 = (index1 + 2u) % NUFFT_GRID_SIZE;
+    let fraction = coordinate - floor(coordinate);
+    let base = u32(density_modes.records[112].z)
+        + ((eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT
+            * NUFFT_PAIR_COUNT + coefficient * NUFFT_PAIR_COUNT + pair) * NUFFT_GRID_SIZE;
+    let p0 = line_samples[base + index0];
+    let p1 = line_samples[base + index1];
+    let p2 = line_samples[base + index2];
+    let p3 = line_samples[base + index3];
+    // Spell out the vector weight for browser WGSL implementations that do
+    // not yet accept the vector-vector-scalar overload of `mix`.
+    let linear = mix(p1, p2, vec4<f32>(fraction));
+    let fraction2 = fraction * fraction;
+    let fraction3 = fraction2 * fraction;
+    let cubic = 0.5 * (
+        2.0 * p1
+        + (-p0 + p2) * fraction
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * fraction2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * fraction3
+    );
+    var result: NufftInterpolation;
+    result.value = cubic;
+    result.error = abs(cubic - linear);
+    return result;
+}
+#endif
+
 fn coefficient_index(a: u32, b: u32) -> u32 {
     let degree = a + b;
     return degree * (degree + 1u) / 2u + b;
@@ -151,52 +203,54 @@ fn transverse_basis(direction: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(tangent, normal, binormal);
 }
 
-fn scalar_power_coefficient(
-    coefficients: ptr<function, array<f32, 45>>,
+#ifdef EQ106_SOURCE
+fn radial_power_coefficient(
+    coefficients: ptr<function, array<vec2<f32>, 45>>,
     a: u32,
     b: u32,
-) -> f32 {
+) -> vec2<f32> {
     if a + b > TAYLOR_MAX_ORDER {
-        return 0.0;
+        return vec2<f32>(0.0);
     }
     return (*coefficients)[coefficient_index(a, b)];
 }
 
-// Build the coefficients of
-// (x0 + x10*u + x01*v + u^2 + v^2)^alpha
-// by grouping the bivariate series by total degree. This is the multivariate
-// form of the same power-series recurrence used by the CPU reference tests.
-fn build_radial_power_series(
+// Build r^-1 and r^-3 together. Both powers share the same sparse bivariate
+// polynomial and predecessor walk, so a paired recurrence avoids constructing
+// and traversing two 45-element function-local arrays for every volume source.
+// The x/y components are exactly the alpha=-1/2 and alpha=-3/2 recurrences
+// used by the independent CPU reference tests.
+fn build_inverse_radial_power_series(
     x0: f32,
     x10: f32,
     x01: f32,
-    alpha: f32,
-    initial: f32,
-) -> array<f32, 45> {
-    var result: array<f32, 45>;
+) -> array<vec2<f32>, 45> {
+    var result: array<vec2<f32>, 45>;
     for (var index = 0u; index < active_coefficient_count(); index += 1u) {
-        result[index] = 0.0;
+        result[index] = vec2<f32>(0.0);
     }
-    result[0] = initial;
+    let inverse_radius = inverseSqrt(x0);
+    result[0] = vec2<f32>(inverse_radius, inverse_radius / x0);
     for (var degree = 1u; degree <= min(eq_params.taylor_order, TAYLOR_MAX_ORDER); degree += 1u) {
         for (var b = 0u; b <= degree; b += 1u) {
             let a = degree - b;
-            var numerator = 0.0;
-            let linear_factor = (alpha + 1.0) - f32(degree);
+            var numerator = vec2<f32>(0.0);
+            let degree_f = f32(degree);
+            let linear_factor = vec2<f32>(0.5 - degree_f, -0.5 - degree_f);
             if a >= 1u {
-                numerator += linear_factor * x10 * scalar_power_coefficient(&result, a - 1u, b);
+                numerator += linear_factor * x10 * radial_power_coefficient(&result, a - 1u, b);
             }
             if b >= 1u {
-                numerator += linear_factor * x01 * scalar_power_coefficient(&result, a, b - 1u);
+                numerator += linear_factor * x01 * radial_power_coefficient(&result, a, b - 1u);
             }
-            let quadratic_factor = 2.0 * (alpha + 1.0) - f32(degree);
+            let quadratic_factor = vec2<f32>(1.0 - degree_f, -1.0 - degree_f);
             if a >= 2u {
-                numerator += quadratic_factor * scalar_power_coefficient(&result, a - 2u, b);
+                numerator += quadratic_factor * radial_power_coefficient(&result, a - 2u, b);
             }
             if b >= 2u {
-                numerator += quadratic_factor * scalar_power_coefficient(&result, a, b - 2u);
+                numerator += quadratic_factor * radial_power_coefficient(&result, a, b - 2u);
             }
-            result[coefficient_index(a, b)] = numerator / (f32(degree) * x0);
+            result[coefficient_index(a, b)] = numerator / (degree_f * x0);
         }
     }
     return result;
@@ -213,14 +267,8 @@ fn accumulate_source_range(
     let coefficient_count = active_coefficient_count();
     // Store the Taylor jet in dimensionless transverse coordinates. This
     // keeps high-order coefficients near the scale of the field instead of
-    // summing metre^-8 values in f32. Evaluation applies u/d and v/d below.
-    let source_radius = 2.0 / max(eq_params.sigma, 1.0e-12);
-    let transverse_scale = max(length(eq_params.line_origin) - source_radius, 1.0);
-    var transverse_powers: array<f32, 9>;
-    transverse_powers[0] = 1.0;
-    for (var degree = 1u; degree <= TAYLOR_MAX_ORDER; degree += 1u) {
-        transverse_powers[degree] = transverse_powers[degree - 1u] * transverse_scale;
-    }
+    // summing metre^-8 values in f32. The source-independent coordinate scale
+    // is applied once after lane reduction instead of for every source below.
     var packed: array<vec4<f32>, 45>;
     for (var index = 0u; index < MAX_TAYLOR_COEFFICIENT_COUNT; index += 1u) {
         packed[index] = vec4<f32>(0.0);
@@ -231,28 +279,24 @@ fn accumulate_source_range(
         let x0 = max(dot(r0, r0), 1.0e-8);
         let x10 = -2.0 * dot(r0, normal);
         let x01 = -2.0 * dot(r0, binormal);
-        let inverse_radius = inverseSqrt(x0);
-        let inverse_r = build_radial_power_series(x0, x10, x01, -0.5, inverse_radius);
-        let inverse_r3 = build_radial_power_series(
-            x0, x10, x01, -1.5, inverse_radius / x0,
-        );
+        let inverse_radial_powers = build_inverse_radial_power_series(x0, x10, x01);
         let source_scale = eq_params.g_const * source.w;
 
         for (var coefficient = 0u; coefficient < coefficient_count; coefficient += 1u) {
             let a = COEFFICIENT_A[coefficient];
             let b = COEFFICIENT_B[coefficient];
-            let coordinate_scale = transverse_powers[COEFFICIENT_DEGREE[coefficient]];
             var previous_u = 0.0;
             var previous_v = 0.0;
             if a > 0u {
-                previous_u = inverse_r3[coefficient_index(a - 1u, b)];
+                previous_u = inverse_radial_powers[coefficient_index(a - 1u, b)].y;
             }
             if b > 0u {
-                previous_v = inverse_r3[coefficient_index(a, b - 1u)];
+                previous_v = inverse_radial_powers[coefficient_index(a, b - 1u)].y;
             }
-            packed[coefficient] += source_scale * coordinate_scale * vec4<f32>(
-                r0 * inverse_r3[coefficient] - normal * previous_u - binormal * previous_v,
-                inverse_r[coefficient],
+            let inverse_r = inverse_radial_powers[coefficient];
+            packed[coefficient] += source_scale * vec4<f32>(
+                r0 * inverse_r.y - normal * previous_u - binormal * previous_v,
+                inverse_r.x,
             );
         }
     }
@@ -266,40 +310,95 @@ fn reduce_and_store_taylor_jet(
     destination_base: u32,
     quadrature_weight: f32,
 ) {
+    let source_radius = 2.0 / max(eq_params.sigma, 1.0e-12);
+    let transverse_scale = max(length(eq_params.line_origin) - source_radius, 1.0);
+    // Keep every workgroup on the same barrier schedule. The active
+    // coefficient count must not control a loop containing barriers on
+    // Dawn/Tint, even though it is identical in every lane. Inactive
+    // coefficients remain zero and are skipped at the store.
     for (var chunk = 0u; chunk < MAX_TAYLOR_COEFFICIENT_COUNT; chunk += SOURCE_REDUCTION_CHUNK) {
         for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
             let coefficient = chunk + slot;
             var value = vec4<f32>(0.0);
-            if coefficient < MAX_TAYLOR_COEFFICIENT_COUNT {
+            if coefficient < coefficient_count {
                 value = (*packed)[coefficient];
             }
             source_reduction[slot * SOURCE_LANE_COUNT + lane] = value;
         }
         workgroupBarrier();
-        var stride = SOURCE_LANE_COUNT / 2u;
-        loop {
-            if stride == 0u { break; }
-            if lane < stride {
-                for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
-                    let base = slot * SOURCE_LANE_COUNT;
-                    source_reduction[base + lane] += source_reduction[base + lane + stride];
-                }
+        // Keep the barrier schedule syntactically fixed. A `loop` whose
+        // private stride is decremented until zero is mathematically fixed,
+        // but Dawn/Tint's uniformity analysis cannot always prove that fact.
+        // These are the same seven radix-2 stages, written explicitly so every
+        // lane reaches every barrier on every browser backend.
+        if lane < 64u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 64u];
             }
-            workgroupBarrier();
-            stride = stride >> 1u;
         }
+        workgroupBarrier();
+        if lane < 32u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 32u];
+            }
+        }
+        workgroupBarrier();
+        if lane < 16u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 16u];
+            }
+        }
+        workgroupBarrier();
+        if lane < 8u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 8u];
+            }
+        }
+        workgroupBarrier();
+        if lane < 4u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 4u];
+            }
+        }
+        workgroupBarrier();
+        if lane < 2u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 2u];
+            }
+        }
+        workgroupBarrier();
+        if lane < 1u {
+            for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
+                let base = slot * SOURCE_LANE_COUNT;
+                source_reduction[base + lane] += source_reduction[base + lane + 1u];
+            }
+        }
+        workgroupBarrier();
         if lane == 0u {
             for (var slot = 0u; slot < SOURCE_REDUCTION_CHUNK; slot += 1u) {
                 let coefficient = chunk + slot;
                 if coefficient < coefficient_count {
+                    var coordinate_scale = 1.0;
+                    for (var degree = 0u; degree < COEFFICIENT_DEGREE[coefficient]; degree += 1u) {
+                        coordinate_scale *= transverse_scale;
+                    }
                     line_samples[destination_base + coefficient * QUADRATURE_CAPACITY] =
-                        source_reduction[slot * SOURCE_LANE_COUNT] * quadrature_weight;
+                        source_reduction[slot * SOURCE_LANE_COUNT]
+                        * (quadrature_weight * coordinate_scale);
                 }
             }
         }
     }
 }
+#endif
 
+#ifdef EQ106_SOURCE
 @compute @workgroup_size(128, 1, 1)
 fn assemble_line_samples(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
@@ -358,7 +457,9 @@ fn assemble_voxel_line_samples(
         &packed, coefficient_count, local_index, destination_base, sample.y,
     );
 }
+#endif
 
+#ifdef EQ106_SPECTRUM
 @compute @workgroup_size(64, 1, 1)
 fn assemble_spectrum(
     @builtin(global_invocation_id) global_id: vec3<u32>,
@@ -396,7 +497,9 @@ fn assemble_spectrum(
     spectrum[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY
         + flat_index] = result;
 }
+#endif
 
+#ifdef EQ106_SPECTRUM
 @compute @workgroup_size(64, 1, 1)
 fn assemble_voxel_spectrum(
     @builtin(global_invocation_id) global_id: vec3<u32>,
@@ -447,7 +550,9 @@ fn assemble_voxel_spectrum(
         output[high_offset + 1u] = packed_b;
     }
 }
+#endif
 
+#ifdef EQ106_SPECTRUM
 @compute @workgroup_size(64, 1, 1)
 fn combine_voxel_spectrum(
     @builtin(global_invocation_id) global_id: vec3<u32>,
@@ -498,7 +603,9 @@ fn combine_voxel_spectrum(
     spectrum[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT
         * SPECTRUM_FREQUENCY_CAPACITY + flat_index] = result;
 }
+#endif
 
+#ifdef EQ106_EVALUATOR
 fn integer_power(value: f32, exponent: u32) -> f32 {
     var result = 1.0;
     for (var index = 0u; index < exponent; index += 1u) {
@@ -569,7 +676,7 @@ fn fourier_toroidal_potential(position: vec3<f32>) -> f32 {
     return eq_params.g_const * potential / PI;
 }
 
-@compute @workgroup_size(64, 1, 1)
+@compute @workgroup_size(32, 1, 1)
 fn evaluate_field(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
@@ -666,7 +773,7 @@ fn evaluate_field(
 
     var local_edge = vec2<f32>(0.0);
     var local_edge_coarse = vec2<f32>(0.0);
-    for (var frequency_index = lane; frequency_index < frequency_count; frequency_index += 64u) {
+    for (var frequency_index = lane; frequency_index < frequency_count; frequency_index += 32u) {
         let omega = evaluation_omega[frequency_index];
         let denominator = max(eq_params.sigma * eq_params.sigma + omega * omega, 1.0e-20);
         let phase = evaluation_phase[frequency_index];
@@ -675,7 +782,7 @@ fn evaluate_field(
             local_edge_coarse.x +=
                 (phase.x * eq_params.sigma + phase.y * omega) / denominator;
         }
-        if eq_params.inversion_mode == 0u {
+        if eq_params.inversion_mode != 1u {
             let spectral_derivative = evaluation_spectral_derivative[frequency_index];
             local_edge.y += (
                 spectral_derivative.x * eq_params.sigma
@@ -692,7 +799,7 @@ fn evaluate_field(
     evaluation_edge[lane] = local_edge;
     evaluation_edge_coarse[lane] = local_edge_coarse;
     workgroupBarrier();
-    var edge_stride = 32u;
+    var edge_stride = 16u;
     loop {
         if edge_stride == 0u { break; }
         if lane < edge_stride {
@@ -734,34 +841,85 @@ fn evaluate_field(
         // Extra workgroups from a batched dispatch likewise remain on the
         // barrier path without repeating an active target's full evaluation.
         if coefficient < coefficient_count && target_active {
-            for (var frequency_index = lane; frequency_index < frequency_count; frequency_index += 64u) {
-                let signed_index = i32(frequency_index) - i32(eq_params.half_count);
-                let phase = evaluation_phase[frequency_index];
-                let sample = spectrum[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY
-                    + coefficient * SPECTRUM_FREQUENCY_CAPACITY + frequency_index];
-                let x = complex_mul(sample.acceleration_x, phase);
-                let y = complex_mul(sample.acceleration_y, phase);
-                let z = complex_mul(sample.acceleration_z, phase);
-                local_sum += vec4<f32>(
-                    x.x,
-                    y.x,
-                    z.x,
-                    complex_mul(sample.potential, phase).x,
-                );
-                if frequency_index % 2u == 0u {
-                    local_coarse += vec3<f32>(x.x, y.x, z.x);
-                }
-                if eq_params.inversion_mode == 0u {
-                    let spectral_derivative = evaluation_spectral_derivative[frequency_index];
-                    local_derivative += vec3<f32>(
-                        complex_mul(sample.acceleration_x, spectral_derivative).x,
-                        complex_mul(sample.acceleration_y, spectral_derivative).x,
-                        complex_mul(sample.acceleration_z, spectral_derivative).x,
+            if eq_params.inversion_mode == 2u {
+                if lane == 0u {
+                    let growth = exp(eq_params.sigma * h);
+                    let fine_xy = type2_nufft_interpolate(coefficient, 0u, h);
+                    let fine_zp = type2_nufft_interpolate(coefficient, 1u, h);
+                    let derivative_xy = type2_nufft_interpolate(coefficient, 2u, h);
+                    let derivative_z = type2_nufft_interpolate(coefficient, 3u, h);
+                    let coarse_xy = type2_nufft_interpolate(coefficient, 4u, h);
+                    let coarse_z = type2_nufft_interpolate(coefficient, 5u, h);
+                    local_sum = growth * vec4<f32>(
+                        fine_xy.value.x,
+                        fine_xy.value.z,
+                        fine_zp.value.x,
+                        fine_zp.value.z,
+                    );
+                    local_derivative = growth * vec3<f32>(
+                        derivative_xy.value.x,
+                        derivative_xy.value.z,
+                        derivative_z.value.x,
+                    );
+                    local_coarse = growth * vec3<f32>(
+                        coarse_xy.value.x,
+                        coarse_xy.value.z,
+                        coarse_z.value.x,
                     );
                     if eq_params.evaluate_dual_certificate != 0u {
-                        local_imaginary += vec3<f32>(x.y, y.y, z.y);
-                        if abs(signed_index) == i32(eq_params.half_count) {
+                        local_imaginary = growth * vec3<f32>(
+                            fine_xy.value.y,
+                            fine_xy.value.w,
+                            fine_zp.value.y,
+                        );
+                        local_tail = growth * vec3<f32>(
+                            length(fine_xy.error.xy),
+                            length(fine_xy.error.zw),
+                            length(fine_zp.error.xy),
+                        );
+                        for (var endpoint = 0u; endpoint < 2u; endpoint += 1u) {
+                            let frequency_index = select(0u, frequency_count - 1u, endpoint == 1u);
+                            let phase = evaluation_phase[frequency_index];
+                            let sample = spectrum[(eq_params.segment_id - 1u)
+                                * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY
+                                + coefficient * SPECTRUM_FREQUENCY_CAPACITY + frequency_index];
+                            let x = complex_mul(sample.acceleration_x, phase);
+                            let y = complex_mul(sample.acceleration_y, phase);
+                            let z = complex_mul(sample.acceleration_z, phase);
                             local_tail += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+                        }
+                    }
+                }
+            } else {
+                for (var frequency_index = lane; frequency_index < frequency_count; frequency_index += 32u) {
+                    let signed_index = i32(frequency_index) - i32(eq_params.half_count);
+                    let phase = evaluation_phase[frequency_index];
+                    let sample = spectrum[(eq_params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT * SPECTRUM_FREQUENCY_CAPACITY
+                        + coefficient * SPECTRUM_FREQUENCY_CAPACITY + frequency_index];
+                    let x = complex_mul(sample.acceleration_x, phase);
+                    let y = complex_mul(sample.acceleration_y, phase);
+                    let z = complex_mul(sample.acceleration_z, phase);
+                    local_sum += vec4<f32>(
+                        x.x,
+                        y.x,
+                        z.x,
+                        complex_mul(sample.potential, phase).x,
+                    );
+                    if frequency_index % 2u == 0u {
+                        local_coarse += vec3<f32>(x.x, y.x, z.x);
+                    }
+                    if eq_params.inversion_mode != 1u {
+                        let spectral_derivative = evaluation_spectral_derivative[frequency_index];
+                        local_derivative += vec3<f32>(
+                            complex_mul(sample.acceleration_x, spectral_derivative).x,
+                            complex_mul(sample.acceleration_y, spectral_derivative).x,
+                            complex_mul(sample.acceleration_z, spectral_derivative).x,
+                        );
+                        if eq_params.evaluate_dual_certificate != 0u {
+                            local_imaginary += vec3<f32>(x.y, y.y, z.y);
+                            if abs(signed_index) == i32(eq_params.half_count) {
+                                local_tail += vec3<f32>(abs(x.x), abs(y.x), abs(z.x));
+                            }
                         }
                     }
                 }
@@ -774,7 +932,7 @@ fn evaluate_field(
         evaluation_coarse[lane] = vec4<f32>(local_coarse, 0.0);
         workgroupBarrier();
 
-        var stride = 32u;
+        var stride = 16u;
         loop {
             if stride == 0u { break; }
             if lane < stride {
@@ -800,7 +958,7 @@ fn evaluate_field(
             let reconstructed_coarse = evaluation_coarse[0].xyz
                 * (2.0 * inversion_scale) / coarse_edge_response;
             coarse_field += reconstructed_coarse * value;
-            if eq_params.inversion_mode == 0u {
+            if eq_params.inversion_mode != 1u {
                 let raw_derivative_h = evaluation_derivative[0].xyz * inversion_scale;
                 let reconstructed_derivative_h = (
                     raw_derivative_h * edge_response
@@ -851,7 +1009,7 @@ fn evaluate_field(
     if !target_active {
         return;
     }
-    if eq_params.inversion_mode != 0u {
+    if eq_params.inversion_mode == 1u {
         output[target_index] = field;
         return;
     }
@@ -862,13 +1020,24 @@ fn evaluate_field(
     let field_scale = max(length(field.xyz), 1.0e-12);
     let certificate_active = eq_params.evaluate_dual_certificate != 0u;
     let field_taylor_residual = select(0.0, length(last_order_field) / field_scale, certificate_active);
+    let source_compression_absolute_bound = 64.0 * eq_params.g_const
+        * density_modes.records[112].y;
+    let source_compression_residual = select(
+        0.0,
+        source_compression_absolute_bound / field_scale,
+        certificate_active,
+    );
     // The highest retained derivative is part of the solution, not the first
     // omitted term. In particular at A=1,u=v=0 it is usually the dominant
     // transverse gradient and must not be treated as a unit-sized remainder.
     // Gradient-tail admission is controlled by the CPU geometric bound
     // (A+1)*epsilon^A/(1-epsilon)^2; the shader certificate reports only the
     // observable field tail plus independent spectral diagnostics.
-    let taylor_residual = select(1.0, field_taylor_residual, edge_response_valid);
+    let taylor_residual = select(
+        1.0,
+        max(field_taylor_residual, source_compression_residual),
+        edge_response_valid,
+    );
     let imaginary_residual = select(0.0, length(imaginary_field) / field_scale, certificate_active);
     let frequency_convergence_residual = select(
         1.0,
@@ -929,3 +1098,4 @@ fn evaluate_field(
     );
     output[output_base + 10u] = vec4<f32>(self_fd_errors[4], 0.0, 0.0, 0.0);
 }
+#endif

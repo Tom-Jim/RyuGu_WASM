@@ -33,6 +33,8 @@ pub(crate) struct PlanningBatchBuilder {
     density_seed: u64,
     target_mass: f64,
     basis_records: Vec<PlanningBasisRecord>,
+    eq106_compressed_records: Vec<PlanningBasisRecord>,
+    eq106_compression_acceleration_coefficients: [f64; 56],
     basis_hash: u64,
     reference_jets: Vec<PlanningReferenceJet>,
     dynamics_tree: PlanningDynamicsTree,
@@ -107,16 +109,31 @@ impl PlanningBatchBuilder {
             source.radius as f32,
             requested_source_count,
         )?;
-        let eq106_source_radius = basis_records.iter().fold(0.0_f32, |radius, record| {
-            radius.max(
-                Vec3::new(
-                    record.position_volume[0],
-                    record.position_volume[1],
-                    record.position_volume[2],
+        let reference_body_positions = reference_states
+            .iter()
+            .map(|state| state.body_position())
+            .collect::<Vec<_>>();
+        let (eq106_compressed_records, eq106_compression_acceleration_coefficients) =
+            compress_refined_basis_moments(
+                &canonical_basis_records,
+                &basis_records,
+                requested_source_count,
+                &reference_body_positions,
+                PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
+            )?;
+        let eq106_source_radius = basis_records.iter().chain(&eq106_compressed_records).fold(
+            0.0_f32,
+            |radius, record| {
+                radius.max(
+                    Vec3::new(
+                        record.position_volume[0],
+                        record.position_volume[1],
+                        record.position_volume[2],
+                    )
+                    .length(),
                 )
-                .length(),
-            )
-        });
+            },
+        );
         if !eq106_source_radius.is_finite() || eq106_source_radius <= 0.0 {
             return None;
         }
@@ -175,6 +192,8 @@ impl PlanningBatchBuilder {
             density_seed,
             target_mass,
             basis_records,
+            eq106_compressed_records,
+            eq106_compression_acceleration_coefficients,
             basis_hash,
             reference_jets,
             dynamics_tree,
@@ -281,7 +300,7 @@ impl PlanningBatchBuilder {
             "generated uniformly randomized positive voxel-density models with conserved asteroid mass"
         );
         let (eq106_volume_source_bytes, eq106_voxel_source_ranges) =
-            eq106_geometry_buffers(&self.basis_records)?;
+            eq106_geometry_buffers(&self.eq106_compressed_records)?;
         Some((
             PlanningCandidateBatch {
                 batch_id,
@@ -304,6 +323,9 @@ impl PlanningBatchBuilder {
                 basis_records: Arc::from(self.basis_records),
                 eq106_volume_source_bytes,
                 eq106_voxel_source_ranges: Arc::from(eq106_voxel_source_ranges),
+                eq106_compression_acceleration_coefficients: Arc::from(
+                    self.eq106_compression_acceleration_coefficients,
+                ),
                 reference_arc_hash,
                 candidate_hash,
                 density_model_hash,
@@ -558,6 +580,185 @@ fn spatially_refine_basis_records(
         }
     }
     (refined.len() == requested).then_some(refined)
+}
+
+/// Compress each deterministic antithetic child cloud to a positive six-point
+/// sigma rule. The rule preserves zeroth, first, second, and (by central
+/// symmetry) third moments. Consequently the first unmatched contribution to
+/// an exterior Newton field is fourth order. `fourth_moments` contains the sum
+/// of the absolute original and replacement fourth moments, which is a
+/// conservative triangle-inequality remainder bound rather than an empirical
+/// error estimate. Each cluster is divided by its certified minimum distance
+/// to the complete trajectory tube before accumulation, avoiding the overly
+/// pessimistic global enclosing-sphere distance.
+fn compress_refined_basis_moments(
+    canonical: &[PlanningBasisRecord],
+    refined: &[PlanningBasisRecord],
+    requested: u32,
+    trajectory_positions: &[Vec3],
+    trajectory_tube_radius: f32,
+) -> Option<(Vec<PlanningBasisRecord>, [f64; 56])> {
+    if canonical.is_empty()
+        || refined.len() != requested as usize
+        || requested < canonical.len() as u32
+        || trajectory_positions.is_empty()
+        || !trajectory_tube_radius.is_finite()
+        || trajectory_tube_radius < 0.0
+    {
+        return None;
+    }
+    let base = refined.len() / canonical.len();
+    let remainder = refined.len() % canonical.len();
+    let mut cursor = 0_usize;
+    let mut compressed = Vec::with_capacity(canonical.len().saturating_mul(6));
+    let mut fourth_moments = [0.0_f64; 56];
+    for (parent_index, parent) in canonical.iter().copied().enumerate() {
+        let count = base + usize::from(parent_index < remainder);
+        let children = refined.get(cursor..cursor + count)?;
+        cursor += count;
+        if children
+            .iter()
+            .any(|child| child.voxel_index != parent.voxel_index)
+        {
+            return None;
+        }
+        if count <= 6 {
+            compressed.extend_from_slice(children);
+            continue;
+        }
+        let total_volume = children
+            .iter()
+            .map(|child| f64::from(child.position_volume[3]))
+            .sum::<f64>();
+        if !total_volume.is_finite() || total_volume <= 0.0 {
+            return None;
+        }
+        let centroid = children.iter().try_fold(DVec3::ZERO, |sum, child| {
+            let position = DVec3::new(
+                f64::from(child.position_volume[0]),
+                f64::from(child.position_volume[1]),
+                f64::from(child.position_volume[2]),
+            );
+            position
+                .is_finite()
+                .then_some(sum + position * f64::from(child.position_volume[3]))
+        })? / total_volume;
+        let covariance = children.iter().fold(DMat3::ZERO, |sum, child| {
+            let position = DVec3::new(
+                f64::from(child.position_volume[0]),
+                f64::from(child.position_volume[1]),
+                f64::from(child.position_volume[2]),
+            );
+            let delta = position - centroid;
+            sum + DMat3::from_cols(delta * delta.x, delta * delta.y, delta * delta.z)
+                * f64::from(child.position_volume[3])
+        }) / total_volume;
+        let columns = positive_semidefinite_cholesky_columns(covariance)?;
+        let sigma_scale = 3.0_f64.sqrt();
+        let sigma_volume = total_volume / 6.0;
+        let mut replacement_fourth_moment = 0.0_f64;
+        for column in columns {
+            let offset = sigma_scale * column;
+            replacement_fourth_moment += 2.0 * sigma_volume * offset.length_squared().powi(2);
+            for position in [centroid + offset, centroid - offset] {
+                compressed.push(PlanningBasisRecord {
+                    position_volume: [
+                        position.x as f32,
+                        position.y as f32,
+                        position.z as f32,
+                        sigma_volume as f32,
+                    ],
+                    voxel_index: parent.voxel_index,
+                });
+            }
+        }
+        let original_fourth_moment = children.iter().fold(0.0_f64, |sum, child| {
+            let position = DVec3::new(
+                f64::from(child.position_volume[0]),
+                f64::from(child.position_volume[1]),
+                f64::from(child.position_volume[2]),
+            );
+            let radius2 = (position - centroid).length_squared();
+            sum + f64::from(child.position_volume[3]) * radius2 * radius2
+        });
+        let voxel = usize::try_from(parent.voxel_index).ok()?;
+        let moment = original_fourth_moment + replacement_fourth_moment;
+        if voxel >= fourth_moments.len() || !moment.is_finite() || moment < 0.0 {
+            return None;
+        }
+        let support_radius = children
+            .iter()
+            .map(|child| {
+                DVec3::new(
+                    f64::from(child.position_volume[0]),
+                    f64::from(child.position_volume[1]),
+                    f64::from(child.position_volume[2]),
+                )
+                .distance(centroid)
+            })
+            .chain(
+                columns
+                    .into_iter()
+                    .map(|column| sigma_scale * column.length()),
+            )
+            .fold(0.0_f64, f64::max);
+        let distance_to_tube = trajectory_positions
+            .iter()
+            .map(|position| position.as_dvec3().distance(centroid))
+            .fold(f64::INFINITY, f64::min)
+            - f64::from(trajectory_tube_radius)
+            - support_radius;
+        if !distance_to_tube.is_finite() || distance_to_tube <= 0.0 {
+            return None;
+        }
+        fourth_moments[voxel] += moment / distance_to_tube.powi(6);
+    }
+    (cursor == refined.len()).then_some((compressed, fourth_moments))
+}
+
+fn positive_semidefinite_cholesky_columns(matrix: DMat3) -> Option<[DVec3; 3]> {
+    let rows = matrix.transpose();
+    let tolerance = 1.0e-12
+        * matrix
+            .to_cols_array()
+            .into_iter()
+            .map(f64::abs)
+            .fold(1.0, f64::max);
+    let l00 = rows.x_axis.x.max(0.0).sqrt();
+    let l10 = if l00 > tolerance {
+        rows.y_axis.x / l00
+    } else {
+        0.0
+    };
+    let l20 = if l00 > tolerance {
+        rows.z_axis.x / l00
+    } else {
+        0.0
+    };
+    let l11_squared = rows.y_axis.y - l10 * l10;
+    if l11_squared < -tolerance {
+        return None;
+    }
+    let l11 = l11_squared.max(0.0).sqrt();
+    let l21 = if l11 > tolerance {
+        (rows.z_axis.y - l20 * l10) / l11
+    } else {
+        0.0
+    };
+    let l22_squared = rows.z_axis.z - l20 * l20 - l21 * l21;
+    if l22_squared < -tolerance {
+        return None;
+    }
+    let l22 = l22_squared.max(0.0).sqrt();
+    let columns = [
+        DVec3::new(l00, l10, l20),
+        DVec3::new(0.0, l11, l21),
+        DVec3::new(0.0, 0.0, l22),
+    ];
+    columns
+        .iter()
+        .all(|column| column.is_finite())
+        .then_some(columns)
 }
 
 fn radical_inverse_vdc(value: u32) -> f32 {
@@ -1220,6 +1421,71 @@ mod tests {
                 .sum::<f64>();
             assert!((actual - expected_volume).abs() <= 1.0e-6);
         }
+    }
+
+    #[test]
+    fn eq106_sigma_compression_preserves_mass_centroid_and_covariance() {
+        let voxels = vec![InvertedDensityVoxel {
+            center: Vec3::ZERO,
+            volume: 1_000.0,
+            density: 1.0,
+            baseline_density: 1.0,
+            reference_density: 1.0,
+            grid: [5, 4, 5],
+        }];
+        let parent = PlanningBasisRecord {
+            position_volume: [1.0, -2.0, 3.0, 1_000.0],
+            voxel_index: 0,
+        };
+        let refined = spatially_refine_basis_records(&[parent], &voxels, 20.0, 100.0, 128)
+            .expect("refined antithetic cloud");
+        let (compressed, fourth_moments) = compress_refined_basis_moments(
+            &[parent],
+            &refined,
+            128,
+            &[Vec3::new(1_000.0, 0.0, 0.0)],
+            15.0,
+        )
+        .expect("moment compression");
+        assert_eq!(compressed.len(), 6);
+        assert!(fourth_moments[0].is_finite() && fourth_moments[0] > 0.0);
+
+        let moments = |records: &[PlanningBasisRecord]| {
+            let volume = records
+                .iter()
+                .map(|record| f64::from(record.position_volume[3]))
+                .sum::<f64>();
+            let centroid = records.iter().fold(DVec3::ZERO, |sum, record| {
+                sum + DVec3::new(
+                    f64::from(record.position_volume[0]),
+                    f64::from(record.position_volume[1]),
+                    f64::from(record.position_volume[2]),
+                ) * f64::from(record.position_volume[3])
+            }) / volume;
+            let covariance = records.iter().fold(DMat3::ZERO, |sum, record| {
+                let delta = DVec3::new(
+                    f64::from(record.position_volume[0]),
+                    f64::from(record.position_volume[1]),
+                    f64::from(record.position_volume[2]),
+                ) - centroid;
+                sum + DMat3::from_cols(delta * delta.x, delta * delta.y, delta * delta.z)
+                    * f64::from(record.position_volume[3])
+            }) / volume;
+            (volume, centroid, covariance)
+        };
+        let (refined_volume, refined_centroid, refined_covariance) = moments(&refined);
+        let (compressed_volume, compressed_centroid, compressed_covariance) = moments(&compressed);
+        assert!((refined_volume - compressed_volume).abs() <= 2.0e-4);
+        assert!(refined_centroid.distance(compressed_centroid) <= 2.0e-5);
+        let covariance_error = refined_covariance - compressed_covariance;
+        assert!(
+            covariance_error
+                .to_cols_array()
+                .into_iter()
+                .map(f64::abs)
+                .fold(0.0, f64::max)
+                <= 2.0e-4
+        );
     }
 
     #[test]

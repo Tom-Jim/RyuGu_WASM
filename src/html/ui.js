@@ -126,9 +126,12 @@
   const formatAxis = (value) => {
     if (!Number.isFinite(value)) return '--';
     const normalized = Object.is(value, -0) ? 0 : value;
-    return normalized.toExponential(2);
+    return normalized
+      .toExponential(3)
+      .replace(/\.?(?:0+)e/, 'e')
+      .replace('e+', 'e');
   };
-  function drawChart(svg, series, { xLog = false, yLog = false, xLabel = '', yLabel = '', fallbackXDomain = null, fallbackYDomain = null, empty = 'Waiting for samples…' } = {}) {
+  function drawChart(svg, series, { xLog = false, yLog = false, xLabel = '', yLabel = '', xDomain = null, minimumYDomain = null, empty = 'Waiting for samples…' } = {}) {
     svg.replaceChildren();
     const width = 900;
     const height = 430;
@@ -145,13 +148,15 @@
     let xMax = xs.length ? Math.max(...xs) : 1;
     let yMin = ys.length ? Math.min(...ys) : 0;
     let yMax = ys.length ? Math.max(...ys) : 1;
-    if (!points.length && fallbackXDomain?.length === 2 && fallbackXDomain.every((value) => Number.isFinite(value) && (!xLog || value > 0))) {
-      xMin = transformX(fallbackXDomain[0]);
-      xMax = transformX(fallbackXDomain[1]);
+    if (xDomain?.length === 2 && xDomain.every((value) => Number.isFinite(value) && (!xLog || value > 0))) {
+      xMin = transformX(xDomain[0]);
+      xMax = transformX(xDomain[1]);
     }
-    if (!points.length && fallbackYDomain?.length === 2 && fallbackYDomain.every((value) => Number.isFinite(value) && (!yLog || value > 0))) {
-      yMin = transformY(fallbackYDomain[0]);
-      yMax = transformY(fallbackYDomain[1]);
+    if (minimumYDomain?.length === 2 && minimumYDomain.every((value) => Number.isFinite(value) && (!yLog || value > 0))) {
+      const domainMin = transformY(minimumYDomain[0]);
+      const domainMax = transformY(minimumYDomain[1]);
+      yMin = points.length ? Math.min(yMin, domainMin) : domainMin;
+      yMax = points.length ? Math.max(yMax, domainMax) : domainMax;
     }
     if (xMin === xMax) {
       const pad = Math.max(Math.abs(xMin) * 0.05, xLog ? 0.5 : 1);
@@ -379,7 +384,11 @@
         points: history.map((sample, progress) => [progress, Math.abs((sample[1] - baseline) / denominator)]),
       };
     });
-    drawChart($('#performance-fps-chart'), fpsSeries, { xLabel: 'measurement sample', yLabel: 'frames per second' });
+    drawChart($('#performance-fps-chart'), fpsSeries, {
+      xLabel: 'measurement sample',
+      yLabel: 'frames per second',
+      minimumYDomain: [0, 60],
+    });
     drawChart($('#performance-jacobi-chart'), jacobiSeries, { yLog: true, xLabel: 'measurement sample', yLabel: '|ΔCⱼ/Cⱼ₀| (log₁₀)' });
     $('#performance-status').textContent = performance.measuring ? `Measuring ${methodLabels[performance.phase] ?? 'method'}…` : 'Benchmark complete. Repeat uses the same enabled methods.';
     const summaries = methodLabels.map((label, index) => {
@@ -431,7 +440,7 @@
       }
       $('#planning-status').textContent = snapshot.planning.status;
       $('#modal-status').textContent = snapshot.planning.status;
-      $('#quadrature-state').textContent = snapshot.planning.running ? Math.round(snapshot.planning.sourceCount / 1024) + 'K · R' + snapshot.planning.repeat : 'IDLE';
+      $('#quadrature-state').textContent = snapshot.planning.running ? Math.round(snapshot.planning.sourceCount / 1000) + 'K · R' + snapshot.planning.repeat : 'IDLE';
       $('#quadrature-start').disabled = snapshot.planning.running;
       $('#repeat-benchmark').disabled = !snapshot.performance.active || snapshot.performance.measuring;
       toggleDialog($('#quadrature-modal'), snapshot.planning.visible);
@@ -439,10 +448,10 @@
       drawChart($('#quadrature-chart'), benchmarkSeries, {
         xLog: true,
         yLog: true,
-        fallbackXDomain: [32 * 1024, 8192 * 1024],
-        fallbackYDomain: [1, 10],
-        xLabel: 'distinct quadrature points (log₂)',
-        yLabel: 'measured total time (ms, log₁₀)',
+        xDomain: [32_000, 8_192_000],
+        minimumYDomain: [1, 10],
+        xLabel: 'distinct quadrature points (log₂ scale)',
+        yLabel: 'measured total time (ms, log₁₀ scale)',
         empty: 'Waiting for measured GPU samples…',
       });
       makeLegend($('#curve-legend'), benchmarkSeries);

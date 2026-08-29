@@ -14,6 +14,7 @@ pub(crate) enum EmbeddedShader {
     Gravity,
     Werner,
     Eq106,
+    Eq106Nufft,
     Mmfft,
     Fmm,
     Normals,
@@ -27,6 +28,7 @@ pub(crate) fn load(server: &AssetServer, shader: EmbeddedShader) -> Handle<Shade
         EmbeddedShader::Gravity => load_embedded_asset!(server, "gravity.wgsl"),
         EmbeddedShader::Werner => load_embedded_asset!(server, "werner_gravity.wgsl"),
         EmbeddedShader::Eq106 => load_embedded_asset!(server, "eq106_complex.wgsl"),
+        EmbeddedShader::Eq106Nufft => load_embedded_asset!(server, "eq106_nufft.wgsl"),
         EmbeddedShader::Mmfft => load_embedded_asset!(server, "mmfft_compressed.wgsl"),
         EmbeddedShader::Fmm => load_embedded_asset!(server, "fmm_gravity.wgsl"),
         EmbeddedShader::Normals => load_embedded_asset!(server, "normals.wgsl"),
@@ -45,6 +47,7 @@ impl Plugin for WgslPlugin {
         embedded_asset!(app, "gravity.wgsl");
         embedded_asset!(app, "werner_gravity.wgsl");
         embedded_asset!(app, "eq106_complex.wgsl");
+        embedded_asset!(app, "eq106_nufft.wgsl");
         embedded_asset!(app, "mmfft_compressed.wgsl");
         embedded_asset!(app, "fmm_gravity.wgsl");
         embedded_asset!(app, "normals.wgsl");
