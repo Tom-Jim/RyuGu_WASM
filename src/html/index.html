@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/src/html/ui.css" />
-    <link rel="stylesheet" href="/src/html/tailwind.generated.css" />
+    <link rel="stylesheet" href="src/html/ui.css" />
+    <link rel="stylesheet" href="src/html/tailwind.generated.css" />
     <title>Ryugu Dynamics Laboratory</title>
 </head>
 <body>
@@ -125,9 +125,9 @@
         <section id="runtime-modal" class="modal critical" aria-hidden="true" role="alertdialog" aria-modal="true"><div class="error-card glass"><small>GPU PIPELINE STOPPED</small><h1>Computation paused</h1><p id="runtime-message"></p><button onclick="window.ryuguUi?.activate?.(this)" class="primary" data-action="runtime-reset">Reset parameters</button></div></section>
     </main>
     <div id="no-webgpu"><h2>WebGPU unavailable</h2><p>This simulation requires a browser and GPU with WebGPU support.</p></div>
-    <script type="importmap">{"imports":{"vue":"/node_modules/vue/dist/vue.esm-browser.prod.js"}}</script>
-    <script src="/src/html/ui.js"></script>
-    <script type="module" src="/src/html/app.js"></script>
+    <script type="importmap">{"imports":{"vue":"node_modules/vue/dist/vue.esm-browser.prod.js"}}</script>
+    <script src="src/html/ui.js"></script>
+    <script type="module" src="src/html/app.js"></script>
     <script type="module">
         const viewportFrame = document.getElementById('viewport-frame');
         function updateViewportFrame() {
@@ -156,8 +156,8 @@
         } else {
             const version = new URL(location.href).searchParams.get('v');
             const suffix = version ? `?v=${encodeURIComponent(version)}` : '';
-            const wasm = await import(`/pkg/ryugu_wasm.js${suffix}`);
-            await wasm.default({ module_or_path: `/pkg/ryugu_wasm_bg.wasm${suffix}` });
+            const wasm = await import(`pkg/ryugu_wasm.js${suffix}`);
+            await wasm.default({ module_or_path: `pkg/ryugu_wasm_bg.wasm${suffix}` });
         }
     </script>
 </body>

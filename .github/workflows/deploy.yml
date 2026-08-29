@@ -61,6 +61,18 @@ jobs:
                   cp -r assets site/ 2>/dev/null || true
                   cp -r pkg site/ 2>/dev/null || true
 
+            - name: Verify GitHub Pages asset paths
+              run: |
+                  test -f site/index.html
+                  test -f site/src/html/ui.css
+                  test -f site/src/html/ui.js
+                  test -f site/src/html/app.js
+                  test -f site/src/html/tailwind.generated.css
+                  test -f site/node_modules/vue/dist/vue.esm-browser.prod.js
+                  test -f site/pkg/ryugu_wasm.js
+                  test -f site/pkg/ryugu_wasm_bg.wasm
+                  ! grep -Eq '="/(src/html|pkg|node_modules)/' site/index.html
+
             - name: Upload Pages Artifact
               uses: actions/upload-pages-artifact@v3
               with:

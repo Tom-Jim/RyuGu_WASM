@@ -19,8 +19,9 @@ Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
-    let pathname = url.pathname === "/" ? "/src/html/index.html" : url.pathname;
-    const filePath = join(ROOT, pathname);
+    const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
+    const relativePath = pathname === "/index.html" ? "src/html/index.html" : pathname.slice(1);
+    const filePath = join(ROOT, relativePath);
 
     const file = Bun.file(filePath);
     if (!(await file.exists())) {
