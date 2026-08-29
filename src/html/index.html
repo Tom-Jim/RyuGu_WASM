@@ -130,16 +130,14 @@
     <script type="module" src="./src/html/app.js"></script>
     <script type="module">
         const viewportFrame = document.getElementById('viewport-frame');
+        const layoutWidth = 1280;
+        const layoutHeight = 720;
         function updateViewportFrame() {
-            const aspect = 16 / 9;
-            const compactPortrait = innerWidth < 700 && innerHeight > innerWidth;
-            const width = compactPortrait ? innerWidth : Math.min(innerWidth, innerHeight * aspect);
-            const height = compactPortrait ? innerHeight : width / aspect;
             const turn = Number(viewportFrame.dataset.quarterTurn ?? 0) % 4;
-            const rotatedWidth = turn % 2 === 0 ? width : height;
-            const rotatedHeight = turn % 2 === 0 ? height : width;
-            viewportFrame.style.width = `${width}px`;
-            viewportFrame.style.height = `${height}px`;
+            const rotatedWidth = turn % 2 === 0 ? layoutWidth : layoutHeight;
+            const rotatedHeight = turn % 2 === 0 ? layoutHeight : layoutWidth;
+            viewportFrame.style.width = `${layoutWidth}px`;
+            viewportFrame.style.height = `${layoutHeight}px`;
             viewportFrame.style.setProperty('--display-scale', String(Math.min(innerWidth / rotatedWidth, innerHeight / rotatedHeight)));
         }
         window.setRyuguDisplayRotation = (turn) => {
