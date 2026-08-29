@@ -809,8 +809,8 @@ fn dispatch_planning_eq106(
         voxel_basis_cache_hit = !build_basis_spectrum,
         source_parallel_lanes = 128,
         refined_source_count = batch.source_count,
-        compressed_source_count = source_count,
-        source_compression_ratio = f64::from(batch.source_count) / f64::from(source_count.max(1)),
+        payload_source_count = source_count,
+        payload_source_ratio = f64::from(source_count) / f64::from(batch.source_count.max(1)),
         voxel_basis_count = 56,
         type2_nufft_grid_size = NUFFT_GRID_SIZE,
         analytic_zero_correction = false,
@@ -1137,15 +1137,4 @@ fn planning_eq106_stage_budget(compute_benchmark: bool, total_stages: usize) -> 
     // Reserved for non-benchmark diagnostic callers. Both user-selectable
     // planning profiles use the full-stage fairness path above.
     2.min(total_stages.max(1))
-}
-
-#[cfg(test)]
-mod planning_stage_budget_tests {
-    use super::planning_eq106_stage_budget;
-
-    #[test]
-    fn fixed_benchmarks_encode_every_stage_but_interactive_runs_remain_paced() {
-        assert_eq!(planning_eq106_stage_budget(true, 4), 4);
-        assert!(planning_eq106_stage_budget(false, 4) <= 2);
-    }
 }

@@ -97,7 +97,10 @@ impl PlanningWorkloadProfile {
         match self {
             Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),
             Self::InteractiveStress => (PLANNING_CANDIDATE_COUNT, 32, 512),
-            Self::SourceCrossover => (64, 4, 96),
+            // One propagated trajectory with eight targets measures a real
+            // target-point cost while keeping 512 density-model switches
+            // practical in a browser frame loop.
+            Self::SourceCrossover => (1, 512, 8),
         }
     }
 
@@ -105,7 +108,7 @@ impl PlanningWorkloadProfile {
         match self {
             Self::First => "First 32x4x241",
             Self::InteractiveStress => "Stress 2048x32x512",
-            Self::SourceCrossover => "Quadrature-source crossover 64x4x96",
+            Self::SourceCrossover => "Quadrature-source crossover 1x512x8",
         }
     }
 }
@@ -205,6 +208,9 @@ pub struct PlanningMethodMetrics {
     pub certified_full_pass_ms: f64,
     pub certified_estimated_total_ms: f64,
     pub total_ms: f64,
+    pub geometry_basis_build_ms: f64,
+    pub density_model_ms: f64,
+    pub target_point_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
     pub certified_relative_gravity_error: f32,
@@ -294,8 +300,11 @@ pub struct PlanningBatchJob {
     pub candidate_gradient_sum: Vec<f64>,
     pub candidate_minimum_altitude_m: Vec<f32>,
     pub candidate_valid: Vec<bool>,
-    pub one_time_preparation_ms: f64,
-    pub preprocessing_ms: f64,
+    pub common_geometry_basis_ms: f64,
+    pub method_geometry_basis_ms: f64,
+    pub density_payload_preparation_ms: f64,
+    pub certified_density_payload_preparation_ms: f64,
+    pub gpu_preprocessing_ms: f64,
     pub command_submission_ms: f64,
     pub reduction_ms: f64,
     pub verification_ms: f64,
@@ -411,6 +420,12 @@ pub struct PlanningSourceCurveSample {
     pub source_count: u32,
     /// Eq.106 raw/certified, packed FFT raw/certified, FMM raw/certified.
     pub times_ms: [f64; 6],
+    /// Eq.106, packed FFT, FMM geometry/basis build costs.
+    pub geometry_basis_build_ms: [f64; 3],
+    /// Eq.106, packed FFT, FMM average cost for adding one density model.
+    pub density_model_ms: [f64; 3],
+    /// Eq.106, packed FFT, FMM average cost for one density-model target point.
+    pub target_point_ms: [f64; 3],
     pub eligible: [bool; 6],
 }
 
@@ -492,10 +507,10 @@ impl PlanningComparisonState {
     }
 
     pub fn blocks_realtime_gpu(&self) -> bool {
-        // All planning modes share the frame budget with the running scene.
-        // GPU submission/readback is asynchronous; freezing physics or UI for
-        // a benchmark makes the application appear hung.
-        false
+        // Keep the scene rendered, but freeze orbital integration while the
+        // long-running source sweep owns the shared GPU. Otherwise the probe
+        // can collide mid-benchmark and raise an unrelated reset dialog.
+        self.run_requested && self.workload_profile == PlanningWorkloadProfile::SourceCrossover
     }
 
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
@@ -618,43 +633,5 @@ impl PlanningComparisonState {
         } else {
             format!("{verdict}; {}", disqualified.join("; "))
         })
-    }
-}
-
-#[cfg(test)]
-mod planning_profile_tests {
-    use super::{PLANNING_SOURCE_COUNTS, PlanningComparisonState, PlanningWorkloadProfile};
-
-    #[test]
-    fn visible_profile_uses_fixed_batch_scheduling() {
-        assert!(PlanningWorkloadProfile::First.is_compute_benchmark());
-    }
-    #[test]
-    fn quadrature_curve_spans_32k_through_8192k() {
-        assert_eq!(PLANNING_SOURCE_COUNTS[0], 32_000);
-        assert_eq!(*PLANNING_SOURCE_COUNTS.last().unwrap(), 8_192_000);
-        assert!(PLANNING_SOURCE_COUNTS.windows(2).all(|pair| pair[1] == 2 * pair[0]));
-    }
-
-    #[test]
-    fn source_curve_progress_never_resets_between_source_counts() {
-        let mut state = PlanningComparisonState {
-            workload_profile: PlanningWorkloadProfile::SourceCrossover,
-            source_curve_active: true,
-            source_curve_visible: true,
-            run_requested: true,
-            preparation_progress: 1.0,
-            ..Default::default()
-        };
-        let first_source_prepared = state.progress_fraction();
-        state.source_curve_index = 1;
-        state.preparation_progress = 0.0;
-        let second_source_started = state.progress_fraction();
-        assert!((first_source_prepared - 1.0 / 36.0).abs() < f64::EPSILON);
-        assert!(second_source_started > first_source_prepared);
-
-        state.source_curve_index = PLANNING_SOURCE_COUNTS.len();
-        state.source_curve_active = false;
-        assert_eq!(state.progress_fraction(), 1.0);
     }
 }

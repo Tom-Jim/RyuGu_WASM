@@ -87,16 +87,14 @@ pub struct PlanningCandidateBatch {
     pub density_seed: u64,
     pub target_mass: f64,
     pub basis_records: Arc<[PlanningBasisRecord]>,
-    /// Eq.106 geometry-only source records `(x,y,z,volume)`. Unlike the
-    /// per-method payload this buffer is invariant across density models. The
-    /// refined antithetic clouds are moment-matched to at most six sigma
-    /// points per parent while preserving mass, centroid, and covariance.
+    /// Eq.106 geometry-only source records `(x,y,z,volume)`. The planning
+    /// benchmark uses the same refined basis records as packed FFT and FMM;
+    /// this legacy buffer remains only for non-benchmark callers.
     pub eq106_volume_source_bytes: Arc<[u8]>,
     /// Contiguous `(start,count)` ranges for the 56 density voxels.
     pub eq106_voxel_source_ranges: Arc<[[u32; 2]]>,
-    /// Per-voxel sum of `fourth central moment / distance_to_trajectory^6`.
-    /// Multiplication by density and the Newton-kernel derivative constant
-    /// gives a certified acceleration error for the complete trajectory tube.
+    /// Legacy sigma-compression certificate coefficients retained with the
+    /// batch, but ignored by the fair planning benchmark.
     pub eq106_compression_acceleration_coefficients: Arc<[f64]>,
     pub reference_arc_hash: u64,
     pub candidate_hash: u64,
@@ -240,8 +238,9 @@ pub struct PlanningMethodPayload {
     pub half_extents: [f32; 2],
     pub grid_scales: [f32; 2],
     pub total_mass: f32,
-    /// Program-lifetime setup excluded symmetrically from repeated-workload
-    /// totals (for example FFT plans/static Newton kernel or Eq operator table).
-    pub one_time_preparation_ms: f64,
-    pub preparation_ms: f64,
+    /// Method-specific immutable geometry/basis work performed once per source
+    /// point. Program-lifetime setup such as FFT plans is excluded.
+    pub geometry_basis_preparation_ms: f64,
+    /// CPU work needed to construct one density-dependent method payload.
+    pub density_payload_preparation_ms: f64,
 }

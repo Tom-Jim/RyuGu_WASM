@@ -6,8 +6,9 @@
   const methodKeys = ['radial', 'werner', 'eq106', 'fft', 'fmm'];
   const methodLabels = ['Radial', 'Werner', 'Eq.106', 'Packed FFT', 'FMM'];
   const methodColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77'];
-  const curveColors = ['#36e7f2', '#a873ff', '#ffb23d', '#ffe071', '#42dc77', '#9bffb3'];
+  const curveColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
   const curveLabels = ['Eq.106 raw', 'Eq.106 certified', 'Packed FFT raw', 'Packed FFT certified', 'FMM raw', 'FMM certified'];
+  const quadratureSourceCounts = [32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000];
   const metricFields = {
     density: ['density', ''],
     'inversion-time': ['timeMs', 'ms'],
@@ -131,7 +132,7 @@
       .replace(/\.?(?:0+)e/, 'e')
       .replace('e+', 'e');
   };
-  function drawChart(svg, series, { xLog = false, yLog = false, xLabel = '', yLabel = '', xDomain = null, minimumYDomain = null, empty = 'Waiting for samples…' } = {}) {
+  function drawChart(svg, series, { yLog = false, xLabel = '', yLabel = '', xDomain = null, xCategories = null, minimumYDomain = null, empty = 'Waiting for samples…' } = {}) {
     svg.replaceChildren();
     const width = 900;
     const height = 430;
@@ -139,8 +140,9 @@
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     const points = series
       .flatMap((item) => item.points)
-      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!xLog || point[0] > 0) && (!yLog || point[1] > 0));
-    const transformX = (value) => xLog ? Math.log2(value) : value;
+      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!yLog || point[1] > 0));
+    const categoryIndex = xCategories ? new Map(xCategories.map((value, index) => [value, index])) : null;
+    const transformX = (value) => categoryIndex ? categoryIndex.get(value) : value;
     const transformY = (value) => yLog ? Math.log10(value) : value;
     const xs = points.map((point) => transformX(point[0]));
     const ys = points.map((point) => transformY(point[1]));
@@ -148,7 +150,10 @@
     let xMax = xs.length ? Math.max(...xs) : 1;
     let yMin = ys.length ? Math.min(...ys) : 0;
     let yMax = ys.length ? Math.max(...ys) : 1;
-    if (xDomain?.length === 2 && xDomain.every((value) => Number.isFinite(value) && (!xLog || value > 0))) {
+    if (categoryIndex) {
+      xMin = 0;
+      xMax = Math.max(xCategories.length - 1, 1);
+    } else if (xDomain?.length === 2 && xDomain.every(Number.isFinite)) {
       xMin = transformX(xDomain[0]);
       xMax = transformX(xDomain[1]);
     }
@@ -159,12 +164,16 @@
       yMax = points.length ? Math.max(yMax, domainMax) : domainMax;
     }
     if (xMin === xMax) {
-      const pad = Math.max(Math.abs(xMin) * 0.05, xLog ? 0.5 : 1);
+      const pad = Math.max(Math.abs(xMin) * 0.05, 1);
       xMin -= pad;
       xMax += pad;
     }
     if (yMin === yMax) {
       const pad = Math.max(Math.abs(yMin) * 0.05, yLog ? 0.5 : 1);
+      yMin -= pad;
+      yMax += pad;
+    } else if (points.length) {
+      const pad = (yMax - yMin) * 0.06;
       yMin -= pad;
       yMax += pad;
     }
@@ -179,14 +188,13 @@
         svgNode('text', { x: margin.l - 9, y: y + 3, 'text-anchor': 'end', class: 'axis-label' }, formatAxis(actual)),
       );
     }
-    const xTicks = Array.from({ length: 5 }, (_, index) => {
-      const raw = xMin + index / 4 * (xMax - xMin);
-      return xLog ? 2 ** raw : raw;
+    const xTicks = xCategories ?? Array.from({ length: 5 }, (_, index) => {
+      return xMin + index / 4 * (xMax - xMin);
     });
     xTicks.forEach((value) => {
       const raw = transformX(value);
       const x = margin.l + (raw - xMin) / (xMax - xMin) * (width - margin.l - margin.r);
-      const label = formatAxis(value);
+      const label = categoryIndex ? `${value / 1000}K` : formatAxis(value);
       svg.append(
         svgNode('line', { x1: x, x2: x, y1: margin.t, y2: height - margin.b, class: 'grid-line' }),
         svgNode('text', { x, y: height - margin.b + 18, 'text-anchor': 'middle', class: 'axis-label' }, label),
@@ -203,18 +211,25 @@
       return;
     }
     series.forEach((item) => {
-      const valid = item.points.filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!xLog || point[0] > 0) && (!yLog || point[1] > 0));
+      const valid = item.points.filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!yLog || point[1] > 0));
       if (valid.length) {
         const path = valid.map((point, index) => `${index ? 'L' : 'M'}${pixelX(point[0]).toFixed(2)},${pixelY(point[1]).toFixed(2)}`).join(' ');
-        svg.append(svgNode('path', { d: path, stroke: item.color, class: 'chart-line' }));
+        const pathAttributes = { d: path, stroke: item.color, class: 'chart-line' };
+        if (item.dashed) {
+          pathAttributes['stroke-dasharray'] = '8 5';
+        }
+        svg.append(svgNode('path', pathAttributes));
         valid.forEach((point) => {
-          svg.append(svgNode('circle', {
+          const marker = svgNode('circle', {
             cx: pixelX(point[0]).toFixed(2),
             cy: pixelY(point[1]).toFixed(2),
             r: 4,
             fill: item.color,
             class: 'chart-point',
-          }));
+          });
+          const sourceLabel = categoryIndex ? `${point[0] / 1000}K` : formatAxis(point[0]);
+          marker.append(svgNode('title', {}, `${item.label} at ${sourceLabel}: ${formatAxis(point[1])} ms`));
+          svg.append(marker);
         });
       }
     });
@@ -228,11 +243,14 @@
     const groups = new Map();
     samples.forEach((sample) => {
       if (!groups.has(sample.sources)) groups.set(sample.sources, Array.from({ length: 6 }, () => []));
-      sample.times.forEach((time, index) => groups.get(sample.sources)[index].push(time));
+      sample.times?.forEach((time, index) => {
+        if (Number.isFinite(time) && time > 0) groups.get(sample.sources)[index].push(time);
+      });
     });
     return curveLabels.map((label, index) => ({
       label,
       color: curveColors[index],
+      dashed: index % 2 === 1,
       points: [...groups]
         .sort((a, b) => a[0] - b[0])
         .map(([sources, values]) => [sources, median(values[index])])
@@ -248,20 +266,31 @@
     const entries = series.map((item) => {
       const span = document.createElement('span');
       span.style.setProperty('--series', item.color);
+      span.dataset.lineStyle = item.dashed ? 'certified' : 'raw';
       span.textContent = item.label;
       return span;
     });
     container.replaceChildren(...entries);
   };
   function toggleDialog(dialog, visible) {
-    dialog.classList.toggle('open', visible);
-    dialog.setAttribute('aria-hidden', String(!visible));
     if (visible && openDialog !== dialog) {
+      returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       openDialog = dialog;
+      dialog.inert = false;
+      dialog.classList.add('open');
+      dialog.setAttribute('aria-hidden', 'false');
       requestAnimationFrame(() => dialog.querySelector('button')?.focus());
     } else if (!visible && openDialog === dialog) {
+      if (dialog.contains(document.activeElement)) returnFocus?.focus?.();
       openDialog = null;
-      returnFocus?.focus?.();
+      returnFocus = null;
+      dialog.inert = true;
+      dialog.classList.remove('open');
+      dialog.setAttribute('aria-hidden', 'true');
+    } else if (!visible) {
+      dialog.inert = true;
+      dialog.classList.remove('open');
+      dialog.setAttribute('aria-hidden', 'true');
     }
   }
   const finiteText = (value, suffix = '') => Number.isFinite(value) ? `${formatAxis(value)} ${suffix}`.trim() : '--';
@@ -446,13 +475,11 @@
       toggleDialog($('#quadrature-modal'), snapshot.planning.visible);
       const benchmarkSeries = curveSeries(snapshot.planning.curve);
       drawChart($('#quadrature-chart'), benchmarkSeries, {
-        xLog: true,
         yLog: true,
-        xDomain: [32_000, 8_192_000],
-        minimumYDomain: [1, 10],
-        xLabel: 'distinct quadrature points (log₂ scale)',
+        xCategories: quadratureSourceCounts,
+        xLabel: 'distinct quadrature points (32K–8192K)',
         yLabel: 'measured total time (ms, log₁₀ scale)',
-        empty: 'Waiting for measured GPU samples…',
+        empty: 'Waiting for the first completed 32K source point…',
       });
       makeLegend($('#curve-legend'), benchmarkSeries);
       drawChart($('#jacobi-chart'), [{ color: '#43df81', points: snapshot.jacobi.filter((point) => Number.isFinite(point[1])) }], { xLabel: 'simulation time (s)', yLabel: 'Cⱼ' });

@@ -141,8 +141,11 @@ pub(crate) fn build_planning_fmm_payload(
     cache: &mut PlanningFmmWorkspace,
 ) -> Option<PlanningMethodPayload> {
     let started = bevy::platform::time::Instant::now();
+    let mut geometry_basis_preparation_ms = 0.0;
     if cache.batch_id != batch.batch_id || cache.levels.len() != MAXIMUM_LEVEL as usize + 1 {
+        let one_time_started = bevy::platform::time::Instant::now();
         cache.rebuild(batch)?;
+        geometry_basis_preparation_ms = one_time_started.elapsed().as_secs_f64() * 1.0e3;
     }
     let row_start = model as usize * 56;
     let densities = batch.density_models.get(row_start..row_start + 56)?;
@@ -282,7 +285,10 @@ pub(crate) fn build_planning_fmm_payload(
         // target-cell average (one local expansion plus P2P interactions).
         maximum_level: average_interactions,
         total_mass: masses.iter().sum::<f64>() as f32,
-        preparation_ms: started.elapsed().as_secs_f64() * 1.0e3,
+        geometry_basis_preparation_ms,
+        density_payload_preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3
+            - geometry_basis_preparation_ms)
+            .max(0.0),
         ..default()
     })
 }

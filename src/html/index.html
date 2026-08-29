@@ -75,7 +75,7 @@
                     <label class="range-row accent"><span>Acceleration <output id="acceleration-out">1×</output></span><input id="acceleration" type="range" min="1" max="8" step="1" value="1" /></label>
                     <div class="stat-grid"><div><small>Runtime VRAM</small><strong id="vram">--</strong></div><div><small>Quadrature</small><strong id="quadrature-state">IDLE</strong></div></div>
                 </div>
-                <button onclick="window.ryuguUi?.activate?.(this)" id="quadrature-start" data-action="quadrature-start">Run quadrature 3.2e4 → 8.192e6</button>
+                <button onclick="window.ryuguUi?.activate?.(this)" id="quadrature-start" data-action="quadrature-start">Run quadrature 32K → 8192K</button>
                 <div id="inversion-status" class="inversion-status">Trajectory inversion is ready when samples are captured.</div>
                 <p id="planning-status" class="status-text">Waiting for simulation state.</p>
             </aside>
@@ -116,7 +116,7 @@
 
         <section id="quadrature-modal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="quadrature-title">
             <div class="modal-card glass">
-                <header><div><small>GPU COMPUTE BENCHMARK</small><h1 id="quadrature-title">Quadrature-source crossover</h1><p>Fixed 56 density unknowns · measured total time</p></div><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="quadrature-cancel" aria-label="Close quadrature benchmark">×</button></header>
+                <header><div><small>GPU COMPUTE BENCHMARK</small><h1 id="quadrature-title">Quadrature-source crossover</h1><p>32K–8192K source points · 512 density models · raw and certified totals</p></div><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="quadrature-cancel" aria-label="Close quadrature benchmark">×</button></header>
                 <div class="chart-shell"><svg id="quadrature-chart" role="img" aria-label="Quadrature benchmark chart"></svg></div>
                 <div id="curve-legend" class="legend"></div>
                 <footer><div class="modal-progress"><span id="modal-status">Preparing workload…</span><div id="quadrature-progress"></div></div><button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-cancel">Cancel / close</button></footer>

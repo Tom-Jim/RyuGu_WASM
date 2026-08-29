@@ -282,9 +282,14 @@ pub(crate) fn browser_ui_action_system(
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
                 result.0 = None;
+                let (_, density_models, samples_per_candidate) =
+                    PlanningWorkloadProfile::SourceCrossover.dimensions();
                 planning.status = format!(
-                    "Quadrature-source crossover queued: {} distinct positions, repeat 1/{}, Eq.106 first.",
-                    PLANNING_SOURCE_COUNTS[0], PLANNING_SOURCE_REPEATS,
+                    "Quadrature-source crossover queued: {} distinct positions, {} density models, {} samples/candidate, repeat 1/{}, Eq.106 first.",
+                    PLANNING_SOURCE_COUNTS[0],
+                    density_models,
+                    samples_per_candidate,
+                    PLANNING_SOURCE_REPEATS,
                 );
             }
             "quadrature-cancel" => {
@@ -431,6 +436,9 @@ pub(crate) fn browser_ui_publish_system(
             json!({
                 "sources": sample.source_count,
                 "times": sample.times_ms,
+                "geometry": sample.geometry_basis_build_ms,
+                "density": sample.density_model_ms,
+                "target": sample.target_point_ms,
                 "eligible": sample.eligible,
             })
         })
@@ -523,6 +531,9 @@ pub(crate) fn browser_ui_publish_system(
                 json!({
                     "method": method_key(result.method),
                     "totalMs": result.total_ms,
+                    "geometryMs": result.geometry_basis_build_ms,
+                    "densityModelMs": result.density_model_ms,
+                    "targetPointMs": result.target_point_ms,
                     "gravityError": result.relative_gravity_error,
                     "gradientError": result.gradient_relative_error,
                     "pericenterError": result.pericenter_error_m,

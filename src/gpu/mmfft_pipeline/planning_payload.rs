@@ -1,6 +1,5 @@
 #[derive(Default)]
 pub(crate) struct PlanningMmfftWorkspace {
-    batch_id: u64,
     levels: Vec<MmfftLevelWorkspace>,
 }
 
@@ -11,21 +10,20 @@ pub(crate) fn build_planning_mmfft_payload(
     cache: &mut PlanningMmfftWorkspace,
 ) -> Option<PlanningMethodPayload> {
     let started = bevy::platform::time::Instant::now();
-    let mut one_time_preparation_ms = 0.0;
+    let mut program_setup_ms = 0.0;
     let row_start = model as usize * 56;
     let densities = batch.density_models.get(row_start..row_start + 56)?;
     if batch.basis_records.is_empty() {
         return None;
     }
-    if cache.batch_id != batch.batch_id || cache.levels.len() != LEVEL_GRID_SIZES.len() {
-        let one_time_started = bevy::platform::time::Instant::now();
-        cache.batch_id = batch.batch_id;
+    if cache.levels.len() != LEVEL_GRID_SIZES.len() {
+        let program_setup_started = bevy::platform::time::Instant::now();
         cache.levels = LEVEL_GRID_SIZES
             .into_iter()
             .zip(LEVEL_HALF_EXTENTS)
             .map(|(n, half)| MmfftLevelWorkspace::new(n, half))
             .collect();
-        one_time_preparation_ms = one_time_started.elapsed().as_secs_f64() * 1.0e3;
+        program_setup_ms = program_setup_started.elapsed().as_secs_f64() * 1.0e3;
     }
     // Compute deposition stencils directly into the fixed FFT workspaces.
     // Caching eight heap records per quadrature point exceeded a gigabyte at
@@ -54,8 +52,9 @@ pub(crate) fn build_planning_mmfft_payload(
         half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
         grid_scales,
         total_mass: total_mass as f32,
-        one_time_preparation_ms,
-        preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3 - one_time_preparation_ms)
+        geometry_basis_preparation_ms: 0.0,
+        density_payload_preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3
+            - program_setup_ms)
             .max(0.0),
         ..default()
     })

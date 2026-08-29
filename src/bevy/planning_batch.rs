@@ -15,6 +15,7 @@ pub fn planning_batch_evaluator_system(
     mut payload: ResMut<PlanningMethodPayload>,
     mut gpu_result: ResMut<PlanningGpuResult>,
     mut planning: ResMut<PlanningComparisonState>,
+    mut eq106_workspace: Local<crate::gpu::eq106::PlanningEq106Workspace>,
     mut mmfft_workspace: Local<crate::gpu::mmfft::PlanningMmfftWorkspace>,
     mut fmm_workspace: Local<crate::gpu::fmm::PlanningFmmWorkspace>,
     mut reference_cache: Local<PlanningReferenceCache>,
@@ -134,6 +135,21 @@ pub fn planning_batch_evaluator_system(
                                 fmm.total_ms,
                                 fmm.certified_estimated_total_ms,
                             ],
+                            geometry_basis_build_ms: [
+                                eq106.geometry_basis_build_ms,
+                                mmfft.geometry_basis_build_ms,
+                                fmm.geometry_basis_build_ms,
+                            ],
+                            density_model_ms: [
+                                eq106.density_model_ms,
+                                mmfft.density_model_ms,
+                                fmm.density_model_ms,
+                            ],
+                            target_point_ms: [
+                                eq106.target_point_ms,
+                                mmfft.target_point_ms,
+                                fmm.target_point_ms,
+                            ],
                             eligible: [
                                 eq106.accuracy_eligible(),
                                 eq106.certified_accuracy_eligible(),
@@ -155,8 +171,9 @@ pub fn planning_batch_evaluator_system(
                             planning.results = std::array::from_fn(|_| None);
                             planning.run_id = planning.run_id.wrapping_add(1);
                             planning.status = format!(
-                                "Quadrature-source curve queued: {} distinct points, fixed 56 density unknowns, repeat {}/{}.",
+                                "Quadrature-source curve queued: {} distinct points, {} density models, repeat {}/{}.",
                                 planning.requested_source_count,
+                                job.density_model_count,
                                 planning.source_curve_repeat + 1,
                                 PLANNING_SOURCE_REPEATS
                             );
@@ -166,7 +183,7 @@ pub fn planning_batch_evaluator_system(
                         planning.source_curve_visible = true;
                         planning.run_requested = false;
                         planning.status =
-                            "Quadrature-source crossover complete: directly measured medians and P10/P90 ready; density K remained 56.".into();
+                            "Quadrature-source crossover complete: all six raw/certified total-time curves are ready.".into();
                         return;
                     }
                     planning.run_requested = false;
@@ -206,16 +223,6 @@ pub fn planning_batch_evaluator_system(
         planning.batch_job = Some(job);
         return;
     }
-    if rendering_needs_priority() {
-        planning.status = format!(
-            "{} planning yielded to rendering at {:.1} FPS / {:.1} ms recent frame.",
-            job.method.planning_label(),
-            crate::browser_frame_rate().unwrap_or(0.0),
-            crate::browser_recent_frame_ms().unwrap_or(0.0),
-        );
-        planning.batch_job = Some(job);
-        return;
-    }
     let payload_key = job.run_id
         ^ (job.method.performance_index() as u64).rotate_left(17)
         ^ u64::from(job.density_model).rotate_left(33);
@@ -229,6 +236,7 @@ pub fn planning_batch_evaluator_system(
                     &batch,
                     job.density_model,
                     payload_key,
+                    &mut eq106_workspace,
                 )
             }
             ActiveGravityMethod::MmfftCompressed => {
@@ -259,8 +267,11 @@ pub fn planning_batch_evaluator_system(
             return;
         };
         if !job.warm_repetition {
-            job.one_time_preparation_ms += prepared.one_time_preparation_ms;
-            job.preprocessing_ms += prepared.preparation_ms;
+            job.method_geometry_basis_ms += prepared.geometry_basis_preparation_ms;
+            job.density_payload_preparation_ms += prepared.density_payload_preparation_ms;
+        } else if job.certified_repetition {
+            job.certified_density_payload_preparation_ms +=
+                prepared.density_payload_preparation_ms;
         }
         *payload = prepared;
     }
@@ -350,7 +361,7 @@ fn reduce_planning_packet(
     {
         job.gravity_error_sum = f64::NAN;
         job.gradient_error_sum = f64::NAN;
-        job.preprocessing_ms += packet.timing.method_preprocess_ms;
+        job.gpu_preprocessing_ms += packet.timing.method_preprocess_ms;
         job.command_submission_ms += packet.timing.command_submission_ms;
         job.gpu_completion_map_ms += packet.timing.gpu_completion_map_ms;
         job.dispatch_count = job.dispatch_count.saturating_add(packet.timing.dispatch_count);
@@ -501,7 +512,7 @@ fn reduce_planning_packet(
                 .max(accumulated_position_error[local_candidate].dot(radial).abs() as f32);
         }
     }
-    job.preprocessing_ms += packet.timing.method_preprocess_ms;
+    job.gpu_preprocessing_ms += packet.timing.method_preprocess_ms;
     job.command_submission_ms += packet.timing.command_submission_ms;
     job.gpu_completion_map_ms += packet.timing.gpu_completion_map_ms;
     job.dispatch_count = job.dispatch_count.saturating_add(packet.timing.dispatch_count);
@@ -677,12 +688,6 @@ fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) 
     };
 }
 
-fn rendering_needs_priority() -> bool {
-    crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
-        || crate::browser_recent_frame_ms()
-            .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS)
-}
-
 fn advance_planning_tile(job: &mut PlanningBatchJob, completed_candidates: u32) {
     job.candidate_start += completed_candidates;
     if job.candidate_start < job.candidate_count {
@@ -794,24 +799,31 @@ fn finish_planning_method(
         / (1.0 + gravity_error.max(0.0) + gradient_error.max(0.0));
     let accuracy_penalty = 1.0 + gravity_error.max(0.0) + gradient_error.max(0.0);
     let top_candidates = top_candidate_scores(job, accuracy_penalty);
-    let total_ms = job.preprocessing_ms
-        + job.command_submission_ms
-        + job.reduction_ms
-        + job.gpu_completion_map_ms
-        // Charge the same CPU f64 reference comparison to every backend.
-        // Previously this common validation work was measured but omitted
-        // from total_ms, making the certified Eq.106 line incomparable.
-        + job.verification_ms;
     let warm_per_candidate =
         job.warm_evaluation_ms / f64::from(job.last_request_candidate_count.max(1));
     let cold_amortization_candidates =
-        (job.preprocessing_ms / warm_per_candidate.max(f64::MIN_POSITIVE)).ceil() as u32;
+        ((job.density_payload_preparation_ms + job.gpu_preprocessing_ms)
+            / warm_per_candidate.max(f64::MIN_POSITIVE))
+        .ceil() as u32;
+    let raw_gpu_ms =
+        job.gpu_preprocessing_ms + job.command_submission_ms + job.gpu_completion_map_ms;
     let gpu_build_ms = (job.first_tile_ms
         - job.warm_evaluation_ms * f64::from(job.density_model_count))
-    .max(0.0);
-    let build_ms = job.preprocessing_ms + gpu_build_ms;
-    let certified_estimated_total_ms =
-        build_ms + job.certified_full_pass_ms + job.verification_ms;
+    .clamp(0.0, raw_gpu_ms);
+    let geometry_basis_build_ms = job.common_geometry_basis_ms + job.method_geometry_basis_ms;
+    let density_model_ms = (job.density_payload_preparation_ms + gpu_build_ms)
+        / f64::from(job.density_model_count.max(1));
+    let target_point_ms = (raw_gpu_ms - gpu_build_ms)
+        .max(0.0)
+        / (job.total_evaluations.max(1) as f64);
+    let total_ms = geometry_basis_build_ms
+        + job.density_payload_preparation_ms
+        + job.gpu_preprocessing_ms
+        + job.command_submission_ms
+        + job.gpu_completion_map_ms;
+    let certified_estimated_total_ms = geometry_basis_build_ms
+        + job.certified_density_payload_preparation_ms
+        + job.certified_full_pass_ms;
     let raw_gpu_request_count = job.raw_gpu_request_count;
     let certified_gpu_request_count = job.gpu_request_count.saturating_sub(raw_gpu_request_count);
     let certified_gravity_error = (job.certified_gravity_error_sum
@@ -848,6 +860,9 @@ fn finish_planning_method(
         certified_full_pass_ms: job.certified_full_pass_ms,
         certified_estimated_total_ms,
         total_ms,
+        geometry_basis_build_ms,
+        density_model_ms,
+        target_point_ms,
         relative_gravity_error: gravity_error,
         gradient_relative_error: gradient_error,
         certified_relative_gravity_error: certified_gravity_error,
@@ -882,8 +897,13 @@ fn finish_planning_method(
         method = ?job.method,
         backend = ?backend,
         total_ms,
-        preprocessing_ms = job.preprocessing_ms,
-        one_time_preparation_ms = job.one_time_preparation_ms,
+        geometry_basis_build_ms,
+        density_model_ms,
+        target_point_ms,
+        method_geometry_basis_ms = job.method_geometry_basis_ms,
+        density_payload_preparation_ms = job.density_payload_preparation_ms,
+        certified_density_payload_preparation_ms = job.certified_density_payload_preparation_ms,
+        gpu_preprocessing_ms = job.gpu_preprocessing_ms,
         command_submission_ms = job.command_submission_ms,
         gpu_completion_map_ms = job.gpu_completion_map_ms,
         reduction_ms = job.reduction_ms,
@@ -974,8 +994,10 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.candidate_gradient_sum.fill(0.0);
     job.candidate_minimum_altitude_m.fill(f32::INFINITY);
     job.candidate_valid.fill(true);
-    job.preprocessing_ms = 0.0;
-    job.one_time_preparation_ms = 0.0;
+    job.method_geometry_basis_ms = 0.0;
+    job.density_payload_preparation_ms = 0.0;
+    job.certified_density_payload_preparation_ms = 0.0;
+    job.gpu_preprocessing_ms = 0.0;
     job.command_submission_ms = 0.0;
     job.reduction_ms = 0.0;
     job.verification_ms = 0.0;

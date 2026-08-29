@@ -84,20 +84,6 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     let builder = batch_builder.as_mut().expect("matched planning builder");
-    if crate::browser_frame_rate().is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
-        || crate::browser_recent_frame_ms()
-            .is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS)
-    {
-        planning.status = format!(
-            "{} candidate preparation yielded to rendering at {:.1} FPS / {:.1} ms recent frame: {} / {} curves.",
-            planning.workload_profile.label(),
-            crate::browser_frame_rate().unwrap_or(0.0),
-            crate::browser_recent_frame_ms().unwrap_or(0.0),
-            builder.completed_candidates(),
-            dimensions.0
-        );
-        return;
-    }
     let candidate_budget = if cfg!(target_arch = "wasm32") {
         PLANNING_BUILD_CANDIDATES_PER_FRAME
     } else {
@@ -123,7 +109,7 @@ pub fn update_planning_results_from_inversion_system(
         );
         return;
     }
-    let Some((batch, _common_preparation_ms)) =
+    let Some((batch, common_preparation_ms)) =
         batch_builder.take().and_then(|builder| builder.finish())
     else {
         planning.status = "Planning candidate batch could not be finalized.".into();
@@ -218,8 +204,11 @@ pub fn update_planning_results_from_inversion_system(
         candidate_gradient_sum: vec![0.0; dimensions.0 as usize],
         candidate_minimum_altitude_m: vec![f32::INFINITY; dimensions.0 as usize],
         candidate_valid: vec![true; dimensions.0 as usize],
-        one_time_preparation_ms: 0.0,
-        preprocessing_ms: 0.0,
+        common_geometry_basis_ms: common_preparation_ms,
+        method_geometry_basis_ms: 0.0,
+        density_payload_preparation_ms: 0.0,
+        certified_density_payload_preparation_ms: 0.0,
+        gpu_preprocessing_ms: 0.0,
         command_submission_ms: 0.0,
         reduction_ms: 0.0,
         verification_ms: 0.0,

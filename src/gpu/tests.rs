@@ -108,11 +108,7 @@ fn eq106_complex_shader_matches_bevy_shader_composition() {
         )
         .unwrap_or_else(|error| panic!("{definition} WGSL generation failed: {error:?}"));
         validate_wgsl(&generated);
-        std::fs::write(
-            format!("/private/tmp/eq106_{definition}.wgsl"),
-            generated,
-        )
-        .unwrap();
+        std::fs::write(format!("/private/tmp/eq106_{definition}.wgsl"), generated).unwrap();
     }
 }
 
