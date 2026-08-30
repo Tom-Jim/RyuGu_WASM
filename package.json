@@ -2,8 +2,8 @@
   "name": "ryugu-wasm",
   "version": "0.1.0",
   "scripts": {
-    "build:wasm": "RUSTC_WRAPPER= wasm-pack build --dev --target web --out-dir pkg --out-name ryugu_wasm",
-    "build": "bun run styles && RUSTC_WRAPPER= wasm-pack build --release --target web --out-dir pkg --out-name ryugu_wasm",
+    "build:wasm": "RUSTC_WRAPPER= wasm-pack build --locked --dev --target web --out-dir pkg --out-name ryugu_wasm",
+    "build": "bun run styles && RUSTC_WRAPPER= wasm-pack build --locked --release --target web --out-dir pkg --out-name ryugu_wasm",
     "styles": "bunx @tailwindcss/cli -i src/html/tailwind.css -o src/html/tailwind.generated.css --minify",
     "dev": "bun run styles && bun run build:wasm && bun run server.ts",
     "preview": "bun run build && bun run server.ts",

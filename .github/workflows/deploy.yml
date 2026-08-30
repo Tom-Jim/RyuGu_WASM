@@ -43,11 +43,11 @@ jobs:
 
             - name: Check production Rust library
               run: |
-                  cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
-                  cargo check --target wasm32-unknown-unknown --lib
+                  cargo clippy --locked --target wasm32-unknown-unknown --lib -- -D warnings
+                  cargo check --locked --target wasm32-unknown-unknown --lib
 
             - name: Build WASM Release
-              run: wasm-pack build --release --target web --out-dir pkg --out-name ryugu_wasm
+              run: wasm-pack build --locked --release --target web --out-dir pkg --out-name ryugu_wasm
 
             - name: Build Tailwind stylesheet
               run: bun run styles
@@ -73,10 +73,11 @@ jobs:
               run: |
                   mkdir -p site/src/html
                   cp src/html/index.html site/index.html
+                  sed -i "s/__RYUGU_VERSION__/${GITHUB_SHA}/g" site/index.html
                   cp src/html/ui.css src/html/ui.js src/html/tailwind.generated.css site/src/html/
                   cp build/app.js site/src/html/app.js
-                  cp -r assets site/ 2>/dev/null || true
-                  cp -r pkg site/ 2>/dev/null || true
+                  cp -r assets site/
+                  cp -r pkg site/
 
             - name: Verify GitHub Pages asset paths
               run: |
@@ -87,6 +88,13 @@ jobs:
                   test -f site/src/html/tailwind.generated.css
                   test -f site/pkg/ryugu_wasm.js
                   test -f site/pkg/ryugu_wasm_bg.wasm
+                  test -f site/assets/shaders/mobile_unlit.wgsl
+                  test -f site/assets/models/ryugu.glb
+                  test -f site/assets/models/cassini.gltf
+                  test -f site/assets/models/cassini.bin
+                  test -f site/assets/operators/eq106_psi_table.bin
+                  test -f site/assets/operators/eq106_toroidal_table.bin
+                  grep -Fq "${GITHUB_SHA}" site/index.html
                   ! grep -Eq '="/(src/html|pkg|node_modules)/' site/index.html
                   grep -Fq 'import(`./pkg/ryugu_wasm.js' site/index.html
                   ! grep -Fq 'from "vue"' site/src/html/app.js

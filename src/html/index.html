@@ -153,7 +153,10 @@
             document.getElementById('viewport-frame').hidden = true;
             document.getElementById('no-webgpu').style.display = 'grid';
         } else {
-            const version = new URL(location.href).searchParams.get('v');
+            // CI replaces this placeholder with the commit SHA. The query
+            // keeps Pages/CDN caches from mixing an old JS/WASM pair with the
+            // current HTML shell. Local development still accepts ?v=... .
+            const version = new URL(location.href).searchParams.get('v') || '__RYUGU_VERSION__';
             const suffix = version ? `?v=${encodeURIComponent(version)}` : '';
             const wasm = await import(`./pkg/ryugu_wasm.js${suffix}`);
             await wasm.default({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` });
