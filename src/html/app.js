@@ -313,7 +313,10 @@ function mountTelemetryChart(target, kind) {
   createApp({
     components: { VChart },
     setup() {
-      const snapshot = ref(null);
+      // A phone can finish the WASM boot before its delayed module fetch. Use
+      // the most recent UI snapshot immediately instead of waiting for the
+      // next render tick.
+      const snapshot = ref(window.ryuguUi?.snapshot ?? null);
       const update = (event) => { snapshot.value = event.detail ?? null; };
       const points = computed(() => recentTelemetryPoints(snapshot.value, kind));
       const option = computed(() => telemetryOption(points.value, kind));
@@ -333,3 +336,4 @@ function mountTelemetryChart(target, kind) {
 
 mountTelemetryChart('#residual-chart', 'residual');
 mountTelemetryChart('#jacobi-chart', 'jacobi');
+window.ryuguTelemetryReady = true;

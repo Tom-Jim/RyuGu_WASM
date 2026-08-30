@@ -389,6 +389,49 @@
     const relative = Number.isFinite(residual.relativeResidual) ? residual.relativeResidual.toExponential(2) : '--';
     $('#residual-diagnostics').textContent = `segments ${residual.segments} · accepted/rejected ${residual.accepted}/${residual.rejected} · Picard ${residual.picardIterations ?? '--'} · endpoint ${residual.endpointIterations ?? '--'} · remainder ${remainder} · relative ${relative}`;
   }
+  // Vue/ECharts is the primary telemetry renderer. This lightweight SVG path is
+  // deliberately kept as a resilience fallback: mobile port forwarding can
+  // occasionally lose the deferred module request after the page and WASM have
+  // already loaded. The fallback consumes the same snapshot and keeps the
+  // coordinate system adaptive until the module becomes available again.
+  const telemetryWindow = (samples, mapper, positiveOnly = false) => (samples ?? [])
+    .map(mapper)
+    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value) && (!positiveOnly || value > 0))
+    .slice(-96);
+  const telemetryDomain = (points) => {
+    if (!points.length) return null;
+    const values = points.map(([time]) => time);
+    const low = Math.min(...values);
+    const high = Math.max(...values);
+    const padding = high === low ? Math.max(Math.abs(high) * .01, 1) : (high - low) * .04;
+    return [low - padding, high + padding];
+  };
+  function fallbackTelemetrySvg(host, key) {
+    let svg = host.querySelector(`svg[data-telemetry-fallback="${key}"]`);
+    if (!svg) {
+      svg = svgNode('svg', { 'data-telemetry-fallback': key, role: 'img' });
+      host.replaceChildren(svg);
+    }
+    return svg;
+  }
+  function renderTelemetryFallback(snapshot) {
+    if (window.ryuguTelemetryReady) return;
+    const residual = telemetryWindow(snapshot.eq106Residual?.samples, (sample) => [Number(sample.time), Number(sample.epsilon)], true);
+    const jacobi = telemetryWindow(snapshot.jacobi, (sample) => [Number(sample[0]), Number(sample[1])]);
+    drawChart(fallbackTelemetrySvg($('#residual-chart'), 'residual'), [{ label: 'Eq.106 residual', color: '#36e7f2', points: residual }], {
+      yLog: true,
+      xLabel: 't (s)',
+      yLabel: 'ε max',
+      xDomain: telemetryDomain(residual),
+      empty: 'Waiting for residual samples…',
+    });
+    drawChart(fallbackTelemetrySvg($('#jacobi-chart'), 'jacobi'), [{ label: 'Jacobi constant', color: '#43df81', points: jacobi }], {
+      xLabel: 't (s)',
+      yLabel: 'Cⱼ',
+      xDomain: telemetryDomain(jacobi),
+      empty: 'Waiting for Jacobi samples…',
+    });
+  }
   function renderPerformance(performance) {
     toggleDialog($('#performance-page'), performance.active);
     if (!performance.active) return;
@@ -476,6 +519,7 @@
       });
       makeLegend($('#curve-legend'), benchmarkSeries);
       renderResidual(snapshot.eq106Residual);
+      renderTelemetryFallback(snapshot);
       renderPlanning(snapshot.planning);
       renderInversion(snapshot.inversion, snapshot.method);
       renderTrajectoryControls(snapshot.inversion, snapshot.method);
