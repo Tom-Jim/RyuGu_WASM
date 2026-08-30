@@ -53,13 +53,20 @@ jobs:
               run: bun run styles
 
             - name: Bundle Vue telemetry UI
-              run: bun build src/html/app.js --target browser --minify --outfile build/app.js
+              run: >-
+                  bun build src/html/app.js --target=browser --production --minify
+                  --define=__VUE_OPTIONS_API__=true
+                  --define=__VUE_PROD_DEVTOOLS__=false
+                  --define=__VUE_PROD_HYDRATION_MISMATCH_DETAILS__=false
+                  --outfile=build/app.js
 
             - name: Verify browser sources
               run: |
                   node --check src/html/ui.js
                   node --check src/html/app.js
                   node --check build/app.js
+                  ! grep -Fq 'Runtime compilation is not supported in this build of Vue' build/app.js
+                  ! grep -Fq 'Feature flags __VUE_OPTIONS_API__' build/app.js
                   HITS_BADGE_SVG='<svg><title>site visits: 3 / 42</title></svg>' HITS_DATE=2026-01-02 bun scripts/update_hits_chart.mjs --check
 
             - name: Assemble Site Directory

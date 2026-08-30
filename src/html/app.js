@@ -1,4 +1,4 @@
-import { createApp, computed, ref, onMounted, onBeforeUnmount } from 'vue';
+import { createApp, computed, ref, onMounted, onBeforeUnmount } from './vue-compiler.js';
 import VChart from 'vue-echarts';
 import { use } from 'echarts/core';
 import { LineChart } from 'echarts/charts';
