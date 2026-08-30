@@ -337,3 +337,112 @@ function mountTelemetryChart(target, kind) {
 mountTelemetryChart('#residual-chart', 'residual');
 mountTelemetryChart('#jacobi-chart', 'jacobi');
 window.ryuguTelemetryReady = true;
+
+const benchmarkColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77', '#a8f7bd'];
+const benchmarkLabels = ['Radial', 'Werner', 'Eq.106', 'Packed FFT', 'FMM'];
+const quadratureLabels = ['Eq.106 raw', 'Eq.106 certified', 'Packed FFT raw', 'Packed FFT certified', 'FMM raw', 'FMM certified'];
+const quadratureColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
+
+const modalAxisStyle = {
+  axisLine: { lineStyle: { color: 'rgba(120, 208, 213, .38)' } },
+  axisTick: { show: false },
+  splitLine: { show: true, lineStyle: { color: 'rgba(103, 193, 198, .12)' } },
+  axisLabel: { color: '#8fa9ae', fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', hideOverlap: true },
+  nameTextStyle: { color: '#8fa9ae', fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
+};
+const modalChartFrame = () => ({
+  animation: false,
+  backgroundColor: 'transparent',
+  grid: { left: 62, right: 22, top: 14, bottom: 48 },
+  tooltip: {
+    trigger: 'axis',
+    backgroundColor: 'rgba(2, 12, 16, .96)',
+    borderColor: 'rgba(102, 232, 235, .55)',
+    textStyle: { color: '#ddf5f6', fontFamily: 'ui-monospace, monospace', fontSize: 11 },
+  },
+});
+
+function performanceOption(snapshot, kind) {
+  const histories = kind === 'fps'
+    ? snapshot?.performance?.fpsHistory ?? []
+    : snapshot?.performance?.jacobiHistory ?? [];
+  const series = histories.map((history, index) => {
+    const baseline = Number(history?.[0]?.[1] ?? 0);
+    const points = (history ?? []).map((sample, pointIndex) => {
+      const value = kind === 'fps'
+        ? Number(sample)
+        : Math.max(Math.abs((Number(sample?.[1]) - baseline) / Math.max(Math.abs(baseline), 1e-12)), 1e-16);
+      return [pointIndex, value];
+    }).filter(([, value]) => Number.isFinite(value));
+    return {
+      type: 'line',
+      name: benchmarkLabels[index] ?? `Method ${index + 1}`,
+      data: points,
+      showSymbol: false,
+      sampling: 'lttb',
+      lineStyle: { width: 2, color: benchmarkColors[index] ?? '#d9eef0' },
+      itemStyle: { color: benchmarkColors[index] ?? '#d9eef0' },
+    };
+  });
+  return {
+    ...modalChartFrame(),
+    xAxis: { ...modalAxisStyle, type: 'value', name: 'measurement sample', minInterval: 1 },
+    yAxis: {
+      ...modalAxisStyle,
+      type: kind === 'fps' ? 'value' : 'log',
+      logBase: 10,
+      name: kind === 'fps' ? 'frames / second' : '|ΔCⱼ / Cⱼ₀|',
+      min: kind === 'fps' ? 0 : undefined,
+      scale: true,
+      axisLabel: { ...modalAxisStyle.axisLabel, formatter: chartAxisNumber },
+    },
+    series,
+  };
+}
+
+function quadratureOption(snapshot) {
+  const grouped = new Map();
+  for (const sample of snapshot?.planning?.curve ?? []) {
+    if (!grouped.has(sample.sources)) grouped.set(sample.sources, Array.from({ length: 6 }, () => []));
+    sample.times?.forEach((time, index) => {
+      if (Number.isFinite(time) && time > 0) grouped.get(sample.sources)[index].push(Number(time));
+    });
+  }
+  const median = (values) => {
+    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+    return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
+  };
+  const series = quadratureLabels.map((name, index) => ({
+    type: 'line',
+    name,
+    data: [...grouped].sort((a, b) => a[0] - b[0]).map(([sources, values]) => [Number(sources), median(values[index])]).filter(([, value]) => value !== null),
+    showSymbol: false,
+    lineStyle: { width: 2, type: index % 2 ? 'dashed' : 'solid', color: quadratureColors[index] },
+    itemStyle: { color: quadratureColors[index] },
+  }));
+  return {
+    ...modalChartFrame(),
+    xAxis: { ...modalAxisStyle, type: 'log', logBase: 2, name: 'source points', min: 32_000, max: 8_192_000, axisLabel: { ...modalAxisStyle.axisLabel, formatter: (value) => `${Math.round(value / 1000)}K` } },
+    yAxis: { ...modalAxisStyle, type: 'log', logBase: 10, name: 'total time (ms)', axisLabel: { ...modalAxisStyle.axisLabel, formatter: chartAxisNumber } },
+    series,
+  };
+}
+
+function mountBenchmarkChart(target, makeOption) {
+  createApp({
+    components: { VChart },
+    setup() {
+      const snapshot = ref(window.ryuguUi?.snapshot ?? null);
+      const update = (event) => { snapshot.value = event.detail ?? null; };
+      onMounted(() => window.addEventListener('ryugu-snapshot', update));
+      onBeforeUnmount(() => window.removeEventListener('ryugu-snapshot', update));
+      return { option: computed(() => makeOption(snapshot.value)) };
+    },
+    template: '<v-chart class="modal-echart" :option="option" :autoresize="{ throttle: 80 }" renderer="svg" />',
+  }).mount(target);
+}
+
+mountBenchmarkChart('#performance-fps-chart', (snapshot) => performanceOption(snapshot, 'fps'));
+mountBenchmarkChart('#performance-jacobi-chart', (snapshot) => performanceOption(snapshot, 'jacobi'));
+mountBenchmarkChart('#quadrature-chart', quadratureOption);
+window.ryuguBenchmarkChartsReady = true;

@@ -107,8 +107,8 @@
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="4">FMM</button>
                 </div>
                 <div class="performance-charts">
-                    <article><div class="panel-heading"><span>Frame rate</span><small>FPS</small></div><svg id="performance-fps-chart" role="img" aria-label="Frame rate by gravity method"></svg></article>
-                    <article><div class="panel-heading"><span>Relative Jacobi drift</span><small>|ΔCⱼ/Cⱼ₀|</small></div><svg id="performance-jacobi-chart" role="img" aria-label="Relative Jacobi drift by gravity method"></svg></article>
+                    <article><div class="panel-heading"><span>Frame rate</span><small>FPS</small></div><div id="performance-fps-chart" class="modal-echart" role="img" aria-label="Frame rate by gravity method"></div></article>
+                    <article><div class="panel-heading"><span>Relative Jacobi drift</span><small>|ΔCⱼ/Cⱼ₀|</small></div><div id="performance-jacobi-chart" class="modal-echart" role="img" aria-label="Relative Jacobi drift by gravity method"></div></article>
                 </div>
                 <footer><span id="performance-status">Preparing test…</span><div id="performance-summary" class="summary-row"></div></footer>
             </div>
@@ -117,7 +117,7 @@
         <section id="quadrature-modal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="quadrature-title">
             <div class="modal-card glass">
                 <header><div><small>GPU COMPUTE BENCHMARK</small><h1 id="quadrature-title">Quadrature-source crossover</h1><p>32K–8192K source points · 512 density models · raw and certified totals</p></div><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="quadrature-cancel" aria-label="Close quadrature benchmark">×</button></header>
-                <div class="chart-shell"><svg id="quadrature-chart" role="img" aria-label="Quadrature benchmark chart"></svg></div>
+                <div class="chart-shell"><div id="quadrature-chart" class="modal-echart" role="img" aria-label="Quadrature benchmark chart"></div></div>
                 <div id="curve-legend" class="legend"></div>
                 <footer><div class="modal-progress"><span id="modal-status">Preparing workload…</span><div id="quadrature-progress"></div></div><button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-cancel">Cancel / close</button></footer>
             </div>

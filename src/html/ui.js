@@ -449,12 +449,14 @@
         points: history.map((sample, progress) => [progress, Math.abs((sample[1] - baseline) / denominator)]),
       };
     });
-    drawChart($('#performance-fps-chart'), fpsSeries, {
-      xLabel: 'measurement sample',
-      yLabel: 'frames per second',
-      minimumYDomain: [0, 60],
-    });
-    drawChart($('#performance-jacobi-chart'), jacobiSeries, { yLog: true, xLabel: 'measurement sample', yLabel: '|ΔCⱼ/Cⱼ₀| (log₁₀)' });
+    if (!window.ryuguBenchmarkChartsReady) {
+      drawChart($('#performance-fps-chart'), fpsSeries, {
+        xLabel: 'measurement sample',
+        yLabel: 'frames per second',
+        minimumYDomain: [0, 60],
+      });
+      drawChart($('#performance-jacobi-chart'), jacobiSeries, { yLog: true, xLabel: 'measurement sample', yLabel: '|ΔCⱼ/Cⱼ₀| (log₁₀)' });
+    }
     $('#performance-status').textContent = performance.measuring ? `Measuring ${methodLabels[performance.phase] ?? 'method'}…` : 'Benchmark complete. Repeat uses the same enabled methods.';
     const summaries = methodLabels.map((label, index) => {
       const span = document.createElement('span');
@@ -510,13 +512,15 @@
       $('#repeat-benchmark').disabled = !snapshot.performance.active || snapshot.performance.measuring;
       toggleDialog($('#quadrature-modal'), snapshot.planning.visible);
       const benchmarkSeries = curveSeries(snapshot.planning.curve);
-      drawChart($('#quadrature-chart'), benchmarkSeries, {
-        yLog: true,
-        xCategories: quadratureSourceCounts,
-        xLabel: 'distinct quadrature points (32K–8192K)',
-        yLabel: 'measured total time (ms, log₁₀ scale)',
-        empty: 'Waiting for the first completed 32K source point…',
-      });
+      if (!window.ryuguBenchmarkChartsReady) {
+        drawChart($('#quadrature-chart'), benchmarkSeries, {
+          yLog: true,
+          xCategories: quadratureSourceCounts,
+          xLabel: 'distinct quadrature points (32K–8192K)',
+          yLabel: 'measured total time (ms, log₁₀ scale)',
+          empty: 'Waiting for the first completed 32K source point…',
+        });
+      }
       makeLegend($('#curve-legend'), benchmarkSeries);
       renderResidual(snapshot.eq106Residual);
       renderTelemetryFallback(snapshot);

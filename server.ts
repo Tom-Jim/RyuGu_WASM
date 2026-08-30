@@ -1,7 +1,6 @@
 import { join } from "path";
 
 const PORT = Number.parseInt(Bun.env.PORT ?? "3000", 10);
-const HOST = Bun.env.HOST ?? "127.0.0.1";
 const ROOT = import.meta.dir;
 
 const MIME: Record<string, string> = {
@@ -18,9 +17,9 @@ const MIME: Record<string, string> = {
 
 Bun.serve({
   port: PORT,
-  // Bind to the LAN as well as loopback so a phone can use either its Wi-Fi
-  // address or `adb reverse`. Set HOST=127.0.0.1 to restrict it locally.
-  hostname: HOST,
+  // USB `adb reverse` forwards the phone's localhost to this loopback socket.
+  // Keeping it loopback-only avoids exposing the development tree on Wi-Fi.
+  hostname: "127.0.0.1",
   async fetch(req) {
     const url = new URL(req.url);
     const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
@@ -47,4 +46,4 @@ Bun.serve({
   },
 });
 
-console.log(`Dev server running at http://${HOST}:${PORT}`);
+console.log(`Dev server running at http://localhost:${PORT}`);
