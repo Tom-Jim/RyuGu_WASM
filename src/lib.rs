@@ -133,6 +133,12 @@ use wasm_bindgen::prelude::*;
 
     export function is_mobile_browser() {
         if (typeof navigator === "undefined") return false;
+        if (typeof window?.__RYUGU_MOBILE_RENDERER__ === "boolean") {
+            return window.__RYUGU_MOBILE_RENDERER__;
+        }
+        const renderer = new URL(globalThis.location?.href ?? "http://localhost").searchParams.get("renderer");
+        if (renderer === "mobile") return true;
+        if (renderer === "desktop") return false;
         if (navigator.userAgentData?.mobile === true) return true;
         return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent ?? "");
     }
@@ -329,6 +335,8 @@ pub fn main() {
                 // fragile default PBR pipeline on mobile Vulkan/Dawn.
                 .set(PbrPlugin {
                     gltf_enable_standard_materials: !is_mobile_browser,
+                    prepass_enabled: !is_mobile_browser,
+                    add_default_deferred_lighting_plugin: !is_mobile_browser,
                     ..default()
                 })
                 .set(RenderPlugin {
@@ -377,9 +385,10 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     if is_mobile_browser {
         app.add_plugins(MaterialPlugin::<bevy_app::render::MobileUnlitMaterial>::default());
-        // GLTF scenes are instantiated by Bevy between Update and PostUpdate.
-        // Convert their materials in PostUpdate so no StandardMaterial reaches
-        // the render extraction stage, even for the first visible frame.
+        bevy_app::render::register_mobile_gltf_materials(&mut app);
+        // The glTF loader attaches MobileUnlitMaterial directly. Keep this
+        // conversion system as a defensive fallback for meshes introduced by
+        // another plugin or by future application code.
         app.add_systems(
             PostUpdate,
             bevy_app::render::configure_mobile_materials_system,

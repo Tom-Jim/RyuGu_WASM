@@ -149,7 +149,23 @@
         };
         addEventListener('resize', updateViewportFrame, { passive: true });
         window.setRyuguDisplayRotation(0);
-        if (!navigator.gpu || !(await navigator.gpu.requestAdapter())) {
+        const rendererOverride = new URL(location.href).searchParams.get('renderer');
+        const detectedMobile = navigator.userAgentData?.mobile === true
+            || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent ?? '');
+        const mobileRenderer = rendererOverride === 'mobile'
+            || (rendererOverride !== 'desktop' && detectedMobile);
+        window.__RYUGU_MOBILE_RENDERER__ = mobileRenderer;
+
+        const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+        console.info('[Ryugu] WebGPU startup', {
+            rendererOverride,
+            mobileRenderer,
+            userAgentMobile: navigator.userAgentData?.mobile ?? null,
+            userAgent: navigator.userAgent,
+            adapter: adapter?.info ?? null,
+        });
+
+        if (!adapter) {
             document.getElementById('viewport-frame').hidden = true;
             document.getElementById('no-webgpu').style.display = 'grid';
         } else {
