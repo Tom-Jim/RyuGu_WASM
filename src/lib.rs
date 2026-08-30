@@ -130,6 +130,12 @@ use wasm_bindgen::prelude::*;
         return typeof navigator !== "undefined" && navigator.gpu !== undefined;
     }
 
+    export function is_mobile_browser() {
+        if (typeof navigator === "undefined") return false;
+        if (navigator.userAgentData?.mobile === true) return true;
+        return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent ?? "");
+    }
+
     export function show_webgpu_error() {
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.9);color:white;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:99999;font-family:sans-serif;text-align:center;padding:20px;box-sizing:border-box;";
@@ -161,6 +167,9 @@ extern "C" {
 
     #[wasm_bindgen(js_name = has_webgpu)]
     fn browser_has_webgpu() -> bool;
+
+    #[wasm_bindgen(js_name = is_mobile_browser)]
+    fn browser_is_mobile_js() -> bool;
 
     fn show_webgpu_error();
 
@@ -195,6 +204,11 @@ pub(crate) fn set_display_rotation(quarter_turn: u8) {
     browser_set_display_rotation(quarter_turn);
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn browser_is_mobile() -> bool {
+    browser_is_mobile_js()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn set_display_rotation(_quarter_turn: u8) {}
 
@@ -208,6 +222,16 @@ pub fn main() {
         #[cfg(not(target_arch = "wasm32"))]
         {
             true
+        }
+    };
+    let is_mobile_browser = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            browser_is_mobile()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            false
         }
     };
 
@@ -302,7 +326,11 @@ pub fn main() {
                     render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                         backends: Some(backends),
                         limits,
-                        instance_flags: InstanceFlags::debugging(),
+                        instance_flags: if is_mobile_browser {
+                            InstanceFlags::empty()
+                        } else {
+                            InstanceFlags::debugging()
+                        },
                         ..default()
                     })),
                     ..default()
@@ -336,6 +364,23 @@ pub fn main() {
     }
 
     app.add_systems(Startup, setup_scene);
+
+    #[cfg(target_arch = "wasm32")]
+    if is_mobile_browser {
+        app.add_plugins(MaterialPlugin::<bevy_app::render::MobileUnlitMaterial>::default());
+        // GLTF scenes are instantiated by Bevy between Update and PostUpdate.
+        // Convert their materials in PostUpdate so no StandardMaterial reaches
+        // the render extraction stage, even for the first visible frame.
+        app.add_systems(
+            PostUpdate,
+            bevy_app::render::configure_mobile_materials_system,
+        );
+        app.add_systems(
+            Update,
+            bevy_app::render::mobile_section_alpha_system
+                .after(bevy_app::render::section_alpha_system),
+        );
+    }
 
     #[cfg(target_arch = "wasm32")]
     app.add_systems(

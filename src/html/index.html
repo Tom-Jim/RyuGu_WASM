@@ -83,12 +83,12 @@
             <section class="telemetry-stack" data-float-panel>
                 <article id="residual-card" class="chart-card glass" hidden>
                     <div class="panel-heading"><span>Eq.106 residual estimate</span><small id="residual-order">WAITING</small></div>
-                    <svg id="residual-chart" role="img" aria-label="Eq.106 residual estimate over simulation time"></svg>
+                    <div id="residual-chart" class="live-chart-host" aria-label="Eq.106 residual estimate over simulation time"></div>
                     <p id="residual-diagnostics" class="chart-diagnostics">Waiting for Volterra propagation.</p>
                 </article>
                 <article class="chart-card glass">
-                    <div class="panel-heading"><span>Rotating-frame Jacobi constant</span><small>LIVE</small></div>
-                    <svg id="jacobi-chart" role="img" aria-label="Jacobi constant over simulation time"></svg>
+                    <div class="panel-heading"><span>Rotating-frame Jacobi constant</span><small>ROLLING WINDOW</small></div>
+                    <div id="jacobi-chart" class="live-chart-host" aria-label="Jacobi constant over simulation time"></div>
                 </article>
             </section>
         </section>
@@ -125,7 +125,9 @@
         <section id="runtime-modal" class="modal critical" aria-hidden="true" role="alertdialog" aria-modal="true"><div class="error-card glass"><small>GPU PIPELINE STOPPED</small><h1>Computation paused</h1><p id="runtime-message"></p><button onclick="window.ryuguUi?.activate?.(this)" class="primary" data-action="runtime-reset">Reset parameters</button></div></section>
     </main>
     <div id="no-webgpu"><h2>WebGPU unavailable</h2><p>This simulation requires a browser and GPU with WebGPU support.</p></div>
-    <script type="importmap">{"imports":{"vue":"./node_modules/vue/dist/vue.esm-browser.prod.js"}}</script>
+    <img id="site-visit-beacon" src="https://hits.sh/tom-jim.github.io/RyuGu_WASM.svg?view=today-total&amp;label=site%20visits&amp;color=48e7e2&amp;labelColor=071418" width="1" height="1" alt="" aria-hidden="true" />
+    <script type="importmap">{"imports":{"vue":"./node_modules/vue/dist/vue.esm-browser.prod.js","vue-echarts":"./node_modules/vue-echarts/dist/index.js","echarts/core":"./node_modules/echarts/core.js","echarts/charts":"./node_modules/echarts/charts.js","echarts/components":"./node_modules/echarts/components.js","echarts/renderers":"./node_modules/echarts/renderers.js","echarts/":"./node_modules/echarts/","zrender/":"./node_modules/zrender/","tslib":"./node_modules/tslib/tslib.es6.js"}}</script>
+    <script>globalThis.process ??= { env: { NODE_ENV: 'production' } };</script>
     <script src="./src/html/ui.js"></script>
     <script type="module" src="./src/html/app.js"></script>
     <script type="module">

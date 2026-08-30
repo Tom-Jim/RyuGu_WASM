@@ -149,6 +149,8 @@ input[type="range"] { width: 100%; height: 3px; margin-top: 8px; accent-color: v
 .chart-card { height: 220px; padding: 12px; border-radius: 10px; min-width: 0; }
 .chart-card .panel-heading { margin-bottom: 1px; }
 .chart-card svg { height: 160px; }
+.live-chart-host { height: 164px; min-height: 0; }
+.live-chart-host .live-echart { width: 100%; height: 100%; }
 .chart-diagnostics { margin: -1px 2px 0; color: #82989f; font: 11px/1.3 ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 svg { width: 100%; height: 100%; display: block; overflow: visible; }
 
@@ -182,6 +184,7 @@ svg { width: 100%; height: 100%; display: block; overflow: visible; }
 .error-card h1 { margin: 7px 0 12px; }
 .error-card p { color: #b9c5c7; line-height: 1.65; white-space: pre-wrap; }
 #no-webgpu { display: none; position: fixed; inset: 0; place-items: center; align-content: center; gap: 8px; color: #e8f3f4; background: #05090c; text-align: center; }
+#site-visit-beacon { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: .001; pointer-events: none; }
 .axis-label { fill: #a9c1c6; font: 15px ui-monospace, monospace; }
 .grid-line { stroke: rgba(111, 181, 188, .12); stroke-width: 1; }
 .axis-line { stroke: rgba(140, 224, 228, .34); stroke-width: 1; }

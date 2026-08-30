@@ -17,6 +17,9 @@ const MIME: Record<string, string> = {
 
 Bun.serve({
   port: PORT,
+  // USB `adb reverse` forwards the phone's localhost to this loopback socket.
+  // Keeping it loopback-only avoids exposing the development tree on Wi-Fi.
+  hostname: "127.0.0.1",
   async fetch(req) {
     const url = new URL(req.url);
     const pathname = url.pathname === "/" ? "/index.html" : url.pathname;

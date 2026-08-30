@@ -10,7 +10,9 @@
     "serve": "bun run server.ts"
   },
   "dependencies": {
-    "vue": "^3.5.0"
+    "echarts": "^6.1.0",
+    "vue": "^3.5.0",
+    "vue-echarts": "^8.2.0"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.0.0",

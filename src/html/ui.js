@@ -384,13 +384,6 @@
     const card = $('#residual-card');
     card.hidden = !residual.visible;
     if (!residual.visible) return;
-    const points = (residual.samples ?? []).map((sample) => [sample.time, sample.epsilon]);
-    drawChart($('#residual-chart'), [{ color: '#36e7f2', points }], {
-      yLog: true,
-      xLabel: 'simulation time (s)',
-      yLabel: 'max residual ε (log₁₀)',
-      empty: 'Waiting for Eq.106 certified residuals…',
-    });
     $('#residual-order').textContent = `ORDER ${residual.order} · ${residual.mode}`;
     const remainder = Number.isFinite(residual.remainder) ? residual.remainder.toExponential(2) : '--';
     const relative = Number.isFinite(residual.relativeResidual) ? residual.relativeResidual.toExponential(2) : '--';
@@ -482,7 +475,6 @@
         empty: 'Waiting for the first completed 32K source point…',
       });
       makeLegend($('#curve-legend'), benchmarkSeries);
-      drawChart($('#jacobi-chart'), [{ color: '#43df81', points: snapshot.jacobi.filter((point) => Number.isFinite(point[1])) }], { xLabel: 'simulation time (s)', yLabel: 'Cⱼ' });
       renderResidual(snapshot.eq106Residual);
       renderPlanning(snapshot.planning);
       renderInversion(snapshot.inversion, snapshot.method);

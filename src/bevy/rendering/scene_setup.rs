@@ -26,7 +26,7 @@ pub fn setup_scene(
         Transform::from_xyz(1000.0, 2000.0, 1500.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    commands.spawn((
+    let _camera = commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             far: 100_000.0,
@@ -35,7 +35,16 @@ pub fn setup_scene(
         }),
         Transform::from_xyz(0.0, 800.0, 2500.0).looking_at(Vec3::ZERO, Vec3::Y),
         PanOrbitCamera::default(),
-    ));
+    )).id();
+
+    // Mobile Dawn/Vulkan stacks are particularly prone to failing PBR pipeline
+    // creation for multisampled targets (reported as VK_ERROR_UNKNOWN). The
+    // simulation's compute paths stay exactly the same; this only selects the
+    // single-sampled PBR variant, which is supported by the WebGPU baseline.
+    #[cfg(target_arch = "wasm32")]
+    if crate::browser_is_mobile() {
+        commands.entity(_camera).insert(Msaa::Off);
+    }
 
     commands.spawn((
         WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/ryugu.glb"))),

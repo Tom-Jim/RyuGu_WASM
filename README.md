@@ -522,3 +522,9 @@ Eq.106 implementation note: Taylor order is selected per certified segment from 
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+## Live site traffic
+
+[![RyuGu WASM live site traffic](https://raw.githubusercontent.com/Tom-Jim/RyuGu_WASM/main/assets/site-traffic.svg?v=2026-08-30)](https://hits.sh/tom-jim.github.io/RyuGu_WASM/)
+
+The chart is regenerated daily from the privacy-friendly HITS counter embedded in the [live WebGPU demo](https://tom-jim.github.io/RyuGu_WASM/). It reports image requests rather than strict unique visitors.
