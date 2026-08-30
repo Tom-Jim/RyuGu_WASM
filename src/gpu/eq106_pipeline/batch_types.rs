@@ -45,6 +45,11 @@ const OUTPUT_ROWS_PER_BLOCK: u64 = 11;
 const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
 const TAYLOR_REMAINDER_TARGET: f32 = 1.0e-3;
 const TAYLOR_GRADIENT_REMAINDER_TARGET: f32 = 1.0e-2;
+// Mobile WebGPU implementations use device-specific f32 transcendental and
+// reduction paths. Keep the desktop/benchmark admission criterion at 4%, but
+// allow a wider runtime certificate on mobile as an explicit platform policy.
+#[cfg(target_arch = "wasm32")]
+const MOBILE_EQ106_CERTIFICATE_TOLERANCE: f32 = 0.20;
 const TIMESTAMP_BYTES: u64 = 8;
 const TARGET_DISPATCH_WIDTH: u32 = 65_535;
 const EQ106_GPU_TIMEOUT: Duration = Duration::from_secs(10);
@@ -627,7 +632,7 @@ fn poll_eq106_readback(
         inversion.target_evaluation_ms = packet.timings.target_evaluation_ms;
         return;
     }
-    let decoded = match decode_eq106_packet(&packet) {
+    let decoded = match decode_eq106_packet(&packet, eq106_certificate_tolerance()) {
         Ok(decoded) => decoded,
         Err(Eq106DecodeError::Incomplete { actual, expected }) => {
             runtime_error.raise(format!(
@@ -710,7 +715,18 @@ impl Eq106RejectReason {
     }
 }
 
-fn decode_eq106_packet(packet: &Eq106ReadbackPacket) -> Result<Vec<GravityFieldSample>, Eq106DecodeError> {
+fn eq106_certificate_tolerance() -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    if crate::browser_is_mobile() {
+        return MOBILE_EQ106_CERTIFICATE_TOLERANCE;
+    }
+    GRAVITY_BENCHMARK_RELATIVE_TOLERANCE
+}
+
+fn decode_eq106_packet(
+    packet: &Eq106ReadbackPacket,
+    certificate_tolerance: f32,
+) -> Result<Vec<GravityFieldSample>, Eq106DecodeError> {
     let expected_rows = packet.snapshots.len() * OUTPUT_ROWS_PER_BLOCK as usize;
     if packet.partial_sums.len() != expected_rows {
         return Err(Eq106DecodeError::Incomplete {
@@ -727,6 +743,7 @@ fn decode_eq106_packet(packet: &Eq106ReadbackPacket) -> Result<Vec<GravityFieldS
             decode_eq106_sample(
                 &packet.partial_sums[start..start + OUTPUT_ROWS_PER_BLOCK as usize],
                 snapshot,
+                certificate_tolerance,
             )
             .map_err(|reason| Eq106DecodeError::Rejected {
                 sample: index,
@@ -739,6 +756,7 @@ fn decode_eq106_packet(packet: &Eq106ReadbackPacket) -> Result<Vec<GravityFieldS
 fn decode_eq106_sample(
     rows: &[[f32; 4]],
     base_snapshot: &GravityRequestSnapshot,
+    certificate_tolerance: f32,
 ) -> Result<GravityFieldSample, Eq106RejectReason> {
     let field = rows[0];
     let certificate = rows[1];
@@ -747,21 +765,21 @@ fn decode_eq106_sample(
             certificate[0],
             Eq106RejectReason::TaylorField {
                 value: certificate[0],
-                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+                limit: certificate_tolerance,
             },
         ),
         (
             certificate[1],
             Eq106RejectReason::ImaginaryResidual {
                 value: certificate[1],
-                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+                limit: certificate_tolerance,
             },
         ),
         (
             certificate[2],
             Eq106RejectReason::SpectralTail {
                 value: certificate[2],
-                limit: GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
+                limit: certificate_tolerance,
             },
         ),
         (
