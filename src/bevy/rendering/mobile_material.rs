@@ -33,6 +33,10 @@ pub fn configure_mobile_materials_system(
         (Entity, &MeshMaterial3d<StandardMaterial>),
         Without<MeshMaterial3d<MobileUnlitMaterial>>,
     >,
+    unmaterialized_meshes: Query<
+        Entity,
+        (With<Mesh3d>, Without<MeshMaterial3d<StandardMaterial>>, Without<MeshMaterial3d<MobileUnlitMaterial>>),
+    >,
     standard_materials: Res<Assets<StandardMaterial>>,
     mut mobile_materials: ResMut<Assets<MobileUnlitMaterial>>,
 ) {
@@ -55,6 +59,16 @@ pub fn configure_mobile_materials_system(
             .entity(entity)
             .remove::<MeshMaterial3d<StandardMaterial>>()
             .insert(MeshMaterial3d(material));
+    }
+
+    // On mobile the glTF loader is configured not to create StandardMaterial
+    // at all. Add the neutral fallback directly to those mesh entities.
+    let fallback = mobile_materials.add(MobileUnlitMaterial {
+        color: LinearRgba::new(0.32, 0.38, 0.42, 1.0),
+        alpha_mode: AlphaMode::Opaque,
+    });
+    for entity in &unmaterialized_meshes {
+        commands.entity(entity).insert(MeshMaterial3d(fallback.clone()));
     }
 }
 

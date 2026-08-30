@@ -11,6 +11,7 @@ mod wgsl;
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::log::{Level, LogPlugin};
+use bevy::pbr::PbrPlugin;
 use bevy::prelude::*;
 use bevy::render::render_resource::WgpuLimits;
 use bevy::render::{
@@ -320,6 +321,14 @@ pub fn main() {
                         present_mode: PresentMode::AutoVsync,
                         ..default()
                     }),
+                    ..default()
+                })
+                // Do not let the glTF loader create StandardMaterial on mobile.
+                // Those entities can reach render extraction before the
+                // PostUpdate material conversion system and trigger the
+                // fragile default PBR pipeline on mobile Vulkan/Dawn.
+                .set(PbrPlugin {
+                    gltf_enable_standard_materials: !is_mobile_browser,
                     ..default()
                 })
                 .set(RenderPlugin {
