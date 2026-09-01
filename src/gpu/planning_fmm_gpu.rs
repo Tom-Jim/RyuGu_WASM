@@ -140,7 +140,7 @@ impl PlanningFmmGpu {
             let largest = (batch.basis_records.len() as u64 * 16)
                 .max(FMM_GPU_NODES * 56 * 12 * 4)
                 .max(u64::from(response_count) * 56 * 96);
-            if largest > u64::from(limits.max_storage_buffer_binding_size)
+            if largest > limits.max_storage_buffer_binding_size
                 || largest > limits.max_buffer_size
                 || limits.max_storage_buffers_per_shader_stage < 8
                 || response_count > FMM_GPU_CAPACITY
@@ -234,16 +234,16 @@ impl PlanningFmmGpu {
                     }
                 }
             }
-            if state.pending_sources > 0 {
-                if let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0) {
-                    state.source_chunk = if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
-                        (state.source_chunk / 2).max(1)
-                    } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
-                        state.source_chunk.saturating_mul(2).min(16_384)
-                    } else {
-                        state.source_chunk
-                    };
-                }
+            if state.pending_sources > 0
+                && let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0)
+            {
+                state.source_chunk = if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
+                    (state.source_chunk / 2).max(1)
+                } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
+                    state.source_chunk.saturating_mul(2).min(16_384)
+                } else {
+                    state.source_chunk
+                };
             }
             state.uncharged.add(completion.cost);
             state.pending = None;

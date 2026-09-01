@@ -1020,6 +1020,7 @@ fn build_planning_reference_jets(
 /// intentionally not used by Picard propagation: certification needs an
 /// exact, method-independent field/gradient, while candidate dynamics use the
 /// source-count-independent FMM tree and reevaluate every updated position.
+#[cfg(test)]
 pub(crate) fn evaluate_planning_reference_field(
     target: DVec3,
     basis_records: &[PlanningBasisRecord],

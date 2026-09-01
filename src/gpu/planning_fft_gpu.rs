@@ -188,7 +188,7 @@ impl PlanningFftGpu {
             // Fail explicitly on insufficient device limits; never fall back to
             // synchronously computing these large bases on the event-loop CPU.
             let limits = device.limits();
-            if u64::from(limits.max_storage_buffer_binding_size) < FFT_GPU_BANK_BYTES
+            if limits.max_storage_buffer_binding_size < FFT_GPU_BANK_BYTES
                 || limits.max_buffer_size < FFT_GPU_BANK_BYTES
                 || limits.max_storage_buffers_per_shader_stage < 7
             {
@@ -262,28 +262,28 @@ impl PlanningFftGpu {
                 }
                 return None;
             }
-            if state.pending_columns > 0 {
-                if let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0) {
-                    let per_column = ms / f64::from(state.pending_columns);
-                    // Timestamp the whole submission and change the next
-                    // batch conservatively. Slow work shrinks immediately;
-                    // growth requires a comfortable margin below the target.
-                    state.column_batch = if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
-                        PLANNING_GPU_MIN_BATCH
-                    } else if per_column > PLANNING_GPU_TARGET_SUBMISSION_MS {
-                        state
-                            .column_batch
-                            .saturating_sub(1)
-                            .max(PLANNING_GPU_MIN_BATCH)
-                    } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
-                        state
-                            .column_batch
-                            .saturating_add(1)
-                            .min(PLANNING_GPU_MAX_BATCH)
-                    } else {
-                        state.column_batch
-                    };
-                }
+            if state.pending_columns > 0
+                && let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0)
+            {
+                let per_column = ms / f64::from(state.pending_columns);
+                // Timestamp the whole submission and change the next
+                // batch conservatively. Slow work shrinks immediately;
+                // growth requires a comfortable margin below the target.
+                state.column_batch = if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
+                    PLANNING_GPU_MIN_BATCH
+                } else if per_column > PLANNING_GPU_TARGET_SUBMISSION_MS {
+                    state
+                        .column_batch
+                        .saturating_sub(1)
+                        .max(PLANNING_GPU_MIN_BATCH)
+                } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
+                    state
+                        .column_batch
+                        .saturating_add(1)
+                        .min(PLANNING_GPU_MAX_BATCH)
+                } else {
+                    state.column_batch
+                };
             }
             state.uncharged.add(completion.cost);
             state.pending = None;

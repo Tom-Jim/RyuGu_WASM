@@ -359,7 +359,6 @@ struct Eq106ComputePipeline {
     planning_voxel_line_samples_id: CachedComputePipelineId,
     planning_voxel_spectrum_id: CachedComputePipelineId,
     planning_combine_spectrum_id: CachedComputePipelineId,
-    planning_nufft_grid_id: CachedComputePipelineId,
     planning_evaluate_id: CachedComputePipelineId,
 }
 
@@ -500,19 +499,6 @@ impl FromWorld for Eq106ComputePipeline {
                 entry_point: Some("combine_voxel_spectrum".into()),
                 zero_initialize_workgroup_memory: false,
             });
-        let nufft_shader = crate::wgsl::load(
-            world.resource::<AssetServer>(),
-            crate::wgsl::EmbeddedShader::Eq106Nufft,
-        );
-        let planning_nufft_grid_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("eq106_planning_type2_nufft_grid".into()),
-            layout: vec![planning_layout.clone()],
-            immediate_size: 0,
-            shader: nufft_shader,
-            shader_defs: vec![],
-            entry_point: Some("build_type2_nufft_grid".into()),
-            zero_initialize_workgroup_memory: false,
-        });
         let planning_evaluate_id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("eq106_planning_evaluate_field".into()),
             layout: vec![planning_layout],
@@ -529,7 +515,6 @@ impl FromWorld for Eq106ComputePipeline {
             planning_voxel_line_samples_id,
             planning_voxel_spectrum_id,
             planning_combine_spectrum_id,
-            planning_nufft_grid_id,
             planning_evaluate_id,
         }
     }

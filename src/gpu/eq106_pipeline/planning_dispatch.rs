@@ -684,10 +684,8 @@ fn dispatch_planning_eq106(
     } else {
         1
     };
-    if starting_request {
-        if let Some(queries) = &mut state.active_timestamps {
-            queries.set_pass_count(total_stages as u32);
-        }
+    if starting_request && let Some(queries) = &mut state.active_timestamps {
+        queries.set_pass_count(total_stages as u32);
     }
     let stage_budget = planning_eq106_stage_budget(
         request.compute_benchmark,
@@ -804,10 +802,8 @@ fn dispatch_planning_eq106(
         }
         resources
     });
-    if final_submission {
-        if let Some(queries) = &state.active_timestamps {
-            queries.resolve_into(&mut encoder, &staging, data_size);
-        }
+    if final_submission && let Some(queries) = &state.active_timestamps {
+        queries.resolve_into(&mut encoder, &staging, data_size);
     }
     render_queue.submit([encoder.finish()]);
     state.active_command_submission_ms += encode_started.elapsed().as_secs_f64() * 1.0e3;

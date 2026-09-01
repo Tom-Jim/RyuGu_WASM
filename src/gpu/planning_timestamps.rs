@@ -178,7 +178,9 @@ impl PlanningTimestampQueries {
     pub(crate) fn decode(&self, bytes: &[u8]) -> Option<Vec<f64>> {
         let bytes = bytes.get(..self.passes as usize * 16)?;
         bytes
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|pair| {
                 let begin = u64::from_le_bytes(pair[..8].try_into().ok()?);
                 let end = u64::from_le_bytes(pair[8..].try_into().ok()?);

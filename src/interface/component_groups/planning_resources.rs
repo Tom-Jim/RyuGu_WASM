@@ -420,6 +420,7 @@ impl PlanningMethodMetrics {
         self.accuracy_failure_mask(PlanningAccuracyProfile::Strict, false) == 0
     }
 
+    #[cfg(test)]
     pub fn certified_accuracy_eligible(self) -> bool {
         self.accuracy_failure_mask(PlanningAccuracyProfile::Strict, true) == 0
     }
