@@ -7,21 +7,8 @@ import { SVGRenderer } from 'echarts/renderers';
 
 use([LineChart, GridComponent, TooltipComponent, SVGRenderer]);
 
-const clampPercent = (value) => Math.min(100, Math.max(0, Number(value) || 0));
-const emptyProgress = () => ({ runId: null, progress: 0, accuracy: 0, running: false });
-const mergeProgress = (previous, planning) => {
-  const sameRun = previous.runId === planning.runId;
-  return {
-    runId: planning.runId,
-    progress: sameRun
-      ? Math.max(previous.progress, clampPercent(planning.progress))
-      : clampPercent(planning.progress),
-    accuracy: sameRun
-      ? Math.max(previous.accuracy, clampPercent(planning.accuracy))
-      : clampPercent(planning.accuracy),
-    running: Boolean(planning.running),
-  };
-};
+const emptyProgress = () => ({ runId: null, progress: 0, accuracy: 0, running: false, completed: false });
+const mergeProgress = (_previous, planning) => window.ryuguPlanningProgress(planning);
 
 const useViewportNavigation = () => {
   const view = ref({ zoom: 1, x: 0, y: 0 });
@@ -173,12 +160,12 @@ const app = createApp({
       <div v-for="kind in workloads" :key="kind" class="rounded-md border border-cyan-200/15 bg-black/20 px-2 py-1.5">
         <div class="flex items-center justify-between gap-2 font-mono text-[10px] text-slate-300">
           <span>{{ labels[kind] }} calculation</span>
-          <span>{{ Math.round(tracked[kind].progress) }}%</span>
+          <span>{{ tracked[kind].progress }}%</span>
         </div>
-        <div class="mt-1 h-1.5 overflow-hidden rounded bg-cyan-950/80" role="progressbar" :aria-label="labels[kind] + ' calculation progress'" :aria-valuenow="Math.round(tracked[kind].progress)" aria-valuemin="0" aria-valuemax="100">
+        <div class="mt-1 h-1.5 overflow-hidden rounded bg-cyan-950/80" role="progressbar" :aria-label="labels[kind] + ' calculation progress'" :aria-valuenow="tracked[kind].progress" aria-valuemin="0" aria-valuemax="100">
           <div class="h-full rounded bg-cyan-300" :style="{ width: tracked[kind].progress + '%' }"></div>
         </div>
-        <div class="mt-1 font-mono text-[9px] text-slate-500">{{ tracked[kind].running ? Math.round(tracked[kind].progress) + '% complete' : tracked[kind].progress >= 100 ? 'Complete' : tracked[kind].progress > 0 ? 'Stopped' : 'Ready' }}</div>
+        <div class="mt-1 font-mono text-[9px] text-slate-500">{{ tracked[kind].running ? tracked[kind].progress + '% complete' : tracked[kind].completed ? 'Complete' : tracked[kind].progress > 0 ? 'Stopped' : 'Ready' }}</div>
       </div>
     </section>
   `,
@@ -200,7 +187,7 @@ createApp({
     onBeforeUnmount(() => window.removeEventListener('ryugu-snapshot', update));
     return { planning, tracked };
   },
-  template: `<div v-if="planning.workload === 'quadrature'" class="mt-1 min-w-64"><div class="flex justify-between font-mono text-[10px] text-slate-300"><span>Quadrature calculation</span><span>{{ Math.round(tracked.progress) }}% complete</span></div><div class="mt-1 h-1.5 overflow-hidden rounded bg-cyan-950/80" role="progressbar" aria-label="Quadrature calculation progress" :aria-valuenow="Math.round(tracked.progress)" aria-valuemin="0" aria-valuemax="100"><div class="h-full rounded bg-cyan-300" :style="{ width: tracked.progress + '%' }"></div></div></div>`,
+  template: `<div v-if="planning.workload === 'quadrature'" class="mt-1 min-w-64"><div class="flex justify-between font-mono text-[10px] text-slate-300"><span>Quadrature calculation</span><span>{{ tracked.progress }}% complete</span></div><div class="mt-1 h-1.5 overflow-hidden rounded bg-cyan-950/80" role="progressbar" aria-label="Quadrature calculation progress" :aria-valuenow="tracked.progress" aria-valuemin="0" aria-valuemax="100"><div class="h-full rounded bg-cyan-300" :style="{ width: tracked.progress + '%' }"></div></div></div>`,
 }).mount('#quadrature-progress');
 
 const LIVE_SAMPLE_WINDOW = 96;
@@ -330,7 +317,7 @@ function mountTelemetryChart(target, kind) {
       onBeforeUnmount(() => window.removeEventListener('ryugu-snapshot', update));
       return { option, windowLabel };
     },
-    template: '<v-chart class="live-echart" :option="option" :autoresize="{ throttle: 80 }" renderer="svg" role="img" :aria-label="windowLabel" />',
+    template: '<v-chart class="live-echart" :option="option" :autoresize="{ throttle: 80 }" :init-options="{ renderer: \'svg\' }" role="img" :aria-label="windowLabel" />',
   }).mount(target);
 }
 
@@ -340,8 +327,6 @@ window.ryuguTelemetryReady = true;
 
 const benchmarkColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77', '#a8f7bd'];
 const benchmarkLabels = ['Radial', 'Werner', 'Eq.106', 'Packed FFT', 'FMM'];
-const quadratureLabels = ['Eq.106 raw', 'Eq.106 certified', 'Packed FFT raw', 'Packed FFT certified', 'FMM raw', 'FMM certified'];
-const quadratureColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
 
 const modalAxisStyle = {
   axisLine: { lineStyle: { color: 'rgba(120, 208, 213, .38)' } },
@@ -400,33 +385,9 @@ function performanceOption(snapshot, kind) {
   };
 }
 
-function quadratureOption(snapshot) {
-  const grouped = new Map();
-  for (const sample of snapshot?.planning?.curve ?? []) {
-    if (!grouped.has(sample.sources)) grouped.set(sample.sources, Array.from({ length: 6 }, () => []));
-    sample.times?.forEach((time, index) => {
-      if (Number.isFinite(time) && time > 0) grouped.get(sample.sources)[index].push(Number(time));
-    });
-  }
-  const median = (values) => {
-    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
-    return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
-  };
-  const series = quadratureLabels.map((name, index) => ({
-    type: 'line',
-    name,
-    data: [...grouped].sort((a, b) => a[0] - b[0]).map(([sources, values]) => [Number(sources), median(values[index])]).filter(([, value]) => value !== null),
-    showSymbol: false,
-    lineStyle: { width: 2, type: index % 2 ? 'dashed' : 'solid', color: quadratureColors[index] },
-    itemStyle: { color: quadratureColors[index] },
-  }));
-  return {
-    ...modalChartFrame(),
-    xAxis: { ...modalAxisStyle, type: 'log', logBase: 2, name: 'source points', min: 32_000, max: 8_192_000, axisLabel: { ...modalAxisStyle.axisLabel, formatter: (value) => `${Math.round(value / 1000)}K` } },
-    yAxis: { ...modalAxisStyle, type: 'log', logBase: 10, name: 'total time (ms)', axisLabel: { ...modalAxisStyle.axisLabel, formatter: chartAxisNumber } },
-    series,
-  };
-}
+// The quadrature curve is a native SVG owned by ui.js. It updates as each
+// source cell completes, including while the modal is hidden. Do not mount a
+// second renderer into that node or gate it on ECharts/module readiness.
 
 function mountBenchmarkChart(target, makeOption) {
   createApp({
@@ -438,11 +399,10 @@ function mountBenchmarkChart(target, makeOption) {
       onBeforeUnmount(() => window.removeEventListener('ryugu-snapshot', update));
       return { option: computed(() => makeOption(snapshot.value)) };
     },
-    template: '<v-chart class="modal-echart" :option="option" :autoresize="{ throttle: 80 }" renderer="svg" />',
+    template: '<v-chart class="modal-echart" :option="option" :autoresize="{ throttle: 80 }" :init-options="{ renderer: \'svg\' }" />',
   }).mount(target);
 }
 
 mountBenchmarkChart('#performance-fps-chart', (snapshot) => performanceOption(snapshot, 'fps'));
 mountBenchmarkChart('#performance-jacobi-chart', (snapshot) => performanceOption(snapshot, 'jacobi'));
-mountBenchmarkChart('#quadrature-chart', quadratureOption);
 window.ryuguBenchmarkChartsReady = true;

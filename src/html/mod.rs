@@ -15,10 +15,15 @@ export function take_ryugu_ui_action() {
 export function update_ryugu_ui(snapshot) {
     window.ryuguUi?.render?.(JSON.parse(snapshot));
 }
+
+export function ryugu_page_visible() {
+    return document.visibilityState === "visible";
+}
 "#)]
 extern "C" {
     fn take_ryugu_ui_action() -> String;
     fn update_ryugu_ui(snapshot: &str);
+    fn ryugu_page_visible() -> bool;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -52,6 +57,17 @@ pub(crate) fn browser_ui_action_system(
         };
         let value = action.get("value");
         match kind {
+            "planning-accuracy" => {
+                if let Some(profile) = match value.and_then(Value::as_str) {
+                    Some("strict") => Some(PlanningAccuracyProfile::Strict),
+                    Some("screening") => Some(PlanningAccuracyProfile::Screening),
+                    _ => None,
+                } {
+                    // Reporting-only switch; keep measurements and the current
+                    // GPU job intact, and reclassify every stored repetition.
+                    planning.accuracy_profile = profile;
+                }
+            }
             "method" => {
                 let next = match value.and_then(Value::as_str) {
                     Some("radial") => Some(ActiveGravityMethod::RadialAnalytic),
@@ -241,6 +257,10 @@ pub(crate) fn browser_ui_action_system(
                 }
                 probe.preset = ProbeOrbitPreset::Custom;
             }
+            "quadrature-open" => {
+                // Opening the parameter picker does not launch a hidden sweep.
+                planning.source_curve_visible = true;
+            }
             "quadrature-start" => {
                 if channel.in_flight.load(Ordering::Acquire) {
                     // A cancelled map/submit can still be completing on the
@@ -266,6 +286,8 @@ pub(crate) fn browser_ui_action_system(
                     &channel,
                     "Starting a fresh quadrature workload.",
                 );
+                planning.computation_complete = false;
+                planning.stopped_operation_work = 0.0;
                 planning.workload_profile = PlanningWorkloadProfile::SourceCrossover;
                 planning.selected_metric = ComparisonMetric::SpeedupVsGpuFmm;
                 planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
@@ -273,26 +295,54 @@ pub(crate) fn browser_ui_action_system(
                 planning.source_curve_visible = true;
                 planning.source_curve_index = 0;
                 planning.source_curve_repeat = 0;
+                planning.source_curve_all_parameters = action.get("scope")
+                    .and_then(Value::as_str) == Some("all");
+                planning.source_curve_density_index = if planning.source_curve_all_parameters { 0 } else {
+                    action.get("densityModels").and_then(Value::as_u64)
+                        .and_then(|k| PLANNING_DENSITY_MODEL_COUNTS.iter().position(|&value| u64::from(value) == k))
+                        .unwrap_or(0)
+                };
+                planning.source_curve_target_index = if planning.source_curve_all_parameters { 0 } else {
+                    action.get("targets").and_then(Value::as_u64)
+                        .and_then(|nt| PLANNING_TARGET_COUNTS.iter().position(|&value| u64::from(value) == nt))
+                        .unwrap_or(0)
+                };
+                let mut order_seed_bytes = [0u8; 8];
+                if getrandom::fill(&mut order_seed_bytes).is_err() {
+                    planning.source_curve_active = false;
+                    planning.source_curve_visible = false;
+                    planning.status = "Quadrature stopped: could not seed the randomized method order.".into();
+                    continue;
+                }
+                planning.source_curve_order_seed = u64::from_le_bytes(order_seed_bytes);
                 planning.source_curve_samples.clear();
                 planning.results = std::array::from_fn(|_| None);
                 planning.batch_job = None;
                 planning.preparation_progress = 0.0;
                 planning.run_requested = true;
                 planning.run_id = planning.run_id.wrapping_add(1);
+                planning.source_curve_run_id = planning.run_id;
+                planning.computation_complete = false;
+                planning.stopped_operation_work = 0.0;
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
                 result.0 = None;
                 let (_, density_models, samples_per_candidate) =
-                    PlanningWorkloadProfile::SourceCrossover.dimensions();
+                    planning.dimensions();
                 planning.status = format!(
-                    "Quadrature-source crossover queued: {} distinct positions, {} density models, {} samples/candidate, repeat 1/{}, Eq.106 first.",
+                    "Quadrature sweep queued: {} sources, {} density models, {} targets, repeat 1/{}; random method order; scope: {}.",
                     PLANNING_SOURCE_COUNTS[0],
                     density_models,
                     samples_per_candidate,
                     PLANNING_SOURCE_REPEATS,
+                    if planning.source_curve_all_parameters { "all K x target combinations" } else { "selected K x target combination" },
                 );
             }
             "quadrature-cancel" => {
+                if planning.workload_profile != PlanningWorkloadProfile::SourceCrossover {
+                    planning.source_curve_visible = false;
+                    continue;
+                }
                 cancel_planning(
                     &mut planning,
                     &mut request,
@@ -342,6 +392,8 @@ fn queue_planning_run(
     planning.preparation_progress = 0.0;
     planning.reference_duration_seconds = 0.0;
     planning.run_requested = true;
+    planning.computation_complete = false;
+    planning.stopped_operation_work = 0.0;
     planning.run_id = planning.run_id.wrapping_add(1);
     *request = PlanningGpuRequest::default();
     *payload = PlanningMethodPayload::default();
@@ -360,6 +412,7 @@ fn cancel_planning(
     channel: &PlanningGpuReadbackChannel,
     status: &str,
 ) {
+    planning.stopped_operation_work = planning.operation_work().0;
     planning.run_requested = false;
     planning.batch_job = None;
     planning.preparation_progress = 0.0;
@@ -419,30 +472,81 @@ pub(crate) struct BrowserUiSnapshot<'w> {
 
 pub(crate) fn browser_ui_publish_system(
     state: BrowserUiSnapshot,
-    mut publish_state: Local<(u8, usize)>,
+    mut publish_state: Local<(u8, usize, u64, String, Option<bevy::platform::time::Instant>)>,
 ) {
     publish_state.0 = publish_state.0.wrapping_add(1);
     let curve_len = state.planning.source_curve_samples.len();
-    let curve_changed = curve_len != publish_state.1;
-    if !curve_changed && !publish_state.0.is_multiple_of(6) {
-        return;
+    let curve_changed = curve_len != publish_state.1
+        || publish_state.2 != state.planning.source_curve_run_id
+        || publish_state.3 != state.planning.accuracy_profile.key();
+    let now = bevy::platform::time::Instant::now();
+    // Export each new repetition even while hidden. Otherwise the nine
+    // screenshot milestones are lost until someone returns to the tab.
+    // Progress-only hidden snapshots are limited to once per second.
+    if !curve_changed {
+        if !ryugu_page_visible() {
+            if publish_state.4.is_some_and(|last| now.duration_since(last).as_secs_f64() < 1.0) {
+                return;
+            }
+        } else if !publish_state.0.is_multiple_of(6) {
+            return;
+        }
     }
+    publish_state.4 = Some(now);
     publish_state.1 = curve_len;
-    let curve = state
+    publish_state.2 = state.planning.source_curve_run_id;
+    publish_state.3 = state.planning.accuracy_profile.key().into();
+    // The browser retains immutable curve rows. Only send them when numerical
+    // results or their accuracy profile change, not on every progress tick.
+    let curve = curve_changed.then(|| state
         .planning
         .source_curve_samples
         .iter()
         .map(|sample| {
+            let failures = match state.planning.accuracy_profile {
+                PlanningAccuracyProfile::Strict => sample.strict_failures,
+                PlanningAccuracyProfile::Screening => sample.screening_failures,
+            };
             json!({
                 "sources": sample.source_count,
-                "times": sample.times_ms,
+                "densityModels": sample.density_model_count,
+                "targets": sample.target_count,
+                "repeat": sample.repeat,
+                "orderSeed": sample.order_seed.to_string(),
+                "methodOrder": sample.method_order,
+                // Archival exports retain both gates and unfiltered values;
+                // a later display-profile change cannot rewrite a screenshot.
+                "rawTimes": sample.times_ms,
+                "rawKernelTimes": sample.kernel_times_ms,
+                "rawEvaluationKernelTimes": sample.evaluation_kernel_times_ms,
+                "strictFailures": sample.strict_failures,
+                "screeningFailures": sample.screening_failures,
+                "screeningFailureReasons": sample.screening_failures.map(planning_accuracy_failure_labels),
+                // Fail closed even for clients that forget the eligibility gate.
+                "times": std::array::from_fn::<_, 6, _>(|index| {
+                    (failures[index] == 0 && sample.times_ms[index].is_finite()
+                        && sample.times_ms[index] > 0.0).then_some(sample.times_ms[index])
+                }),
+                "kernelTimes": std::array::from_fn::<_, 6, _>(|index| {
+                    sample.kernel_times_ms[index].filter(|time| failures[index] == 0 && time.is_finite() && *time >= 0.0)
+                }),
+                "evaluationKernelTimes": std::array::from_fn::<_, 6, _>(|index| {
+                    sample.evaluation_kernel_times_ms[index].filter(|time| failures[index] == 0 && time.is_finite() && *time >= 0.0)
+                }),
+                "basisKernelTimes": sample.basis_kernel_times_ms,
+                "gravityErrors": sample.gravity_errors,
+                "gradientErrors": sample.gradient_errors,
                 "geometry": sample.geometry_basis_build_ms,
                 "density": sample.density_model_ms,
                 "target": sample.target_point_ms,
-                "eligible": sample.eligible,
+                "eligible": failures.map(|mask| mask == 0),
+                "strictEligible": sample.eligible,
+                "failureReasons": failures.map(planning_accuracy_failure_labels),
+                "strictFailureReasons": sample.strict_failures.map(planning_accuracy_failure_labels),
+                "accuracyProfile": state.planning.accuracy_profile.key(),
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>());
     let jacobi = state
         .jacobi
         .samples
@@ -528,9 +632,21 @@ pub(crate) fn browser_ui_publish_system(
         .iter()
         .map(|result| {
             result.map(|result| {
+                let failures = result.accuracy_failure_mask(state.planning.accuracy_profile, false);
                 json!({
                     "method": method_key(result.method),
-                    "totalMs": result.total_ms,
+                    "implementation": result.method.planning_label(),
+                    "totalMs": (failures == 0).then_some(result.total_ms),
+                    "checkedTotalMs": (result.accuracy_failure_mask(state.planning.accuracy_profile, true) == 0)
+                        .then_some(result.certified_estimated_total_ms),
+                    "kernelMs": result.raw_kernels.all_ms,
+                    "checkedKernelMs": result.checked_kernels.all_ms,
+                    "evaluationKernelMs": result.raw_kernels.evaluation_ms,
+                    "basisKernelMs": result.raw_kernels.basis_ms,
+                    "externalValidationMs": result.external_validation_ms,
+                    "eligible": failures == 0,
+                    "strictEligible": result.accuracy_eligible(),
+                    "failureReasons": planning_accuracy_failure_labels(failures),
                     "geometryMs": result.geometry_basis_build_ms,
                     "densityModelMs": result.density_model_ms,
                     "targetPointMs": result.target_point_ms,
@@ -576,11 +692,33 @@ pub(crate) fn browser_ui_publish_system(
         "activeVramBytes": state.memory.bytes[state.active_method.performance_index()],
         "planning": {
             "running": state.planning.run_requested,
-            "runId": state.planning.run_id,
+            "runId": if state.planning.workload_profile == PlanningWorkloadProfile::SourceCrossover {
+                state.planning.source_curve_run_id
+            } else { state.planning.run_id },
+            "completed": state.planning.computation_complete,
+            "scope": if state.planning.source_curve_all_parameters { "all" } else { "selected" },
+            "workCompleted": state.planning.operation_work().0,
+            "workTotal": state.planning.operation_work().1,
+            "progressUnit": "estimated arithmetic operation units (source/basis/FFT/RHS/target/reference work); not measured FLOPs or an ETA",
+            "implementation": "Eq.106 Taylor/Chebyshev; GPU FFT (compensated f32), 56 GPU density bases + quintic evaluation; GPU order-2 FMM (P2M/M2M/M2L/P2P and 56-basis density mix). Independent f64 validation uses bounded CPU slices.",
+            "timingDefinition": "Raw total = shared CPU preparation + method CPU preparation + GPU preparation/evaluation submission wall times + result processing. Cooperative gaps between submissions are excluded. Checked total = raw total + the additional full checked pass; fixed-target bases charged once, streamed FMM target windows charged whenever rebuilt. Warm calibration and shared f64 references are excluded. GPU views use only pass timestamps; no CPU or readback substitution.",
             "visible": state.planning.source_curve_visible,
             "status": state.planning.status,
             "sourceCount": state.planning.requested_source_count,
             "repeat": state.planning.source_curve_repeat + 1,
+            "requiredRepeats": PLANNING_SOURCE_REPEATS,
+            "accuracyProfile": state.planning.accuracy_profile.key(),
+            "accuracyLimits": {
+                "gravity": state.planning.accuracy_profile.limits().gravity,
+                "gradient": state.planning.accuracy_profile.limits().gradient,
+                "gravityP99": state.planning.accuracy_profile.limits().gravity_p99,
+                "gradientP99": state.planning.accuracy_profile.limits().gradient_p99,
+                "gravityMax": state.planning.accuracy_profile.limits().gravity_max,
+                "gradientMax": state.planning.accuracy_profile.limits().gradient_max,
+                "pericenterM": state.planning.accuracy_profile.limits().pericenter_m,
+            },
+            "densityModels": state.planning.dimensions().1,
+            "targets": state.planning.dimensions().2,
             "metric": metric_key(state.planning.selected_metric),
             "workload": workload_key(state.planning.workload_profile),
             "results": planning_results,

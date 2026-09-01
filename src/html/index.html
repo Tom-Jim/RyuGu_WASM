@@ -52,6 +52,12 @@
 
             <aside class="right-rail glass" data-float-panel>
                 <div class="panel-heading drag-handle"><span>Inversion &amp; planning</span><small id="method-label">INITIALIZING · DRAG</small></div>
+                <details class="background-settings">
+                    <summary>Background execution / sleep</summary>
+                    <label><input type="checkbox" id="background-toggle" checked /> Continue scheduling when this tab is hidden</label>
+                    <p id="background-status" role="status">Waiting for the runtime…</p>
+                    <p>Local server ticks keep hidden-tab computation independent of browser timer throttling; Worker scheduling is the fallback. The macOS service prevents idle system sleep (and system sleep on AC power), while allowing the display to turn off. Browser freeze/discard, forced sleep and lid closure cannot be overridden. Keep the server and tab open, connect power, disable Chrome Energy Saver and add this site to “Always keep these sites active” for overnight jobs. Completed results and pending screenshots are archived; reloading cannot restore live WASM/GPU computation.</p>
+                </details>
                 <div class="metric-grid" role="group" aria-label="Planning comparison metric">
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="density">Density fit</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-metric" data-value="inversion-time">Inversion time</button>
@@ -69,13 +75,15 @@
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-workload" data-value="first">First</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="planning-workload" data-value="stress">Stress</button>
                 </div>
+                <label class="benchmark-filters">Comparison accuracy <select data-planning-accuracy><option value="strict" selected>Strict: g 0.1% / gradient 1%</option><option value="screening">Screening: g 2% / gradient 25%</option></select></label>
+                <p id="planning-accuracy-note" class="status-text">Strict comparison thresholds: g 0.1% / gradient 1%.</p>
                 <div id="planning-progress"></div>
                 <div id="planning-result" class="result-strip">No comparison result yet.</div>
                 <div class="runtime-row">
                     <label class="range-row accent"><span>Acceleration <output id="acceleration-out">1×</output></span><input id="acceleration" type="range" min="1" max="8" step="1" value="1" /></label>
                     <div class="stat-grid"><div><small>Runtime VRAM</small><strong id="vram">--</strong></div><div><small>Quadrature</small><strong id="quadrature-state">IDLE</strong></div></div>
                 </div>
-                <button onclick="window.ryuguUi?.activate?.(this)" id="quadrature-start" data-action="quadrature-start">Run quadrature 32K → 8192K</button>
+                <button onclick="window.ryuguUi?.activate?.(this)" id="quadrature-start" data-action="quadrature-open">Configure quadrature 32K → 8192K</button>
                 <div id="inversion-status" class="inversion-status">Trajectory inversion is ready when samples are captured.</div>
                 <p id="planning-status" class="status-text">Waiting for simulation state.</p>
             </aside>
@@ -116,10 +124,27 @@
 
         <section id="quadrature-modal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="quadrature-title">
             <div class="modal-card glass">
-                <header><div><small>GPU COMPUTE BENCHMARK</small><h1 id="quadrature-title">Quadrature-source crossover</h1><p>32K–8192K source points · 512 density models · raw and certified totals</p></div><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="quadrature-cancel" aria-label="Close quadrature benchmark">×</button></header>
-                <div class="chart-shell"><div id="quadrature-chart" class="modal-echart" role="img" aria-label="Quadrature benchmark chart"></div></div>
+                <header><div><small>GPU COMPUTE BENCHMARK</small><h1 id="quadrature-title">Quadrature-source crossover</h1><p id="quadrature-run-scope">Selected Kρ × Nt · 9 source sizes × 7 repeats · randomized order · median / min–max</p></div><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="quadrature-cancel" aria-label="Close quadrature benchmark">×</button></header>
+                <div class="benchmark-filters">
+                    <label>Accuracy <select data-planning-accuracy><option value="strict" selected>Strict: g 0.1% / gradient 1%</option><option value="screening">Screening: g 2% / gradient 25%</option></select></label>
+                    <label>Density models Kρ <select id="quadrature-density"><option>1</option><option>4</option><option>16</option><option>64</option><option>256</option><option>512</option><option>1024</option></select></label>
+                    <label>Targets Nt <select id="quadrature-targets"><option>8</option><option>64</option><option>241</option><option>1024</option><option>8192</option></select></label>
+                    <label>Timing <select id="quadrature-timing"><option value="times">Full pipeline total</option><option value="kernelTimes">GPU method kernels</option><option value="evaluationKernelTimes">GPU target kernels only</option></select></label>
+                    <label>Next run <select id="quadrature-scope"><option value="selected" selected>Selected Kρ × Nt</option><option value="all">All 35 combinations</option></select></label>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-start">Run selected scope</button>
+                    <span>Parameter dropdowns select the displayed curve and the next run; an active task keeps its original scope.</span>
+                    <span id="quadrature-accuracy-policy">Strict comparison thresholds; each source size is plotted after 7 passing repetitions.</span>
+                </div>
+                <p id="quadrature-implementation" class="benchmark-note"></p>
+                <p id="quadrature-timing-policy" class="benchmark-note"></p>
+                <div class="chart-shell"><svg id="quadrature-chart" viewBox="0 0 900 430" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Qualified median times by source size"></svg></div>
                 <div id="curve-legend" class="legend"></div>
-                <footer><div class="modal-progress"><span id="modal-status">Preparing workload…</span><div id="quadrature-progress"></div></div><button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-cancel">Cancel / close</button></footer>
+                <details class="benchmark-note"><summary id="quadrature-capture-status" role="status">Auto screenshots: 32K–8192K · 9 PNGs · parameters fixed at launch</summary><p>For an all-35 run, only the Kρ × Nt curve selected at launch produces the nine screenshots. Each completed source is captured even if accuracy fails. Local files save automatically under benchmark-captures; no download prompt is needed. Downloads:</p><div id="quadrature-capture-files"></div></details>
+                <div id="quadrature-accuracy-panel">
+                    <p id="quadrature-plot-status" role="status" aria-live="polite" data-accuracy-state="pending">Waiting for the first source size to complete 7 repetitions.</p>
+                    <details><summary id="quadrature-accuracy-summary">Accuracy details</summary><pre id="quadrature-accuracy"></pre></details>
+                </div>
+                <footer><div class="modal-progress"><span id="modal-status">Preparing workload…</span><div id="quadrature-progress"></div><small id="quadrature-work" class="benchmark-note"></small></div><button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-cancel">Cancel / close</button></footer>
             </div>
         </section>
         <section id="runtime-modal" class="modal critical" aria-hidden="true" role="alertdialog" aria-modal="true"><div class="error-card glass"><small>GPU PIPELINE STOPPED</small><h1>Computation paused</h1><p id="runtime-message"></p><button onclick="window.ryuguUi?.activate?.(this)" class="primary" data-action="runtime-reset">Reset parameters</button></div></section>
@@ -127,6 +152,7 @@
     <div id="no-webgpu"><h2>WebGPU unavailable</h2><p>This simulation requires a browser and GPU with WebGPU support.</p></div>
     <script type="importmap">{"imports":{"vue":"./node_modules/vue/dist/vue.esm-browser.prod.js","vue/dist/vue.esm-bundler.js":"./node_modules/vue/dist/vue.esm-browser.prod.js","vue-echarts":"./node_modules/vue-echarts/dist/index.js","echarts/core":"./node_modules/echarts/core.js","echarts/charts":"./node_modules/echarts/charts.js","echarts/components":"./node_modules/echarts/components.js","echarts/renderers":"./node_modules/echarts/renderers.js","echarts/":"./node_modules/echarts/","zrender/":"./node_modules/zrender/","tslib":"./node_modules/tslib/tslib.es6.js"}}</script>
     <script>globalThis.process ??= { env: { NODE_ENV: 'production' } }; globalThis.__VUE_OPTIONS_API__ = true; globalThis.__VUE_PROD_DEVTOOLS__ = false; globalThis.__VUE_PROD_HYDRATION_MISMATCH_DETAILS__ = false;</script>
+    <script src="./src/html/capture.js"></script>
     <script src="./src/html/ui.js"></script>
     <script type="module" src="./src/html/app.js"></script>
     <script type="module">
@@ -149,17 +175,49 @@
         };
         addEventListener('resize', updateViewportFrame, { passive: true });
         window.setRyuguDisplayRotation(0);
-        if (!navigator.gpu || !(await navigator.gpu.requestAdapter())) {
+        async function waitForWebGpuAdapter() {
+            if (!navigator.gpu) return null;
+            // Chrome may keep navigator.gpu present while the adapter is
+            // temporarily unavailable during a device/context reset. Avoid
+            // entering Bevy with a null adapter: its renderer constructor
+            // intentionally panics when no adapter exists.
+            for (let attempt = 0; attempt < 20; attempt += 1) {
+                try {
+                    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+                    if (adapter) return adapter;
+                } catch { /* retry after the browser finishes restoring WebGPU */ }
+                await new Promise((resolve) => setTimeout(resolve, 750));
+            }
+            return null;
+        }
+        if (!(await waitForWebGpuAdapter())) {
             document.getElementById('viewport-frame').hidden = true;
             document.getElementById('no-webgpu').style.display = 'grid';
         } else {
+            const { installBackgroundExecution } = await import('./src/html/background.js');
+            installBackgroundExecution();
             // CI replaces this placeholder with the commit SHA. The query
             // keeps Pages/CDN caches from mixing an old JS/WASM pair with the
             // current HTML shell. Local development still accepts ?v=... .
-            const version = new URL(location.href).searchParams.get('v') || '__RYUGU_VERSION__';
-            const suffix = version ? `?v=${encodeURIComponent(version)}` : '';
+            const requestedVersion = new URL(location.href).searchParams.get('v');
+            const version = requestedVersion || '__RYUGU_VERSION__';
+            // A local/unprocessed checkout still contains the CI placeholder.
+            // Do not let that literal query pin an old WASM module after a
+            // device-loss reload; production replaces it with a commit SHA.
+            const cacheVersion = version === '__RYUGU_VERSION__'
+                ? Date.now().toString(36)
+                : version;
+            const suffix = cacheVersion ? `?v=${encodeURIComponent(cacheVersion)}` : '';
             const wasm = await import(`./pkg/ryugu_wasm.js${suffix}`);
             await wasm.default({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` });
+            try {
+                const resume = JSON.parse(sessionStorage.getItem('ryugu-device-lost-resume') || 'null');
+                if (resume) {
+                    sessionStorage.removeItem('ryugu-device-lost-resume');
+                    sessionStorage.removeItem('ryugu-device-lost-reload-pending');
+                    window.ryuguUi?.resumeQuadrature?.(resume);
+                }
+            } catch { /* A blocked session store must not prevent startup. */ }
         }
     </script>
 </body>

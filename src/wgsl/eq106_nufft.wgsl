@@ -172,8 +172,10 @@ fn build_type2_nufft_grid(
         + ((params.segment_id - 1u) * MAX_TAYLOR_COEFFICIENT_COUNT
             * FFT_PAIR_COUNT + coefficient * FFT_PAIR_COUNT + pair) * FFT_SIZE;
     for (var grid_index = lane; grid_index < FFT_SIZE; grid_index += 256u) {
-        // WGSL's inverse transform is unnormalised, so restore the Fourier
-        // sum scale before interpolation.
-        nufft_storage[grid_base + grid_index] = fft_values[grid_index] / f32(FFT_SIZE);
+        // Positive-exponent butterflies already produce sum_k F_k exp(i k theta).
+        // These are Fourier-series coefficients, not a forward-FFT output:
+        // dividing by FFT_SIZE would attenuate fields AND derivatives by 1024.
+        // The evaluator applies the same Bromwich scale as the direct sum.
+        nufft_storage[grid_base + grid_index] = fft_values[grid_index];
     }
 }

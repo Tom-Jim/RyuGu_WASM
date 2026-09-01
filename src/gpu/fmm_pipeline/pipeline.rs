@@ -17,7 +17,7 @@ use bevy::render::{
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,7 +107,7 @@ impl Plugin for FmmComputePlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedFmmInput>();
-        render_app.init_resource::<FmmGpuBuffers>();
+        render_app.init_gpu_resource::<FmmGpuBuffers>();
         render_app.add_systems(ExtractSchedule, extract_fmm_input);
         render_app.add_systems(Render, dispatch_fmm.in_set(RenderSystems::Render));
     }
@@ -116,7 +116,7 @@ impl Plugin for FmmComputePlugin {
         let channel = app.world().resource::<FmmReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<FmmComputePipeline>();
+        render_app.init_gpu_resource::<FmmComputePipeline>();
     }
 }
 
@@ -154,8 +154,9 @@ pub fn build_fmm_source_system(
     aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     existing: Option<Res<FmmSource>>,
     active_method: Res<ActiveGravityMethod>,
+    planning: Res<PlanningComparisonState>,
 ) {
-    if existing.is_some() || *active_method != ActiveGravityMethod::Fmm {
+    if planning.blocks_realtime_gpu() || existing.is_some() || *active_method != ActiveGravityMethod::Fmm {
         return;
     }
     let Some(aggregated) = aggregated else {

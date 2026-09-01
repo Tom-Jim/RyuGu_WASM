@@ -61,6 +61,12 @@ impl Default for FmmReadbackChannel {
         }
     }
 }
+impl FmmReadbackChannel {
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
 
 
 impl Default for Eq106GpuReadbackChannel {
@@ -140,6 +146,12 @@ impl Default for MmfftReadbackChannel {
         }
     }
 }
+impl MmfftReadbackChannel {
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
 
 /// Blend weight retained for performance/Jacobi warm-up bookkeeping.
 /// Physics never substitutes an alternate force model while this value ramps.
@@ -184,6 +196,12 @@ impl Default for GravityReadbackChannel {
             data: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+impl GravityReadbackChannel {
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        self.in_flight.store(false, Ordering::Release);
     }
 }
 
@@ -354,9 +372,9 @@ impl ActiveGravityMethod {
 
     pub fn planning_label(self) -> &'static str {
         match self {
-            Self::CurvedArcEq106 => "Eq.106 full forward",
-            Self::MmfftCompressed => "packed MMFFT + GPU interpolation",
-            Self::Fmm => "GPU order-2 target-cell FMM",
+            Self::CurvedArcEq106 => "Eq.106 Taylor/Chebyshev variant",
+            Self::MmfftCompressed => "GPU FFT 56-basis convolution + quintic interpolation",
+            Self::Fmm => "GPU order-2 FMM + 56 density bases",
             _ => self.as_str(),
         }
     }

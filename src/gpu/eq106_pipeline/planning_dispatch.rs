@@ -11,7 +11,6 @@ struct PlanningEq106DispatchState {
     active_maximum_elements_per_candidate: u32,
     active_build_spectrum: bool,
     active_build_basis_spectrum: bool,
-    active_build_nufft_grid: bool,
     // A staged request owns the shared readback lock until either its map
     // callback runs or, when no map was scheduled yet, the submitted stages
     // have drained. Releasing it unconditionally on cancellation lets a new
@@ -20,6 +19,7 @@ struct PlanningEq106DispatchState {
     active_verification_targets: Vec<u32>,
     active_uniform: Option<Buffer>,
     active_bind_groups: Vec<BindGroup>,
+    active_timestamps: Option<crate::gpu::planning_timestamps::PlanningTimestampQueries>,
     batch_id: u64,
     payload_request_id: u64,
     output_size: u64,
@@ -42,7 +42,6 @@ struct PlanningEq106DispatchState {
     canonical_elements: Vec<Eq106BatchElement>,
     spectrum_ready: bool,
     basis_spectrum_ready: bool,
-    nufft_grid_ready: bool,
     last_block_key: Option<(u64, u8)>,
 }
 
@@ -58,11 +57,11 @@ impl PlanningEq106DispatchState {
         self.active_maximum_elements_per_candidate = 0;
         self.active_build_spectrum = false;
         self.active_build_basis_spectrum = false;
-        self.active_build_nufft_grid = false;
         self.active_map_scheduled = false;
         self.active_verification_targets.clear();
         self.active_uniform = None;
         self.active_bind_groups.clear();
+        self.active_timestamps = None;
     }
 }
 
@@ -76,6 +75,7 @@ fn dispatch_planning_eq106(
     render_queue: Res<RenderQueue>,
     channel: Res<PlanningGpuReadbackChannel>,
     mut state: ResMut<PlanningEq106DispatchState>,
+    timestamp_pool: Res<crate::gpu::planning_timestamps::PlanningTimestampPool>,
 ) {
     let request = &planning.request;
     let request_matches = request.method == Some(ActiveGravityMethod::CurvedArcEq106)
@@ -85,10 +85,14 @@ fn dispatch_planning_eq106(
         && (!request_matches || state.active_request_id != request.request_id)
     {
         let map_scheduled = state.active_map_scheduled;
+        let timestamps = state.active_timestamps.take();
         state.clear_active();
         if !map_scheduled {
             let in_flight = Arc::clone(&channel.in_flight);
             render_queue.on_submitted_work_done(move || {
+                // Submitted stages may still write their query indices. Keep
+                // the shared lease until those writes have drained.
+                drop(timestamps);
                 in_flight.store(false, Ordering::Release);
             });
         }
@@ -129,14 +133,14 @@ fn dispatch_planning_eq106(
             ("voxel line samples", pipelines.planning_voxel_line_samples_id),
             ("voxel basis spectrum", pipelines.planning_voxel_spectrum_id),
             ("spectrum combination", pipelines.planning_combine_spectrum_id),
-            ("Type-2 NUFFT grid", pipelines.planning_nufft_grid_id),
-            ("inverse spectrum", pipelines.planning_evaluate_id),
+            ("Chebyshev Taylor evaluation", pipelines.planning_evaluate_id),
             ("planning reduction", reduction.0),
         ],
     ) {
         fail_planning_eq106(
             &mut state,
             &channel,
+            &render_queue,
             request.request_id,
             message,
         );
@@ -146,13 +150,11 @@ fn dispatch_planning_eq106(
         Some(voxel_line_samples_pipeline),
         Some(voxel_spectrum_pipeline),
         Some(combine_spectrum_pipeline),
-        Some(nufft_grid_pipeline),
         Some(evaluate_pipeline),
     ) = (
         cache.get_compute_pipeline(pipelines.planning_voxel_line_samples_id),
         cache.get_compute_pipeline(pipelines.planning_voxel_spectrum_id),
         cache.get_compute_pipeline(pipelines.planning_combine_spectrum_id),
-        cache.get_compute_pipeline(pipelines.planning_nufft_grid_id),
         cache.get_compute_pipeline(pipelines.planning_evaluate_id),
     )
     else {
@@ -188,6 +190,8 @@ fn dispatch_planning_eq106(
         return;
     }
     if starting_request {
+        let std::task::Poll::Ready(timestamps) = timestamp_pool.acquire(&render_device, &render_queue, 4)
+            else { return; };
         if channel
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -202,6 +206,7 @@ fn dispatch_planning_eq106(
             return;
         }
         state.active_request_id = request.request_id;
+        state.active_timestamps = timestamps;
         state.next_stage = 0;
         state.active_started = Some(Instant::now());
         state.active_method_preprocess_ms = 0.0;
@@ -259,7 +264,6 @@ fn dispatch_planning_eq106(
         state.source_groups = None;
         state.spectrum_ready = false;
         state.basis_spectrum_ready = false;
-        state.nufft_grid_ready = false;
     }
     let (elements, maximum_elements_per_candidate, invalid_candidates) = if !starting_request {
         (
@@ -321,7 +325,7 @@ fn dispatch_planning_eq106(
         state.quadrature = Some(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("planning_eq106_quadrature"),
-                contents: &half_line_quadrature_bytes(0.5 * planning.source_radius.max(1.0)),
+                contents: &planning_chebyshev_quadrature_bytes(),
                 usage: BufferUsages::STORAGE,
             }),
         );
@@ -350,23 +354,17 @@ fn dispatch_planning_eq106(
         );
         state.basis_spectrum_ready = false;
         state.spectrum_ready = false;
-        state.nufft_grid_ready = false;
     }
     let coefficient_count = taylor_coefficient_count(TAYLOR_MAX_ORDER) as u64;
     let canonical_count = state.canonical_elements.len().max(1) as u64;
     if state.payload_request_id != planning.payload.request_id || state.source_groups.is_none() {
         state.payload_request_id = planning.payload.request_id;
         state.spectrum_ready = false;
-        state.nufft_grid_ready = false;
         let mut metadata = vec![0_u8; 544 * 16];
         metadata[..planning.payload.secondary.len()].copy_from_slice(&planning.payload.secondary);
         let low_basis_offset_vec4 =
             (coefficient_count * QUADRATURE_COUNT as u64 * canonical_count * 56) as f32;
         metadata[112 * 16..112 * 16 + 4].copy_from_slice(&low_basis_offset_vec4.to_le_bytes());
-        let nufft_grid_offset_vec4 = low_basis_offset_vec4
-            + (coefficient_count * FREQUENCY_COUNT as u64 * 2 * canonical_count * 28) as f32;
-        metadata[112 * 16 + 8..112 * 16 + 12]
-            .copy_from_slice(&nufft_grid_offset_vec4.to_le_bytes());
         state.source_groups = Some(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("planning_eq106_source_groups_and_densities"),
@@ -388,14 +386,9 @@ fn dispatch_planning_eq106(
             coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56;
         let basis_bank_bytes =
             coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count * 28;
-        let nufft_grid_bytes = coefficient_count
-            * NUFFT_PAIR_COUNT as u64
-            * NUFFT_GRID_SIZE as u64
-            * 16
-            * canonical_count;
         state.line_samples = Some(render_device.create_buffer(&BufferDescriptor {
             label: Some("planning_eq106_voxel_lines_and_low_basis"),
-            size: line_sample_bytes + basis_bank_bytes + nufft_grid_bytes,
+            size: line_sample_bytes + basis_bank_bytes,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -414,7 +407,9 @@ fn dispatch_planning_eq106(
     };
     let metric_size = u64::from(request.candidate_count) * 16;
     // Six contiguous evaluator rows plus the two non-contiguous FD scan rows.
-    let staging_size = metric_size + verification_targets.len() as u64 * 8 * 16;
+    let data_size = metric_size + verification_targets.len() as u64 * 8 * 16;
+    // At most four method passes, two u64 timestamps per pass.
+    let staging_size = data_size + 64;
     let output_storage_size = 90_112_u64 * 16 + basis_bank_size;
     if state.output_storage_size != output_storage_size || state.output.is_none() {
         state.output_storage_size = output_storage_size;
@@ -426,7 +421,6 @@ fn dispatch_planning_eq106(
         }));
         state.basis_spectrum_ready = false;
         state.spectrum_ready = false;
-        state.nufft_grid_ready = false;
     }
     state.output_size = output_size;
     let baseline_size = batch.state_count() as u64 * 16;
@@ -532,7 +526,6 @@ fn dispatch_planning_eq106(
     if starting_request {
         state.active_build_spectrum = !state.spectrum_ready;
         state.active_build_basis_spectrum = !state.basis_spectrum_ready;
-        state.active_build_nufft_grid = !state.nufft_grid_ready;
         let uniform_size = 96_u64;
         let mut uniform_data = vec![0_u8; uniform_size as usize * 256];
         if elements.len() > 256 {
@@ -557,7 +550,7 @@ fn dispatch_planning_eq106(
                 0,
                 element.spectrum_index,
                 request.eq106_certified,
-                2,
+                3,
                 element.target_count,
                 element.target_offset,
             );
@@ -617,20 +610,19 @@ fn dispatch_planning_eq106(
     }
     let build_spectrum = state.active_build_spectrum;
     let build_basis_spectrum = state.active_build_basis_spectrum;
-    let build_nufft_grid = state.active_build_nufft_grid;
-    // The planning benchmark deliberately evaluates the coherent spectrum assembled from the
-    // sampled line.  Mixing in the separate analytic zero-order correction makes coefficient 0
-    // follow a different discretisation from coefficients 1..A, which is especially harmful for
-    // the spatial derivative used by the gradient benchmark.
+    // Planning uses one coherent Chebyshev expansion for all Taylor
+    // coefficients, including longitudinal derivatives. No inverse-Laplace
+    // quotient or NUFFT grid is needed; real-time modes keep those paths.
     let total_stages = if build_basis_spectrum {
-        5
+        4
     } else if build_spectrum {
-        3
-    } else if build_nufft_grid {
         2
     } else {
         1
     };
+    if starting_request && let Some(queries) = &mut state.active_timestamps {
+        queries.set_pass_count(total_stages as u32);
+    }
     let stage_budget = planning_eq106_stage_budget(request.compute_benchmark, total_stages);
     if stage_budget == 0 {
         return;
@@ -657,11 +649,9 @@ fn dispatch_planning_eq106(
         .unwrap_or(1);
     for stage in state.next_stage..stage_end {
         let physical_stage = if build_basis_spectrum {
-            [0, 1, 3, 5, 4][stage]
+            [0, 1, 3, 4][stage]
         } else if build_spectrum {
-            [3, 5, 4][stage]
-        } else if build_nufft_grid {
-            [5, 4][stage]
+            [3, 4][stage]
         } else {
             4
         };
@@ -676,23 +666,16 @@ fn dispatch_planning_eq106(
             1 => (
                 "planning_eq106_voxel_basis_spectrum",
                 voxel_spectrum_pipeline,
-                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * FREQUENCY_COUNT).div_ceil(64),
+                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES).div_ceil(64),
                 canonical_segment_count,
                 56,
             ),
             3 => (
                 "planning_eq106_combine_voxel_spectrum",
                 combine_spectrum_pipeline,
-                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * FREQUENCY_COUNT).div_ceil(64),
+                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES).div_ceil(64),
                 canonical_segment_count,
                 1,
-            ),
-            5 => (
-                "planning_eq106_type2_nufft_grid",
-                nufft_grid_pipeline,
-                taylor_coefficient_count(TAYLOR_MAX_ORDER),
-                canonical_segment_count,
-                NUFFT_PAIR_COUNT,
             ),
             _ => {
                 let (width, height) = target_dispatch_grid(max_targets);
@@ -707,7 +690,8 @@ fn dispatch_planning_eq106(
         };
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some(label),
-            timestamp_writes: None,
+            timestamp_writes: state.active_timestamps.as_ref()
+                .map(|queries| queries.writes(stage as u32)),
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_groups[0], &[]);
@@ -746,6 +730,11 @@ fn dispatch_planning_eq106(
         }
         resources
     });
+    if final_submission {
+        if let Some(queries) = &state.active_timestamps {
+            queries.resolve_into(&mut encoder, &staging, data_size);
+        }
+    }
     render_queue.submit([encoder.finish()]);
     state.active_command_submission_ms += encode_started.elapsed().as_secs_f64() * 1.0e3;
     state.next_stage = stage_end;
@@ -754,9 +743,6 @@ fn dispatch_planning_eq106(
     }
     if build_spectrum {
         state.spectrum_ready = true;
-    }
-    if build_nufft_grid {
-        state.nufft_grid_ready = true;
     }
     if build_basis_spectrum {
         state.basis_spectrum_ready = true;
@@ -788,11 +774,6 @@ fn dispatch_planning_eq106(
         + coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count
         + coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56
         + basis_bank_size
-        + coefficient_count
-            * NUFFT_PAIR_COUNT as u64
-            * NUFFT_GRID_SIZE as u64
-            * 16
-            * canonical_count
         + output_storage_size
         + baseline_size
         + metric_size
@@ -812,12 +793,13 @@ fn dispatch_planning_eq106(
         payload_source_count = source_count,
         payload_source_ratio = f64::from(source_count) / f64::from(batch.source_count.max(1)),
         voxel_basis_count = 56,
-        type2_nufft_grid_size = NUFFT_GRID_SIZE,
+        chebyshev_modes = PLANNING_CHEBYSHEV_MODES,
         analytic_zero_correction = false,
         estimated_gpu_buffer_bytes,
         maximum_elements_per_candidate = reported_segment_count,
-        "Eq.106 canonical centre-arc spectrum is shared across candidates and candidate tiles"
+        "Eq.106 Taylor/Chebyshev variant: finite-arc basis shared across candidates and tiles"
     );
+    let timestamps = state.active_timestamps.take();
     state.clear_active();
     state.active_map_scheduled = true;
     mapped
@@ -826,9 +808,13 @@ fn dispatch_planning_eq106(
             let request_wall_ms = request_wall_started.elapsed().as_secs_f64() * 1.0e3;
             let gpu_completion_map_ms =
                 (request_wall_ms - method_preprocess_ms - command_submission_ms).max(0.0);
+            let decode_started = bevy::platform::time::Instant::now();
+            let mut pass_ms = None;
             let rows = if result.is_ok() {
                 let view = staging.slice(..staging_size).get_mapped_range();
-                let full_rows = bytes_to_f32x4(&view);
+                pass_ms = timestamps.as_ref()
+                    .and_then(|queries| queries.decode(&view[data_size as usize..]));
+                let full_rows = bytes_to_f32x4(&view[..data_size as usize]);
                 let mut candidate_metrics = full_rows[..request_candidate_count as usize].to_vec();
                 let mut rejected_candidates = vec![false; request_candidate_count as usize];
                 for (candidate, metric) in candidate_metrics.iter_mut().enumerate() {
@@ -1019,6 +1005,12 @@ fn dispatch_planning_eq106(
                         method_preprocess_ms,
                         command_submission_ms,
                         gpu_completion_map_ms,
+                        readback_decode_ms: decode_started.elapsed().as_secs_f64() * 1.0e3,
+                        kernel_ms: pass_ms.as_ref().map(|values| values.iter().sum()),
+                        evaluation_kernel_ms: pass_ms.as_ref().and_then(|values| values.last().copied()),
+                        basis_kernel_ms: pass_ms.as_ref().map(|values| {
+                            if build_basis_spectrum { values[..2].iter().sum() } else { 0.0 }
+                        }),
                         // First geometry: voxel line + coherent sampled spectrum
                         // + combine + evaluate + reduction. New density: combine
                         // + evaluate + reduction.
@@ -1033,14 +1025,14 @@ fn dispatch_planning_eq106(
                             * u64::from(source_count)
                             * u64::from(QUADRATURE_COUNT)
                             * u64::from(canonical_element_count)
-                            + u64::from(build_spectrum)
+                            + (u64::from(build_basis_spectrum) * u64::from(QUADRATURE_COUNT)
+                                + u64::from(build_spectrum))
                                 * 56
-                                * u64::from(FREQUENCY_COUNT)
+                                * u64::from(PLANNING_CHEBYSHEV_MODES)
                                 * u64::from(taylor_coefficient_count(TAYLOR_MAX_ORDER))
-                                * u64::from(QUADRATURE_COUNT)
                                 * u64::from(canonical_element_count)
                             + target_count as u64
-                                * u64::from(FREQUENCY_COUNT)
+                                * u64::from(PLANNING_CHEBYSHEV_MODES)
                                 * u64::from(taylor_coefficient_count(TAYLOR_MAX_ORDER)),
                         spectral_element_count: reported_segment_count,
                         gradient_self_fd_relative_error: rows.4,
@@ -1086,13 +1078,25 @@ fn first_planning_pipeline_error(
 fn fail_planning_eq106(
     state: &mut PlanningEq106DispatchState,
     channel: &PlanningGpuReadbackChannel,
+    queue: &RenderQueue,
     request_id: u64,
     message: String,
 ) {
     error!(target: "planning::eq106", request_id, error = %message);
+    let timestamps = state.active_timestamps.take();
+    let has_submitted_stages = state.next_stage > 0;
     state.clear_active();
     state.last_request_id = request_id;
-    channel.in_flight.store(false, Ordering::Release);
+    if has_submitted_stages {
+        let in_flight = Arc::clone(&channel.in_flight);
+        queue.on_submitted_work_done(move || {
+            drop(timestamps);
+            in_flight.store(false, Ordering::Release);
+        });
+    } else {
+        drop(timestamps);
+        channel.in_flight.store(false, Ordering::Release);
+    }
     if let Ok(mut slot) = channel.error.try_lock()
         && slot.is_none()
     {

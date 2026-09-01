@@ -1,3 +1,77 @@
+// Shared by both chart renderers. A timing cell is published only after all
+// seven distinct repetitions pass; never take a median of just the survivors.
+window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats = 7, timingKey = 'times') => {
+  const groups = new Map();
+  for (const sample of samples ?? []) {
+    if (sample.densityModels !== densityModels || sample.targets !== targets
+      || !Number.isInteger(sample.repeat) || sample.repeat < 1) continue;
+    if (!groups.has(sample.sources)) groups.set(sample.sources, new Map());
+    groups.get(sample.sources).set(sample.repeat, sample);
+  }
+  return [...groups].sort((a, b) => a[0] - b[0]).map(([sources, repeats]) => {
+    const rows = [...repeats.values()];
+    const complete = Array.from({ length: Math.max(7, requiredRepeats) }, (_, i) => i + 1)
+      .every((repeat) => repeats.has(repeat));
+    const methods = Array.from({ length: 6 }, (_, index) => {
+      const valid = rows.filter((sample) => sample.eligible?.[index] === true
+        && Number.isFinite(sample.times?.[index]) && sample.times[index] > 0);
+      const rejected = rows.length - valid.length;
+      const qualified = complete && rejected === 0;
+      const measured = valid.map((sample) => sample[timingKey]?.[index]);
+      const timingAvailable = qualified && measured.every((time) => Number.isFinite(time) && time >= 0);
+      const sorted = timingAvailable ? measured.sort((a, b) => a - b) : [];
+      const median = sorted.length ? (sorted[Math.floor(sorted.length / 2)] + sorted[Math.ceil(sorted.length / 2) - 1]) / 2 : null;
+      const maximumError = (key) => rows.every((sample) => Number.isFinite(sample[key]?.[index]))
+        ? Math.max(...rows.map((sample) => sample[key][index])) : null;
+      return {
+        value: timingAvailable && median > 0 ? median : null,
+        low: timingAvailable ? sorted[0] : null,
+        high: timingAvailable ? sorted[sorted.length - 1] : null,
+        timingAvailable,
+        belowResolution: timingAvailable && median === 0,
+        count: rows.length,
+        rejected,
+        gravityError: maximumError('gravityErrors'),
+        gradientError: maximumError('gradientErrors'),
+        reasons: [...new Set(rows.flatMap((sample) => sample.failureReasons?.[index] ?? []))],
+        strictPassed: rows.filter((sample) => sample.strictEligible?.[index] === true).length,
+        status: rejected ? 'FAIL' : qualified ? 'PASS' : 'PENDING',
+      };
+    });
+    return { sources, methods };
+  });
+};
+
+// A full source axis is shared by every series. Missing/failed cells remain
+// explicit gaps; completed cells do not wait for the rest of the sweep.
+window.ryuguCurvePlotData = (groups, sourceCounts) => {
+  const bySource = new Map(groups.map((group) => [group.sources, group]));
+  return Array.from({ length: 6 }, (_, methodIndex) => ({
+    points: sourceCounts.map((source) => {
+      const method = bySource.get(source)?.methods[methodIndex];
+      return [source, method?.status === 'PASS' ? method.value : null, method];
+    }),
+    ranges: sourceCounts.flatMap((source) => {
+      const method = bySource.get(source)?.methods[methodIndex];
+      return method?.status === 'PASS' && method.low > 0 && Number.isFinite(method.high)
+        ? [[source, method.low, method.high]] : [];
+    }),
+  }));
+};
+
+// Backend completion is authoritative. Rounding 99.5% to 100% or keeping a
+// previous run's high-water mark can falsely announce completion.
+window.ryuguPlanningProgress = (planning) => ({
+  runId: planning.runId,
+  progress: planning.completed === true ? 100
+    : Math.floor(Math.min(99.9, Math.max(0, Number(planning.progress) || 0)) * 10) / 10,
+  accuracy: Math.min(100, Math.max(0, Number(planning.accuracy) || 0)),
+  running: Boolean(planning.running),
+  completed: planning.completed === true,
+  workCompleted: Number(planning.workCompleted) || 0,
+  workTotal: Number(planning.workTotal) || 0,
+});
+
 (() => {
   const queue = [];
   const $ = (selector) => document.querySelector(selector);
@@ -7,7 +81,7 @@
   const methodLabels = ['Radial', 'Werner', 'Eq.106', 'Packed FFT', 'FMM'];
   const methodColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77'];
   const curveColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
-  const curveLabels = ['Eq.106 raw', 'Eq.106 certified', 'Packed FFT raw', 'Packed FFT certified', 'FMM raw', 'FMM certified'];
+  const curveLabels = ['Eq.106 raw total', 'Eq.106 checked total', 'FFT raw total', 'FFT checked total', 'FMM raw total', 'FMM checked total'];
   const quadratureSourceCounts = [32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000];
   const metricFields = {
     density: ['density', ''],
@@ -25,6 +99,9 @@
   let editingProbe = false;
   let editingTrajectory = false;
   let lastSnapshot = null;
+  let lastCurveRenderKey = null;
+  let lastCurveDataKey = null;
+  let lastCurveGroups = [];
   let openDialog = null;
   let returnFocus = null;
 
@@ -132,10 +209,17 @@
       .replace(/\.?(?:0+)e/, 'e')
       .replace('e+', 'e');
   };
-  function drawChart(svg, series, { yLog = false, xLabel = '', yLabel = '', xDomain = null, xCategories = null, minimumYDomain = null, empty = 'Waiting for samples…' } = {}) {
+  function drawChart(svg, series, { fitViewport = false, yLog = false, xLabel = '', yLabel = '', xDomain = null, xCategories = null, minimumYDomain = null, empty = 'Waiting for samples…' } = {}) {
+    // Fallback callers may supply a host div; SVG shapes require an actual
+    // SVG viewport, not a div carrying a meaningless viewBox attribute.
+    if (svg.namespaceURI !== 'http://www.w3.org/2000/svg') {
+      const viewport = svgNode('svg', { role: 'img' });
+      svg.replaceChildren(viewport);
+      svg = viewport;
+    }
     svg.replaceChildren();
-    const width = 900;
-    const height = 430;
+    const width = fitViewport ? Math.max(svg.clientWidth, 640) : 900;
+    const height = fitViewport ? Math.max(svg.clientHeight, 240) : 430;
     const margin = { l: 104, r: 28, t: 22, b: 70 };
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     const points = series
@@ -145,7 +229,9 @@
     const transformX = (value) => categoryIndex ? categoryIndex.get(value) : value;
     const transformY = (value) => yLog ? Math.log10(value) : value;
     const xs = points.map((point) => transformX(point[0]));
-    const ys = points.map((point) => transformY(point[1]));
+    const ys = points.map((point) => transformY(point[1])).concat(series
+      .flatMap((item) => item.ranges ?? []).flatMap((range) => range.slice(1))
+      .filter((value) => Number.isFinite(value) && (!yLog || value > 0)).map(transformY));
     let xMin = xs.length ? Math.min(...xs) : 0;
     let xMax = xs.length ? Math.max(...xs) : 1;
     let yMin = ys.length ? Math.min(...ys) : 0;
@@ -211,14 +297,28 @@
       return;
     }
     series.forEach((item) => {
-      const valid = item.points.filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!yLog || point[1] > 0));
+      const isValid = (point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!yLog || point[1] > 0);
+      const valid = item.points.filter(isValid);
       if (valid.length) {
-        const path = valid.map((point, index) => `${index ? 'L' : 'M'}${pixelX(point[0]).toFixed(2)},${pixelY(point[1]).toFixed(2)}`).join(' ');
+        let connected = false;
+        const path = item.points.map((point) => {
+          if (!isValid(point)) { connected = false; return ''; }
+          const command = connected ? 'L' : 'M';
+          connected = true;
+          return `${command}${pixelX(point[0]).toFixed(2)},${pixelY(point[1]).toFixed(2)}`;
+        }).join(' ');
         const pathAttributes = { d: path, stroke: item.color, class: 'chart-line' };
         if (item.dashed) {
           pathAttributes['stroke-dasharray'] = '8 5';
         }
         svg.append(svgNode('path', pathAttributes));
+        for (const [source, low, high] of item.ranges ?? []) {
+          const x = pixelX(source);
+          svg.append(svgNode('path', {
+            d: `M${x},${pixelY(low)}V${pixelY(high)} M${x - 3},${pixelY(low)}H${x + 3} M${x - 3},${pixelY(high)}H${x + 3}`,
+            stroke: item.color, fill: 'none',
+          }));
+        }
         valid.forEach((point) => {
           const marker = svgNode('circle', {
             cx: pixelX(point[0]).toFixed(2),
@@ -228,34 +328,152 @@
             class: 'chart-point',
           });
           const sourceLabel = categoryIndex ? `${point[0] / 1000}K` : formatAxis(point[0]);
-          marker.append(svgNode('title', {}, `${item.label} at ${sourceLabel}: ${formatAxis(point[1])} ms`));
+          const stats = point[2];
+          const detail = stats
+            ? `; ${stats.count} repetitions; min–max ${formatAxis(stats.low)}–${formatAxis(stats.high)} ms; εg=${formatAxis(stats.gravityError)}, ε∇g=${formatAxis(stats.gradientError)}; strict ${stats.strictPassed}/${stats.count}` : '';
+          marker.append(svgNode('title', {}, `${item.label} at ${sourceLabel}: ${formatAxis(point[1])} ms${detail}`));
           svg.append(marker);
         });
       }
     });
   }
 
-  const median = (values) => {
-    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
-    return sorted.length ? sorted[Math.floor(sorted.length / 2)] : NaN;
-  };
-  function curveSeries(samples) {
-    const groups = new Map();
-    samples.forEach((sample) => {
-      if (!groups.has(sample.sources)) groups.set(sample.sources, Array.from({ length: 6 }, () => []));
-      sample.times?.forEach((time, index) => {
-        if (Number.isFinite(time) && time > 0) groups.get(sample.sources)[index].push(time);
-      });
-    });
+  function curveSeries(groups, timingKey) {
+    const plot = window.ryuguCurvePlotData(groups, quadratureSourceCounts);
     return curveLabels.map((label, index) => ({
-      label,
+      label: timingKey === 'times' ? label : label.replace(' total', ' kernels'),
       color: curveColors[index],
       dashed: index % 2 === 1,
-      points: [...groups]
-        .sort((a, b) => a[0] - b[0])
-        .map(([sources, values]) => [sources, median(values[index])])
-        .filter((point) => Number.isFinite(point[1])),
+      ...plot[index],
     }));
+  }
+
+  function exportQuadrature(planning, selection, source) {
+    // Build a detached, self-contained SVG at fixed resolution. Do not depend
+    // on layout, the visible dropdowns, screenshots of the desktop, or RAF.
+    const timingKey = selection.timingKey;
+    const strict = selection.accuracyProfile === 'strict';
+    const rows = (planning.curve ?? []).filter((row) => row.sources <= source).map((row) => {
+      const masks = strict ? row.strictFailures : row.screeningFailures;
+      return {
+        ...row,
+        times: row.rawTimes ?? row.times,
+        kernelTimes: row.rawKernelTimes ?? row.kernelTimes,
+        evaluationKernelTimes: row.rawEvaluationKernelTimes ?? row.evaluationKernelTimes,
+        eligible: masks ? masks.map((mask) => mask === 0) : row.eligible,
+        failureReasons: strict ? row.strictFailureReasons ?? row.failureReasons
+          : row.screeningFailureReasons ?? row.failureReasons,
+      };
+    });
+    const groups = window.ryuguCurveStatistics(rows, selection.densityModels,
+      selection.targets, planning.requiredRepeats, timingKey);
+    const series = curveSeries(groups, timingKey);
+    // XMLSerializer supplies the namespace for this createElementNS root.
+    const root = svgNode('svg', { width: 1800, height: 1500, viewBox: '0 0 1800 1500' });
+    root.append(svgNode('style', {}, `
+      text { font-family: monospace; fill: #d9edf0; font-size: 20px; }
+      .axis-label { fill: #a3bcc1; font-size: 11px; }
+      .grid-line { stroke: #193439; stroke-width: 0.7; }
+      .axis-line { stroke: #50737b; }
+      .chart-line { fill: none; stroke-width: 2; }
+      .chart-point { stroke: #071215; stroke-width: 1; }
+      .empty-label { fill: #98b4bc; font-size: 12px; }
+    `));
+    root.append(svgNode('rect', { width: 1800, height: 1500, fill: '#061013' }));
+    const text = (x, y, value, attrs = {}) => root.append(svgNode('text', { x, y, ...attrs }, value));
+    text(32, 48, 'Quadrature-source crossover', { style: 'font-size:32px;font-weight:bold' });
+    text(32, 88, `Kρ=${selection.densityModels} · Nt=${selection.targets} · ${selection.accuracyProfile} · ${timingKey} · 7 repetitions / median / min–max`);
+    const completed = groups.filter((group) => group.methods.every((method) => method.count >= (planning.requiredRepeats ?? 7))).length;
+    text(32, 122, `Milestone ${source / 1000}K · ${completed}/9 source sizes complete · ${new Date().toISOString()}`);
+    text(32, 155, 'Finished FAIL cells remain gaps. Screenshots keep the parameters selected at task launch.', { fill: '#98b4bc' });
+    const chart = svgNode('svg', { x: 20, y: 174, width: 1760, height: 840 });
+    drawChart(chart, series, {
+      yLog: true, xCategories: quadratureSourceCounts, xLabel: 'source points',
+      yLabel: `${timingKey === 'times' ? 'pipeline total' : 'GPU kernels'} median / min–max (ms)`,
+      empty: 'Completed cells have no qualified positive timings; see the accuracy results below.',
+    });
+    root.append(chart);
+    series.forEach((item, index) => {
+      const x = 32 + (index % 3) * 580;
+      const y = 1040 + Math.floor(index / 3) * 38;
+      root.append(svgNode('line', { x1: x, x2: x + 42, y1: y - 7, y2: y - 7,
+        stroke: item.color, 'stroke-width': 3, ...(item.dashed ? { 'stroke-dasharray': '8 5' } : {}) }));
+      text(x + 52, y, item.label);
+    });
+    text(32, 1130, `${source / 1000}K accuracy / timings (ms)`, { style: 'font-weight:bold' });
+    text(680, 1130, 'Status / median');
+    text(1030, 1130, 'min–max');
+    text(1370, 1130, 'RMS εg / ε∇g');
+    const cell = groups.find((group) => group.sources === source);
+    cell?.methods.forEach((method, index) => {
+      const y = 1172 + index * 42;
+      text(32, y, series[index].label);
+      text(680, y, `${method.status} ${method.count}/7 · ${formatAxis(method.value)}`);
+      text(1030, y, `${formatAxis(method.low)}–${formatAxis(method.high)}`);
+      text(1370, y, `${formatAxis(method.gravityError)} / ${formatAxis(method.gradientError)}`);
+    });
+    text(32, 1440, 'Raw + checked GPU methods · independent f64 validation · full result/gate details in results.json');
+    text(32, 1476, 'Capture continues while hidden; OS sleep/browser discard can stop the engine.', { fill: '#98b4bc' });
+    return new XMLSerializer().serializeToString(root);
+  }
+
+  function renderQuadrature(planning, selection) {
+    const timingKey = $('#quadrature-timing').value;
+    const timingTitle = timingKey === 'times' ? 'pipeline total' : timingKey === 'kernelTimes'
+      ? 'GPU method kernels' : 'GPU target kernels';
+    // Numerical rows are append-only within a run. Do not reaggregate the
+    // whole sweep or rewrite accuracy text on every status/progress snapshot.
+    const dataKey = JSON.stringify([planning.runId, planning.accuracyProfile,
+      selection.densityModels, selection.targets, planning.requiredRepeats, timingKey, planning.curve?.length ?? 0]);
+    if (dataKey !== lastCurveDataKey) {
+      lastCurveGroups = window.ryuguCurveStatistics(planning.curve,
+        selection.densityModels, selection.targets, planning.requiredRepeats, timingKey);
+      lastCurveDataKey = dataKey;
+      lastCurveRenderKey = null;
+    }
+    if (lastCurveRenderKey !== null) return;
+    const groups = lastCurveGroups;
+    $('#quadrature-timing-policy').textContent = timingKey === 'times' ? planning.timingDefinition ?? ''
+      : `${timingTitle}: wgpu pass-boundary timestamps only; checked is raw + the additional checked pass. Excludes CPU preparation, copies, queue waits and metrics reduction. FFT source deposition, 56 basis convolutions and density combinations run on GPU. FMM moment construction, tree traversal, near field and 56-basis density mixing also run on GPU; target-only FMM mixes cached responses. These kernels do different work, so this is not hardware FLOP throughput or an end-to-end algorithm speedup. Missing/zero-resolution timestamps are not replaced by wall time.`;
+    const required = Math.max(7, planning.requiredRepeats ?? 7);
+    const complete = groups.filter((group) => group.methods.every((method) => method.count >= required));
+    const plotted = groups.reduce((total, group) => total
+      + group.methods.filter((method) => method.status === 'PASS' && Number.isFinite(method.value)).length, 0);
+    const failed = groups.reduce((total, group) => total
+      + group.methods.filter((method) => method.status === 'FAIL').length, 0);
+    const unavailable = groups.reduce((total, group) => total
+      + group.methods.filter((method) => method.status === 'PASS' && !Number.isFinite(method.value)).length, 0);
+    const pending = groups.find((group) => group.methods.some((method) => method.count < required));
+    const status = $('#quadrature-plot-status');
+    status.dataset.accuracyState = failed ? 'fail' : plotted ? 'pass' : 'pending';
+    const progress = pending
+      ? ` · ${pending.sources / 1000}K accumulating ${pending.methods[0].count}/${required} repetitions`
+      : '';
+    status.textContent = `${complete.length}/${quadratureSourceCounts.length} source sizes complete · ${plotted} qualified method points plotted${failed ? ` · ${failed} failed method cells excluded` : ''}${unavailable ? ` · ${unavailable} timestamp cells unavailable/below resolution` : ''}${progress}. Each completed source size adds its points immediately.`;
+    const errorText = (value) => Number.isFinite(value) ? value.toExponential(2) : 'unavailable';
+    $('#quadrature-accuracy').textContent = groups.length ? groups.map((group) =>
+      `${group.sources / 1000}K: ` + group.methods.map((method, index) =>
+        `${curveLabels[index]} ${planning.accuracyProfile} ${method.status} (${method.count}/${required}${method.rejected ? `; ${method.rejected} failed` : ''}; strict ${method.strictPassed}/${method.count}; εg=${errorText(method.gravityError)}, ε∇g=${errorText(method.gradientError)}${method.reasons.length ? '; reasons: ' + method.reasons.join(', ') : ''}${method.status === 'PASS' && !Number.isFinite(method.value) ? '; timestamp unavailable/below resolution' : ''})`
+      ).join(' · ')).join('\n') : 'No completed repetitions for this Kρ × Nt cell.';
+    // Preserve existing point nodes between new results (and their tooltips).
+    // A seventh repetition updates immediately; task completion is not a gate.
+    const key = JSON.stringify([planning.runId, planning.accuracyProfile,
+      selection.densityModels, selection.targets, timingKey, groups]);
+    if (key !== lastCurveRenderKey) {
+      const series = curveSeries(groups, timingKey);
+      drawChart($('#quadrature-chart'), series, {
+        fitViewport: true,
+        yLog: true,
+        xCategories: quadratureSourceCounts,
+        xLabel: 'source points',
+        yLabel: `${timingTitle} median / min–max (ms)`,
+        empty: unavailable ? 'GPU timestamps unavailable or below timer resolution; pipeline totals remain available.'
+          : failed ? 'Completed repetitions failed accuracy; see details below.'
+          : 'Waiting for the first source size to complete 7 passing repetitions…',
+      });
+      makeLegend($('#curve-legend'), series);
+      lastCurveRenderKey = key;
+    }
   }
   const bytes = (values) => {
     const total = (values ?? []).reduce((sum, value) => sum + value, 0);
@@ -302,6 +520,21 @@
     return `density ${density}${scale} · fit ${fit} · holdout RMSE ${holdout}`;
   };
   function renderPlanning(planning) {
+    $$('[data-planning-accuracy]').forEach((select) => {
+      select.value = planning.accuracyProfile ?? 'strict';
+    });
+    const limits = planning.accuracyLimits;
+    const accuracyLabel = planning.accuracyProfile === 'screening'
+      ? 'Screening comparison thresholds (relaxed; strict verdict shown separately)'
+      : 'Strict comparison thresholds';
+    const thresholdText = limits
+      ? `RMS εg ≤ ${limits.gravity.toExponential(1)}, ε∇g ≤ ${limits.gradient.toExponential(1)}; p99 ≤ ${limits.gravityP99.toExponential(1)} / ${limits.gradientP99.toExponential(1)}; max ≤ ${limits.gravityMax.toExponential(1)} / ${limits.gradientMax.toExponential(1)}; drift ≤ ${limits.pericenterM} m`
+      : 'Thresholds pending';
+    $('#planning-accuracy-note').dataset.profile = planning.accuracyProfile;
+    $('#quadrature-accuracy-policy').dataset.profile = planning.accuracyProfile;
+    $('#planning-accuracy-note').textContent = `${accuracyLabel}. ${thresholdText}. ${planning.implementation ?? ''}`;
+    $('#quadrature-accuracy-policy').textContent = `${accuracyLabel}. ${thresholdText}. Each source size is plotted after 7 passing repetitions.`;
+    $('#quadrature-accuracy-summary').textContent = `Accuracy details — ${planning.accuracyProfile ?? 'strict'} profile (worst repetition RMS)`;
     pressed('[data-action="planning-metric"]', (button) => button.dataset.value === planning.metric);
     pressed('[data-action="planning-workload"]', (button) => button.dataset.value === planning.workload);
     const inversionRows = (lastSnapshot?.inversion?.results ?? []).filter(Boolean);
@@ -324,8 +557,12 @@
         : 'Waiting for density inversion result.';
       return;
     }
+    $('#planning-result').dataset.accuracyState = planning.metric !== 'speedup' || !rows.length
+      ? 'pending' : rows.some((row) => row.eligible !== true) ? 'fail' : 'pass';
     $('#planning-result').textContent = rows.length
-      ? rows.map((row) => `${row.method}: ${finiteText(row[field], unit)}`).join(' · ')
+      ? rows.map((row) => planning.metric === 'speedup' && row.eligible !== true
+        ? `${row.method}: FAIL (${row.failureReasons?.join(', ') || 'accuracy'})`
+        : `${row.method}: ${finiteText(row[field], unit)}${planning.metric === 'speedup' ? ` [${planning.accuracyProfile}; strict ${row.strictEligible ? 'PASS' : 'FAIL'}]` : ''}`).join(' · ')
       : 'No comparison result yet.';
   }
   function renderInversion(inversion, method) {
@@ -467,20 +704,56 @@
   }
 
   window.ryuguUi = {
+    exportQuadrature,
+    curveSelection: () => ({
+      densityModels: Number($('#quadrature-density').value),
+      targets: Number($('#quadrature-targets').value),
+      scope: $('#quadrature-scope').value,
+    }),
     activate(button) {
       if (!button?.dataset.action || button.disabled) return;
       returnFocus = button;
       const action = button.dataset.action;
+      if (action === 'quadrature-start') window.ryuguCapture?.begin();
       const value = action === 'normals'
         ? button.getAttribute('aria-pressed') !== 'true'
         : action === 'section'
           ? button.getAttribute('aria-pressed') !== 'true'
           : button.dataset.value ?? null;
-      push(action, value);
+      push(action, value, action === 'quadrature-start' ? window.ryuguUi.curveSelection() : {});
     },
     takeAction: () => queue.shift() ?? '',
+    resumeQuadrature(selection) {
+      const densityModels = Number(selection?.densityModels);
+      const targets = Number(selection?.targets);
+      const scope = selection?.scope === 'all' ? 'all' : 'selected';
+      if (![1, 4, 16, 64, 256, 512, 1024].includes(densityModels)
+        || ![8, 64, 241, 1024, 8192].includes(targets)) return false;
+      queue.push(JSON.stringify({
+        type: 'quadrature-start',
+        value: null,
+        densityModels,
+        targets,
+        scope,
+      }));
+      return true;
+    },
     render(snapshot) {
+      if (snapshot.planning.curve == null) {
+        snapshot.planning.curve = snapshot.planning.runId === lastSnapshot?.planning.runId
+          ? lastSnapshot.planning.curve : [];
+      }
       lastSnapshot = snapshot;
+      // Do not consume the restart marker here. The bootstrap script reads it
+      // before the first WASM snapshot is published; consuming it in render
+      // would erase a queued recovery before the action system can see it.
+      // Archiving is independent of repainting and must never throw through
+      // the WASM UI bridge and interrupt the numerical engine.
+      try { window.ryuguCapture?.observe(snapshot.planning); }
+      catch (error) {
+        $('#quadrature-capture-status').textContent = `Screenshot export error: ${error.message}; calculation continues and export will retry.`;
+      }
+      if (document.visibilityState === 'hidden') return;
       window.dispatchEvent(new CustomEvent('ryugu-snapshot', { detail: snapshot }));
       if (!snapshot.performance.active) document.title = 'Ryugu Dynamics Laboratory';
       $('#fps').textContent = 'FPS ' + snapshot.fps.toFixed(0);
@@ -506,31 +779,72 @@
         });
       }
       $('#planning-status').textContent = snapshot.planning.status;
-      $('#modal-status').textContent = snapshot.planning.status;
+      $('#modal-status').textContent = snapshot.planning.workload === 'quadrature'
+        ? snapshot.planning.status : 'Choose parameters, then press Run to start the quadrature task.';
       $('#quadrature-state').textContent = snapshot.planning.running ? Math.round(snapshot.planning.sourceCount / 1000) + 'K · R' + snapshot.planning.repeat : 'IDLE';
-      $('#quadrature-start').disabled = snapshot.planning.running;
+      $$('[data-action="quadrature-start"]').forEach((button) => { button.disabled = snapshot.planning.running; });
+      const plan = snapshot.planning;
+      const cells = plan.scope === 'all' ? 'all 35 Kρ × Nt combinations' : `Kρ=${plan.densityModels}, Nt=${plan.targets}`;
+      $('#quadrature-run-scope').textContent = plan.workload === 'quadrature'
+        ? `Task: ${cells} · 9 source sizes × 7 repeats · randomized order · median / min–max`
+        : 'Choose Kρ, Nt and scope, then Run · 9 source sizes × 7 repeats · randomized order';
+      $('#quadrature-implementation').textContent = plan.implementation ?? '';
+      $('#quadrature-work').textContent = plan.workload === 'quadrature'
+        ? `${Math.floor(plan.workCompleted ?? 0).toLocaleString()} / ${Math.floor(plan.workTotal ?? 0).toLocaleString()} estimated operation units · source/basis/FFT/RHS/target/reference work. Geometry-dependent work is estimated, not measured FLOPs or elapsed time. 100% requires all computation and validation to finish.`
+        : 'No quadrature work is launched by opening this window.';
       $('#repeat-benchmark').disabled = !snapshot.performance.active || snapshot.performance.measuring;
       toggleDialog($('#quadrature-modal'), snapshot.planning.visible);
-      const benchmarkSeries = curveSeries(snapshot.planning.curve);
-      if (!window.ryuguBenchmarkChartsReady) {
-        drawChart($('#quadrature-chart'), benchmarkSeries, {
-          yLog: true,
-          xCategories: quadratureSourceCounts,
-          xLabel: 'distinct quadrature points (32K–8192K)',
-          yLabel: 'measured total time (ms, log₁₀ scale)',
-          empty: 'Waiting for the first completed 32K source point…',
-        });
+      const selection = window.ryuguUi.curveSelection();
+      if (snapshot.planning.visible) renderQuadrature(snapshot.planning, selection);
+      // The fullscreen benchmark covers these charts. Keep state snapshots,
+      // but do not rebuild invisible SVGs/tables while it is open.
+      if (!snapshot.planning.visible) {
+        renderResidual(snapshot.eq106Residual);
+        renderTelemetryFallback(snapshot);
+        renderPlanning(snapshot.planning);
+        renderInversion(snapshot.inversion, snapshot.method);
+        renderTrajectoryControls(snapshot.inversion, snapshot.method);
+        renderPerformance(snapshot.performance);
       }
-      makeLegend($('#curve-legend'), benchmarkSeries);
-      renderResidual(snapshot.eq106Residual);
-      renderTelemetryFallback(snapshot);
-      renderPlanning(snapshot.planning);
-      renderInversion(snapshot.inversion, snapshot.method);
-      renderTrajectoryControls(snapshot.inversion, snapshot.method);
-      renderPerformance(snapshot.performance);
       $('#runtime-message').textContent = snapshot.runtimeError ?? '';
+      if (snapshot.planning.running) {
+        try {
+          sessionStorage.removeItem('ryugu-device-lost-attempts');
+          sessionStorage.removeItem('ryugu-device-lost-reload-pending');
+        } catch { /* optional */ }
+      }
       toggleDialog($('#runtime-modal'), Boolean(snapshot.runtimeError));
     },
     get snapshot() { return lastSnapshot; },
   };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && lastSnapshot) window.ryuguUi.render({ ...lastSnapshot });
+  });
+  // Opening the modal or expanding accuracy details changes the viewport,
+  // even if no new numerical result arrives. SVG needs only a new viewBox;
+  // it has no hidden-container renderer initialization to get stranded in.
+  if (typeof ResizeObserver !== 'undefined') {
+    let sizeKey = '';
+    let resizeFrame = 0;
+    const curveResize = new ResizeObserver(([entry]) => {
+      if (!lastSnapshot?.planning.visible || entry.contentRect.width <= 0 || entry.contentRect.height <= 0) return;
+      const nextSize = `${Math.round(entry.contentRect.width)}x${Math.round(entry.contentRect.height)}`;
+      if (nextSize === sizeKey) return;
+      sizeKey = nextSize;
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => {
+        lastCurveRenderKey = null;
+        if (lastSnapshot?.planning.visible) renderQuadrature(lastSnapshot.planning, window.ryuguUi.curveSelection());
+      });
+    });
+    curveResize.observe($('#quadrature-chart'));
+  }
+  for (const selector of ['#quadrature-density', '#quadrature-targets', '#quadrature-timing']) {
+    $(selector).addEventListener('change', () => {
+      if (lastSnapshot) window.ryuguUi.render({ ...lastSnapshot });
+    });
+  }
+  $$('[data-planning-accuracy]').forEach((select) => {
+    select.addEventListener('change', () => push('planning-accuracy', select.value));
+  });
 })();

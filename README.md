@@ -407,6 +407,45 @@ Closing the Quadrature page, selecting a density/inversion metric, or starting t
 
 ## Build and run
 
+### Background execution and display sleep
+
+The `Background execution / sleep` control is on by default. The browser shell
+keeps native animation frames while visible and uses a paced dedicated worker
+to deliver pending Bevy/winit update callbacks while hidden. Only one worker
+tick is outstanding, so a stalled page cannot accumulate a message backlog.
+Hidden DOM/chart publication is skipped; returning to the tab publishes the
+newly completed curve points. Display FPS is not used to reduce compute tiles
+while the page is hidden.
+
+This is a **scheduling worker**, not a migration of the WASM engine: Bevy still
+owns a main-thread DOM window, and CPU preparation remains cooperatively sliced.
+The existing numerical kernels and density bases remain on the GPU. Worker
+messages carry only small control/status records, not copies of WASM memory or
+GPU matrices. Moving the whole engine would require a separate headless compute
+runtime and an explicit transferable-data protocol.
+
+When served by this repository's local Bun server on macOS, an open page connects
+to the same-origin `/__ryugu/power` WebSocket. The server holds `caffeinate -i`
+while at least one enabled page is connected. This prevents **idle system sleep**
+while still allowing the display to switch off; it does not change permanent
+power settings. Closing the final connected page, disabling its background
+toggle, or stopping the server releases the request. Lost connections are
+detected by WebSocket ping/pong. Restart an existing Bun server after updating
+`server.ts` to enable this endpoint. Set `RYUGU_KEEP_AWAKE=0` to disable the native
+power request. GitHub Pages and other hosts without this endpoint cannot prevent
+system sleep; a phone using USB forwarding does not inherit the server Mac's
+sleep protection.
+
+No webpage or dedicated worker can promise full-speed execution through forced
+sleep, browser freezing/discarding, memory pressure, or GPU device loss. For a
+long local job, keep the Mac powered and its lid open, disable Chrome Energy
+Saver, and add the site to Chrome's **Always keep these sites active** list.
+These are user-controlled settings; the application does not change them.
+See [Chrome's background freezing policy](https://developer.chrome.com/blog/freezing-on-energy-saver)
+and [Chrome performance settings](https://support.google.com/chrome/answer/12929150).
+No Service Worker lifetime hack, fake audio, or extension-only `chrome.runtime`
+call is used.
+
 ### Requirements
 
 - Rust with the `wasm32-unknown-unknown` target

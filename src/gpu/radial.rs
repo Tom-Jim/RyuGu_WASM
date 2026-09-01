@@ -8,7 +8,7 @@ use bevy::render::{
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -56,7 +56,7 @@ impl Plugin for GravityComputePlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedGravityInput>();
-        render_app.init_resource::<GravityGpuBuffers>();
+        render_app.init_gpu_resource::<GravityGpuBuffers>();
         render_app.add_systems(ExtractSchedule, extract_gravity_input_system);
         render_app.add_systems(
             Render,
@@ -68,7 +68,7 @@ impl Plugin for GravityComputePlugin {
         let channel = app.world().resource::<GravityReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<GravityComputePipeline>();
+        render_app.init_gpu_resource::<GravityComputePipeline>();
     }
 }
 

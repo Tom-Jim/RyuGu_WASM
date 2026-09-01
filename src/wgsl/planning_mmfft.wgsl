@@ -16,23 +16,22 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> hierarchy: array<u32>;
 @group(0) @binding(2) var<storage, read> positions: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> densities: array<f32>;
-@group(0) @binding(4) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<f32>>;
 
 var<workgroup> field_sum: array<vec4<f32>, 64>;
 var<workgroup> jacobian_x_sum: array<vec4<f32>, 64>;
 var<workgroup> jacobian_y_sum: array<vec4<f32>, 64>;
 var<workgroup> jacobian_z_sum: array<vec4<f32>, 64>;
 var<workgroup> sample_base: vec3<u32>;
-var<workgroup> weights_x: vec4<f32>;
-var<workgroup> weights_y: vec4<f32>;
-var<workgroup> weights_z: vec4<f32>;
-var<workgroup> derivatives_x: vec4<f32>;
-var<workgroup> derivatives_y: vec4<f32>;
-var<workgroup> derivatives_z: vec4<f32>;
-var<workgroup> second_derivatives_x: vec4<f32>;
-var<workgroup> second_derivatives_y: vec4<f32>;
-var<workgroup> second_derivatives_z: vec4<f32>;
+var<workgroup> weights_x: array<f32, 6>;
+var<workgroup> weights_y: array<f32, 6>;
+var<workgroup> weights_z: array<f32, 6>;
+var<workgroup> derivatives_x: array<f32, 6>;
+var<workgroup> derivatives_y: array<f32, 6>;
+var<workgroup> derivatives_z: array<f32, 6>;
+var<workgroup> second_derivatives_x: array<f32, 6>;
+var<workgroup> second_derivatives_y: array<f32, 6>;
+var<workgroup> second_derivatives_z: array<f32, 6>;
 var<workgroup> inverse_spacing: f32;
 var<workgroup> selected_level: u32;
 
@@ -47,33 +46,38 @@ fn linear_index(cell: vec3<u32>, level: u32) -> u32 {
 }
 
 fn potential_at(index: u32, level: u32) -> f32 {
-    let pair = unpack2x16float(hierarchy[index >> 1u]);
-    return select(pair.x, pair.y, (index & 1u) != 0u) * params.grid_scales[level];
+    // The GPU basis combiner stores one f32 potential per word, not two f16
+    // samples. Differentiate the same potential without half-precision noise.
+    return bitcast<f32>(hierarchy[index]) * params.grid_scales[level];
 }
 
-fn cubic_weights(t: f32) -> vec4<f32> {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    return vec4<f32>(
-        -0.5 * t + t2 - 0.5 * t3,
-        1.0 - 2.5 * t2 + 1.5 * t3,
-        0.5 * t + 2.0 * t2 - 1.5 * t3,
-        -0.5 * t2 + 0.5 * t3,
-    );
-}
-
-fn cubic_derivatives(t: f32) -> vec4<f32> {
-    let t2 = t * t;
-    return vec4<f32>(
-        -0.5 + 2.0 * t - 1.5 * t2,
-        -5.0 * t + 4.5 * t2,
-        0.5 + 4.0 * t - 4.5 * t2,
-        -t + 1.5 * t2,
-    );
-}
-
-fn cubic_second_derivatives(t: f32) -> vec4<f32> {
-    return vec4<f32>(2.0 - 3.0 * t, -5.0 + 9.0 * t, 4.0 - 9.0 * t, -1.0 + 3.0 * t);
+// A single quintic interpolant supplies potential, gravity and Hessian.
+// Catmull-Rom second derivatives retain large cell-scale errors even when its
+// values look smooth. Six nodes reproduce degree-five polynomials exactly.
+struct InterpolationWeights {
+    value: array<f32, 6>,
+    first: array<f32, 6>,
+    second: array<f32, 6>,
+};
+fn quintic_weights(t: f32) -> InterpolationWeights {
+    var weights: InterpolationWeights;
+    for (var i = 0u; i < 6u; i += 1u) {
+        var value = 1.0;
+        var first = 0.0;
+        var second = 0.0;
+        for (var j = 0u; j < 6u; j += 1u) {
+            if i == j { continue; }
+            let inverse = 1.0 / (f32(i) - f32(j));
+            let factor = (t - (f32(j) - 2.0)) * inverse;
+            second = second * factor + 2.0 * first * inverse;
+            first = first * factor + value * inverse;
+            value *= factor;
+        }
+        weights.value[i] = value;
+        weights.first[i] = first;
+        weights.second[i] = second;
+    }
+    return weights;
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -81,14 +85,15 @@ fn main(
     @builtin(workgroup_id) group_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
-    if group_id.x >= params.state_count { return; }
+    let target_index = group_id.x + group_id.y * 65535u;
+    if target_index >= params.state_count { return; }
     let lane = local_id.x;
-    let observer_position = positions[params.state_offset + group_id.x].xyz;
+    let observer_position = positions[params.state_offset + target_index].xyz;
     if lane == 0u {
         selected_level = 0xffffffffu;
         for (var level = 0u; level < params.level_count; level += 1u) {
             let spacing = 2.0 * params.half_extents[level] / f32(params.grid_sizes[level]);
-            if all(abs(observer_position) <= vec3<f32>(params.half_extents[level] - spacing)) {
+            if all(abs(observer_position) <= vec3<f32>(params.half_extents[level] - 4.0 * spacing)) {
                 selected_level = level;
                 break;
             }
@@ -99,20 +104,23 @@ fn main(
             let coordinate = (observer_position + vec3<f32>(half)) / spacing - vec3<f32>(0.5);
             let base = clamp(
                 floor(coordinate),
-                vec3<f32>(1.0),
-                vec3<f32>(f32(params.grid_sizes[selected_level] - 3u)),
+                vec3<f32>(2.0),
+                vec3<f32>(f32(params.grid_sizes[selected_level] - 4u)),
             );
             let fraction = clamp(coordinate - base, vec3<f32>(0.0), vec3<f32>(1.0));
-            sample_base = vec3<u32>(base) - vec3<u32>(1u);
-            weights_x = cubic_weights(fraction.x);
-            weights_y = cubic_weights(fraction.y);
-            weights_z = cubic_weights(fraction.z);
-            derivatives_x = cubic_derivatives(fraction.x);
-            derivatives_y = cubic_derivatives(fraction.y);
-            derivatives_z = cubic_derivatives(fraction.z);
-            second_derivatives_x = cubic_second_derivatives(fraction.x);
-            second_derivatives_y = cubic_second_derivatives(fraction.y);
-            second_derivatives_z = cubic_second_derivatives(fraction.z);
+            sample_base = vec3<u32>(base) - vec3<u32>(2u);
+            let x = quintic_weights(fraction.x);
+            let y = quintic_weights(fraction.y);
+            let z = quintic_weights(fraction.z);
+            weights_x = x.value;
+            weights_y = y.value;
+            weights_z = z.value;
+            derivatives_x = x.first;
+            derivatives_y = y.first;
+            derivatives_z = z.first;
+            second_derivatives_x = x.second;
+            second_derivatives_y = y.second;
+            second_derivatives_z = z.second;
             inverse_spacing = 1.0 / spacing;
         }
     }
@@ -149,33 +157,44 @@ fn main(
             jacobian_z_sum[lane] = vec4<f32>(0.0);
         }
     } else {
-        let dx = lane & 3u;
-        let dy = (lane >> 2u) & 3u;
-        let dz = lane >> 4u;
-        let potential = potential_at(
-            linear_index(sample_base + vec3<u32>(dx, dy, dz), selected_level),
-            selected_level,
-        );
-        let wx = weights_x[dx];
-        let wy = weights_y[dy];
-        let wz = weights_z[dz];
-        let first_scale = inverse_spacing;
-        let second_scale = inverse_spacing * inverse_spacing;
-        let dxx = second_derivatives_x[dx] * wy * wz * second_scale;
-        let dyy = second_derivatives_y[dy] * wx * wz * second_scale;
-        let dzz = second_derivatives_z[dz] * wx * wy * second_scale;
-        let dxy = derivatives_x[dx] * derivatives_y[dy] * wz * second_scale;
-        let dxz = derivatives_x[dx] * wy * derivatives_z[dz] * second_scale;
-        let dyz = wx * derivatives_y[dy] * derivatives_z[dz] * second_scale;
-        field_sum[lane] = potential * vec4<f32>(
-            derivatives_x[dx] * wy * wz * first_scale,
-            derivatives_y[dy] * wx * wz * first_scale,
-            derivatives_z[dz] * wx * wy * first_scale,
-            wx * wy * wz,
-        );
-        jacobian_x_sum[lane] = potential * vec4<f32>(dxx, dxy, dxz, 0.0);
-        jacobian_y_sum[lane] = potential * vec4<f32>(dxy, dyy, dyz, 0.0);
-        jacobian_z_sum[lane] = potential * vec4<f32>(dxz, dyz, dzz, 0.0);
+        var field = vec4<f32>(0.0);
+        var jacobian_x = vec4<f32>(0.0);
+        var jacobian_y = vec4<f32>(0.0);
+        var jacobian_z = vec4<f32>(0.0);
+        // Same 64-lane group; at most four grid loads per lane.
+        for (var stencil = lane; stencil < 216u; stencil += 64u) {
+            let dx = stencil % 6u;
+            let dy = (stencil / 6u) % 6u;
+            let dz = stencil / 36u;
+            let potential = potential_at(
+                linear_index(sample_base + vec3<u32>(dx, dy, dz), selected_level),
+                selected_level,
+            );
+            let wx = weights_x[dx];
+            let wy = weights_y[dy];
+            let wz = weights_z[dz];
+            let first_scale = inverse_spacing;
+            let second_scale = inverse_spacing * inverse_spacing;
+            let dxx = second_derivatives_x[dx] * wy * wz * second_scale;
+            let dyy = second_derivatives_y[dy] * wx * wz * second_scale;
+            let dzz = second_derivatives_z[dz] * wx * wy * second_scale;
+            let dxy = derivatives_x[dx] * derivatives_y[dy] * wz * second_scale;
+            let dxz = derivatives_x[dx] * wy * derivatives_z[dz] * second_scale;
+            let dyz = wx * derivatives_y[dy] * derivatives_z[dz] * second_scale;
+            field += potential * vec4<f32>(
+                derivatives_x[dx] * wy * wz * first_scale,
+                derivatives_y[dy] * wx * wz * first_scale,
+                derivatives_z[dz] * wx * wy * first_scale,
+                wx * wy * wz,
+            );
+            jacobian_x += potential * vec4<f32>(dxx, dxy, dxz, 0.0);
+            jacobian_y += potential * vec4<f32>(dxy, dyy, dyz, 0.0);
+            jacobian_z += potential * vec4<f32>(dxz, dyz, dzz, 0.0);
+        }
+        field_sum[lane] = field;
+        jacobian_x_sum[lane] = jacobian_x;
+        jacobian_y_sum[lane] = jacobian_y;
+        jacobian_z_sum[lane] = jacobian_z;
     }
     workgroupBarrier();
     var stride = 32u;
@@ -191,8 +210,8 @@ fn main(
         stride >>= 1u;
     }
     if lane == 0u {
-        let valid = select(0.0, 1.0, densities[params.density_model * 56u] > 0.0);
-        let base = group_id.x * 4u;
+        let valid = 1.0; // The complete density row is validated by the host; voxel 0 may be empty.
+        let base = target_index * 4u;
         output[base] = field_sum[0] * valid;
         output[base + 1u] = jacobian_x_sum[0] * valid;
         output[base + 2u] = jacobian_y_sum[0] * valid;

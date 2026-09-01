@@ -8,7 +8,7 @@ use bevy::render::{
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,17 @@ impl Default for WernerReadbackChannel {
             data: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+impl WernerReadbackChannel {
+    /// Clear callbacks and pending data that belong to a destroyed WebGPU
+    /// device before Bevy starts the renderer recovery lifecycle.
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.data.try_lock() {
+            data.take();
+        }
+        self.in_flight.store(false, Ordering::Release);
     }
 }
 
@@ -95,7 +106,7 @@ impl Plugin for WernerComputePlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedWernerInput>();
-        render_app.init_resource::<WernerGpuBuffers>();
+        render_app.init_gpu_resource::<WernerGpuBuffers>();
         render_app.add_systems(ExtractSchedule, extract_werner_input_system);
         render_app.add_systems(Render, dispatch_werner_system.in_set(RenderSystems::Render));
     }
@@ -104,7 +115,7 @@ impl Plugin for WernerComputePlugin {
         let channel = app.world().resource::<WernerReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<WernerComputePipeline>();
+        render_app.init_gpu_resource::<WernerComputePipeline>();
     }
 }
 

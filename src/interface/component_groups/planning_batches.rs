@@ -151,9 +151,17 @@ pub struct PlanningGpuRequest {
 pub struct PlanningGpuTiming {
     pub method_preprocess_ms: f64,
     pub command_submission_ms: f64,
+    /// CPU decoding and packing after map completion, not GPU kernel time.
+    pub readback_decode_ms: f64,
     /// Wall time from queue submission through GPU execution, copy, and map.
-    /// WebGPU timestamp queries are intentionally not used on browser Metal.
     pub gpu_completion_map_ms: f64,
+    /// Sum of method compute-pass timestamps, excluding transfer/reduction.
+    pub kernel_ms: Option<f64>,
+    /// Target field/Jacobian evaluator only (no basis or density combination).
+    pub evaluation_kernel_ms: Option<f64>,
+    /// Measured Eq.106/FFT/FMM basis preparation passes. Large FMM stress
+    /// windows may rebuild target responses; those executed passes are included.
+    pub basis_kernel_ms: Option<f64>,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,
@@ -161,6 +169,42 @@ pub struct PlanningGpuTiming {
     /// difference. Other backends report zero because this diagnostic is
     /// specific to the cached Taylor reconstruction.
     pub gradient_self_fd_relative_error: f32,
+}
+
+/// Accumulate only a complete set of timestamp measurements. One unavailable
+/// request makes the whole series unavailable; it must not become a partial sum.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanningKernelTotals {
+    pub all_ms: Option<f64>,
+    pub evaluation_ms: Option<f64>,
+    pub basis_ms: Option<f64>,
+}
+
+impl Default for PlanningKernelTotals {
+    fn default() -> Self {
+        Self { all_ms: Some(0.0), evaluation_ms: Some(0.0), basis_ms: Some(0.0) }
+    }
+}
+
+impl PlanningKernelTotals {
+    pub fn plus(self, other: Self) -> Self {
+        let add = |a: Option<f64>, b: Option<f64>| a.zip(b)
+            .filter(|(a, b)| a.is_finite() && b.is_finite() && *a >= 0.0 && *b >= 0.0)
+            .map(|(a, b)| a + b).filter(|sum| sum.is_finite());
+        Self {
+            all_ms: add(self.all_ms, other.all_ms),
+            evaluation_ms: add(self.evaluation_ms, other.evaluation_ms),
+            basis_ms: add(self.basis_ms, other.basis_ms),
+        }
+    }
+
+    pub fn record(&mut self, timing: PlanningGpuTiming) {
+        *self = self.plus(Self {
+            all_ms: timing.kernel_ms,
+            evaluation_ms: timing.evaluation_kernel_ms,
+            basis_ms: timing.basis_kernel_ms,
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +238,15 @@ pub struct PlanningGpuPacket {
 #[derive(Resource, Default)]
 pub struct PlanningGpuResult(pub Option<PlanningGpuPacket>);
 
+/// Render-to-main progress for bounded GPU preparation submissions.
+#[derive(Clone, Debug)]
+pub struct PlanningGpuPreparation {
+    pub request_id: u64,
+    pub completed_submissions: u32,
+    pub basis_fraction: f64,
+    pub status: String,
+}
+
 #[derive(Resource, Clone)]
 pub struct PlanningGpuReadbackChannel {
     pub data: Arc<Mutex<Option<PlanningGpuPacket>>>,
@@ -203,6 +256,7 @@ pub struct PlanningGpuReadbackChannel {
     /// error from cancelling a later retry.
     pub error: Arc<Mutex<Option<(u64, String)>>>,
     pub in_flight: Arc<AtomicBool>,
+    pub preparation: Arc<Mutex<Option<PlanningGpuPreparation>>>,
 }
 
 impl Default for PlanningGpuReadbackChannel {
@@ -211,7 +265,16 @@ impl Default for PlanningGpuReadbackChannel {
             data: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(AtomicBool::new(false)),
+            preparation: Arc::new(Mutex::new(None)),
         }
+    }
+}
+impl PlanningGpuReadbackChannel {
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        if let Ok(mut error) = self.error.try_lock() { error.take(); }
+        if let Ok(mut preparation) = self.preparation.try_lock() { preparation.take(); }
+        self.in_flight.store(false, Ordering::Release);
     }
 }
 

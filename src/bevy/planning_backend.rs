@@ -27,7 +27,7 @@ pub fn update_planning_results_from_inversion_system(
         planning.status = "Planning queued: the frozen capture identity is incomplete.".into();
         return;
     }
-    let dimensions = planning.workload_profile.dimensions();
+    let dimensions = planning.dimensions();
     let builder_matches = batch_builder.as_ref().is_some_and(|builder| {
         builder.matches(
             planning.workload_profile,
@@ -35,6 +35,7 @@ pub fn update_planning_results_from_inversion_system(
             capture_id,
             source_hash,
             planning.requested_source_count,
+            dimensions,
         )
     });
     if !builder_matches {
@@ -63,6 +64,7 @@ pub fn update_planning_results_from_inversion_system(
             inversion.capture_epoch,
             source_hash,
             planning.requested_source_count,
+            dimensions,
             voxel_size,
             &inversion.knots,
             &voxels,
@@ -134,12 +136,9 @@ pub fn update_planning_results_from_inversion_system(
     commands.insert_resource(batch);
     commands.insert_resource(PlanningGpuRequest::default());
     commands.insert_resource(PlanningMethodPayload::default());
-    let order_rotation = if planning.source_curve_active {
-        planning.source_curve_repeat as usize
-    } else {
-        0
-    };
-    let method_order = planning_method_order(order_rotation);
+    let order_seed = planning.source_curve_order_seed
+        ^ (planning.source_curve_samples.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let method_order = planning_method_order(order_seed);
     planning.batch_job = Some(PlanningBatchJob {
         run_id: planning.run_id,
         profile: planning.workload_profile,
@@ -162,7 +161,11 @@ pub fn update_planning_results_from_inversion_system(
         raw_gpu_request_count: 0,
         last_request_candidate_count: 0,
         awaiting_gpu: false,
-        awaiting_gpu_frames: 0,
+        awaiting_gpu_seconds: 0.0,
+        awaiting_gpu_last_poll: None,
+        gpu_basis_progress: 0.0,
+        reference_inflight_fraction: 0.0,
+        gpu_preparation_submission: 0,
         warm_repetition: false,
         certified_repetition: false,
         total_evaluations: u64::from(dimensions.0)
@@ -179,6 +182,8 @@ pub fn update_planning_results_from_inversion_system(
         raw_gradient_error_sum: 0.0,
         pointwise_gravity_errors: Vec::new(),
         pointwise_gradient_errors: Vec::new(),
+        certified_pointwise_gravity_errors: Vec::new(),
+        certified_pointwise_gradient_errors: Vec::new(),
         certified_gravity_error_sum: 0.0,
         certified_gravity_reference_sum: 0.0,
         certified_gradient_error_sum: 0.0,
@@ -208,15 +213,18 @@ pub fn update_planning_results_from_inversion_system(
         method_geometry_basis_ms: 0.0,
         density_payload_preparation_ms: 0.0,
         certified_density_payload_preparation_ms: 0.0,
+        raw_kernels: PlanningKernelTotals::default(),
+        certified_kernels: PlanningKernelTotals::default(),
         gpu_preprocessing_ms: 0.0,
         command_submission_ms: 0.0,
         reduction_ms: 0.0,
+        certified_reduction_ms: 0.0,
         verification_ms: 0.0,
         gpu_completion_map_ms: 0.0,
+        readback_decode_ms: 0.0,
         warm_evaluation_ms: 0.0,
         certified_warm_evaluation_ms: 0.0,
         certified_full_pass_ms: 0.0,
-        first_tile_ms: 0.0,
         dispatch_count: 0,
         forward_kernel_evaluations: 0,
         spectral_element_count: 0,
@@ -234,12 +242,14 @@ pub fn update_planning_results_from_inversion_system(
     );
 }
 
-fn planning_method_order(rotation: usize) -> [ActiveGravityMethod; 3] {
+fn planning_method_order(seed: u64) -> [ActiveGravityMethod; 3] {
+    use rand::{SeedableRng, seq::SliceRandom};
     let mut order = [
         ActiveGravityMethod::CurvedArcEq106,
         ActiveGravityMethod::MmfftCompressed,
         ActiveGravityMethod::Fmm,
     ];
-    order.rotate_left(rotation % 3);
+    // Fisher-Yates samples all six permutations, independently of density RNG.
+    order.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
     order
 }

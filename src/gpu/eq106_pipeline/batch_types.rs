@@ -25,7 +25,7 @@ use bevy::render::{
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, MapMode,
         PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
 };
 use bevy::shader::{ShaderCacheError, ShaderDefVal};
 use std::sync::Arc;
@@ -36,10 +36,9 @@ use wgpu29::{ComputePassTimestampWrites, QuerySet};
 const HALF_COUNT: u32 = 64;
 const FREQUENCY_COUNT: u32 = 2 * HALF_COUNT + 1;
 const QUADRATURE_COUNT: u32 = 64;
+const PLANNING_CHEBYSHEV_MODES: u32 = 32;
 const TAYLOR_MAX_ORDER: u32 = 8;
 const MAX_TAYLOR_COEFFICIENT_COUNT: u32 = 45;
-const NUFFT_GRID_SIZE: u32 = 1024;
-const NUFFT_PAIR_COUNT: u32 = 6;
 const DUAL_CERTIFICATE_CADENCE: u32 = 30;
 const OUTPUT_ROWS_PER_BLOCK: u64 = 11;
 const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
@@ -243,9 +242,19 @@ fn build_tube_batch_elements(
             let line_point = origin + h.max(0.0) * direction;
             let next_maximum_offset =
                 maximum_offset.max(position.distance(line_point) + tube_radius);
-            let next_minimum_line_radius = minimum_line_radius.min(line_point.length());
+            let next_maximum_h = maximum_h.max(h + tube_radius);
+            let next_minimum_line_radius = if tube_radius > 0.0 {
+                // Planning samples the entire finite interval, including the
+                // tube's longitudinal margins. Bound its closest approach,
+                // not just the discrete target positions.
+                let closest_h = (-origin.dot(direction)).clamp(0.0, next_maximum_h);
+                (origin + closest_h * direction).length()
+            } else { minimum_line_radius.min(line_point.length()) };
             let distance_lower_bound = next_minimum_line_radius - source_radius;
-            if distance_lower_bound <= 0.0 {
+            if distance_lower_bound <= 0.0
+                || (tube_radius > 0.0 && next_maximum_h > 4.0 * distance_lower_bound) {
+                // Keep the nearest possible source singularity far enough
+                // from the Chebyshev interval for the fixed degree-31 budget.
                 break;
             }
             let epsilon = next_maximum_offset / distance_lower_bound;
@@ -267,10 +276,14 @@ fn build_tube_batch_elements(
             target_count: best_count,
             line_origin: origin,
             line_direction: direction,
-            line_limit: (maximum_h / 0.85)
-                .max(0.35 * source_radius)
-                .min(maximum_line_limit)
-                .max(1.0),
+            line_limit: if tube_radius > 0.0 {
+                // No artificial 0.35*R minimum: sampling beyond a short arc
+                // can approach the body even though all actual targets are safe.
+                maximum_h.max(1.0)
+            } else {
+                (maximum_h / 0.85).max(0.35 * source_radius)
+                    .min(maximum_line_limit).max(1.0)
+            },
             taylor_order: best_order,
             spectrum_index: elements.len() as u32 + 1,
         });
@@ -364,8 +377,8 @@ impl Plugin for Eq106GpuComputePlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedEq106Input>();
-        render_app.init_resource::<Eq106GpuBuffers>();
-        render_app.init_resource::<PlanningEq106DispatchState>();
+        render_app.init_gpu_resource::<Eq106GpuBuffers>();
+        render_app.init_gpu_resource::<PlanningEq106DispatchState>();
         render_app.add_systems(ExtractSchedule, extract_eq106_input);
         render_app.add_systems(
             Render,
@@ -390,7 +403,7 @@ impl Plugin for Eq106GpuComputePlugin {
         // Queue every active entry point during application startup. This
         // keeps the first Eq.106 selection and First benchmark free of compile
         // time without retaining the unused analytic-spectrum pipeline.
-        render_app.init_resource::<Eq106ComputePipeline>();
+        render_app.init_gpu_resource::<Eq106ComputePipeline>();
     }
 }
 
@@ -897,4 +910,24 @@ fn decode_eq106_sample(
         independent_positive_potential: independent_potential,
         body_acceleration_jacobian: Some(jacobian),
     })
+}
+
+
+#[cfg(test)]
+mod finite_planning_segment_tests {
+    use super::*;
+
+    #[test]
+    fn short_outgoing_arc_does_not_sample_an_unused_body_scale_interval() {
+        let positions = [Vec3::new(600.0, 0.0, 0.0), Vec3::new(610.0, 0.0, 0.0)];
+        let velocities = [Vec3::X; 2];
+        let elements = build_canonical_tube_elements(&positions, &velocities, &[0.0, 10.0],
+            500.0, 2000.0, 15.0);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].target_count, 2);
+        assert_eq!(elements[0].line_limit, 40.0);
+        assert!(elements[0].line_limit < 0.35 * 500.0);
+        let start = elements[0].line_origin;
+        assert!(start.length() > 500.0);
+    }
 }

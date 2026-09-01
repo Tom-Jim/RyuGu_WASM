@@ -4,7 +4,7 @@ use bevy::platform::time::Instant;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 pub const G: f32 = 6.6743e-11;
 pub const RYUGU_MASS: f32 = 4.5e11;
 pub const TIME_SCALE: f32 = 60.0;
@@ -396,6 +396,14 @@ impl Default for NormalsReadbackChannel {
     }
 }
 
+impl NormalsReadbackChannel {
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.0.try_lock() {
+            data.take();
+        }
+    }
+}
+
 /// Radial-analytic discretization. Each 32-byte record stores one angular cell
 /// and one radial layer as `[direction.xyz, solid_angle]` followed by
 /// `[r_inner, r_outer, density, padding]`.
@@ -595,4 +603,14 @@ pub struct Eq106GpuReadbackChannel {
     /// element must be shortened and rebuilt. The render world consumes it
     /// before submitting another query for the same simulation snapshot.
     pub rebuild_requested: Arc<AtomicBool>,
+}
+
+impl Eq106GpuReadbackChannel {
+    pub fn reset_after_device_loss(&self) {
+        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        if let Ok(mut error) = self.pipeline_error.try_lock() { error.take(); }
+        if let Ok(mut submitted) = self.submitted_at.try_lock() { submitted.take(); }
+        self.rebuild_requested.store(false, Ordering::Release);
+        self.in_flight.store(false, Ordering::Release);
+    }
 }

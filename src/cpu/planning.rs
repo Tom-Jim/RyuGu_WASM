@@ -56,14 +56,16 @@ impl PlanningBatchBuilder {
         capture_epoch: u64,
         source_hash: u64,
         requested_source_count: u32,
+        dimensions: (u32, u32, u32),
         voxel_size: f32,
         reference_knots: &[TrajectoryInversionKnot],
         voxels: &[InvertedDensityVoxel],
         source: &AggregatedGravitySource,
     ) -> Option<Self> {
         let started = bevy::platform::time::Instant::now();
-        let (candidate_count, density_model_count, samples_per_candidate) = profile.dimensions();
+        let (candidate_count, density_model_count, samples_per_candidate) = dimensions;
         if candidate_count == 0 || candidate_count > PLANNING_CANDIDATE_COUNT || voxels.len() != 56
+            || density_model_count == 0 || samples_per_candidate < 2
         {
             return None;
         }
@@ -202,12 +204,14 @@ impl PlanningBatchBuilder {
         capture_id: u64,
         source_hash: u64,
         requested_source_count: u32,
+        dimensions: (u32, u32, u32),
     ) -> bool {
         self.profile == profile
             && self.run_id == run_id
             && self.capture_id == capture_id
             && self.source_hash == source_hash
             && self.source_count == requested_source_count
+            && (self.candidate_count, self.density_model_count, self.samples_per_candidate) == dimensions
     }
 
     pub(crate) fn advance(&mut self, candidate_budget: u32) -> bool {
@@ -1014,11 +1018,22 @@ pub(crate) fn evaluate_planning_reference_field(
     basis_records: &[PlanningBasisRecord],
     densities: &[f32],
 ) -> Option<(DVec3, DMat3)> {
-    if densities.len() != 56 || !target.is_finite() {
-        return None;
-    }
     let mut acceleration = DVec3::ZERO;
     let mut gradient = DMat3::ZERO;
+    accumulate_planning_reference_chunk(target, basis_records, densities, &mut acceleration, &mut gradient)?;
+    Some((acceleration, gradient))
+}
+
+/// Independent f64 oracle. WebGPU has no portable shader-f64, so keep this
+/// verification on CPU but bound each caller's work and retain sum order.
+pub(crate) fn accumulate_planning_reference_chunk(
+    target: DVec3,
+    basis_records: &[PlanningBasisRecord],
+    densities: &[f32],
+    acceleration: &mut DVec3,
+    gradient: &mut DMat3,
+) -> Option<()> {
+    if densities.len() != 56 || !target.is_finite() { return None; }
     for source in basis_records {
         let density = f64::from(*densities.get(source.voxel_index as usize)?);
         let position = DVec3::new(
@@ -1031,18 +1046,18 @@ pub(crate) fn evaluate_planning_reference_field(
         let inverse_radius = radius_squared.sqrt().recip();
         let inverse_radius_cubed = inverse_radius / radius_squared;
         let mass = f64::from(source.position_volume[3]) * density;
-        acceleration += f64::from(G) * mass * displacement * inverse_radius_cubed;
+        *acceleration += f64::from(G) * mass * displacement * inverse_radius_cubed;
         let outer = DMat3::from_cols(
             displacement * displacement.x,
             displacement * displacement.y,
             displacement * displacement.z,
         );
-        gradient += f64::from(G)
+        *gradient += f64::from(G)
             * mass
             * (-DMat3::IDENTITY * inverse_radius_cubed
                 + outer * (3.0 * inverse_radius_cubed / radius_squared));
     }
-    (acceleration.is_finite() && gradient.is_finite()).then_some((acceleration, gradient))
+    (acceleration.is_finite() && gradient.is_finite()).then_some(())
 }
 
 fn candidate_tube_parameters(candidate: u32, candidate_count: u32) -> (f32, f32, f32, f32) {

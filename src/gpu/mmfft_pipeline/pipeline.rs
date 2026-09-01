@@ -17,7 +17,7 @@ use bevy::render::{
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
 };
 use num_complex::Complex64;
 use rustfft::{Fft, FftPlanner};
@@ -69,7 +69,7 @@ impl Plugin for MmfftCompressedComputePlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ExtractedMmfftInput>();
-        render_app.init_resource::<MmfftGpuBuffers>();
+        render_app.init_gpu_resource::<MmfftGpuBuffers>();
         render_app.add_systems(ExtractSchedule, extract_mmfft_input_system);
         render_app.add_systems(Render, dispatch_mmfft_system.in_set(RenderSystems::Render));
     }
@@ -78,7 +78,7 @@ impl Plugin for MmfftCompressedComputePlugin {
         let channel = app.world().resource::<MmfftReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<MmfftComputePipeline>();
+        render_app.init_gpu_resource::<MmfftComputePipeline>();
     }
 }
 
@@ -251,8 +251,9 @@ pub fn build_mmfft_compressed_source_system(
     aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
     existing: Option<Res<MmfftCompressedSource>>,
     active_method: Res<ActiveGravityMethod>,
+    planning: Res<PlanningComparisonState>,
 ) {
-    if existing.is_some() || *active_method != ActiveGravityMethod::MmfftCompressed {
+    if planning.blocks_realtime_gpu() || existing.is_some() || *active_method != ActiveGravityMethod::MmfftCompressed {
         return;
     }
     let Some(aggregated) = aggregated else {

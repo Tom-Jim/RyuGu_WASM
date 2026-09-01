@@ -160,6 +160,29 @@ svg { width: 100%; height: 100%; display: block; overflow: visible; }
 #performance-page .performance-card, #quadrature-modal .modal-card { width: 100%; max-width: none; height: 100%; max-height: none; border-radius: 0; }
 .modal-card, .performance-card { max-width: 100%; max-height: 100%; overflow: auto; border-radius: 12px; padding: 18px; }
 .modal-card { width: min(980px, 92vw); height: min(660px, 84vh); display: grid; grid-template-rows: auto 1fr auto auto; gap: 10px; }
+/* Name the rows: adding explanatory text must never take the chart's 1fr. */
+#quadrature-modal .modal-card {
+  grid-template-areas: "header" "filters" "implementation" "chart" "legend" "accuracy" "footer" "timing";
+  grid-template-rows: auto auto auto minmax(240px, 1fr) auto auto auto auto;
+  grid-template-columns: minmax(0, 1fr);
+}
+#quadrature-modal .modal-card > header { grid-area: header; }
+#quadrature-modal .benchmark-filters { grid-area: filters; }
+#quadrature-timing-policy { grid-area: timing; margin: 0; }
+#quadrature-implementation { grid-area: implementation; margin: 0; }
+#quadrature-modal .chart-shell { grid-area: chart; min-height: 240px; min-width: 0; position: relative; }
+#quadrature-chart { position: absolute; inset: 8px; width: calc(100% - 16px); height: calc(100% - 16px); }
+#curve-legend { grid-area: legend; }
+#quadrature-accuracy-panel { grid-area: accuracy; min-width: 0; }
+#quadrature-modal .modal-card > footer { grid-area: footer; }
+#quadrature-plot-status { margin: 0 0 6px; font-size: 12px; }
+#quadrature-plot-status[data-accuracy-state="pass"], #planning-result[data-accuracy-state="pass"] { color: #a8f7bd; }
+#quadrature-plot-status[data-accuracy-state="fail"], #planning-result[data-accuracy-state="fail"] { color: #ff9393; }
+#quadrature-plot-status[data-accuracy-state="pending"], #planning-result[data-accuracy-state="pending"] { color: #8fa9ae; }
+.benchmark-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; font-size: 12px; }
+#quadrature-accuracy-policy, #planning-accuracy-note { color: var(--muted); }
+#quadrature-accuracy-policy[data-profile="screening"], #planning-accuracy-note[data-profile="screening"] { color: #ffcc77; }
+#quadrature-accuracy { max-height: 140px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
 .modal-card header, .modal-card footer, .performance-card header, .performance-card footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .modal h1 { margin: 3px 0; font-size: 17px; }
 .modal p, .modal small, .modal footer { color: var(--muted); font: 11px/1.5 ui-monospace, monospace; }
@@ -196,3 +219,11 @@ svg { width: 100%; height: 100%; display: block; overflow: visible; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+.benchmark-note { color: var(--muted, #91acb5); font-size: 0.75rem; overflow-wrap: anywhere; }
+
+.background-settings { margin: 0 0 12px; padding: 8px; border: 1px solid #23454b; border-radius: 6px; font-size: 11px; line-height: 1.45; }
+.background-settings summary { cursor: pointer; color: #a9d3d7; }
+.background-settings label { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.background-settings p { margin: 8px 0 0; color: #8cabb1; }
+.background-settings [data-power-active="true"] { color: #90edb0; }

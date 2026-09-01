@@ -15,7 +15,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::WgpuLimits;
 use bevy::render::{
     RenderPlugin,
-    settings::{Backends, InstanceFlags, RenderCreation, WgpuSettings},
+    error_handler::{RenderError, RenderErrorHandler, RenderErrorPolicy, ErrorType},
+    settings::{Backends, InstanceFlags, RenderCreation, WgpuSettings, WgpuSettingsPriority},
 };
 use bevy::window::PresentMode;
 use bevy::winit::{UpdateMode, WinitSettings};
@@ -57,17 +58,139 @@ use gpu::{
     normals::NormalsComputePlugin,
     planning::PlanningGpuComputePlugin,
     radial::{GravityComputePlugin, build_radial_gravity_source_system},
-    werner::WernerComputePlugin,
+    werner::{WernerComputePlugin, WernerReadbackChannel},
 };
 use interface::components::{
     ActiveGravityMethod, CameraMode, DensityC, DensitySensitivityCaches, DisplayRotation,
-    GpuMemoryEstimate, GravityAcceleration, GravityBenchmarkTrajectory, GravityBlendFactor,
-    GravityPotential, GravityRuntimeError, JacobiHistory, PerformanceComparisonState,
-    PlanningComparisonState, ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions,
+    Eq106GpuReadbackChannel, FmmReadbackChannel, GpuMemoryEstimate, GravityAcceleration,
+    GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential, GravityReadbackChannel,
+    GravityRuntimeError, JacobiHistory, MmfftReadbackChannel, NormalsReadbackChannel, PerformanceComparisonState,
+    PlanningComparisonState, PlanningGpuReadbackChannel, PlanningGpuRequest, PlanningGpuResult,
+    PlanningMethodPayload, ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions,
     ShowNormals, ShowSection, SimulationAcceleration, SimulationClock, TrajectoryInversionState,
 };
 use std::time::Duration;
 use wgsl::WgslPlugin;
+
+fn ryugu_render_error_handler(
+    error: &RenderError,
+    main_world: &mut World,
+    _render_world: &mut World,
+) -> RenderErrorPolicy {
+    match error.ty {
+        ErrorType::DeviceLost => {
+            // Ask the browser shell to record the restart intent before the
+            // main-world job is cleared below. The last published snapshot
+            // still identifies an active quadrature run, including hidden tabs.
+            schedule_device_loss_reload();
+            // Drop every readback produced by the old device, then let the
+            // planning evaluator issue a fresh request after RenderStartup
+            // has rebuilt all GPU-owned resources. Completed source-curve
+            // rows remain in PlanningComparisonState.
+            if let Some(channel) = main_world.get_resource::<PlanningGpuReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<Eq106GpuReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<GravityReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<MmfftReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<FmmReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<WernerReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<NormalsReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+
+            if let Some(mut planning) = main_world.get_resource_mut::<PlanningComparisonState>() {
+                let mut retry_status = None;
+                if let Some(job) = planning.batch_job.as_mut() {
+                    job.awaiting_gpu = false;
+                    job.awaiting_gpu_seconds = 0.0;
+                    job.awaiting_gpu_last_poll = None;
+                    job.gpu_preparation_submission = 0;
+                    job.gpu_basis_progress = 0.0;
+                    job.reference_inflight_fraction = 0.0;
+                    retry_status = Some(format!(
+                        "GPU device lost; rebuilding WebGPU and retrying {} request {}.",
+                        job.method.planning_label(),
+                        job.request_id,
+                    ));
+                    // Stop this WASM instance before Chrome tears down the
+                    // WebGPU context. The browser shell will cold-restart
+                    // and re-queue the saved quadrature request.
+                    planning.run_requested = false;
+                    planning.source_curve_active = false;
+                    planning.batch_job = None;
+                }
+                if let Some(status) = retry_status {
+                    planning.status = status;
+                }
+            }
+            if let Some(mut request) = main_world.get_resource_mut::<PlanningGpuRequest>() {
+                *request = PlanningGpuRequest::default();
+            }
+            if let Some(mut payload) = main_world.get_resource_mut::<PlanningMethodPayload>() {
+                *payload = PlanningMethodPayload::default();
+            }
+            if let Some(mut result) = main_world.get_resource_mut::<PlanningGpuResult>() {
+                result.0 = None;
+            }
+            if let Some(mut error_state) = main_world.get_resource_mut::<GravityRuntimeError>() {
+                error_state.raise(format!(
+                    "WebGPU device lost: {}. The page will restart and resume the saved quadrature workload.",
+                    error.description
+                ));
+            }
+            bevy::log::warn!(
+                "WebGPU device lost ({}); stopping this instance for browser-level restart.",
+                error.description
+            );
+            // Recreating a WebGPU device in-place is not reliable in Chrome
+            // once the external Instance has disappeared; Bevy's automatic
+            // path can panic when no adapter is immediately available. Stop
+            // cleanly and let the browser shell perform a cold restart.
+            RenderErrorPolicy::StopRendering
+        }
+        ErrorType::OutOfMemory | ErrorType::Validation | ErrorType::Internal => {
+            if let Some(mut error_state) = main_world.get_resource_mut::<GravityRuntimeError>() {
+                error_state.raise(format!(
+                    "GPU render error ({:?}): {}",
+                    error.ty, error.description
+                ));
+            }
+            if let Some(mut planning) = main_world.get_resource_mut::<PlanningComparisonState>() {
+                planning.run_requested = false;
+                planning.source_curve_active = false;
+                planning.batch_job = None;
+                planning.status = format!(
+                    "Planning stopped after fatal GPU render error ({:?}); inspect the error before starting a new run.",
+                    error.ty
+                );
+            }
+            if let Some(mut request) = main_world.get_resource_mut::<PlanningGpuRequest>() {
+                *request = PlanningGpuRequest::default();
+            }
+            if let Some(mut payload) = main_world.get_resource_mut::<PlanningMethodPayload>() {
+                *payload = PlanningMethodPayload::default();
+            }
+            if let Some(mut result) = main_world.get_resource_mut::<PlanningGpuResult>() {
+                result.0 = None;
+            }
+            // StopRendering leaves the app alive so the UI can display the
+            // failure and the user can inspect it; it never submits work to a
+            // device after a fatal validation/OOM/internal error.
+            RenderErrorPolicy::StopRendering
+        }
+    }
+}
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum UiComputeOrdering {
@@ -92,6 +215,14 @@ use wasm_bindgen::prelude::*;
     let ryuguLastAnimationFrame = 0;
 
     function record_ryugu_animation_frame(timestamp) {
+        if (document.visibilityState !== "visible") {
+            // Worker-driven update ticks are not displayed frames. Do not
+            // interpret hidden-tab pacing as low GPU performance.
+            ryuguLastAnimationFrame = 0;
+            ryuguFrameIntervalCount = 0;
+            requestAnimationFrame(record_ryugu_animation_frame);
+            return;
+        }
         if (ryuguLastAnimationFrame > 0) {
             ryuguFrameIntervals[ryuguFrameIntervalCursor] = timestamp - ryuguLastAnimationFrame;
             ryuguFrameIntervalCursor = (ryuguFrameIntervalCursor + 1) % ryuguFrameIntervals.length;
@@ -106,6 +237,7 @@ use wasm_bindgen::prelude::*;
     }
 
     export function browser_actual_fps() {
+        if (document.visibilityState !== "visible") return 0;
         if (ryuguFrameIntervalCount === 0) return 0;
         let elapsed = 0;
         for (let index = 0; index < ryuguFrameIntervalCount; index += 1) {
@@ -115,6 +247,7 @@ use wasm_bindgen::prelude::*;
     }
 
     export function browser_recent_frame_ms() {
+        if (document.visibilityState !== "visible") return 0;
         if (ryuguFrameIntervalCount === 0) return 0;
         const sampleCount = Math.min(8, ryuguFrameIntervalCount);
         let longest = 0;
@@ -157,6 +290,23 @@ use wasm_bindgen::prelude::*;
     export function set_display_rotation(quarter_turn) {
         window.setRyuguDisplayRotation?.(quarter_turn);
     }
+
+    export function schedule_device_loss_reload() {
+        try {
+            const planning = window.ryuguUi?.snapshot?.planning;
+            if (!planning || planning.workload !== 'quadrature' || planning.running !== true) return false;
+            const attempts = Number(sessionStorage.getItem('ryugu-device-lost-attempts') || '0');
+            if (attempts >= 2 || sessionStorage.getItem('ryugu-device-lost-reload-pending') === '1') return false;
+            const densityModels = Number(document.getElementById('quadrature-density')?.value);
+            const targets = Number(document.getElementById('quadrature-targets')?.value);
+            if (![1, 4, 16, 64, 256, 512, 1024].includes(densityModels) || ![8, 64, 241, 1024, 8192].includes(targets)) return false;
+            sessionStorage.setItem('ryugu-device-lost-attempts', String(attempts + 1));
+            sessionStorage.setItem('ryugu-device-lost-resume', JSON.stringify({ densityModels, targets, scope: document.getElementById('quadrature-scope')?.value === 'all' ? 'all' : 'selected' }));
+            sessionStorage.setItem('ryugu-device-lost-reload-pending', '1');
+            setTimeout(() => location.reload(), 1200);
+            return true;
+        } catch { return false; }
+    }
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = browser_actual_fps)]
@@ -175,7 +325,16 @@ extern "C" {
 
     #[wasm_bindgen(js_name = set_display_rotation)]
     fn browser_set_display_rotation(quarter_turn: u8);
+
+    #[wasm_bindgen(js_name = schedule_device_loss_reload)]
+    fn schedule_device_loss_reload_js() -> bool;
 }
+
+#[cfg(target_arch = "wasm32")]
+fn schedule_device_loss_reload() { let _ = schedule_device_loss_reload_js(); }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn schedule_device_loss_reload() {}
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn browser_frame_rate() -> Option<f64> {
@@ -256,6 +415,19 @@ pub fn main() {
     };
 
     let mut app = App::new();
+    let render_settings = WgpuSettings {
+        backends: Some(backends),
+        // Enable adapter-supported optional features, including
+        // TIMESTAMP_QUERY, without requiring it on mobile GPUs.
+        priority: WgpuSettingsPriority::Functionality,
+        limits,
+        instance_flags: if is_mobile_browser {
+            InstanceFlags::empty()
+        } else {
+            InstanceFlags::debugging()
+        },
+        ..default()
+    };
 
     app.insert_resource(ClearColor(Color::srgb(0.01, 0.01, 0.03)))
         .init_resource::<CameraMode>()
@@ -289,7 +461,13 @@ pub fn main() {
             // Adding a 16.7 ms reactive wait on top of VSync can miss every
             // other presentation and produce an artificial ~30 FPS ceiling.
             focused_mode: UpdateMode::Continuous,
-            unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 30.0)),
+            // The browser shell supplies paced worker update ticks when
+            // hidden. Do not add a second 30 Hz unfocused wait to those ticks.
+            unfocused_mode: if cfg!(target_arch = "wasm32") {
+                UpdateMode::Continuous
+            } else {
+                UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 30.0))
+            },
         })
         .add_plugins(
             DefaultPlugins
@@ -323,22 +501,18 @@ pub fn main() {
                     ..default()
                 })
                 .set(RenderPlugin {
-                    render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
-                        backends: Some(backends),
-                        limits,
-                        instance_flags: if is_mobile_browser {
-                            InstanceFlags::empty()
-                        } else {
-                            InstanceFlags::debugging()
-                        },
-                        ..default()
-                    })),
+                    render_creation: RenderCreation::Automatic(Box::new(render_settings.clone())),
                     ..default()
                 }),
         )
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(WgslPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default());
+
+    // Bevy's default handler exits on every render error. DeviceLost is
+    // recoverable in WebGPU, so replace it with a handler that resets shared
+    // readback state and asks Bevy to recreate the device.
+    app.insert_resource(RenderErrorHandler(ryugu_render_error_handler));
 
     // Native builds use a precise sleep/spin limiter. Browsers use continuous
     // requestAnimationFrame scheduling with VSync above.

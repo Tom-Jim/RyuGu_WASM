@@ -139,6 +139,55 @@ impl MmfftLevelWorkspace {
         &self.field
     }
 
+    /// One potential grid per unit-density voxel, in f64 until the final RHS
+    /// combination. Deposit all source volumes once; run the existing rustfft
+    /// convolution once per column. Storage is 56*n^3, not 56*(2n)^3 complex
+    /// spectra and not eight heap records per source.
+    #[cfg(test)]
+    fn unit_density_potentials(&mut self, records: &[PlanningBasisRecord]) -> Option<Vec<f64>> {
+        let nodes = self.n.checked_pow(3)?;
+        let mut basis = Vec::new();
+        basis.try_reserve_exact(nodes.checked_mul(56)?).ok()?;
+        basis.resize(nodes * 56, 0.0_f64);
+        for record in records {
+            let voxel = record.voxel_index as usize;
+            let volume = f64::from(record.position_volume[3]);
+            if voxel >= 56 || !volume.is_finite() || volume < 0.0 { return None; }
+            let position = DVec3::new(f64::from(record.position_volume[0]),
+                f64::from(record.position_volume[1]), f64::from(record.position_volume[2]));
+            if !position.is_finite() { return None; }
+            visit_deposition_weights(position, self.half_extent, self.spacing, self.n,
+                |x, y, z, weight| {
+                    basis[voxel * nodes + grid_index(x, y, z, self.n)] += volume * weight;
+                });
+        }
+        for column in basis.chunks_exact_mut(nodes) {
+            if column.iter().all(|value| *value == 0.0) { continue; }
+            self.density.fill(Complex64::default());
+            for z in 0..self.n {
+                for y in 0..self.n {
+                    for x in 0..self.n {
+                        self.density[grid_index(x, y, z, self.p)].re = column[grid_index(x, y, z, self.n)];
+                    }
+                }
+            }
+            self.fft.transform(&mut self.density, false);
+            for (value, kernel) in self.density.iter_mut().zip(&self.kernel_spectrum) { *value *= *kernel; }
+            self.fft.transform(&mut self.density, true);
+            for z in 0..self.n {
+                for y in 0..self.n {
+                    for x in 0..self.n {
+                        let potential = f64::from(G) * self.density[grid_index(x, y, z, self.p)].re;
+                        if !potential.is_finite() { return None; }
+                        column[grid_index(x, y, z, self.n)] = potential;
+                    }
+                }
+            }
+        }
+        Some(basis)
+    }
+
+    #[cfg(test)]
     fn build_from_basis(
         &mut self,
         records: &[PlanningBasisRecord],
@@ -196,28 +245,27 @@ fn deposit_particle(
     n: usize,
     p: usize,
 ) {
+    visit_deposition_weights(position, half_extent, spacing, n, |x, y, z, weight| {
+        density[grid_index(x, y, z, p)].re += mass * weight;
+    });
+}
+
+fn visit_deposition_weights(
+    position: DVec3, half_extent: f64, spacing: f64, n: usize,
+    mut visit: impl FnMut(usize, usize, usize, f64),
+) {
     let grid = (position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
     let base = grid.floor();
     let fraction = grid - base;
-    let weights = [
-        [1.0 - fraction.x, fraction.x],
-        [1.0 - fraction.y, fraction.y],
-        [1.0 - fraction.z, fraction.z],
-    ];
+    let weights = [[1.0 - fraction.x, fraction.x], [1.0 - fraction.y, fraction.y],
+        [1.0 - fraction.z, fraction.z]];
     for dz in 0..=1 {
         for dy in 0..=1 {
             for dx in 0..=1 {
-                let cell = [
-                    base.x as isize + dx,
-                    base.y as isize + dy,
-                    base.z as isize + dz,
-                ];
-                if cell.iter().any(|value| *value < 0 || *value >= n as isize) {
-                    continue;
-                }
-                density[grid_index(cell[0] as usize, cell[1] as usize, cell[2] as usize, p)].re +=
-                    mass * weights[0][dx as usize] * weights[1][dy as usize]
-                        * weights[2][dz as usize];
+                let cell = [base.x as isize + dx, base.y as isize + dy, base.z as isize + dz];
+                if cell.iter().any(|value| *value < 0 || *value >= n as isize) { continue; }
+                visit(cell[0] as usize, cell[1] as usize, cell[2] as usize,
+                    weights[0][dx as usize] * weights[1][dy as usize] * weights[2][dz as usize]);
             }
         }
     }

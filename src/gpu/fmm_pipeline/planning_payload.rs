@@ -1,9 +1,32 @@
+/// No source traversal or target solve here. The render world builds the
+/// topology, 56 moment/response banks and RHS combination on GPU.
+pub(crate) fn build_planning_fmm_gpu_payload(
+    batch: &PlanningCandidateBatch, model: u32, request_id: u64,
+) -> Option<PlanningMethodPayload> {
+    let started = bevy::platform::time::Instant::now();
+    let densities = batch.density_models.get(model as usize*56..(model as usize+1)*56)?;
+    let mass = *batch.density_model_masses.get(model as usize)?;
+    if batch.basis_records.is_empty() || !batch.eq106_source_radius.is_finite() || batch.eq106_source_radius <= 0.0
+        || !mass.is_finite() || mass <= 0.0
+        || densities.iter().any(|d| !d.is_finite() || *d < 0.0) { return None; }
+    Some(PlanningMethodPayload {
+        request_id, method: Some(ActiveGravityMethod::Fmm), density_model: model,
+        maximum_level: 56, total_mass: mass as f32,
+        density_payload_preparation_ms: started.elapsed().as_secs_f64()*1e3,
+        ..default()
+    })
+}
+
+#[cfg(test)]
+mod cpu_reference {
+use super::*;
 type PlanningCellKey = (u32, u32, u32);
 type PlanningTargetKey = (i32, i32, i32);
 
 /// Geometry cache shared by every density row in one planning batch.
 /// Source topology, target leaf boxes and the state-to-target mapping are
-/// immutable; only P2M/M2M moments and M2L coefficients change with density.
+/// immutable. Bounded fixed-target batches also cache all 56 unit-density
+/// responses, including L2P and near-field P2P, before combining any RHS.
 #[derive(Default)]
 pub(crate) struct PlanningFmmWorkspace {
     batch_id: u64,
@@ -15,6 +38,10 @@ pub(crate) struct PlanningFmmWorkspace {
     leaf_ranges: HashMap<PlanningCellKey, (u32, u32)>,
     target_keys: Vec<PlanningTargetKey>,
     state_target_indices: Vec<u32>,
+    /// State-major [state][voxel][g, potential, Jacobian columns], in f64.
+    response_basis: Vec<[f64; 13]>,
+    basis_volumes: Vec<f64>,
+    response_state_map: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +65,9 @@ impl Default for LocalExpansion {
 
 impl PlanningFmmWorkspace {
     fn rebuild(&mut self, batch: &PlanningCandidateBatch) -> Option<()> {
+        self.response_basis.clear();
+        self.basis_volumes.clear();
+        self.response_state_map = Arc::from([]);
         self.batch_id = batch.batch_id;
         self.radius = batch
             .basis_records
@@ -134,7 +164,198 @@ impl PlanningFmmWorkspace {
     }
 }
 
-pub(crate) fn build_planning_fmm_payload(
+// Kept as an independent CPU oracle for the existing small numerical tests;
+// production planning calls the GPU metadata builder below.
+#[cfg(test)]
+fn build_planning_fmm_payload(
+    batch: &PlanningCandidateBatch,
+    model: u32,
+    request_id: u64,
+    cache: &mut PlanningFmmWorkspace,
+) -> Option<PlanningMethodPayload> {
+    // Every source/K/target sweep cell fits this bound (<=8192 targets).
+    // Keep the million-state interactive stress workload on the streaming
+    // path instead of allocating a multi-gigabyte response matrix.
+    if batch.state_count() > 8192 {
+        return build_planning_fmm_streaming_payload(batch, model, request_id, cache);
+    }
+    let started = bevy::platform::time::Instant::now();
+    let mut geometry_basis_preparation_ms = 0.0;
+    if cache.batch_id != batch.batch_id || cache.response_basis.is_empty() {
+        cache.rebuild(batch)?;
+        cache.build_response_basis(batch)?;
+        geometry_basis_preparation_ms = started.elapsed().as_secs_f64() * 1.0e3;
+    }
+    let row_start = model as usize * 56;
+    let densities = batch.density_models.get(row_start..row_start + 56)?;
+    if densities
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return None;
+    }
+    let mut primary = Vec::with_capacity(batch.state_count() * 96);
+    for (state, basis) in batch
+        .states
+        .iter()
+        .zip(cache.response_basis.chunks_exact(56))
+    {
+        let mut response = [0.0_f64; 13];
+        for (column, density) in basis.iter().zip(densities) {
+            for (total, value) in response.iter_mut().zip(column) {
+                *total += f64::from(*density) * value;
+            }
+        }
+        if response.iter().any(|value| !(*value as f32).is_finite()) {
+            return None;
+        }
+        // Use the existing GPU L2P ABI with the expansion centered exactly on
+        // its target. P2P is already in the basis; no density-dependent source
+        // scans, tree moments, translations or near-particle packing remain.
+        let position = state.body_position();
+        push_f32s(&mut primary, [position.x, position.y, position.z, 0.0]);
+        push_f32s(
+            &mut primary,
+            std::array::from_fn::<_, 4, _>(|i| response[i] as f32),
+        );
+        for column in response[4..].chunks_exact(3) {
+            push_f32s(
+                &mut primary,
+                [column[0] as f32, column[1] as f32, column[2] as f32, 0.0],
+            );
+        }
+        primary.extend_from_slice(&[0u8; 16]);
+    }
+    Some(PlanningMethodPayload {
+        request_id,
+        method: Some(ActiveGravityMethod::Fmm),
+        density_model: model,
+        primary: Arc::from(primary),
+        secondary: Arc::clone(&cache.response_state_map),
+        item_count: batch.state_count() as u32,
+        secondary_count: 0,
+        maximum_level: 1, // One GPU L2P read; the 56-term CPU mix is timed below.
+        total_mass: cache
+            .basis_volumes
+            .iter()
+            .zip(densities)
+            .map(|(volume, density)| volume * f64::from(*density))
+            .sum::<f64>() as f32,
+        geometry_basis_preparation_ms,
+        density_payload_preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3
+            - geometry_basis_preparation_ms)
+            .max(0.0),
+        ..default()
+    })
+}
+
+impl PlanningFmmWorkspace {
+    fn build_response_basis(&mut self, batch: &PlanningCandidateBatch) -> Option<()> {
+        let mut voxel_sources = vec![Vec::new(); 56];
+        self.basis_volumes = vec![0.0; 56];
+        // Visit the source bank once to partition P2M work by basis column.
+        for (index, record) in batch.basis_records.iter().enumerate() {
+            let voxel = record.voxel_index as usize;
+            let volume = f64::from(record.position_volume[3]);
+            if !volume.is_finite() || volume < 0.0 {
+                return None;
+            }
+            voxel_sources.get_mut(voxel)?.push(index);
+            self.basis_volumes[voxel] += volume;
+        }
+        let mut responses = vec![[0.0_f64; 13]; batch.state_count().checked_mul(56)?];
+        let leaf_level = MAXIMUM_LEVEL as usize;
+        let leaf_grid = 1u32 << MAXIMUM_LEVEL;
+        for (voxel, indices) in voxel_sources.iter().enumerate() {
+            let mut moments = self
+                .levels
+                .iter()
+                .map(|level| vec![MomentAccumulator::default(); level.len()])
+                .collect::<Vec<_>>();
+            for &index in indices {
+                let record = batch.basis_records[index];
+                let position = record_position(record);
+                let normalized = (position / self.radius + DVec3::ONE) * 0.5;
+                let coordinate = |value: f64| {
+                    ((value.clamp(0.0, 1.0 - f64::EPSILON) * f64::from(leaf_grid)) as u32)
+                        .min(leaf_grid - 1)
+                };
+                let key = (
+                    coordinate(normalized.x),
+                    coordinate(normalized.y),
+                    coordinate(normalized.z),
+                );
+                let global = *self.index_maps[leaf_level].get(&key)?;
+                moments[leaf_level][(global - self.level_offsets[leaf_level]) as usize]
+                    .add(position, f64::from(record.position_volume[3]));
+            }
+            for level in (1..=leaf_level).rev() {
+                let (parents, children) = moments.split_at_mut(level);
+                for (index, &child) in children[0].iter().enumerate() {
+                    let key = self.levels[level][index];
+                    let parent =
+                        *self.index_maps[level - 1].get(&(key.0 / 2, key.1 / 2, key.2 / 2))?;
+                    parents[level - 1][(parent - self.level_offsets[level - 1]) as usize]
+                        .merge(child);
+                }
+            }
+            for (state, target) in batch.states.iter().enumerate() {
+                let observer = target.body_position().as_dvec3();
+                let mut local = LocalExpansion::default();
+                // Center each fixed-target basis expansion on the actual
+                // observer. A quadratic potential at a shared leaf center has
+                // a constant Hessian, leaving an O(target offset / distance)
+                // gradient error even as source quadrature is refined.
+                // This extra M2L work is paid only during the 56-basis build.
+                accumulate_target_local(self, &moments, 0, (0, 0, 0), observer, 0.0, &mut local)?;
+                let mut acceleration = local.acceleration;
+                let mut potential = local.potential;
+                let mut jacobian = local.jacobian;
+                for &source in &local.near_sources {
+                    let record = batch.basis_records[source];
+                    if record.voxel_index as usize != voxel {
+                        continue;
+                    }
+                    let displacement = record_position(record) - observer;
+                    let radius2 = displacement.length_squared().max(1.0e-8);
+                    let inverse_radius = radius2.sqrt().recip();
+                    let mass = f64::from(record.position_volume[3]);
+                    let inverse_radius3 = inverse_radius / radius2;
+                    acceleration += mass * displacement * inverse_radius3;
+                    potential += mass * inverse_radius;
+                    let column = |axis: DVec3, component: f64| {
+                        -mass * inverse_radius3 * axis
+                            + 3.0 * mass * inverse_radius3 / radius2 * displacement * component
+                    };
+                    jacobian += bevy::math::DMat3::from_cols(
+                        column(DVec3::X, displacement.x),
+                        column(DVec3::Y, displacement.y),
+                        column(DVec3::Z, displacement.z),
+                    );
+                }
+                let response = &mut responses[state * 56 + voxel];
+                response[..3].copy_from_slice(&acceleration.to_array());
+                response[3] = potential;
+                response[4..].copy_from_slice(&jacobian.to_cols_array());
+                for value in response {
+                    *value *= f64::from(G);
+                    if !value.is_finite() {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.response_basis = responses;
+        self.response_state_map = Arc::from(
+            (0..batch.state_count() as u32)
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        Some(())
+    }
+}
+
+fn build_planning_fmm_streaming_payload(
     batch: &PlanningCandidateBatch,
     model: u32,
     request_id: u64,
@@ -171,8 +392,7 @@ pub(crate) fn build_planning_fmm_payload(
         let position = record_position(*record);
         let normalized = (position / cache.radius + DVec3::ONE) * 0.5;
         let coordinate = |value: f64| {
-            ((value.clamp(0.0, 1.0 - f64::EPSILON) * leaf_grid as f64) as u32)
-                .min(leaf_grid - 1)
+            ((value.clamp(0.0, 1.0 - f64::EPSILON) * leaf_grid as f64) as u32).min(leaf_grid - 1)
         };
         let key = (
             coordinate(normalized.x),
@@ -189,8 +409,7 @@ pub(crate) fn build_planning_fmm_payload(
             let key = cache.levels[level][index];
             let parent_key = (key.0 / 2, key.1 / 2, key.2 / 2);
             let global_parent = *cache.index_maps[level - 1].get(&parent_key)?;
-            moments[level - 1]
-                [(global_parent - cache.level_offsets[level - 1]) as usize]
+            moments[level - 1][(global_parent - cache.level_offsets[level - 1]) as usize]
                 .merge(child);
         }
     }
@@ -262,9 +481,8 @@ pub(crate) fn build_planning_fmm_payload(
 
     // One raw-u32 buffer keeps the state map and packed P2P records under a
     // single browser storage binding.
-    let mut secondary = Vec::with_capacity(
-        cache.state_target_indices.len() * 4 + near_particle_bytes.len(),
-    );
+    let mut secondary =
+        Vec::with_capacity(cache.state_target_indices.len() * 4 + near_particle_bytes.len());
     for index in cache.state_target_indices.iter().copied() {
         secondary.extend_from_slice(&index.to_le_bytes());
     }
@@ -319,9 +537,16 @@ fn accumulate_target_local(
     );
     let distance = source_center.distance(target_center);
     let expansion_radius = 3.0_f64.sqrt() * (source_half + target_half);
+    // Exact-target basis locals use a tighter source opening ratio for the
+    // Hessian; streaming target-cell payloads retain their original setting.
+    let opening_ratio = if target_half == 0.0 {
+        0.05
+    } else {
+        f64::from(THETA)
+    };
     let accepted = level > 0
         && distance > 1.01 * expansion_radius
-        && expansion_radius / distance.max(1.0e-12) < f64::from(THETA);
+        && expansion_radius / distance.max(1.0e-12) < opening_ratio;
     if accepted {
         accumulate_multipole(moment, target_center, local)?;
         return Some(());
@@ -376,21 +601,9 @@ fn accumulate_multipole(
         moment.second[5] - mass * z * z,
     ];
     let trace = central[0] + central[3] + central[5];
-    let qx = DVec3::new(
-        3.0 * central[0] - trace,
-        3.0 * central[1],
-        3.0 * central[2],
-    );
-    let qy = DVec3::new(
-        3.0 * central[1],
-        3.0 * central[3] - trace,
-        3.0 * central[4],
-    );
-    let qz = DVec3::new(
-        3.0 * central[2],
-        3.0 * central[4],
-        3.0 * central[5] - trace,
-    );
+    let qx = DVec3::new(3.0 * central[0] - trace, 3.0 * central[1], 3.0 * central[2]);
+    let qy = DVec3::new(3.0 * central[1], 3.0 * central[3] - trace, 3.0 * central[4]);
+    let qz = DVec3::new(3.0 * central[2], 3.0 * central[4], 3.0 * central[5] - trace);
     let displacement = com - observer;
     let radius2 = displacement.length_squared().max(1.0e-16);
     let inverse_radius = radius2.sqrt().recip();
@@ -447,4 +660,156 @@ fn push_f32s<const N: usize>(bytes: &mut Vec<u8>, values: [f32; N]) {
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+}
+
+#[cfg(test)]
+mod planning_basis_tests {
+    use super::*;
+
+    fn fixture() -> PlanningCandidateBatch {
+        let records = (0..56)
+            .flat_map(|voxel| {
+                (0..2).map(move |source| PlanningBasisRecord {
+                    position_volume: [
+                        (voxel % 7) as f32 * 2.0 - 6.0 + source as f32 * 0.1,
+                        (voxel / 7) as f32 * 2.0 - 7.0,
+                        source as f32 - 0.5,
+                        1.0 + voxel as f32 / 56.0,
+                    ],
+                    voxel_index: voxel,
+                })
+            })
+            .collect::<Vec<_>>();
+        let states = [[0.1, 0.2, 15.0, 0.0], [1500.0, 400.0, 800.0, 1.0]].map(|position_time| {
+            PlanningCandidateState {
+                position_time,
+                ..default()
+            }
+        });
+        let densities = (0..4)
+            .flat_map(|model| {
+                (0..56).map(move |voxel| {
+                    let a = 0.5 + voxel as f32 / 56.0;
+                    let b = 2.0 - voxel as f32 / 112.0;
+                    match model {
+                        0 => a,
+                        1 => b,
+                        2 => a + b,
+                        _ => 0.0,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        PlanningCandidateBatch {
+            batch_id: 1,
+            candidate_count: 1,
+            samples_per_candidate: 2,
+            density_model_count: 4,
+            basis_records: Arc::from(records),
+            states: Arc::from(states),
+            density_models: Arc::from(densities),
+            ..default()
+        }
+    }
+
+    fn response(payload: &PlanningMethodPayload, state: usize) -> [f64; 13] {
+        let bytes = &payload.primary[state * 96 + 16..state * 96 + 80];
+        let floats = bytes
+            .chunks_exact(4)
+            .map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap())))
+            .collect::<Vec<_>>();
+        [
+            floats[0], floats[1], floats[2], floats[3], floats[4], floats[5], floats[6], floats[8],
+            floats[9], floats[10], floats[12], floats[13], floats[14],
+        ]
+    }
+
+    #[test]
+    fn cached_fmm_is_linear_and_agrees_with_direct_gravity_and_jacobian() {
+        let batch = fixture();
+        let mut cache = PlanningFmmWorkspace::default();
+        let a = build_planning_fmm_payload(&batch, 0, 1, &mut cache).unwrap();
+        let pointer = cache.response_basis.as_ptr();
+        let b = build_planning_fmm_payload(&batch, 1, 2, &mut cache).unwrap();
+        let sum = build_planning_fmm_payload(&batch, 2, 3, &mut cache).unwrap();
+        let zero = build_planning_fmm_payload(&batch, 3, 4, &mut cache).unwrap();
+        assert_eq!(cache.response_basis.as_ptr(), pointer);
+        assert_eq!(b.geometry_basis_preparation_ms, 0.0);
+        assert_eq!(sum.secondary_count, 0);
+        for state in 0..batch.state_count() {
+            let (ra, rb, rs) = (
+                response(&a, state),
+                response(&b, state),
+                response(&sum, state),
+            );
+            for i in 0..13 {
+                assert!(
+                    (ra[i] + rb[i] - rs[i]).abs() < 3e-7 * (ra[i].abs() + rb[i].abs()).max(1e-25)
+                );
+            }
+            assert_eq!(response(&zero, state), [0.0; 13]);
+            let (gravity, jacobian) = crate::cpu::planning::evaluate_planning_reference_field(
+                batch.states[state].body_position().as_dvec3(),
+                &batch.basis_records,
+                &batch.density_models[..56],
+            )
+            .unwrap();
+            let actual_g = DVec3::from_array(ra[..3].try_into().unwrap());
+            let actual_j = bevy::math::DMat3::from_cols_array(&ra[4..].try_into().unwrap());
+            assert!(actual_g.distance(gravity) / gravity.length() < 1e-3);
+            let squared_norm = |matrix: bevy::math::DMat3| {
+                matrix.to_cols_array().iter().map(|x| x * x).sum::<f64>()
+            };
+            assert!((squared_norm(actual_j - jacobian) / squared_norm(jacobian)).sqrt() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn new_batch_invalidates_response_basis_and_negative_density_is_rejected() {
+        let mut batch = fixture();
+        let mut cache = PlanningFmmWorkspace::default();
+        let old = build_planning_fmm_payload(&batch, 0, 1, &mut cache).unwrap();
+        Arc::make_mut(&mut batch.states)[0].position_time[2] += 4.0;
+        batch.batch_id += 1;
+        let new = build_planning_fmm_payload(&batch, 0, 2, &mut cache).unwrap();
+        assert_ne!(response(&old, 0), response(&new, 0));
+        Arc::make_mut(&mut batch.density_models)[0] = -1.0;
+        assert!(build_planning_fmm_payload(&batch, 0, 3, &mut cache).is_none());
+    }
+
+    #[test]
+    fn jacobian_varies_between_observers_in_the_same_target_leaf() {
+        let batch = PlanningCandidateBatch {
+            batch_id: 1,
+            candidate_count: 1,
+            samples_per_candidate: 2,
+            density_model_count: 1,
+            basis_records: Arc::from([PlanningBasisRecord {
+                position_volume: [100.0, 0.0, 0.0, 2.0],
+                voxel_index: 0,
+            }]),
+            density_models: Arc::from(vec![1.0; 56]),
+            states: Arc::from([-140.0, -139.0].map(|x| PlanningCandidateState {
+                position_time: [x, 0.0, 0.0, 0.0],
+                ..default()
+            })),
+            ..default()
+        };
+        let mut cache = PlanningFmmWorkspace::default();
+        let payload = build_planning_fmm_payload(&batch, 0, 1, &mut cache).unwrap();
+        assert_eq!(cache.state_target_indices[0], cache.state_target_indices[1]);
+        assert_ne!(response(&payload, 0)[4], response(&payload, 1)[4]);
+        for state in 0..2 {
+            let (_, reference) = crate::cpu::planning::evaluate_planning_reference_field(
+                batch.states[state].body_position().as_dvec3(),
+                &batch.basis_records,
+                &batch.density_models,
+            )
+            .unwrap();
+            assert!((response(&payload, state)[4] / reference.x_axis.x - 1.0).abs() < 2e-7);
+        }
+    }
+}
+
+
 }

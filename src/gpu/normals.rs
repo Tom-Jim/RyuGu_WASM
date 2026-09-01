@@ -8,7 +8,7 @@ use bevy::render::{
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
 };
 use std::sync::Arc;
 
@@ -63,8 +63,10 @@ impl Plugin for NormalsComputePlugin {
         let render_app = app.sub_app_mut(RenderApp);
         // Pre-insert Option resources so render-world systems use ResMut, not Commands
         render_app.init_resource::<ExtractedTopologyRaw>();
-        render_app.init_resource::<NormalsGpuBuffers>();
-        render_app.init_resource::<DispatchState>();
+        render_app.init_gpu_resource::<NormalsGpuBuffers>();
+        // Reinitialize the state machine after a recovered device so a prior
+        // `Done` state cannot suppress all future normal dispatches.
+        render_app.init_gpu_resource::<DispatchState>();
         render_app.add_systems(ExtractSchedule, extract_topology_system);
         render_app.add_systems(
             Render,
@@ -76,7 +78,7 @@ impl Plugin for NormalsComputePlugin {
         let channel = app.world().resource::<NormalsReadbackChannel>().clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
-        render_app.init_resource::<NormalsComputePipeline>();
+        render_app.init_gpu_resource::<NormalsComputePipeline>();
     }
 }
 

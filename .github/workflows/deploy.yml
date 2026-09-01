@@ -63,7 +63,10 @@ jobs:
             - name: Verify browser sources
               run: |
                   node --check src/html/ui.js
+                  node --check src/html/capture.js
                   node --check src/html/app.js
+                  node --check src/html/background.js
+                  node --check src/html/background-worker.js
                   node --check build/app.js
                   ! grep -Fq 'Runtime compilation is not supported in this build of Vue' build/app.js
                   ! grep -Fq 'Feature flags __VUE_OPTIONS_API__' build/app.js
@@ -75,6 +78,8 @@ jobs:
                   cp src/html/index.html site/index.html
                   sed -i "s/__RYUGU_VERSION__/${GITHUB_SHA}/g" site/index.html
                   cp src/html/ui.css src/html/ui.js src/html/tailwind.generated.css site/src/html/
+                  cp src/html/capture.js site/src/html/
+                  cp src/html/background.js src/html/background-worker.js site/src/html/
                   cp build/app.js site/src/html/app.js
                   cp -r assets site/
                   cp -r pkg site/
@@ -84,7 +89,10 @@ jobs:
                   test -f site/index.html
                   test -f site/src/html/ui.css
                   test -f site/src/html/ui.js
+                  test -f site/src/html/capture.js
                   test -f site/src/html/app.js
+                  test -f site/src/html/background.js
+                  test -f site/src/html/background-worker.js
                   test -f site/src/html/tailwind.generated.css
                   test -f site/pkg/ryugu_wasm.js
                   test -f site/pkg/ryugu_wasm_bg.wasm

@@ -7,12 +7,85 @@ pub const NEAR_SYNC_SEGMENT_MAX_SECONDS: f32 = 300.0;
 pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
 pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
+
+/// Reporting policy only: changing it never changes numerical outputs or
+/// reference samples. Screening is explicitly unsuitable for strict claims.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanningAccuracyProfile {
+    #[default]
+    Strict,
+    Screening,
+}
+
+#[derive(Clone, Copy)]
+pub struct PlanningAccuracyLimits {
+    pub gravity: f32,
+    pub gradient: f32,
+    pub gravity_p99: f32,
+    pub gradient_p99: f32,
+    pub gravity_max: f32,
+    pub gradient_max: f32,
+    pub pericenter_m: f32,
+}
+
+impl PlanningAccuracyProfile {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Screening => "screening",
+        }
+    }
+
+    pub fn limits(self) -> PlanningAccuracyLimits {
+        match self {
+            Self::Strict => PlanningAccuracyLimits {
+                gravity: PLANNING_GRAVITY_ERROR_LIMIT,
+                gradient: PLANNING_GRADIENT_ERROR_LIMIT,
+                gravity_p99: 5.0 * PLANNING_GRAVITY_ERROR_LIMIT,
+                gradient_p99: 5.0 * PLANNING_GRADIENT_ERROR_LIMIT,
+                gravity_max: 10.0 * PLANNING_GRAVITY_ERROR_LIMIT,
+                gradient_max: 10.0 * PLANNING_GRADIENT_ERROR_LIMIT,
+                pericenter_m: PLANNING_PERICENTER_ERROR_LIMIT_METERS,
+            },
+            Self::Screening => PlanningAccuracyLimits {
+                gravity: 0.02,
+                gradient: 0.25,
+                gravity_p99: 0.05,
+                gradient_p99: 0.50,
+                gravity_max: 0.10,
+                gradient_max: 1.0,
+                pericenter_m: 10.0,
+            },
+        }
+    }
+}
+
+pub fn planning_accuracy_failure_labels(mask: u32) -> Vec<&'static str> {
+    [
+        "GPU/workload verification",
+        "gravity RMS",
+        "gradient RMS",
+        "gravity p99/max",
+        "gradient p99/max",
+        "pericenter drift",
+        "candidate coverage/score",
+        "invalid timing",
+        "missing/common reference samples",
+        "certificate rejection",
+        "Eq.106 segment cap",
+    ]
+    .into_iter()
+    .enumerate()
+    .filter_map(|(bit, reason)| (mask & (1 << bit) != 0).then_some(reason))
+    .collect()
+}
 pub const PLANNING_EQ106_MAX_SEGMENTS: u32 = 16;
 pub const PLANNING_SOURCE_COUNTS: [u32; 9] = [
-    32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000,
-    8_192_000,
+    32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000,
 ];
-pub const PLANNING_SOURCE_REPEATS: u32 = 1;
+pub const PLANNING_SOURCE_REPEATS: u32 = 7;
+pub const PLANNING_DENSITY_MODEL_COUNTS: [u32; 7] = [1, 4, 16, 64, 256, 512, 1024];
+pub const PLANNING_TARGET_COUNTS: [u32; 5] = [8, 64, 241, 1024, 8192];
 pub const RYUGU_COLLISION_RADIUS_METERS: f32 = 464.765;
 pub const PROBE_COLLISION_RADIUS_METERS: f32 = 3.35;
 
@@ -83,8 +156,8 @@ pub enum PlanningWorkloadProfile {
     /// Large, interruptible workload for exercising the planning pipelines
     /// without taking ownership of the browser frame loop.
     InteractiveStress,
-    /// Internal source-crossover workload: enough hot targets for stable GPU
-    /// timing across the requested quadrature-source range.
+    /// Fixed geometry crossover over source count, density RHS count and
+    /// target count, with independent repeated timings in every sweep cell.
     SourceCrossover,
 }
 
@@ -97,10 +170,13 @@ impl PlanningWorkloadProfile {
         match self {
             Self::First => (PLANNING_FIRST_CANDIDATE_COUNT, 4, 241),
             Self::InteractiveStress => (PLANNING_CANDIDATE_COUNT, 32, 512),
-            // One propagated trajectory with eight targets measures a real
-            // target-point cost while keeping 512 density-model switches
-            // practical in a browser frame loop.
-            Self::SourceCrossover => (1, 512, 8),
+            // Initial sweep cell. PlanningComparisonState supplies the current
+            // K_rho x N_t dimensions for every subsequent cell.
+            Self::SourceCrossover => (
+                1,
+                PLANNING_DENSITY_MODEL_COUNTS[0],
+                PLANNING_TARGET_COUNTS[0],
+            ),
         }
     }
 
@@ -108,7 +184,7 @@ impl PlanningWorkloadProfile {
         match self {
             Self::First => "First 32x4x241",
             Self::InteractiveStress => "Stress 2048x32x512",
-            Self::SourceCrossover => "Quadrature-source crossover 1x512x8",
+            Self::SourceCrossover => "Quadrature-source/density/target crossover",
         }
     }
 }
@@ -206,10 +282,18 @@ pub struct PlanningMethodMetrics {
     /// Measured certified hot pass over the complete BxKxH workload. The
     /// immutable geometry/basis build is reused and reported separately.
     pub certified_full_pass_ms: f64,
+    /// Full raw cost plus the measured additional checked pass, with the
+    /// immutable basis charged exactly once. Shared f64 references are separate.
     pub certified_estimated_total_ms: f64,
+    pub raw_kernels: PlanningKernelTotals,
+    pub checked_kernels: PlanningKernelTotals,
+    pub external_validation_ms: f64,
     pub total_ms: f64,
+    /// CPU geometry/basis wall time. GPU basis timestamps are in raw_kernels.
     pub geometry_basis_build_ms: f64,
+    /// CPU RHS preparation per density model, excluding immutable basis.
     pub density_model_ms: f64,
+    /// GPU request wall time per output, including amortized setup and readback.
     pub target_point_ms: f64,
     pub relative_gravity_error: f32,
     pub gradient_relative_error: f32,
@@ -221,6 +305,10 @@ pub struct PlanningMethodMetrics {
     pub gravity_error_max: f32,
     pub gradient_error_p99: f32,
     pub gradient_error_max: f32,
+    pub certified_gravity_error_p99: f32,
+    pub certified_gravity_error_max: f32,
+    pub certified_gradient_error_p99: f32,
+    pub certified_gradient_error_max: f32,
     pub pericenter_error_m: f32,
     pub minimum_altitude_m: f32,
     pub model_discrimination: f32,
@@ -258,9 +346,13 @@ pub struct PlanningBatchJob {
     pub raw_gpu_request_count: u32,
     pub last_request_candidate_count: u32,
     pub awaiting_gpu: bool,
-    /// Frames spent waiting for the packet belonging to the current request.
+    /// Active seconds waiting for the packet belonging to the current request.
     /// A lost WebGPU map/readback must never leave the UI at 0% forever.
-    pub awaiting_gpu_frames: u32,
+    pub awaiting_gpu_seconds: f64,
+    pub awaiting_gpu_last_poll: Option<bevy::platform::time::Instant>,
+    pub gpu_basis_progress: f64,
+    pub reference_inflight_fraction: f64,
+    pub gpu_preparation_submission: u32,
     pub warm_repetition: bool,
     pub certified_repetition: bool,
     pub total_evaluations: u64,
@@ -275,6 +367,8 @@ pub struct PlanningBatchJob {
     pub raw_gradient_error_sum: f64,
     pub pointwise_gravity_errors: Vec<f32>,
     pub pointwise_gradient_errors: Vec<f32>,
+    pub certified_pointwise_gravity_errors: Vec<f32>,
+    pub certified_pointwise_gradient_errors: Vec<f32>,
     pub certified_gravity_error_sum: f64,
     pub certified_gravity_reference_sum: f64,
     pub certified_gradient_error_sum: f64,
@@ -304,103 +398,110 @@ pub struct PlanningBatchJob {
     pub method_geometry_basis_ms: f64,
     pub density_payload_preparation_ms: f64,
     pub certified_density_payload_preparation_ms: f64,
+    pub raw_kernels: PlanningKernelTotals,
+    pub certified_kernels: PlanningKernelTotals,
     pub gpu_preprocessing_ms: f64,
     pub command_submission_ms: f64,
     pub reduction_ms: f64,
+    pub certified_reduction_ms: f64,
     pub verification_ms: f64,
     pub gpu_completion_map_ms: f64,
+    pub readback_decode_ms: f64,
     pub warm_evaluation_ms: f64,
     pub certified_warm_evaluation_ms: f64,
     pub certified_full_pass_ms: f64,
-    pub first_tile_ms: f64,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
     pub spectral_element_count: u32,
 }
 
-impl PlanningBatchJob {
-    /// Fraction of GPU evaluation work that has actually completed for this
-    /// method. The denominator covers the full raw pass, its measured warm
-    /// tile, and the full independently certified pass.
-    pub fn completion_fraction(&self) -> f64 {
-        let pass_work = u64::from(self.candidate_count) * u64::from(self.density_model_count);
-        let warm_work = u64::from(self.candidate_tile_size.min(self.candidate_count));
-        let total_work = pass_work.saturating_mul(2).saturating_add(warm_work).max(1);
-        let current_pass_work = u64::from(self.density_model)
-            .saturating_mul(u64::from(self.candidate_count))
-            .saturating_add(u64::from(self.candidate_start))
-            .min(pass_work);
-        let completed = if !self.warm_repetition {
-            current_pass_work
-        } else if !self.certified_repetition {
-            pass_work
-        } else {
-            pass_work
-                .saturating_add(warm_work)
-                .saturating_add(current_pass_work)
-        };
-        completed.min(total_work) as f64 / total_work as f64
-    }
-}
-
 impl PlanningMethodMetrics {
     pub fn accuracy_eligible(self) -> bool {
-        self.gpu_batch_verified
-            && self.workload.is_complete()
-            && self.relative_gravity_error.is_finite()
-            && self.relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
-            && self.gradient_relative_error.is_finite()
-            && self.gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
-            && self.gravity_error_p99.is_finite()
-            && self.gravity_error_p99 <= 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
-            && self.gravity_error_max.is_finite()
-            && self.gravity_error_max <= 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
-            && self.gradient_error_p99.is_finite()
-            && self.gradient_error_p99 <= 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
-            && self.gradient_error_max.is_finite()
-            && self.gradient_error_max <= 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
-            && self.pericenter_error_m.is_finite()
-            && self.pericenter_error_m <= PLANNING_PERICENTER_ERROR_LIMIT_METERS
-            && self.top_candidates[0].objective.is_finite()
-            && self.valid_candidate_count == self.workload.candidate_count
-            && self.total_ms.is_finite()
-            && self.total_ms > 0.0
+        self.accuracy_failure_mask(PlanningAccuracyProfile::Strict, false) == 0
     }
 
     pub fn certified_accuracy_eligible(self) -> bool {
-        self.gpu_batch_verified
-            && self.workload.is_complete()
-            && self.certified_relative_gravity_error.is_finite()
-            && self.certified_relative_gravity_error <= PLANNING_GRAVITY_ERROR_LIMIT
-            && self.certified_gradient_relative_error.is_finite()
-            && self.certified_gradient_relative_error <= PLANNING_GRADIENT_ERROR_LIMIT
-            // The certified pass must satisfy the same pointwise outlier
-            // policy as the ordinary pass.  Until certified pointwise strata
-            // are stored separately, the raw strata are the conservative
-            // common gate for both reported raw/certified timings.
-            && self.gravity_error_p99.is_finite()
-            && self.gravity_error_p99 <= 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
-            && self.gravity_error_max.is_finite()
-            && self.gravity_error_max <= 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
-            && self.gradient_error_p99.is_finite()
-            && self.gradient_error_p99 <= 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
-            && self.gradient_error_max.is_finite()
-            && self.gradient_error_max <= 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
-            && self.certified_verification_sample_count == self.verification_sample_count
-            && self.certified_rejected_sample_count == 0
-            && self.certified_valid_candidate_count == self.workload.candidate_count
-            && self.certified_full_pass_ms.is_finite()
-            && self.certified_full_pass_ms > 0.0
+        self.accuracy_failure_mask(PlanningAccuracyProfile::Strict, true) == 0
+    }
+
+    /// Keep numerical validity, coverage and actual certificate failures as
+    /// hard gates in every profile. No blanket "show failed timings" option.
+    pub fn accuracy_failure_mask(self, profile: PlanningAccuracyProfile, certified: bool) -> u32 {
+        let limits = profile.limits();
+        let within = |value: f32, limit: f32| value.is_finite() && value >= 0.0 && value <= limit;
+        let gravity = if certified {
+            self.certified_relative_gravity_error
+        } else {
+            self.relative_gravity_error
+        };
+        let gradient = if certified {
+            self.certified_gradient_relative_error
+        } else {
+            self.gradient_relative_error
+        };
+        let total_ms = if certified {
+            self.certified_estimated_total_ms
+        } else {
+            self.total_ms
+        };
+        let valid_candidates = if certified {
+            self.certified_valid_candidate_count
+        } else {
+            self.valid_candidate_count
+        };
+        let (gravity_p99, gravity_max, gradient_p99, gradient_max) = if certified {
+            (self.certified_gravity_error_p99, self.certified_gravity_error_max,
+                self.certified_gradient_error_p99, self.certified_gradient_error_max)
+        } else {
+            (self.gravity_error_p99, self.gravity_error_max, self.gradient_error_p99, self.gradient_error_max)
+        };
+        let failures = [
+            !self.gpu_batch_verified || !self.workload.is_complete(),
+            !within(gravity, limits.gravity),
+            !within(gradient, limits.gradient),
+            !within(gravity_p99, limits.gravity_p99)
+                || !within(gravity_max, limits.gravity_max),
+            !within(gradient_p99, limits.gradient_p99)
+                || !within(gradient_max, limits.gradient_max),
+            !within(self.pericenter_error_m, limits.pericenter_m),
+            valid_candidates != self.workload.candidate_count
+                || !self.top_candidates[0].objective.is_finite(),
+            !total_ms.is_finite()
+                || total_ms <= 0.0
+                || (certified
+                    && (!self.certified_full_pass_ms.is_finite()
+                        || self.certified_full_pass_ms <= 0.0
+                        || self.certified_estimated_total_ms < self.total_ms)),
+            self.verification_sample_count == 0
+                || (certified
+                    && self.certified_verification_sample_count != self.verification_sample_count),
+            certified && self.certified_rejected_sample_count != 0,
+            self.method == ActiveGravityMethod::CurvedArcEq106
+                && self.segment_count > PLANNING_EQ106_MAX_SEGMENTS,
+        ];
+        failures
+            .into_iter()
+            .enumerate()
+            .fold(0, |mask, (bit, failed)| {
+                mask | if failed { 1 << bit } else { 0 }
+            })
     }
 }
 
 #[derive(Resource)]
 pub struct PlanningComparisonState {
     pub selected_metric: ComparisonMetric,
+    pub accuracy_profile: PlanningAccuracyProfile,
     pub workload_profile: PlanningWorkloadProfile,
     pub results: [Option<PlanningMethodMetrics>; 5],
     pub run_requested: bool,
     pub run_id: u64,
+    /// Only the final reduced/read-back result may set this, never a percentage.
+    pub computation_complete: bool,
+    /// Scope is fixed at launch; display selections do not mutate an active run.
+    pub source_curve_all_parameters: bool,
+    pub source_curve_run_id: u64,
+    pub stopped_operation_work: f64,
     pub reference_duration_seconds: f32,
     pub status: String,
     pub batch_job: Option<PlanningBatchJob>,
@@ -412,14 +513,26 @@ pub struct PlanningComparisonState {
     pub source_curve_visible: bool,
     pub source_curve_index: usize,
     pub source_curve_repeat: u32,
+    pub source_curve_density_index: usize,
+    pub source_curve_target_index: usize,
+    /// Reproducible random method order; independent of density generation.
+    pub source_curve_order_seed: u64,
     pub source_curve_samples: Vec<PlanningSourceCurveSample>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanningSourceCurveSample {
     pub source_count: u32,
+    pub density_model_count: u32,
+    pub target_count: u32,
+    pub repeat: u32,
+    pub order_seed: u64,
+    pub method_order: [usize; 3],
     /// Eq.106 raw/certified, packed FFT raw/certified, FMM raw/certified.
     pub times_ms: [f64; 6],
+    pub kernel_times_ms: [Option<f64>; 6],
+    pub evaluation_kernel_times_ms: [Option<f64>; 6],
+    pub basis_kernel_times_ms: [Option<f64>; 3],
     /// Eq.106, packed FFT, FMM geometry/basis build costs.
     pub geometry_basis_build_ms: [f64; 3],
     /// Eq.106, packed FFT, FMM average cost for adding one density model.
@@ -427,6 +540,10 @@ pub struct PlanningSourceCurveSample {
     /// Eq.106, packed FFT, FMM average cost for one density-model target point.
     pub target_point_ms: [f64; 3],
     pub eligible: [bool; 6],
+    pub strict_failures: [u32; 6],
+    pub screening_failures: [u32; 6],
+    pub gravity_errors: [f32; 6],
+    pub gradient_errors: [f32; 6],
 }
 
 #[derive(Resource, Debug, Default)]
@@ -456,10 +573,15 @@ impl Default for PlanningComparisonState {
     fn default() -> Self {
         Self {
             selected_metric: ComparisonMetric::DensityFit,
+            accuracy_profile: PlanningAccuracyProfile::default(),
             workload_profile: PlanningWorkloadProfile::First,
             results: std::array::from_fn(|_| None),
             run_requested: false,
             run_id: 0,
+            computation_complete: false,
+            source_curve_all_parameters: false,
+            source_curve_run_id: 0,
+            stopped_operation_work: 0.0,
             reference_duration_seconds: 0.0,
             status: "Choose a planning metric to run First, or use inversion metrics with the inversion button.".into(),
             batch_job: None,
@@ -469,55 +591,127 @@ impl Default for PlanningComparisonState {
             source_curve_visible: false,
             source_curve_index: 0,
             source_curve_repeat: 0,
+            source_curve_density_index: 0,
+            source_curve_target_index: 0,
+            source_curve_order_seed: 0,
             source_curve_samples: Vec::new(),
         }
     }
 }
 
 impl PlanningComparisonState {
-    /// Monotonic end-to-end progress. Each source point consists of one CPU
-    /// preparation stage followed by the three GPU method stages.
-    pub fn progress_fraction(&self) -> f64 {
-        const STAGES_PER_SOURCE: f64 = 4.0;
-        let source_curve = self.workload_profile == PlanningWorkloadProfile::SourceCrossover
-            && (self.source_curve_active || self.source_curve_visible);
-        let source_count = if source_curve {
-            PLANNING_SOURCE_COUNTS.len()
+    pub fn dimensions(&self) -> (u32, u32, u32) {
+        if self.workload_profile == PlanningWorkloadProfile::SourceCrossover {
+            (
+                1,
+                PLANNING_DENSITY_MODEL_COUNTS[self.source_curve_density_index],
+                PLANNING_TARGET_COUNTS[self.source_curve_target_index],
+            )
         } else {
-            1
-        };
-        let source_index = if source_curve {
-            self.source_curve_index.min(source_count)
-        } else {
-            0
-        };
-        if source_index == source_count
-            || (!source_curve && !self.run_requested && self.completed_workload().is_some())
-        {
-            return 1.0;
+            self.workload_profile.dimensions()
         }
-        let within_source = self.batch_job.as_ref().map_or_else(
-            || self.preparation_progress.clamp(0.0, 1.0) / STAGES_PER_SOURCE,
-            |job| {
-                (1.0 + job.method_order_index as f64 + job.completion_fraction())
-                    / STAGES_PER_SOURCE
-            },
-        );
-        ((source_index as f64 + within_source) / source_count as f64).clamp(0.0, 1.0)
+    }
+
+    /// Seven fresh batches per cell; source count varies fastest, then K, then N_t.
+    pub fn advance_source_curve(&mut self) -> bool {
+        self.source_curve_repeat += 1;
+        if self.source_curve_repeat == PLANNING_SOURCE_REPEATS {
+            self.source_curve_repeat = 0;
+            self.source_curve_index += 1;
+            if self.source_curve_index == PLANNING_SOURCE_COUNTS.len() {
+                if !self.source_curve_all_parameters {
+                    self.source_curve_index = PLANNING_SOURCE_COUNTS.len() - 1;
+                    self.source_curve_repeat = PLANNING_SOURCE_REPEATS - 1;
+                    return false;
+                }
+                self.source_curve_index = 0;
+                self.source_curve_density_index += 1;
+                if self.source_curve_density_index == PLANNING_DENSITY_MODEL_COUNTS.len() {
+                    self.source_curve_density_index = 0;
+                    self.source_curve_target_index += 1;
+                    if self.source_curve_target_index == PLANNING_TARGET_COUNTS.len() {
+                        // Keep dimensions addressable for the final verdict/UI.
+                        self.source_curve_index = PLANNING_SOURCE_COUNTS.len() - 1;
+                        self.source_curve_repeat = PLANNING_SOURCE_REPEATS - 1;
+                        self.source_curve_density_index = PLANNING_DENSITY_MODEL_COUNTS.len() - 1;
+                        self.source_curve_target_index = PLANNING_TARGET_COUNTS.len() - 1;
+                        return false;
+                    }
+                }
+            }
+        }
+        self.requested_source_count = PLANNING_SOURCE_COUNTS[self.source_curve_index];
+        true
+    }
+
+    /// Estimated arithmetic work with source traversal, basis construction,
+    /// FFT butterflies, density combinations, targets and reference validation.
+    /// This is not a GPU FLOP counter or an ETA. Only completion can yield 100%.
+    pub fn operation_work(&self) -> (f64, f64) {
+        let source_curve = self.workload_profile == PlanningWorkloadProfile::SourceCrossover;
+        let (b, k, nt) = self.dimensions();
+        let ns = self.requested_source_count;
+        let one_batch = planning_batch_work(ns, b, k, nt);
+        let total = if source_curve {
+            PLANNING_SOURCE_COUNTS.iter().map(|&sources| {
+                if self.source_curve_all_parameters {
+                    PLANNING_TARGET_COUNTS.iter().map(|&targets| {
+                        PLANNING_DENSITY_MODEL_COUNTS.iter().map(|&density| {
+                            planning_source_cell_work(sources, density, targets)
+                        }).sum::<f64>()
+                    }).sum::<f64>()
+                } else { planning_source_cell_work(sources, k, nt) }
+            }).sum::<f64>()
+        } else { one_batch };
+        if self.computation_complete { return (total, total); }
+        let finished = if source_curve {
+            self.source_curve_samples.iter().map(|sample| {
+                planning_repeat_work(sample.source_count, 1, sample.density_model_count, sample.target_count, sample.repeat)
+            }).sum::<f64>()
+        } else { 0.0 };
+        let preparation = planning_preparation_work(ns, b, k, nt);
+        let current = self.batch_job.as_ref().map_or(
+            preparation * self.preparation_progress.clamp(0.0, 1.0), |job| {
+                let budget = PlanningOperationBudget::for_method(job.method, ns, nt, b);
+                let done = job.method_order[..job.method_order_index].iter().map(|&method| {
+                    PlanningOperationBudget::for_method(method, ns, nt, b)
+                        .total(b, k, job.candidate_tile_size.min(b))
+                }).sum::<f64>();
+                // Reference generation is shared. Credit it during the first
+                // method's raw pass only, after the reference results exist.
+                let reference_fraction = if job.method_order_index > 0 || job.warm_repetition { 1.0 }
+                    else { (f64::from(job.density_model) * f64::from(b)
+                        + f64::from(job.candidate_start) + job.reference_inflight_fraction)
+                        / (f64::from(k) * f64::from(b)).max(1.0) };
+                preparation + done + budget.completed(job)
+                    + reference_fraction * planning_validation_work(
+                        if source_curve && self.source_curve_repeat > 0 { 0 } else { ns }, b, k, nt)
+            });
+        ((finished + current).max(self.stopped_operation_work).min(total), total)
+    }
+
+    pub fn progress_fraction(&self) -> f64 {
+        if self.computation_complete { return 1.0; }
+        let (completed, total) = self.operation_work();
+        // The UI also floors the displayed percentage; only an explicit final
+        // completion flag can produce 100%, including when a run is cancelled.
+        (completed / total.max(1.0)).clamp(0.0, 0.999_999)
     }
 
     pub fn blocks_realtime_gpu(&self) -> bool {
-        // Keep the scene rendered, but freeze orbital integration while the
-        // long-running source sweep owns the shared GPU. Otherwise the probe
-        // can collide mid-benchmark and raise an unrelated reset dialog.
-        self.run_requested && self.workload_profile == PlanningWorkloadProfile::SourceCrossover
+        // Keep rendering / input responsive while a prepared benchmark owns
+        // the compute queue. First/Stress must not compete with real-time
+        // kernels or trigger a probe collision halfway through validation.
+        // Before a First/Stress capture is ready, live integration still runs.
+        self.run_requested && (self.batch_job.is_some()
+            || self.workload_profile == PlanningWorkloadProfile::SourceCrossover)
     }
 
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
         let eq106 = self.results[ActiveGravityMethod::CurvedArcEq106.performance_index()]?;
         let mmfft = self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?;
         let fmm = self.results[ActiveGravityMethod::Fmm.performance_index()]?;
-        let dimensions = self.workload_profile.dimensions();
+        let dimensions = self.dimensions();
         (eq106.workload == mmfft.workload
             && eq106.workload == fmm.workload
             && (
@@ -534,104 +728,232 @@ impl PlanningComparisonState {
 
     pub fn fair_verdict(&self) -> Option<String> {
         self.completed_workload()?;
-        let eq106 = self.results[2]?;
-        let mmfft = self.results[3]?;
-        let fmm = self.results[4]?;
         let methods = [
-            ("Eq.106 full forward", eq106),
-            ("packed FFT", mmfft),
-            ("target-cell FMM", fmm),
+            ("Eq.106 Cheb", self.results[2]?),
+            ("FFT", self.results[3]?),
+            ("FMM", self.results[4]?),
         ];
-        let common_samples = eq106.verification_sample_count > 0
-            && eq106.verification_sample_count == mmfft.verification_sample_count
-            && eq106.verification_sample_count == fmm.verification_sample_count;
+        let common_samples = methods[0].1.verification_sample_count > 0
+            && methods.iter().all(|(_, result)| {
+                result.verification_sample_count == methods[0].1.verification_sample_count
+            });
         let mut eligible = Vec::new();
         let mut disqualified = Vec::new();
         for (name, result) in methods {
-            let mut reasons = Vec::new();
-            if !result.gpu_batch_verified {
-                reasons.push("GPU verification failed".to_string());
-            }
-            if !result.relative_gravity_error.is_finite()
-                || result.relative_gravity_error > PLANNING_GRAVITY_ERROR_LIMIT
-            {
-                reasons.push(format!(
-                    "gravity {:.3e} > {:.1e}",
-                    result.relative_gravity_error, PLANNING_GRAVITY_ERROR_LIMIT
-                ));
-            }
-            if !result.gradient_relative_error.is_finite()
-                || result.gradient_relative_error > PLANNING_GRADIENT_ERROR_LIMIT
-            {
-                reasons.push(format!(
-                    "gradient {:.3e} > {:.1e}",
-                    result.gradient_relative_error, PLANNING_GRADIENT_ERROR_LIMIT
-                ));
-            }
-            if !result.gravity_error_p99.is_finite()
-                || result.gravity_error_p99 > 5.0 * PLANNING_GRAVITY_ERROR_LIMIT
-                || !result.gravity_error_max.is_finite()
-                || result.gravity_error_max > 10.0 * PLANNING_GRAVITY_ERROR_LIMIT
-            {
-                reasons.push(format!(
-                    "gravity point p99/max {:.3e}/{:.3e}",
-                    result.gravity_error_p99, result.gravity_error_max
-                ));
-            }
-            if !result.gradient_error_p99.is_finite()
-                || result.gradient_error_p99 > 5.0 * PLANNING_GRADIENT_ERROR_LIMIT
-                || !result.gradient_error_max.is_finite()
-                || result.gradient_error_max > 10.0 * PLANNING_GRADIENT_ERROR_LIMIT
-            {
-                reasons.push(format!(
-                    "gradient point p99/max {:.3e}/{:.3e}",
-                    result.gradient_error_p99, result.gradient_error_max
-                ));
-            }
-            if !result.pericenter_error_m.is_finite()
-                || result.pericenter_error_m > PLANNING_PERICENTER_ERROR_LIMIT_METERS
-            {
-                reasons.push(format!(
-                    "pericenter {:.3e}m > {:.1}m",
-                    result.pericenter_error_m, PLANNING_PERICENTER_ERROR_LIMIT_METERS
-                ));
-            }
-            if result.valid_candidate_count != result.workload.candidate_count {
-                reasons.push(format!(
-                    "coverage {}/{}",
-                    result.valid_candidate_count, result.workload.candidate_count
-                ));
-            }
-            if name.starts_with("Eq.106") && result.segment_count > PLANNING_EQ106_MAX_SEGMENTS {
-                reasons.push(format!(
-                    "segments {} > {}",
-                    result.segment_count, PLANNING_EQ106_MAX_SEGMENTS
-                ));
-            }
-            if !common_samples {
-                reasons.push(format!(
-                    "non-common f64 sample count {}",
-                    result.verification_sample_count
-                ));
-            }
-            if reasons.is_empty() && result.accuracy_eligible() {
+            let mask = result.accuracy_failure_mask(self.accuracy_profile, false)
+                | if common_samples { 0 } else { 1 << 8 };
+            if mask == 0 {
                 eligible.push((name, result.total_ms));
             } else {
-                if reasons.is_empty() {
-                    reasons.push("incomplete score or timing data".into());
-                }
-                disqualified.push(format!("{name} disqualified: {}", reasons.join(", ")));
+                disqualified.push(format!(
+                    "{name}: {}",
+                    planning_accuracy_failure_labels(mask).join(", ")
+                ));
             }
         }
         eligible.sort_by(|left, right| left.1.total_cmp(&right.1));
         let verdict = eligible.first().map_or_else(
             || "No eligible winner".to_string(),
-            |(name, milliseconds)| format!("Eligible winner: {name} ({milliseconds:.2} ms)"),
+            |(name, milliseconds)| {
+                format!("Fastest eligible method: {name} ({milliseconds:.2} ms)")
+            },
         );
-        Some(if disqualified.is_empty() {
-            verdict
-        } else {
-            format!("{verdict}; {}", disqualified.join("; "))
-        })
+        Some(format!(
+            "{} profile — {verdict}{}",
+            self.accuracy_profile.key(),
+            if disqualified.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", disqualified.join("; "))
+            }
+        ))
+    }
+}
+
+#[cfg(test)]
+mod planning_sweep_tests {
+    use super::*;
+
+    fn measured_row() -> PlanningMethodMetrics {
+        PlanningMethodMetrics {
+            method: ActiveGravityMethod::Fmm,
+            backend: PlanningExecutionBackend::GpuFmm,
+            gpu_batch_verified: true,
+            workload: PlanningWorkloadIdentity {
+                reference_capture_id: 1,
+                reference_capture_epoch: 1,
+                source_hash: 1,
+                source_count: 32000,
+                basis_hash: 1,
+                reference_arc_hash: 1,
+                candidate_hash: 1,
+                density_model_hash: 1,
+                sample_hash: 1,
+                tolerance_hash: 1,
+                candidate_count: 1,
+                density_model_count: 1,
+                samples_per_candidate: 8,
+                outputs: PlanningWorkloadIdentity::REQUIRED_OUTPUTS,
+            },
+            certified_full_pass_ms: 10.0,
+            certified_estimated_total_ms: 21.0,
+            raw_kernels: PlanningKernelTotals::default(),
+            checked_kernels: PlanningKernelTotals::default(),
+            external_validation_ms: 0.0,
+            total_ms: 11.0,
+            geometry_basis_build_ms: 1.0,
+            density_model_ms: 1.0,
+            target_point_ms: 1.0,
+            relative_gravity_error: 0.00395,
+            gradient_relative_error: 0.189,
+            certified_relative_gravity_error: 0.00395,
+            certified_gradient_relative_error: 0.189,
+            gravity_error_p99: 0.005,
+            gravity_error_max: 0.006,
+            gradient_error_p99: 0.2,
+            gradient_error_max: 0.25,
+            certified_gravity_error_p99: 0.005,
+            certified_gravity_error_max: 0.006,
+            certified_gradient_error_p99: 0.2,
+            certified_gradient_error_max: 0.25,
+            pericenter_error_m: 0.5,
+            minimum_altitude_m: 150.0,
+            model_discrimination: 0.0,
+            planning_objective: 0.0,
+            segment_count: 1,
+            valid_candidate_count: 1,
+            verification_sample_count: 8,
+            certified_verification_sample_count: 8,
+            certified_rejected_sample_count: 0,
+            certified_valid_candidate_count: 1,
+            cold_amortization_candidates: 1,
+            top_candidates: [PlanningCandidateScore { objective: 0.0 }; 5],
+        }
+    }
+
+    #[test]
+    fn screening_does_not_relabel_a_strict_failure() {
+        let row = measured_row();
+        assert!(!row.accuracy_eligible());
+        assert!(!row.certified_accuracy_eligible());
+        assert_eq!(
+            row.accuracy_failure_mask(PlanningAccuracyProfile::Screening, false),
+            0
+        );
+        assert_eq!(
+            row.accuracy_failure_mask(PlanningAccuracyProfile::Screening, true),
+            0
+        );
+        let reasons = planning_accuracy_failure_labels(
+            row.accuracy_failure_mask(PlanningAccuracyProfile::Strict, false),
+        );
+        assert!(reasons.contains(&"gradient RMS"));
+        assert_eq!(row.gradient_relative_error, 0.189); // no mutation or calibration
+    }
+
+    #[test]
+    fn screening_keeps_nonfinite_outlier_coverage_and_certificate_gates() {
+        let profile = PlanningAccuracyProfile::Screening;
+        for invalid in [f32::NAN, f32::INFINITY, -0.1] {
+            let mut row = measured_row();
+            row.relative_gravity_error = invalid;
+            assert_ne!(row.accuracy_failure_mask(profile, false) & (1 << 1), 0);
+        }
+        let mut row = measured_row();
+        row.gradient_error_max = 1.1;
+        assert_ne!(row.accuracy_failure_mask(profile, false) & (1 << 4), 0);
+        row = measured_row();
+        row.valid_candidate_count = 0;
+        assert_ne!(row.accuracy_failure_mask(profile, false) & (1 << 6), 0);
+        row = measured_row();
+        row.certified_rejected_sample_count = 1;
+        assert_ne!(row.accuracy_failure_mask(profile, true) & (1 << 9), 0);
+        row = measured_row();
+        row.certified_verification_sample_count = 0;
+        assert_ne!(row.accuracy_failure_mask(profile, true) & (1 << 8), 0);
+    }
+
+    #[test]
+    fn checked_time_and_outlier_gates_are_independent_of_raw() {
+        let mut row = measured_row();
+        let profile = PlanningAccuracyProfile::Screening;
+        assert_eq!(row.accuracy_failure_mask(profile, true), 0);
+        row.certified_gradient_error_max = 1.1;
+        assert_eq!(row.accuracy_failure_mask(profile, false), 0);
+        assert_ne!(row.accuracy_failure_mask(profile, true) & (1 << 4), 0);
+        row = measured_row();
+        row.certified_estimated_total_ms = row.total_ms - 1.0;
+        assert_ne!(row.accuracy_failure_mask(profile, true) & (1 << 7), 0);
+    }
+
+    #[test]
+    fn selected_scope_visits_only_requested_parameters_and_never_finishes_early() {
+        for density_index in 0..PLANNING_DENSITY_MODEL_COUNTS.len() {
+            for target_index in 0..PLANNING_TARGET_COUNTS.len() {
+                let mut state = PlanningComparisonState {
+                    workload_profile: PlanningWorkloadProfile::SourceCrossover,
+                    source_curve_density_index: density_index,
+                    source_curve_target_index: target_index,
+                    run_requested: true,
+                    ..Default::default()
+                };
+                let dimensions = state.dimensions();
+                let repeats = PLANNING_SOURCE_COUNTS.len() * PLANNING_SOURCE_REPEATS as usize;
+                let expected_work = PLANNING_SOURCE_COUNTS.iter().map(|&sources|
+                    planning_source_cell_work(sources, dimensions.1, dimensions.2))
+                    .sum::<f64>();
+                assert_eq!(state.operation_work(), (0.0, expected_work));
+                let mut visited = 0;
+                loop {
+                    assert_eq!(state.dimensions(), dimensions);
+                    visited += 1;
+                    if !state.advance_source_curve() { break; }
+                }
+                assert_eq!(visited, repeats);
+                // Exhausting the workload is insufficient: final readback and
+                // verification must have committed before announcing 100%.
+                state.stopped_operation_work = expected_work;
+                assert!(state.progress_fraction() < 1.0);
+                state.run_requested = false; // cancellation must not pass
+                assert!(state.progress_fraction() < 1.0);
+                state.computation_complete = true;
+                assert_eq!(state.progress_fraction(), 1.0);
+                assert_eq!(state.operation_work(), (expected_work, expected_work));
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_visits_every_source_density_target_repeat_once() {
+        let mut state = PlanningComparisonState {
+            source_curve_all_parameters: true,
+            workload_profile: PlanningWorkloadProfile::SourceCrossover,
+            ..Default::default()
+        };
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            let (candidates, density, targets) = state.dimensions();
+            assert_eq!(candidates, 1);
+            assert!(PLANNING_DENSITY_MODEL_COUNTS.contains(&density));
+            assert!(PLANNING_TARGET_COUNTS.contains(&targets));
+            assert!(state.source_curve_repeat < PLANNING_SOURCE_REPEATS);
+            assert!(visited.insert((
+                state.requested_source_count,
+                density,
+                targets,
+                state.source_curve_repeat
+            )));
+            if !state.advance_source_curve() {
+                break;
+            }
+        }
+        assert_eq!(
+            visited.len(),
+            PLANNING_SOURCE_COUNTS.len()
+                * PLANNING_DENSITY_MODEL_COUNTS.len()
+                * PLANNING_TARGET_COUNTS.len()
+                * PLANNING_SOURCE_REPEATS as usize
+        );
+        assert_eq!(state.dimensions(), (1, 1024, 8192));
     }
 }
