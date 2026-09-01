@@ -564,6 +564,6 @@ MIT. See [`LICENSE`](LICENSE).
 
 ## Live site traffic
 
-[![RyuGu WASM live site traffic](https://raw.githubusercontent.com/Tom-Jim/RyuGu_WASM/main/assets/site-traffic.svg?v=2026-08-30)](https://hits.sh/tom-jim.github.io/RyuGu_WASM/)
+[![RyuGu WASM live site traffic](https://raw.githubusercontent.com/Tom-Jim/RyuGu_WASM/main/assets/site-traffic.svg?v=2026-08-31)](https://hits.sh/tom-jim.github.io/RyuGu_WASM/)
 
 The chart is regenerated daily from the privacy-friendly HITS counter. It reports image requests rather than strict unique visitors. The demo itself makes no third-party analytics request, so it remains usable on offline or DNS-restricted networks.
