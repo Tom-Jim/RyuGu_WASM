@@ -64,8 +64,11 @@ impl PlanningBatchBuilder {
     ) -> Option<Self> {
         let started = bevy::platform::time::Instant::now();
         let (candidate_count, density_model_count, samples_per_candidate) = dimensions;
-        if candidate_count == 0 || candidate_count > PLANNING_CANDIDATE_COUNT || voxels.len() != 56
-            || density_model_count == 0 || samples_per_candidate < 2
+        if candidate_count == 0
+            || candidate_count > PLANNING_CANDIDATE_COUNT
+            || voxels.len() != 56
+            || density_model_count == 0
+            || samples_per_candidate < 2
         {
             return None;
         }
@@ -211,7 +214,11 @@ impl PlanningBatchBuilder {
             && self.capture_id == capture_id
             && self.source_hash == source_hash
             && self.source_count == requested_source_count
-            && (self.candidate_count, self.density_model_count, self.samples_per_candidate) == dimensions
+            && (
+                self.candidate_count,
+                self.density_model_count,
+                self.samples_per_candidate,
+            ) == dimensions
     }
 
     pub(crate) fn advance(&mut self, candidate_budget: u32) -> bool {
@@ -1020,7 +1027,13 @@ pub(crate) fn evaluate_planning_reference_field(
 ) -> Option<(DVec3, DMat3)> {
     let mut acceleration = DVec3::ZERO;
     let mut gradient = DMat3::ZERO;
-    accumulate_planning_reference_chunk(target, basis_records, densities, &mut acceleration, &mut gradient)?;
+    accumulate_planning_reference_chunk(
+        target,
+        basis_records,
+        densities,
+        &mut acceleration,
+        &mut gradient,
+    )?;
     Some((acceleration, gradient))
 }
 
@@ -1033,7 +1046,9 @@ pub(crate) fn accumulate_planning_reference_chunk(
     acceleration: &mut DVec3,
     gradient: &mut DMat3,
 ) -> Option<()> {
-    if densities.len() != 56 || !target.is_finite() { return None; }
+    if densities.len() != 56 || !target.is_finite() {
+        return None;
+    }
     for source in basis_records {
         let density = f64::from(*densities.get(source.voxel_index as usize)?);
         let position = DVec3::new(

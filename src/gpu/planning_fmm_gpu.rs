@@ -3,6 +3,7 @@
 // target traversal, P2P or RHS combination occurs in the benchmark path.
 const FMM_GPU_NODES: u64 = 37_449;
 const FMM_GPU_CAPACITY: u32 = 8192;
+const FMM_GPU_SOURCE_CHUNK_INITIAL: usize = 1_024;
 const FMM_GPU_ENTRIES: [&str; 3] = ["p2m", "m2m", "response_basis"];
 fn fmm_gpu_layout() -> [BindGroupLayoutEntry; 9] {
     [
@@ -63,6 +64,8 @@ struct FmmGpuCache {
     response_start: u32,
     response_count: u32,
     response_tile: u32,
+    source_chunk: usize,
+    pending_sources: u32,
     pending_targets: u32,
     pending: Option<Arc<std::sync::Mutex<Option<PlanningPreparationCompletion>>>>,
     uncharged: PlanningPreparationCost,
@@ -77,8 +80,15 @@ impl Drop for FmmGpuCache {
     fn drop(&mut self) {
         // No later request may submit these banks after a cache replacement.
         // Already submitted work retains them until it completes.
-        for buffer in [&self.source_upload, &self.particles, &self.links,
-            &self.heads, &self.moments_a, &self.moments_b, &self.responses] {
+        for buffer in [
+            &self.source_upload,
+            &self.particles,
+            &self.links,
+            &self.heads,
+            &self.moments_a,
+            &self.moments_b,
+            &self.responses,
+        ] {
             buffer.destroy();
         }
         // Leave the tiny readback fence alive for any outstanding map callback.
@@ -110,8 +120,9 @@ impl PlanningFmmGpu {
                 return None;
             }
         }
-        let std::task::Poll::Ready(queries) = timestamp_pool.acquire(device, queue, 1)
-            else { return None; };
+        let std::task::Poll::Ready(queries) = timestamp_pool.acquire(device, queue, 1) else {
+            return None;
+        };
         let started = bevy::platform::time::Instant::now();
         let response_start = if batch.state_count() <= FMM_GPU_CAPACITY as usize {
             0
@@ -154,10 +165,7 @@ impl PlanningFmmGpu {
             self.0 = Some(FmmGpuCache {
                 batch_id: batch.batch_id,
                 stage: FmmGpuStage::Sources(0),
-                source_upload: buffer(
-                    "planning_fmm_source_chunk",
-                    FFT_GPU_SOURCE_CHUNK as u64 * 20,
-                ),
+                source_upload: buffer("planning_fmm_source_chunk", 16_384_u64 * 20),
                 particles: buffer(
                     "planning_fmm_particles",
                     batch.basis_records.len() as u64 * 16,
@@ -184,7 +192,9 @@ impl PlanningFmmGpu {
                 }),
                 response_start,
                 response_count,
-                response_tile: 8,
+                response_tile: PLANNING_GPU_MIN_BATCH,
+                source_chunk: FMM_GPU_SOURCE_CHUNK_INITIAL,
+                pending_sources: 0,
                 pending_targets: 0,
                 pending: None,
                 uncharged: PlanningPreparationCost::default(),
@@ -208,12 +218,31 @@ impl PlanningFmmGpu {
             if state.pending_targets > 0 {
                 // Keep a bounded queue while giving fast devices enough work.
                 // Use GPU timestamps when available, not browser frame delay.
-                if let Some(ms) = completion.cost.all_ms {
-                    if ms < 3.0 {
-                        state.response_tile = (state.response_tile * 2).min(64);
-                    } else if ms > 12.0 {
-                        state.response_tile = (state.response_tile / 2).max(1);
+                if let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0) {
+                    if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
+                        state.response_tile = PLANNING_GPU_MIN_BATCH;
+                    } else if ms > PLANNING_GPU_TARGET_SUBMISSION_MS {
+                        state.response_tile = state
+                            .response_tile
+                            .saturating_sub(1)
+                            .max(PLANNING_GPU_MIN_BATCH);
+                    } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
+                        state.response_tile = state
+                            .response_tile
+                            .saturating_add(1)
+                            .min(PLANNING_GPU_MAX_BATCH);
                     }
+                }
+            }
+            if state.pending_sources > 0 {
+                if let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0) {
+                    state.source_chunk = if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
+                        (state.source_chunk / 2).max(1)
+                    } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
+                        state.source_chunk.saturating_mul(2).min(16_384)
+                    } else {
+                        state.source_chunk
+                    };
                 }
             }
             state.uncharged.add(completion.cost);
@@ -271,10 +300,11 @@ impl PlanningFmmGpu {
             state.stage = FmmGpuStage::Targets(response_start);
         }
         state.pending_targets = 0;
+        state.pending_sources = 0;
         let (entry, source_start, source_count, level, target_start, target_count, groups) =
             match state.stage {
                 FmmGpuStage::Sources(source) => {
-                    let end = (source + FFT_GPU_SOURCE_CHUNK).min(batch.basis_records.len());
+                    let end = (source + state.source_chunk).min(batch.basis_records.len());
                     let mut bytes = Vec::with_capacity((end - source) * 20);
                     for record in &batch.basis_records[source..end] {
                         if record.voxel_index >= 56
@@ -293,6 +323,7 @@ impl PlanningFmmGpu {
                         bytes.extend_from_slice(&record.voxel_index.to_le_bytes());
                     }
                     queue.write_buffer(&state.source_upload, 0, &bytes);
+                    state.pending_sources = (end - source) as u32;
                     state.pending_work = (end - source) as f64 * 640.0;
                     state.stage = if end == batch.basis_records.len() {
                         FmmGpuStage::Merge(4)

@@ -607,9 +607,15 @@ pub struct Eq106GpuReadbackChannel {
 
 impl Eq106GpuReadbackChannel {
     pub fn reset_after_device_loss(&self) {
-        if let Ok(mut data) = self.data.try_lock() { data.take(); }
-        if let Ok(mut error) = self.pipeline_error.try_lock() { error.take(); }
-        if let Ok(mut submitted) = self.submitted_at.try_lock() { submitted.take(); }
+        if let Ok(mut data) = self.data.try_lock() {
+            data.take();
+        }
+        if let Ok(mut error) = self.pipeline_error.try_lock() {
+            error.take();
+        }
+        if let Ok(mut submitted) = self.submitted_at.try_lock() {
+            submitted.take();
+        }
         self.rebuild_requested.store(false, Ordering::Release);
         self.in_flight.store(false, Ordering::Release);
     }

@@ -76,7 +76,15 @@ mod planning_shader_tests {
             (
                 "planning_fft_basis",
                 include_str!("planning_fft_basis.wgsl"),
-                &["deposit", "seed_kernel", "load_column", "transform", "convolve", "store_column", "combine"],
+                &[
+                    "deposit",
+                    "seed_kernel",
+                    "load_column",
+                    "transform",
+                    "convolve",
+                    "store_column",
+                    "combine",
+                ],
                 64,
                 8,
             ),
@@ -113,18 +121,24 @@ mod planning_shader_tests {
             .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
             assert_eq!(module.entry_points.len(), entry_names.len(), "{name}");
             for entry in entry_names {
-                assert!(module.entry_points.iter().any(|point| {
-                    point.name == *entry && point.stage == naga::ShaderStage::Compute
-                }), "{name}: missing compute entry {entry}");
+                assert!(
+                    module.entry_points.iter().any(|point| {
+                        point.name == *entry && point.stage == naga::ShaderStage::Compute
+                    }),
+                    "{name}: missing compute entry {entry}"
+                );
             }
             let mut bindings = Vec::new();
             for (_, variable) in module.global_variables.iter() {
-                let Some(binding) = &variable.binding else { continue; };
+                let Some(binding) = &variable.binding else {
+                    continue;
+                };
                 assert_eq!(binding.group, 0, "{name}");
                 bindings.push(binding.binding);
                 if binding.binding == 0 {
                     assert_eq!(variable.space, naga::AddressSpace::Uniform, "{name}");
-                    let naga::TypeInner::Struct { span, .. } = &module.types[variable.ty].inner else {
+                    let naga::TypeInner::Struct { span, .. } = &module.types[variable.ty].inner
+                    else {
                         panic!("{name}: expected uniform struct");
                     };
                     assert_eq!(*span, uniform_bytes, "{name}: host/WGSL uniform size");

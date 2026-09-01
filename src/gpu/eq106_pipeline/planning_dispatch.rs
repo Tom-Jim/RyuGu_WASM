@@ -1,4 +1,6 @@
-#[derive(Resource, Default)]
+use std::sync::atomic::AtomicU32;
+
+#[derive(Resource)]
 struct PlanningEq106DispatchState {
     last_request_id: u64,
     active_request_id: u64,
@@ -43,6 +45,56 @@ struct PlanningEq106DispatchState {
     spectrum_ready: bool,
     basis_spectrum_ready: bool,
     last_block_key: Option<(u64, u8)>,
+    /// Number of Eq.106 stages allowed in the next submission. The map
+    /// callback updates this from the previous request's GPU timestamps.
+    adaptive_stage_budget: Arc<AtomicU32>,
+}
+
+impl Default for PlanningEq106DispatchState {
+    fn default() -> Self {
+        Self {
+            last_request_id: 0,
+            active_request_id: 0,
+            next_stage: 0,
+            active_started: None,
+            active_method_preprocess_ms: 0.0,
+            active_command_submission_ms: 0.0,
+            active_elements: Vec::new(),
+            active_invalid_candidates: Vec::new(),
+            active_maximum_elements_per_candidate: 0,
+            active_build_spectrum: false,
+            active_build_basis_spectrum: false,
+            active_map_scheduled: false,
+            active_verification_targets: Vec::new(),
+            active_uniform: None,
+            active_bind_groups: Vec::new(),
+            active_timestamps: None,
+            batch_id: 0,
+            payload_request_id: 0,
+            output_size: 0,
+            output_storage_size: 0,
+            staging_size: 0,
+            baseline_size: 0,
+            metric_size: 0,
+            layout: None,
+            sources: None,
+            quadrature: None,
+            operator: None,
+            dummy_modes: None,
+            spectrum: None,
+            line_samples: None,
+            source_groups: None,
+            output: None,
+            baseline: None,
+            metrics: None,
+            staging: None,
+            canonical_elements: Vec::new(),
+            spectrum_ready: false,
+            basis_spectrum_ready: false,
+            last_block_key: None,
+            adaptive_stage_budget: Arc::new(AtomicU32::new(1)),
+        }
+    }
 }
 
 impl PlanningEq106DispatchState {
@@ -130,10 +182,19 @@ fn dispatch_planning_eq106(
     if let Some(message) = first_planning_pipeline_error(
         &cache,
         &[
-            ("voxel line samples", pipelines.planning_voxel_line_samples_id),
+            (
+                "voxel line samples",
+                pipelines.planning_voxel_line_samples_id,
+            ),
             ("voxel basis spectrum", pipelines.planning_voxel_spectrum_id),
-            ("spectrum combination", pipelines.planning_combine_spectrum_id),
-            ("Chebyshev Taylor evaluation", pipelines.planning_evaluate_id),
+            (
+                "spectrum combination",
+                pipelines.planning_combine_spectrum_id,
+            ),
+            (
+                "Chebyshev Taylor evaluation",
+                pipelines.planning_evaluate_id,
+            ),
             ("planning reduction", reduction.0),
         ],
     ) {
@@ -190,8 +251,11 @@ fn dispatch_planning_eq106(
         return;
     }
     if starting_request {
-        let std::task::Poll::Ready(timestamps) = timestamp_pool.acquire(&render_device, &render_queue, 4)
-            else { return; };
+        let std::task::Poll::Ready(timestamps) =
+            timestamp_pool.acquire(&render_device, &render_queue, 4)
+        else {
+            return;
+        };
         if channel
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -620,10 +684,16 @@ fn dispatch_planning_eq106(
     } else {
         1
     };
-    if starting_request && let Some(queries) = &mut state.active_timestamps {
-        queries.set_pass_count(total_stages as u32);
+    if starting_request {
+        if let Some(queries) = &mut state.active_timestamps {
+            queries.set_pass_count(total_stages as u32);
+        }
     }
-    let stage_budget = planning_eq106_stage_budget(request.compute_benchmark, total_stages);
+    let stage_budget = planning_eq106_stage_budget(
+        request.compute_benchmark,
+        total_stages,
+        state.adaptive_stage_budget.load(Ordering::Acquire) as usize,
+    );
     if stage_budget == 0 {
         return;
     }
@@ -666,14 +736,16 @@ fn dispatch_planning_eq106(
             1 => (
                 "planning_eq106_voxel_basis_spectrum",
                 voxel_spectrum_pipeline,
-                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES).div_ceil(64),
+                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES)
+                    .div_ceil(64),
                 canonical_segment_count,
                 56,
             ),
             3 => (
                 "planning_eq106_combine_voxel_spectrum",
                 combine_spectrum_pipeline,
-                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES).div_ceil(64),
+                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES)
+                    .div_ceil(64),
                 canonical_segment_count,
                 1,
             ),
@@ -690,7 +762,9 @@ fn dispatch_planning_eq106(
         };
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some(label),
-            timestamp_writes: state.active_timestamps.as_ref()
+            timestamp_writes: state
+                .active_timestamps
+                .as_ref()
                 .map(|queries| queries.writes(stage as u32)),
         });
         pass.set_pipeline(pipeline);
@@ -800,6 +874,7 @@ fn dispatch_planning_eq106(
         "Eq.106 Taylor/Chebyshev variant: finite-arc basis shared across candidates and tiles"
     );
     let timestamps = state.active_timestamps.take();
+    let adaptive_stage_budget = Arc::clone(&state.adaptive_stage_budget);
     state.clear_active();
     state.active_map_scheduled = true;
     mapped
@@ -812,8 +887,22 @@ fn dispatch_planning_eq106(
             let mut pass_ms = None;
             let rows = if result.is_ok() {
                 let view = staging.slice(..staging_size).get_mapped_range();
-                pass_ms = timestamps.as_ref()
+                pass_ms = timestamps
+                    .as_ref()
                     .and_then(|queries| queries.decode(&view[data_size as usize..]));
+                if let Some(values) = pass_ms.as_ref() {
+                    let maximum_ms = values.iter().copied().fold(0.0_f64, f64::max);
+                    let next_budget = if maximum_ms > PLANNING_GPU_MAX_SUBMISSION_MS
+                        || maximum_ms > PLANNING_GPU_TARGET_SUBMISSION_MS
+                    {
+                        PLANNING_GPU_MIN_STAGE_BUDGET
+                    } else if maximum_ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
+                        PLANNING_GPU_MAX_STAGE_BUDGET
+                    } else {
+                        PLANNING_GPU_MIN_STAGE_BUDGET
+                    };
+                    adaptive_stage_budget.store(next_budget as u32, Ordering::Release);
+                }
                 let full_rows = bytes_to_f32x4(&view[..data_size as usize]);
                 let mut candidate_metrics = full_rows[..request_candidate_count as usize].to_vec();
                 let mut rejected_candidates = vec![false; request_candidate_count as usize];
@@ -1007,9 +1096,15 @@ fn dispatch_planning_eq106(
                         gpu_completion_map_ms,
                         readback_decode_ms: decode_started.elapsed().as_secs_f64() * 1.0e3,
                         kernel_ms: pass_ms.as_ref().map(|values| values.iter().sum()),
-                        evaluation_kernel_ms: pass_ms.as_ref().and_then(|values| values.last().copied()),
+                        evaluation_kernel_ms: pass_ms
+                            .as_ref()
+                            .and_then(|values| values.last().copied()),
                         basis_kernel_ms: pass_ms.as_ref().map(|values| {
-                            if build_basis_spectrum { values[..2].iter().sum() } else { 0.0 }
+                            if build_basis_spectrum {
+                                values[..2].iter().sum()
+                            } else {
+                                0.0
+                            }
                         }),
                         // First geometry: voxel line + coherent sampled spectrum
                         // + combine + evaluate + reduction. New density: combine
@@ -1071,7 +1166,9 @@ fn first_planning_pipeline_error(
         ) {
             return None;
         }
-        Some(format!("Eq.106 {name} GPU pipeline failed to compile: {error}"))
+        Some(format!(
+            "Eq.106 {name} GPU pipeline failed to compile: {error}"
+        ))
     })
 }
 
@@ -1127,9 +1224,15 @@ fn canonical_element_accepts(
     select_batch_taylor_order(epsilon).is_some_and(|order| order <= element.taylor_order)
 }
 
-fn planning_eq106_stage_budget(compute_benchmark: bool, total_stages: usize) -> usize {
+fn planning_eq106_stage_budget(
+    compute_benchmark: bool,
+    total_stages: usize,
+    adaptive_budget: usize,
+) -> usize {
     if compute_benchmark {
-        return total_stages.max(1);
+        return adaptive_budget
+            .clamp(PLANNING_GPU_MIN_STAGE_BUDGET, PLANNING_GPU_MAX_STAGE_BUDGET)
+            .min(total_stages.max(1));
     }
     let average_fps = crate::browser_frame_rate();
     let recent_frame_ms = crate::browser_recent_frame_ms();

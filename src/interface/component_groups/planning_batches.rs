@@ -17,6 +17,14 @@ pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 1;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
 pub const PLANNING_MAX_REQUEST_MS: f64 = 34.0;
+/// Keep individual compute submissions below the browser/driver watchdog
+/// window. These are GPU timestamp targets, independent of CPU frame time.
+pub const PLANNING_GPU_TARGET_SUBMISSION_MS: f64 = 8.0;
+pub const PLANNING_GPU_MAX_SUBMISSION_MS: f64 = 20.0;
+pub const PLANNING_GPU_MIN_STAGE_BUDGET: usize = 1;
+pub const PLANNING_GPU_MAX_STAGE_BUDGET: usize = 2;
+pub const PLANNING_GPU_MIN_BATCH: u32 = 1;
+pub const PLANNING_GPU_MAX_BATCH: u32 = 4;
 pub const PLANNING_MAX_RECENT_FRAME_MS: f64 = 18.5;
 pub const PLANNING_GPU_UPLOAD_BYTES_PER_FRAME: usize = 1024 * 1024;
 pub const PLANNING_REFERENCE_STRIDE: u32 = 32;
@@ -38,7 +46,11 @@ pub struct PlanningCandidateState {
 
 impl PlanningCandidateState {
     pub fn body_position(self) -> Vec3 {
-        Vec3::from_array(self.position_time[..3].try_into().expect("three position values"))
+        Vec3::from_array(
+            self.position_time[..3]
+                .try_into()
+                .expect("three position values"),
+        )
     }
 
     pub fn body_velocity(self) -> Vec3 {
@@ -48,7 +60,6 @@ impl PlanningCandidateState {
                 .expect("three velocity values"),
         )
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -105,8 +116,7 @@ impl PlanningCandidateBatch {
             && self.target_mass > 0.0
             && self.density_model_masses.len() == self.density_model_count as usize
             && self.density_model_masses.iter().all(|mass| {
-                mass.is_finite()
-                    && ((mass - self.target_mass) / self.target_mass).abs() <= 2.0e-7
+                mass.is_finite() && ((mass - self.target_mass) / self.target_mass).abs() <= 2.0e-7
             })
     }
 
@@ -182,15 +192,22 @@ pub struct PlanningKernelTotals {
 
 impl Default for PlanningKernelTotals {
     fn default() -> Self {
-        Self { all_ms: Some(0.0), evaluation_ms: Some(0.0), basis_ms: Some(0.0) }
+        Self {
+            all_ms: Some(0.0),
+            evaluation_ms: Some(0.0),
+            basis_ms: Some(0.0),
+        }
     }
 }
 
 impl PlanningKernelTotals {
     pub fn plus(self, other: Self) -> Self {
-        let add = |a: Option<f64>, b: Option<f64>| a.zip(b)
-            .filter(|(a, b)| a.is_finite() && b.is_finite() && *a >= 0.0 && *b >= 0.0)
-            .map(|(a, b)| a + b).filter(|sum| sum.is_finite());
+        let add = |a: Option<f64>, b: Option<f64>| {
+            a.zip(b)
+                .filter(|(a, b)| a.is_finite() && b.is_finite() && *a >= 0.0 && *b >= 0.0)
+                .map(|(a, b)| a + b)
+                .filter(|sum| sum.is_finite())
+        };
         Self {
             all_ms: add(self.all_ms, other.all_ms),
             evaluation_ms: add(self.evaluation_ms, other.evaluation_ms),
@@ -271,9 +288,15 @@ impl Default for PlanningGpuReadbackChannel {
 }
 impl PlanningGpuReadbackChannel {
     pub fn reset_after_device_loss(&self) {
-        if let Ok(mut data) = self.data.try_lock() { data.take(); }
-        if let Ok(mut error) = self.error.try_lock() { error.take(); }
-        if let Ok(mut preparation) = self.preparation.try_lock() { preparation.take(); }
+        if let Ok(mut data) = self.data.try_lock() {
+            data.take();
+        }
+        if let Ok(mut error) = self.error.try_lock() {
+            error.take();
+        }
+        if let Ok(mut preparation) = self.preparation.try_lock() {
+            preparation.take();
+        }
         self.in_flight.store(false, Ordering::Release);
     }
 }

@@ -15,7 +15,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::WgpuLimits;
 use bevy::render::{
     RenderPlugin,
-    error_handler::{RenderError, RenderErrorHandler, RenderErrorPolicy, ErrorType},
+    error_handler::{ErrorType, RenderError, RenderErrorHandler, RenderErrorPolicy},
     settings::{Backends, InstanceFlags, RenderCreation, WgpuSettings, WgpuSettingsPriority},
 };
 use bevy::window::PresentMode;
@@ -64,10 +64,11 @@ use interface::components::{
     ActiveGravityMethod, CameraMode, DensityC, DensitySensitivityCaches, DisplayRotation,
     Eq106GpuReadbackChannel, FmmReadbackChannel, GpuMemoryEstimate, GravityAcceleration,
     GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential, GravityReadbackChannel,
-    GravityRuntimeError, JacobiHistory, MmfftReadbackChannel, NormalsReadbackChannel, PerformanceComparisonState,
-    PlanningComparisonState, PlanningGpuReadbackChannel, PlanningGpuRequest, PlanningGpuResult,
-    PlanningMethodPayload, ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions,
-    ShowNormals, ShowSection, SimulationAcceleration, SimulationClock, TrajectoryInversionState,
+    GravityRuntimeError, JacobiHistory, MmfftReadbackChannel, NormalsReadbackChannel,
+    PerformanceComparisonState, PlanningComparisonState, PlanningGpuReadbackChannel,
+    PlanningGpuRequest, PlanningGpuResult, PlanningMethodPayload, ProbeCrashResetRequest,
+    ProbeCrashState, ProbeInitialConditions, ShowNormals, ShowSection, SimulationAcceleration,
+    SimulationClock, TrajectoryInversionState,
 };
 use std::time::Duration;
 use wgsl::WgslPlugin;
@@ -331,7 +332,9 @@ extern "C" {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn schedule_device_loss_reload() { let _ = schedule_device_loss_reload_js(); }
+fn schedule_device_loss_reload() {
+    let _ = schedule_device_loss_reload_js();
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn schedule_device_loss_reload() {}

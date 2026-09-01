@@ -1,7 +1,7 @@
 use crate::interface::components::*;
 use bevy::prelude::*;
 use bevy::render::{
-    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+    Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, Buffer,
         BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
@@ -9,7 +9,6 @@ use bevy::render::{
         ComputePassDescriptor, ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
-    GpuResourceAppExt,
 };
 use bevy::shader::ShaderCacheError;
 use std::sync::Arc;
@@ -249,8 +248,12 @@ fn dispatch_planning_method(
         *buffers = PlanningDispatchBuffers::default();
         return;
     };
-    if method != ActiveGravityMethod::MmfftCompressed { fft_gpu.0 = None; }
-    if method != ActiveGravityMethod::Fmm { fmm_gpu.0 = None; }
+    if method != ActiveGravityMethod::MmfftCompressed {
+        fft_gpu.0 = None;
+    }
+    if method != ActiveGravityMethod::Fmm {
+        fmm_gpu.0 = None;
+    }
     if !matches!(
         method,
         ActiveGravityMethod::MmfftCompressed | ActiveGravityMethod::Fmm
@@ -296,16 +299,39 @@ fn dispatch_planning_method(
     // Preparation has its own bounded asynchronous fence. Do not claim the
     // evaluator's in-flight flag while the CPU/UI is waiting for a GPU stage.
     let (primary, response_start) = if method == ActiveGravityMethod::Fmm {
-        let Some(prepared) = fmm_gpu.prepare(&extracted, shared, &fmm_pipelines, &cache,
-            &render_device, &render_queue, &channel, &timestamp_pool) else { return; };
+        let Some(prepared) = fmm_gpu.prepare(
+            &extracted,
+            shared,
+            &fmm_pipelines,
+            &cache,
+            &render_device,
+            &render_queue,
+            &channel,
+            &timestamp_pool,
+        ) else {
+            return;
+        };
         prepared
     } else {
-        let Some(primary) = fft_gpu.prepare(&extracted, shared, &fft_pipelines, &cache,
-            &render_device, &render_queue, &channel, &timestamp_pool) else { return; };
+        let Some(primary) = fft_gpu.prepare(
+            &extracted,
+            shared,
+            &fft_pipelines,
+            &cache,
+            &render_device,
+            &render_queue,
+            &channel,
+            &timestamp_pool,
+        ) else {
+            return;
+        };
         (primary, 0)
     };
-    let std::task::Poll::Ready(timestamps) = timestamp_pool.acquire(&render_device, &render_queue, 1)
-        else { return; };
+    let std::task::Poll::Ready(timestamps) =
+        timestamp_pool.acquire(&render_device, &render_queue, 1)
+    else {
+        return;
+    };
     if channel
         .in_flight
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -488,7 +514,8 @@ fn dispatch_planning_method(
             let mut kernel_ms = None;
             let rows = if result.is_ok() {
                 let view = staging.slice(..staging_size).get_mapped_range();
-                kernel_ms = timestamps.as_ref()
+                kernel_ms = timestamps
+                    .as_ref()
                     .and_then(|queries| queries.decode(&view[data_size as usize..]))
                     .and_then(|values| values.first().copied());
                 let decoded = bytes_to_f32x4(&view[..data_size as usize]);
@@ -519,10 +546,15 @@ fn dispatch_planning_method(
                     readback_valid: result.is_ok(),
                     timing: PlanningGpuTiming {
                         method_preprocess_ms: method_preprocess_ms + preparation_cost.cpu_ms,
-                        command_submission_ms: command_submission_ms + preparation_cost.submission_ms,
-                        gpu_completion_map_ms: gpu_completion_map_ms + preparation_cost.completion_ms,
-                        readback_decode_ms: decode_started.elapsed().as_secs_f64() * 1.0e3 + preparation_cost.decode_ms,
-                        kernel_ms: kernel_ms.zip(preparation_cost.all_ms).map(|(eval, prep)| eval + prep),
+                        command_submission_ms: command_submission_ms
+                            + preparation_cost.submission_ms,
+                        gpu_completion_map_ms: gpu_completion_map_ms
+                            + preparation_cost.completion_ms,
+                        readback_decode_ms: decode_started.elapsed().as_secs_f64() * 1.0e3
+                            + preparation_cost.decode_ms,
+                        kernel_ms: kernel_ms
+                            .zip(preparation_cost.all_ms)
+                            .map(|(eval, prep)| eval + prep),
                         evaluation_kernel_ms: kernel_ms,
                         basis_kernel_ms: kernel_ms.and(preparation_cost.basis_ms),
                         dispatch_count: 2 + preparation_cost.dispatches,
@@ -621,7 +653,12 @@ fn mmfft_planning_uniform(
 // Both evaluator pipelines share this binding shape; their uniform structures
 // and read-only input at binding 2 remain method-specific.
 fn planning_method_layout_entries() -> [BindGroupLayoutEntry; 4] {
-    [uniform_entry(0), storage_ro_entry(1), storage_ro_entry(2), storage_rw_entry(3)]
+    [
+        uniform_entry(0),
+        storage_ro_entry(1),
+        storage_ro_entry(2),
+        storage_rw_entry(3),
+    ]
 }
 
 fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {

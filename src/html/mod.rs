@@ -295,23 +295,40 @@ pub(crate) fn browser_ui_action_system(
                 planning.source_curve_visible = true;
                 planning.source_curve_index = 0;
                 planning.source_curve_repeat = 0;
-                planning.source_curve_all_parameters = action.get("scope")
-                    .and_then(Value::as_str) == Some("all");
-                planning.source_curve_density_index = if planning.source_curve_all_parameters { 0 } else {
-                    action.get("densityModels").and_then(Value::as_u64)
-                        .and_then(|k| PLANNING_DENSITY_MODEL_COUNTS.iter().position(|&value| u64::from(value) == k))
+                planning.source_curve_all_parameters =
+                    action.get("scope").and_then(Value::as_str) == Some("all");
+                planning.source_curve_density_index = if planning.source_curve_all_parameters {
+                    0
+                } else {
+                    action
+                        .get("densityModels")
+                        .and_then(Value::as_u64)
+                        .and_then(|k| {
+                            PLANNING_DENSITY_MODEL_COUNTS
+                                .iter()
+                                .position(|&value| u64::from(value) == k)
+                        })
                         .unwrap_or(0)
                 };
-                planning.source_curve_target_index = if planning.source_curve_all_parameters { 0 } else {
-                    action.get("targets").and_then(Value::as_u64)
-                        .and_then(|nt| PLANNING_TARGET_COUNTS.iter().position(|&value| u64::from(value) == nt))
+                planning.source_curve_target_index = if planning.source_curve_all_parameters {
+                    0
+                } else {
+                    action
+                        .get("targets")
+                        .and_then(Value::as_u64)
+                        .and_then(|nt| {
+                            PLANNING_TARGET_COUNTS
+                                .iter()
+                                .position(|&value| u64::from(value) == nt)
+                        })
                         .unwrap_or(0)
                 };
                 let mut order_seed_bytes = [0u8; 8];
                 if getrandom::fill(&mut order_seed_bytes).is_err() {
                     planning.source_curve_active = false;
                     planning.source_curve_visible = false;
-                    planning.status = "Quadrature stopped: could not seed the randomized method order.".into();
+                    planning.status =
+                        "Quadrature stopped: could not seed the randomized method order.".into();
                     continue;
                 }
                 planning.source_curve_order_seed = u64::from_le_bytes(order_seed_bytes);
@@ -327,15 +344,18 @@ pub(crate) fn browser_ui_action_system(
                 *request = PlanningGpuRequest::default();
                 *payload = PlanningMethodPayload::default();
                 result.0 = None;
-                let (_, density_models, samples_per_candidate) =
-                    planning.dimensions();
+                let (_, density_models, samples_per_candidate) = planning.dimensions();
                 planning.status = format!(
                     "Quadrature sweep queued: {} sources, {} density models, {} targets, repeat 1/{}; random method order; scope: {}.",
                     PLANNING_SOURCE_COUNTS[0],
                     density_models,
                     samples_per_candidate,
                     PLANNING_SOURCE_REPEATS,
-                    if planning.source_curve_all_parameters { "all K x target combinations" } else { "selected K x target combination" },
+                    if planning.source_curve_all_parameters {
+                        "all K x target combinations"
+                    } else {
+                        "selected K x target combination"
+                    },
                 );
             }
             "quadrature-cancel" => {
@@ -472,7 +492,13 @@ pub(crate) struct BrowserUiSnapshot<'w> {
 
 pub(crate) fn browser_ui_publish_system(
     state: BrowserUiSnapshot,
-    mut publish_state: Local<(u8, usize, u64, String, Option<bevy::platform::time::Instant>)>,
+    mut publish_state: Local<(
+        u8,
+        usize,
+        u64,
+        String,
+        Option<bevy::platform::time::Instant>,
+    )>,
 ) {
     publish_state.0 = publish_state.0.wrapping_add(1);
     let curve_len = state.planning.source_curve_samples.len();
@@ -485,7 +511,10 @@ pub(crate) fn browser_ui_publish_system(
     // Progress-only hidden snapshots are limited to once per second.
     if !curve_changed {
         if !ryugu_page_visible() {
-            if publish_state.4.is_some_and(|last| now.duration_since(last).as_secs_f64() < 1.0) {
+            if publish_state
+                .4
+                .is_some_and(|last| now.duration_since(last).as_secs_f64() < 1.0)
+            {
                 return;
             }
         } else if !publish_state.0.is_multiple_of(6) {

@@ -1,14 +1,14 @@
 use crate::interface::components::*;
 use bevy::prelude::*;
 use bevy::render::{
-    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+    Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
         BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
+    renderer::{RenderDevice, RenderQueue},
 };
 use std::sync::Arc;
 

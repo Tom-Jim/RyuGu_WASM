@@ -125,8 +125,14 @@ impl Drop for FftGpuCache {
         // Cancellation/method changes happen after submission. WebGPU retains
         // already submitted work; destroy releases these large banks as soon
         // as that work drains instead of waiting for browser wrapper GC.
-        for buffer in [&self.bank, &self.work, &self.kernel, &self.sources,
-            &self.combined, &self.roots] {
+        for buffer in [
+            &self.bank,
+            &self.work,
+            &self.kernel,
+            &self.sources,
+            &self.combined,
+            &self.roots,
+        ] {
             buffer.destroy();
         }
         // A map callback may still own the tiny fence; it must finish normally.
@@ -164,8 +170,12 @@ impl PlanningFftGpu {
         // Yield before allocating a workspace or advancing the job while the
         // shared bank is busy / its allocation error scopes are unresolved.
         let std::task::Poll::Ready(mut queries) = timestamp_pool.acquire(
-            device, queue, crate::gpu::planning_timestamps::PLANNING_TIMESTAMP_MAX_PASSES,
-        ) else { return None; };
+            device,
+            queue,
+            crate::gpu::planning_timestamps::PLANNING_TIMESTAMP_MAX_PASSES,
+        ) else {
+            return None;
+        };
         let cpu_started = bevy::platform::time::Instant::now();
         if self
             .0
@@ -226,7 +236,8 @@ impl PlanningFftGpu {
                 }),
                 fence: device.create_buffer(&BufferDescriptor {
                     label: Some("planning_fft_reusable_fence"),
-                    size: u64::from(crate::gpu::planning_timestamps::PLANNING_TIMESTAMP_MAX_PASSES) * 16,
+                    size: u64::from(crate::gpu::planning_timestamps::PLANNING_TIMESTAMP_MAX_PASSES)
+                        * 16,
                     usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 }),
@@ -254,7 +265,24 @@ impl PlanningFftGpu {
             if state.pending_columns > 0 {
                 if let Some(ms) = completion.cost.all_ms.filter(|ms| *ms > 0.0) {
                     let per_column = ms / f64::from(state.pending_columns);
-                    state.column_batch = (8.0 / per_column).floor().clamp(1.0, 4.0) as u32;
+                    // Timestamp the whole submission and change the next
+                    // batch conservatively. Slow work shrinks immediately;
+                    // growth requires a comfortable margin below the target.
+                    state.column_batch = if ms > PLANNING_GPU_MAX_SUBMISSION_MS {
+                        PLANNING_GPU_MIN_BATCH
+                    } else if per_column > PLANNING_GPU_TARGET_SUBMISSION_MS {
+                        state
+                            .column_batch
+                            .saturating_sub(1)
+                            .max(PLANNING_GPU_MIN_BATCH)
+                    } else if ms < PLANNING_GPU_TARGET_SUBMISSION_MS * 0.45 {
+                        state
+                            .column_batch
+                            .saturating_add(1)
+                            .min(PLANNING_GPU_MAX_BATCH)
+                    } else {
+                        state.column_batch
+                    };
                 }
             }
             state.uncharged.add(completion.cost);
@@ -359,7 +387,13 @@ impl PlanningFftGpu {
                 // The coarse 32-point FFTs are tiny. Batch several columns in
                 // one submission rather than spending one browser frame per
                 // column. The large level adapts to pass timestamps (~8 ms).
-                let count = (if level == 0 { state.column_batch } else { 8 }).min(56 - column);
+                let count = (if level == 0 {
+                    state.column_batch
+                } else {
+                    PLANNING_GPU_MAX_BATCH
+                })
+                .clamp(PLANNING_GPU_MIN_BATCH, PLANNING_GPU_MAX_BATCH)
+                .min(56 - column);
                 state.pending_columns = count;
                 for current in column..column + count {
                     operations.push((3, level, 0, 0, current, 0, 0));
