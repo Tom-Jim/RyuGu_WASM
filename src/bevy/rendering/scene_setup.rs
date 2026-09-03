@@ -1,10 +1,23 @@
 use crate::interface::components::*;
-use crate::cpu::curved_arc::AggregatedGravitySource;
+use crate::cpu::frequency_domain::{AggregatedGravitySource, generate_fixed_point_trajectory};
 use crate::cpu::inversion::{
     quintic_knot_accelerations, quintic_segment_position_acceleration,
 };
 use bevy::prelude::*;
 use bevy_panorbit_camera::PanOrbitCamera;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+
+#[derive(Default, Reflect, GizmoConfigGroup)]
+pub struct ScientificGizmos;
+
+pub fn configure_scientific_gizmos(mut store: ResMut<GizmoConfigStore>) {
+    let (config, _) = store.config_mut::<ScientificGizmos>();
+    config.line.width = 1.75;
+    config.line.perspective = false;
+    config.line.joints = GizmoLineJoint::Round(4);
+    config.depth_bias = -0.002;
+}
 
 pub fn setup_scene(
     mut commands: Commands,
@@ -65,15 +78,14 @@ pub fn setup_scene(
     ));
 }
 
-/// Records only presentation states for five wall-clock seconds, then maps
-/// them to sixteen uniform knots.  This deliberately runs outside
-/// `FixedUpdate`: no captured value can affect force evaluation or integration.
+/// Builds one deterministic finite-length equation-(185) fixed-point arc and
+/// exposes sixteen uniform knots. The resulting known trajectory is shared
+/// by equation-(184), FFT, and FMM; it never depends on radial readback.
 pub fn capture_trajectory_inversion_system(
-    time: Res<Time>,
     clock: Res<SimulationClock>,
     active_method: Res<ActiveGravityMethod>,
-    radial_history: Option<Res<RadialGravityHistory>>,
-    eq106_source: Option<Res<AggregatedGravitySource>>,
+    frequency_domain_source: Option<Res<AggregatedGravitySource>>,
+    probe_initial: Res<ProbeInitialConditions>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
     if inversion.runtime_epoch != clock.epoch {
@@ -84,7 +96,6 @@ pub fn capture_trajectory_inversion_system(
         inversion.capture_epoch = clock.epoch;
         inversion.last_capture_request_id = None;
         inversion.wall_elapsed_seconds = 0.0;
-        inversion.raw_samples.clear();
         inversion.knots.clear();
         if !preserve_truth_track {
             inversion.truth_knots.clear();
@@ -95,7 +106,7 @@ pub fn capture_trajectory_inversion_system(
         }
         inversion.capture_id = None;
         inversion.capture_source_hash =
-            eq106_source.as_ref().map_or(0, |source| source.source_hash);
+            frequency_domain_source.as_ref().map_or(0, |source| source.source_hash);
         inversion.ready = false;
         inversion.inverted = false;
         inversion.start_requested = queued_inversion;
@@ -119,78 +130,26 @@ pub fn capture_trajectory_inversion_system(
         }
     }
     if !inversion.ready
-        && let Some(source) = eq106_source.as_ref()
+        && let Some(source) = frequency_domain_source.as_ref()
     {
         inversion.capture_source_hash = source.source_hash;
     }
-    if inversion.ready || clock.elapsed_seconds <= 0.0 {
+    if inversion.ready {
         return;
     }
-    // Radial is the single authoritative observation producer. Eq.106,
-    // MMFFT, and FMM all invert this frozen radial trajectory.
-    let sample = radial_history
-        .as_ref()
-        .and_then(|history| history.0.latest_for_epoch(clock.epoch));
-    let Some(sample) = sample else {
+    // Equation (185) fixed-point trajectory: all methods receive the same
+    // deterministic finite arc, independent of radial-history readback.
+    let Some(source) = frequency_domain_source.as_ref() else {
         return;
     };
-    if inversion.last_capture_request_id == Some(sample.snapshot.request_id) {
-        // GPU readback can be visible for several presentation frames. Do not
-        // duplicate one snapshot in the wall-time capture; repeated anchors
-        // make the 16-knot resampling depend on browser scheduling jitter.
-        inversion.wall_elapsed_seconds += time.delta_secs_f64();
-        return;
-    }
-    inversion.last_capture_request_id = Some(sample.snapshot.request_id);
-    let baseline_acceleration = sample.snapshot.ryugu_transform.rotation * sample.body_acceleration;
-    if !baseline_acceleration.is_finite() {
-        return;
-    }
-
-    inversion.wall_elapsed_seconds += time.delta_secs_f64();
-    let elapsed_seconds = inversion.wall_elapsed_seconds;
-    inversion.raw_samples.push(TrajectoryCaptureSample {
-        elapsed_seconds,
-        knot: TrajectoryInversionKnot {
-            position: sample.snapshot.probe_position,
-            velocity: sample.snapshot.probe_velocity,
-            simulation_time_seconds: sample.snapshot.simulation_time_seconds,
-            baseline_acceleration,
-            body_rotation: sample.snapshot.ryugu_transform.rotation,
-        },
-    });
-    if inversion.wall_elapsed_seconds < TRAJECTORY_INVERSION_CAPTURE_SECONDS
-        || inversion.raw_samples.len() < 2
-    {
-        return;
-    }
-
-    let samples = inversion.raw_samples.clone();
-    let duration = samples.last().map_or(0.0, |sample| sample.elapsed_seconds);
-    let mut knots = Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT);
-    for index in 0..TRAJECTORY_INVERSION_SAMPLE_COUNT {
-        let target = duration * index as f64 / (TRAJECTORY_INVERSION_SAMPLE_COUNT - 1) as f64;
-        let upper = samples
-            .iter()
-            .position(|sample| sample.elapsed_seconds >= target)
-            .unwrap_or(samples.len() - 1);
-        let lower = upper.saturating_sub(1);
-        let a = samples[lower];
-        let b = samples[upper];
-        let span = (b.elapsed_seconds - a.elapsed_seconds).max(f64::EPSILON);
-        let factor = ((target - a.elapsed_seconds) / span).clamp(0.0, 1.0) as f32;
-        knots.push(TrajectoryInversionKnot {
-            position: a.knot.position.lerp(b.knot.position, factor),
-            velocity: a.knot.velocity.lerp(b.knot.velocity, factor),
-            simulation_time_seconds: a.knot.simulation_time_seconds
-                + (b.knot.simulation_time_seconds - a.knot.simulation_time_seconds) * factor as f64,
-            baseline_acceleration: a
-                .knot
-                .baseline_acceleration
-                .lerp(b.knot.baseline_acceleration, factor),
-            body_rotation: a.knot.body_rotation.slerp(b.knot.body_rotation, factor),
-        });
-    }
+    let knots = generate_fixed_point_trajectory(
+        source,
+        probe_initial.position,
+        probe_initial.velocity(),
+        TRAJECTORY_INVERSION_CAPTURE_SECONDS,
+        TRAJECTORY_INVERSION_SAMPLE_COUNT,
+    );
+    let Some(knots) = knots else { return; };
     inversion.knots = knots;
     if inversion.truth_knots.is_empty() {
         inversion.truth_knots = inversion.knots.clone();
@@ -208,12 +167,7 @@ pub fn capture_trajectory_inversion_system(
 }
 
 pub(crate) fn hash_trajectory_capture(knots: &[TrajectoryInversionKnot]) -> u64 {
-    let mut hash = 1469598103934665603_u64;
-    let mut absorb = |bytes: &[u8]| {
-        for byte in bytes {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211_u64);
-        }
-    };
+    let mut hasher = DefaultHasher::new();
     for knot in knots {
         for value in [
             knot.simulation_time_seconds.to_bits(),
@@ -231,10 +185,10 @@ pub(crate) fn hash_trajectory_capture(knots: &[TrajectoryInversionKnot]) -> u64 
             knot.body_rotation.z.to_bits() as u64,
             knot.body_rotation.w.to_bits() as u64,
         ] {
-            absorb(&value.to_le_bytes());
+            hasher.write_u64(value);
         }
     }
-    hash
+    hasher.finish()
 }
 
 pub fn camera_follow_system(
@@ -255,8 +209,25 @@ pub fn camera_follow_system(
     };
 }
 
+/// Zoom only the Bevy camera. The HTML overlay is intentionally not involved
+/// so keyboard navigation cannot resize or translate the surrounding UI.
+pub fn camera_keyboard_zoom_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cameras: Query<&mut PanOrbitCamera, With<Camera3d>>,
+) {
+    let zoom_in = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::ArrowRight);
+    let zoom_out = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::ArrowLeft);
+    if !zoom_in && !zoom_out {
+        return;
+    }
+    let factor = if zoom_in { 0.88 } else { 1.14 };
+    for mut camera in &mut cameras {
+        camera.target_radius = (camera.target_radius.max(1.0) * factor).clamp(200.0, 20_000.0);
+    }
+}
+
 pub fn render_gizmos_system(
-    mut gizmos: Gizmos,
+    mut gizmos: Gizmos<ScientificGizmos>,
     camera_query: Query<&Transform, With<Camera3d>>,
     cassini_query: Query<(&Transform, &OrbitHistory), With<CassiniMarker>>,
     global_transforms: Query<&GlobalTransform>,
@@ -274,20 +245,36 @@ pub fn render_gizmos_system(
         let orbit_color = match *active_method {
             ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
             ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
-            ActiveGravityMethod::CurvedArcEq106 => Color::srgba(0.8, 0.35, 1.0, 0.9),
+            ActiveGravityMethod::FrequencyDomain => Color::srgba(0.8, 0.35, 1.0, 0.9),
             ActiveGravityMethod::MmfftCompressed => Color::srgba(1.0, 0.72, 0.2, 0.9),
             ActiveGravityMethod::Fmm => Color::srgba(0.25, 0.9, 0.55, 0.9),
         };
         if history.0.len() >= 2 {
             // The main trail always follows the detector's actual integrated
             // path. Frozen inversion samples are rendered separately below and
-            // must never replace or hide this bounded live history.
-            gizmos.linestrip(history.0.iter().copied(), orbit_color);
+            // must never replace or hide this bounded live history. Decimate
+            // only the display polyline: retaining all 27,500 simulation
+            // samples in the resource preserves the physical history while a
+            // bounded gizmo stream avoids rebuilding tens of thousands of
+            // transient line vertices every frame.
+            const MAX_ORBIT_GIZMO_POINTS: usize = 4_096;
+            let stride = history.0.len().div_ceil(MAX_ORBIT_GIZMO_POINTS).max(1);
+            let last_index = history.0.len() - 1;
+            let append_last = (!last_index.is_multiple_of(stride)).then_some(last_index);
+            gizmos.linestrip(
+                (0..history.0.len())
+                    .step_by(stride)
+                    .chain(append_last)
+                    .map(|index| history.0[index]),
+                orbit_color,
+            );
         }
 
         if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
             let pos = ct.translation;
-            gizmos.sphere(pos, 12.0, Color::srgb(1.0, 0.9, 0.1));
+            gizmos
+                .sphere(pos, 12.0, Color::srgb(1.0, 0.9, 0.1))
+                .resolution(8);
             let pulse = 20.0 + (time.elapsed_secs() * 5.0).sin() * 6.0;
             gizmos.circle(pos, pulse, Color::srgb(1.0, 0.6, 0.0));
             let d = 35.0_f32;
@@ -319,50 +306,41 @@ pub fn render_gizmos_system(
         &[]
     };
     if display_knots.len() >= 2 {
-        let Some(accelerations) = quintic_knot_accelerations(display_knots) else {
-            return;
-        };
         let mut curve = Vec::with_capacity((display_knots.len() - 1) * 25 + 1);
-        for index in 0..display_knots.len() - 1 {
-            let start = display_knots[index];
-            let end = display_knots[index + 1];
-            for substep in 0..25 {
-                if index > 0 && substep == 0 {
-                    continue;
+        if let Some(accelerations) = quintic_knot_accelerations(display_knots) {
+            for index in 0..display_knots.len() - 1 {
+                let start = display_knots[index];
+                let end = display_knots[index + 1];
+                for substep in 0..25 {
+                    if index > 0 && substep == 0 {
+                        continue;
+                    }
+                    let Some((position, _, _)) = quintic_segment_position_acceleration(
+                        start,
+                        end,
+                        accelerations[index],
+                        accelerations[index + 1],
+                        substep as f32 / 24.0,
+                    ) else {
+                        continue;
+                    };
+                    curve.push(position);
                 }
-                let Some((position, _, _)) = quintic_segment_position_acceleration(
-                    start,
-                    end,
-                    accelerations[index],
-                    accelerations[index + 1],
-                    substep as f32 / 24.0,
-                ) else {
-                    continue;
-                };
-                curve.push(position);
             }
+        } else {
+            // A malformed derivative estimate must not make valid captured
+            // knots disappear; retain the honest piecewise-linear trajectory.
+            curve.extend(display_knots.iter().map(|knot| knot.position));
         }
-        // A gizmo line strip can be dropped wholesale by some WebGPU/browser
-        // combinations when its backing transient buffer wraps.  Submit each
-        // segment explicitly: whenever two trajectory points are visible,
-        // their connecting polyline segment is visible as well.
-        for segment in curve.windows(2) {
-            gizmos.line(segment[0], segment[1], Color::srgb(1.0, 0.16, 0.72));
-        }
-        for (index, knot) in display_knots.iter().enumerate() {
-            let hue = index as f32 / display_knots.len() as f32;
-            let color = Color::hsl(hue * 300.0 + 15.0, 0.9, 0.6);
-            gizmos.sphere(knot.position, 16.0, color);
-            gizmos.line(
-                knot.position - Vec3::X * 24.0,
-                knot.position + Vec3::X * 24.0,
-                color,
-            );
-            gizmos.line(
-                knot.position - Vec3::Y * 24.0,
-                knot.position + Vec3::Y * 24.0,
-                color,
-            );
+        if curve.len() >= 2 {
+            let denominator = curve.len().saturating_sub(1).max(1) as f32;
+            gizmos.linestrip_gradient(curve.iter().enumerate().map(|(index, position)| {
+                let t = index as f32 / denominator;
+                (
+                    *position,
+                    Color::hsl(315.0 - 45.0 * t, 0.92, 0.58 + 0.12 * t),
+                )
+            }));
         }
     }
     if show_normals.0
@@ -371,10 +349,11 @@ pub fn render_gizmos_system(
         && let Ok(mesh_gtf) = global_transforms.get(mesh_entity)
     {
         let rot = mesh_gtf.compute_transform().rotation;
-        for (i, &local_pos) in topo.positions.iter().enumerate() {
-            if i >= normals.0.len() {
-                break;
-            }
+        const MAX_VISIBLE_NORMALS: usize = 2_048;
+        let available = topo.positions.len().min(normals.0.len());
+        let stride = available.div_ceil(MAX_VISIBLE_NORMALS).max(1);
+        for i in (0..available).step_by(stride) {
+            let local_pos = topo.positions[i];
             let world_pos = mesh_gtf.transform_point(local_pos);
             let world_normal = (rot * normals.0[i]).normalize_or_zero();
             let tip = world_pos + world_normal * NORMAL_ARROW_LENGTH;

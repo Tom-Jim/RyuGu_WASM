@@ -16,8 +16,8 @@ pub fn benchmark_gravity_algorithms(iterations: u32) -> f64 {
         let werner = edge_log * (radius + 1.0).recip();
         let displacement = 0.05 * (index as f64 * 0.017).sin();
         let ratio = displacement / radius;
-        let taylor = ratio + 0.5 * ratio * ratio + 0.375 * ratio * ratio * ratio;
-        checksum += radial + werner + taylor;
+        let frequency_series = ratio + 0.5 * ratio * ratio + 0.375 * ratio * ratio * ratio;
+        checksum += radial + werner + frequency_series;
     }
     std::hint::black_box(checksum)
 }

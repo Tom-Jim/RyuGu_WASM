@@ -6,7 +6,7 @@ pub(crate) fn build_planning_fmm_gpu_payload(
     let started = bevy::platform::time::Instant::now();
     let densities = batch.density_models.get(model as usize*56..(model as usize+1)*56)?;
     let mass = *batch.density_model_masses.get(model as usize)?;
-    if batch.basis_records.is_empty() || !batch.eq106_source_radius.is_finite() || batch.eq106_source_radius <= 0.0
+    if batch.basis_records.is_empty() || !batch.frequency_domain_source_radius.is_finite() || batch.frequency_domain_source_radius <= 0.0
         || !mass.is_finite() || mass <= 0.0
         || densities.iter().any(|d| !d.is_finite() || *d < 0.0) { return None; }
     Some(PlanningMethodPayload {

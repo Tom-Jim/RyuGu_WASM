@@ -1,41 +1,41 @@
 pub fn convex_optimization_system(
     mut inversion: ResMut<TrajectoryInversionState>,
-    mut performance: ResMut<Eq106PerformanceMetrics>,
-    eq106_sensitivity: Res<Eq106SensitivityMatrix>,
+    mut performance: ResMut<FrequencyDomainPerformanceMetrics>,
+    frequency_domain_sensitivity: Res<FrequencyDomainSensitivityMatrix>,
 ) {
     let Some(mut job) = inversion.optimizer.take() else {
         return;
     };
     let matrix_assembly_started = Instant::now();
     let mut design_matrix_assembly_ms = 0.0;
-    if job.method == ActiveGravityMethod::CurvedArcEq106 {
-        if eq106_sensitivity.capture_id != Some(job.capture_id)
-            || eq106_sensitivity.source_hash != job.source_hash
-            || eq106_sensitivity.basis_hash != job.basis_sources.hash
-            || eq106_sensitivity.configuration_hash
-                != crate::gpu::eq106::eq106_sensitivity_configuration_hash()
-            || eq106_sensitivity.voxel_count != job.voxels.len()
+    if job.method == ActiveGravityMethod::FrequencyDomain {
+        if frequency_domain_sensitivity.capture_id != Some(job.capture_id)
+            || frequency_domain_sensitivity.source_hash != job.source_hash
+            || frequency_domain_sensitivity.basis_hash != job.basis_sources.hash
+            || frequency_domain_sensitivity.configuration_hash
+                != crate::gpu::frequency_domain::frequency_domain_sensitivity_configuration_hash()
+            || frequency_domain_sensitivity.voxel_count != job.voxels.len()
         {
             inversion.displayed_density = None;
-            inversion.error = Some("Eq.106 sensitivity cache identity does not match the frozen trajectory.".into());
+            inversion.error = Some("Frequency-domain algorithm sensitivity cache identity does not match the frozen trajectory.".into());
             return;
         }
-        if eq106_sensitivity.columns.len() < job.voxels.len() {
+        if frequency_domain_sensitivity.columns.len() < job.voxels.len() {
             inversion.optimizer = Some(job);
             return;
         }
-        if eq106_sensitivity.columns.len() != job.voxels.len()
-            || eq106_sensitivity.sample_count != job.observed_accelerations.len()
-            || eq106_sensitivity
+        if frequency_domain_sensitivity.columns.len() != job.voxels.len()
+            || frequency_domain_sensitivity.sample_count != job.observed_accelerations.len()
+            || frequency_domain_sensitivity
                 .columns
                 .iter()
-                .any(|column| column.len() != eq106_sensitivity.sample_count)
+                .any(|column| column.len() != frequency_domain_sensitivity.sample_count)
         {
             inversion.displayed_density = None;
             inversion.error = Some(format!(
-                "Eq.106 sensitivity matrix is invalid: {} columns, {} samples; expected {} x {}.",
-                eq106_sensitivity.columns.len(),
-                eq106_sensitivity.sample_count,
+                "Frequency-domain algorithm sensitivity matrix is invalid: {} columns, {} samples; expected {} x {}.",
+                frequency_domain_sensitivity.columns.len(),
+                frequency_domain_sensitivity.sample_count,
                 job.voxels.len(),
                 job.observed_accelerations.len(),
             ));
@@ -43,10 +43,10 @@ pub fn convex_optimization_system(
         }
         job.sensitivities.clear();
         job.sensitivities.reserve(
-            eq106_sensitivity.sample_count * eq106_sensitivity.voxel_count,
+            frequency_domain_sensitivity.sample_count * frequency_domain_sensitivity.voxel_count,
         );
-        for sample in 0..eq106_sensitivity.sample_count {
-            for column in &eq106_sensitivity.columns {
+        for sample in 0..frequency_domain_sensitivity.sample_count {
+            for column in &frequency_domain_sensitivity.columns {
                 job.sensitivities.push(column[sample]);
             }
         }
@@ -58,7 +58,7 @@ pub fn convex_optimization_system(
         }
         if !job.initial_objective.is_finite() {
             inversion.displayed_density = None;
-            inversion.error = Some("The Eq.106 sensitivity matrix is not finite.".into());
+            inversion.error = Some("The Frequency-domain algorithm sensitivity matrix is not finite.".into());
             return;
         }
     }
@@ -100,7 +100,7 @@ pub fn convex_optimization_system(
     job.timing.total_ms = inversion_time_ms;
     performance.full_inversion_iteration_ms = Some(inversion_time_ms);
     let result = density_result_from_job(&job, &densities, inversion_time_ms);
-    if completed_method == ActiveGravityMethod::CurvedArcEq106 {
+    if completed_method == ActiveGravityMethod::FrequencyDomain {
         let timing = performance.inversion.get_or_insert_default();
         timing.source_preparation_ms = job.source_preparation_ms;
         timing.design_matrix_assembly_ms += design_matrix_assembly_ms;

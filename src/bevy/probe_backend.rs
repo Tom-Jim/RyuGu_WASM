@@ -7,15 +7,11 @@ pub fn apply_probe_input_system(
     mut werner_potential: Option<ResMut<WernerPotential>>,
     mut radial_samples: Option<ResMut<RadialGravityHistory>>,
     mut werner_samples: Option<ResMut<WernerGravityHistory>>,
-    mut eq106_samples: Option<ResMut<Eq106GpuHistory>>,
     mut mmfft_samples: Option<ResMut<MmfftCompressedHistory>>,
     mut fmm_samples: Option<ResMut<FmmGravityHistory>>,
     mut simulation_clock: ResMut<SimulationClock>,
     mut jacobi_history: ResMut<JacobiHistory>,
-    mut curved_arc: ParamSet<(
-        ResMut<CurvedArcPlannerState>,
-        ResMut<CurvedArcResidualHistory>,
-    )>,
+    mut frequency_domain_result: ResMut<FrequencyDomainTrajectoryBatchResult>,
     mut cassini_query: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         With<CassiniMarker>,
@@ -37,7 +33,6 @@ pub fn apply_probe_input_system(
     for history in [
         radial_samples.as_deref_mut().map(|history| &mut history.0),
         werner_samples.as_deref_mut().map(|history| &mut history.0),
-        eq106_samples.as_deref_mut().map(|history| &mut history.0),
         mmfft_samples.as_deref_mut().map(|history| &mut history.0),
         fmm_samples.as_deref_mut().map(|history| &mut history.0),
     ]
@@ -48,8 +43,8 @@ pub fn apply_probe_input_system(
     }
     simulation_clock.reset_state();
     jacobi_history.reset();
-    curved_arc.p0().reset();
-    curved_arc.p1().reset();
+    frequency_domain_result.capture_id = None;
+    frequency_domain_result.observations.clear();
 
     if let Ok((mut transform, mut velocity, mut history)) = cassini_query.single_mut() {
         transform.translation = probe.position;
@@ -135,10 +130,10 @@ pub fn reset_after_probe_crash_state_system(
     mut jacobi: ResMut<JacobiHistory>,
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
     mut sensitivity: ResMut<DensitySensitivityCaches>,
+    mut frequency_domain_result: ResMut<FrequencyDomainTrajectoryBatchResult>,
     mut histories: ParamSet<(
         Option<ResMut<RadialGravityHistory>>,
         Option<ResMut<WernerGravityHistory>>,
-        Option<ResMut<Eq106GpuHistory>>,
         Option<ResMut<MmfftCompressedHistory>>,
         Option<ResMut<FmmGravityHistory>>,
     )>,
@@ -161,6 +156,8 @@ pub fn reset_after_probe_crash_state_system(
     benchmark.capture_id = None;
     benchmark.complete = false;
     *sensitivity = DensitySensitivityCaches::default();
+    frequency_domain_result.capture_id = None;
+    frequency_domain_result.observations.clear();
     if let Some(history) = histories.p0().as_deref_mut() {
         history.0.clear();
     }
@@ -173,8 +170,4 @@ pub fn reset_after_probe_crash_state_system(
     if let Some(history) = histories.p3().as_deref_mut() {
         history.0.clear();
     }
-    if let Some(history) = histories.p4().as_deref_mut() {
-        history.0.clear();
-    }
 }
-

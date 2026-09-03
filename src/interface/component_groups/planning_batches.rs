@@ -1,6 +1,6 @@
 pub const PLANNING_CANDIDATE_COUNT: u32 = 2_048;
 pub const PLANNING_FIRST_CANDIDATE_COUNT: u32 = 32;
-pub const PLANNING_TRAJECTORY_TUBE_RADIUS_METERS: f32 = 15.0;
+pub const PLANNING_PERTURBATION_RADIUS_METERS: f32 = 15.0;
 pub const PLANNING_GPU_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
@@ -12,7 +12,7 @@ pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
 /// Candidate propagation is CPU work in the browser's WASM thread.  Keep it
 /// deliberately small so JS input, painting, and Rust simulation can all get
-/// a turn between Volterra solves.
+/// a turn between propagation slices.
 pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 1;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
@@ -40,24 +40,16 @@ pub struct PlanningCandidateState {
     pub velocity_distance: [f32; 4],
     /// Body-to-world rotation quaternion `(x, y, z, w)`.
     pub body_rotation: [f32; 4],
-    /// Candidate index, sample index, Eq.106 segment index, reserved.
+    /// Candidate index, trajectory/Laplace observation index, backend block index, reserved.
     pub identity: [u32; 4],
 }
 
 impl PlanningCandidateState {
     pub fn body_position(self) -> Vec3 {
-        Vec3::from_array(
-            self.position_time[..3]
-                .try_into()
-                .expect("three position values"),
-        )
-    }
-
-    pub fn body_velocity(self) -> Vec3 {
-        Vec3::from_array(
-            self.velocity_distance[..3]
-                .try_into()
-                .expect("three velocity values"),
+        Vec3::new(
+            self.position_time[0],
+            self.position_time[1],
+            self.position_time[2],
         )
     }
 }
@@ -81,13 +73,13 @@ pub struct PlanningCandidateBatch {
     pub samples_per_candidate: u32,
     pub body_radius: f32,
     /// Exact enclosing radius of the spatially refined quadrature sources.
-    /// Eq.106 convergence bounds must use this value, not the radius of the
-    /// pre-refinement 1024-source aggregate.
-    pub eq106_source_radius: f32,
-    /// Fixed captured centre arc in body-fixed coordinates. Candidate states
-    /// are dynamically propagated from perturbed initial conditions under the
-    /// nominal density's nonlinear FMM field. Eq.106 builds one canonical
-    /// spectrum from this arc and shares it across the certified tube.
+    /// Frequency-domain convergence bounds use this refined point-quadrature
+    /// radius, not a nominal mesh radius.
+    pub frequency_domain_source_radius: f32,
+    /// Fixed captured centre trajectory in body-fixed coordinates. Candidate
+    /// states are propagated from perturbed initial conditions under the
+    /// nominal density's nonlinear FMM field. The equation-(184) transform
+    /// shares one density spectrum across these known samples.
     pub reference_states: Arc<[PlanningCandidateState]>,
     pub states: Arc<[PlanningCandidateState]>,
     pub gpu_position_bytes: Arc<[u8]>,
@@ -131,7 +123,7 @@ impl PlanningCandidateBatch {
             candidate_hash: self.candidate_hash,
             density_model_hash: self.density_model_hash,
             sample_hash: self.sample_hash,
-            tolerance_hash: 0x1060_1570_000f_2048,
+            tolerance_hash: 0x1840_1570_000f_2048,
             candidate_count: self.candidate_count,
             density_model_count: self.density_model_count,
             samples_per_candidate: self.samples_per_candidate,
@@ -149,9 +141,6 @@ pub struct PlanningGpuRequest {
     pub candidate_start: u32,
     pub candidate_count: u32,
     pub warm_repetition: bool,
-    /// Eq.106-only internal Taylor/spectral certificate and five-step self-FD.
-    /// Every method also receives a separate full external f64-certified pass.
-    pub eq106_certified: bool,
     /// First and Interactive Stress both use the fairness-oriented fixed
     /// schedule; the latter remains interactive through progress rendering.
     pub compute_benchmark: bool,
@@ -169,16 +158,12 @@ pub struct PlanningGpuTiming {
     pub kernel_ms: Option<f64>,
     /// Target field/Jacobian evaluator only (no basis or density combination).
     pub evaluation_kernel_ms: Option<f64>,
-    /// Measured Eq.106/FFT/FMM basis preparation passes. Large FMM stress
+    /// Measured Frequency-domain algorithm/FFT/FMM basis preparation passes. Large FMM stress
     /// windows may rebuild target responses; those executed passes are included.
     pub basis_kernel_ms: Option<f64>,
     pub dispatch_count: u32,
     pub forward_kernel_evaluations: u64,
-    pub spectral_element_count: u32,
-    /// Eq.106 analytic transverse Jacobian versus a same-field central finite
-    /// difference. Other backends report zero because this diagnostic is
-    /// specific to the cached Taylor reconstruction.
-    pub gradient_self_fd_relative_error: f32,
+    pub trajectory_block_count: u32,
 }
 
 /// Accumulate only a complete set of timestamp measurements. One unavailable
@@ -231,19 +216,10 @@ pub struct PlanningGpuPacket {
     pub state_indices: Vec<u32>,
     /// Four rows per target: acceleration/potential and three Jacobian columns.
     pub rows: Vec<[f32; 4]>,
-    /// Unmodified method output before certificate failures are converted to
-    /// common full-penalty rows.
+    /// Unmodified method output retained for the common external validation.
     pub raw_rows: Vec<[f32; 4]>,
-    /// Taylor, imaginary, spectral, transverse, self-FD, and non-finite
-    /// rejection counts. Non-Eq.106 methods leave these at zero.
-    pub rejection_counts: [u64; 6],
-    /// Validation rows charged the full penalty after candidate-level gating.
+    /// Validation rows rejected because candidate data was invalid or non-finite.
     pub rejected_sample_count: u64,
-    /// Maximum self-FD mismatch at 0.25, 0.5, 1, 2, and 4 metres.
-    pub self_fd_step_maxima: [f32; 5],
-    /// First certificate rejection as density, global candidate, sample,
-    /// Taylor segment, and reason index. Self-FD warnings do not reject.
-    pub first_rejection: Option<[u32; 5]>,
     /// One GPU-reduced row per candidate: field separation, baseline energy,
     /// minimum altitude, and Jacobian energy.
     pub candidate_metrics: Vec<[f32; 4]>,

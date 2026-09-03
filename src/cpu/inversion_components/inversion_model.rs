@@ -10,10 +10,16 @@
 // acceleration from a previously selected method is never an inverse input.
 
 use crate::interface::components::*;
-use crate::cpu::curved_arc::AggregatedGravitySource;
+use crate::cpu::frequency_domain::{
+    AggregatedGravitySource, EQ184_QUADRATURE_COUNT, eq184_laplace_sigma,
+    eq184_quadrature_node, eq184_trajectory_term,
+};
 use bevy::math::DVec3;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
+use num_complex::Complex64;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 
 // Fifteen Hermite intervals provide 241 acceleration samples (723 scalar
 // components). A 4^3 grid leaves the 56 shape-intersecting cells; mass

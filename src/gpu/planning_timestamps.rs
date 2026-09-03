@@ -14,7 +14,7 @@ use wgpu29::{
     ComputePassTimestampWrites, ErrorFilter, Features, QuerySet, QuerySetDescriptor, QueryType,
 };
 
-// FFT batches at most eight columns of nine passes; Eq.106 needs four,
+// FFT batches at most eight columns of nine passes; Frequency-domain algorithm needs four,
 // FMM/evaluation one. Capacity never grows with source/RHS counts or repeats.
 pub(crate) const PLANNING_TIMESTAMP_MAX_PASSES: u32 = 72;
 

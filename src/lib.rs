@@ -31,7 +31,8 @@ use bevy_app::{
     },
     energy::record_probe_jacobi_system,
     render::{
-        camera_follow_system, capture_trajectory_inversion_system, render_gizmos_system,
+        ScientificGizmos, camera_follow_system, camera_keyboard_zoom_system,
+        capture_trajectory_inversion_system, configure_scientific_gizmos, render_gizmos_system,
         render_section_system, section_alpha_system, setup_scene,
     },
     scale::{build_topology_system, normalize_model_scale_system},
@@ -39,21 +40,14 @@ use bevy_app::{
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
-pub use cpu::eq106_operator::{PsiOperatorTable, ToroidalOperatorTensor};
-pub use cpu::eq106_reference as eq106;
 use cpu::{
-    curved_arc::{
-        CurvedArcPlannerState, CurvedArcResidualHistory, build_aggregated_gravity_source_system,
-        monitor_curved_arc_system,
-    },
-    eq106_operator::build_eq106_operator_tensor_system,
+    frequency_domain::build_aggregated_gravity_source_system,
     inversion::{convex_optimization_system, start_density_inversion_system},
     physics::{physics_system, ryugu_rotation_system},
-    volterra::VolterraPropagationStatus,
 };
 use gpu::{
-    eq106::Eq106GpuComputePlugin,
     fmm::FmmComputePlugin,
+    frequency_domain::FrequencyDomainGpuComputePlugin,
     mmfft::MmfftCompressedComputePlugin,
     normals::NormalsComputePlugin,
     planning::PlanningGpuComputePlugin,
@@ -62,7 +56,7 @@ use gpu::{
 };
 use interface::components::{
     ActiveGravityMethod, CameraMode, DensityC, DensitySensitivityCaches, DisplayRotation,
-    Eq106GpuReadbackChannel, FmmReadbackChannel, GpuMemoryEstimate, GravityAcceleration,
+    FmmReadbackChannel, FrequencyDomainGpuReadbackChannel, GpuMemoryEstimate, GravityAcceleration,
     GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential, GravityReadbackChannel,
     GravityRuntimeError, JacobiHistory, MmfftReadbackChannel, NormalsReadbackChannel,
     PerformanceComparisonState, PlanningComparisonState, PlanningGpuReadbackChannel,
@@ -91,7 +85,7 @@ fn ryugu_render_error_handler(
             if let Some(channel) = main_world.get_resource::<PlanningGpuReadbackChannel>() {
                 channel.reset_after_device_loss();
             }
-            if let Some(channel) = main_world.get_resource::<Eq106GpuReadbackChannel>() {
+            if let Some(channel) = main_world.get_resource::<FrequencyDomainGpuReadbackChannel>() {
                 channel.reset_after_device_loss();
             }
             if let Some(channel) = main_world.get_resource::<GravityReadbackChannel>() {
@@ -372,6 +366,7 @@ pub(crate) fn browser_is_mobile() -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 pub(crate) fn set_display_rotation(_quarter_turn: u8) {}
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
@@ -455,9 +450,6 @@ pub fn main() {
         .init_resource::<ProbeCrashResetRequest>()
         .init_resource::<DisplayRotation>()
         .init_resource::<PerformanceComparisonState>()
-        .init_resource::<CurvedArcPlannerState>()
-        .init_resource::<CurvedArcResidualHistory>()
-        .init_resource::<VolterraPropagationStatus>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             // In browsers, Continuous is driven by requestAnimationFrame.
@@ -510,7 +502,8 @@ pub fn main() {
         )
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(WgslPlugin)
-        .add_plugins(FrameTimeDiagnosticsPlugin::default());
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .init_gizmo_group::<ScientificGizmos>();
 
     // Bevy's default handler exits on every render error. DeviceLost is
     // recoverable in WebGPU, so replace it with a handler that resets shared
@@ -532,7 +525,7 @@ pub fn main() {
         app.add_plugins(NormalsComputePlugin);
         app.add_plugins(GravityComputePlugin);
         app.add_plugins(WernerComputePlugin);
-        app.add_plugins(Eq106GpuComputePlugin);
+        app.add_plugins(FrequencyDomainGpuComputePlugin);
         // MMFFT+compression is the fourth GPU integration slot. Its packed
         // source buffer and tiled reduction are built once and evaluated in
         // the render-world compute pass.
@@ -540,7 +533,7 @@ pub fn main() {
         app.add_plugins(FmmComputePlugin);
     }
 
-    app.add_systems(Startup, setup_scene);
+    app.add_systems(Startup, (configure_scientific_gizmos, setup_scene).chain());
 
     #[cfg(target_arch = "wasm32")]
     if is_mobile_browser {
@@ -586,10 +579,6 @@ pub fn main() {
     )
     .add_systems(
         Update,
-        build_eq106_operator_tensor_system.after(build_aggregated_gravity_source_system),
-    )
-    .add_systems(
-        Update,
         (
             method_selection_system,
             clear_gpu_histories_on_method_change,
@@ -626,6 +615,7 @@ pub fn main() {
         (
             performance_comparison_system,
             camera_follow_system,
+            camera_keyboard_zoom_system.after(camera_follow_system),
             update_gpu_memory_estimate_system,
             section_alpha_system,
         )
@@ -638,7 +628,6 @@ pub fn main() {
     .add_systems(
         FixedUpdate,
         (
-            monitor_curved_arc_system,
             physics_system,
             probe_collision_system,
             ryugu_rotation_system,

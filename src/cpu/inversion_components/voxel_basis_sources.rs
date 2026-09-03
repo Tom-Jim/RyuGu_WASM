@@ -65,20 +65,19 @@ pub(crate) fn build_voxel_basis_sources(
         })
         .collect::<Vec<_>>();
 
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut hasher = DefaultHasher::new();
     for (column, sources) in columns.iter().enumerate() {
-        hash = fnv_mix(hash, column as u64);
-        hash = fnv_mix(hash, sources.len() as u64);
+        hasher.write_usize(column);
+        hasher.write_usize(sources.len());
         for source in sources {
-            hash = fnv_mix(hash, source.position.x.to_bits());
-            hash = fnv_mix(hash, source.position.y.to_bits());
-            hash = fnv_mix(hash, source.position.z.to_bits());
-            hash = fnv_mix(hash, source.volume.to_bits());
+            hasher.write_u64(source.position.x.to_bits());
+            hasher.write_u64(source.position.y.to_bits());
+            hasher.write_u64(source.position.z.to_bits());
+            hasher.write_u64(source.volume.to_bits());
         }
     }
-    Some(VoxelBasisSources { columns, hash })
-}
-
-fn fnv_mix(hash: u64, value: u64) -> u64 {
-    (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+    Some(VoxelBasisSources {
+        columns,
+        hash: hasher.finish(),
+    })
 }

@@ -46,8 +46,8 @@ pub(crate) fn build_planning_mmfft_payload(
 fn planning_fft_half_extents(batch: &PlanningCandidateBatch) -> Option<[f64; 2]> {
     // Keep the 64^3 / 16^3 FFT sizes. Fit every source/target, with 4.5 cells
     // of padding (including a half-cell safety margin against f32 rounding).
-    if !batch.eq106_source_radius.is_finite() { return None; }
-    let mut extent = f64::from(batch.eq106_source_radius).max(1.0);
+    if !batch.frequency_domain_source_radius.is_finite() { return None; }
+    let mut extent = f64::from(batch.frequency_domain_source_radius).max(1.0);
     for state in batch.states.iter() {
         for value in state.body_position().to_array() {
             if !value.is_finite() { return None; }
@@ -90,7 +90,7 @@ mod planning_potential_tests {
     fn fitted_grid_covers_sources_and_targets_with_full_stencil_margin() {
         for distance in [620.0_f32, 2000.0, 16000.0] {
             let mut batch = PlanningCandidateBatch {
-                eq106_source_radius: 650.0,
+                frequency_domain_source_radius: 650.0,
                 basis_records: Arc::from(vec![PlanningBasisRecord {
                     position_volume: [-500.0, 400.0, 50.0, 1.0],
                     voxel_index: 0,

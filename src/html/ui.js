@@ -77,11 +77,11 @@ window.ryuguPlanningProgress = (planning) => ({
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
   const push = (type, value, extra = {}) => queue.push(JSON.stringify({ type, value, ...extra }));
-  const methodKeys = ['radial', 'werner', 'eq106', 'fft', 'fmm'];
-  const methodLabels = ['Radial', 'Werner', 'Eq.106', 'Packed FFT', 'FMM'];
+  const methodKeys = ['radial', 'werner', 'frequency_domain', 'fft', 'fmm'];
+  const methodLabels = ['Radial', 'Werner', 'Frequency-domain algorithm', 'Packed FFT', 'FMM'];
   const methodColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77'];
   const curveColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
-  const curveLabels = ['Eq.106 raw total', 'Eq.106 checked total', 'FFT raw total', 'FFT checked total', 'FMM raw total', 'FMM checked total'];
+  const curveLabels = ['Eq. (184) raw total', 'Eq. (184) checked total', 'FFT raw total', 'FFT checked total', 'FMM raw total', 'FMM checked total'];
   const quadratureSourceCounts = [32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000];
   const metricFields = {
     density: ['density', ''],
@@ -573,7 +573,7 @@ window.ryuguPlanningProgress = (planning) => ({
     inversionButton.hidden = !inversionSupported;
     if (!inversionSupported) {
       status.dataset.state = 'forward-only';
-      status.textContent = 'Forward-only method. Switch to Eq.106, Packed FFT, or FMM to invert the shared Radial trajectory.';
+      status.textContent = 'Forward-only method. Switch to the frequency-domain algorithm, Packed FFT, or FMM to invert the shared Radial trajectory.';
     } else if (inversion.error) {
       status.dataset.state = 'error';
       status.textContent = inversion.error;
@@ -617,15 +617,6 @@ window.ryuguPlanningProgress = (planning) => ({
     });
     $('#trajectory-fields').replaceChildren(...fields);
   }
-  function renderResidual(residual) {
-    const card = $('#residual-card');
-    card.hidden = !residual.visible;
-    if (!residual.visible) return;
-    $('#residual-order').textContent = `ORDER ${residual.order} · ${residual.mode}`;
-    const remainder = Number.isFinite(residual.remainder) ? residual.remainder.toExponential(2) : '--';
-    const relative = Number.isFinite(residual.relativeResidual) ? residual.relativeResidual.toExponential(2) : '--';
-    $('#residual-diagnostics').textContent = `segments ${residual.segments} · accepted/rejected ${residual.accepted}/${residual.rejected} · Picard ${residual.picardIterations ?? '--'} · endpoint ${residual.endpointIterations ?? '--'} · remainder ${remainder} · relative ${relative}`;
-  }
   // Vue/ECharts is the primary telemetry renderer. This lightweight SVG path is
   // deliberately kept as a resilience fallback: mobile port forwarding can
   // occasionally lose the deferred module request after the page and WASM have
@@ -653,20 +644,13 @@ window.ryuguPlanningProgress = (planning) => ({
   }
   function renderTelemetryFallback(snapshot) {
     if (window.ryuguTelemetryReady) return;
-    const residual = telemetryWindow(snapshot.eq106Residual?.samples, (sample) => [Number(sample.time), Number(sample.epsilon)], true);
-    const jacobi = telemetryWindow(snapshot.jacobi, (sample) => [Number(sample[0]), Number(sample[1])]);
-    drawChart(fallbackTelemetrySvg($('#residual-chart'), 'residual'), [{ label: 'Eq.106 residual', color: '#36e7f2', points: residual }], {
-      yLog: true,
-      xLabel: 't (s)',
-      yLabel: 'ε max',
-      xDomain: telemetryDomain(residual),
-      empty: 'Waiting for residual samples…',
-    });
-    drawChart(fallbackTelemetrySvg($('#jacobi-chart'), 'jacobi'), [{ label: 'Jacobi constant', color: '#43df81', points: jacobi }], {
-      xLabel: 't (s)',
-      yLabel: 'Cⱼ',
-      xDomain: telemetryDomain(jacobi),
-      empty: 'Waiting for Jacobi samples…',
+    const transform = snapshot.method === 'frequency_domain';
+    const points = telemetryWindow(transform ? snapshot.frequencyDomain : snapshot.jacobi, (sample) => [Number(sample[0]), Number(sample[1])]);
+    drawChart(fallbackTelemetrySvg($('#jacobi-chart'), 'diagnostic'), [{ label: transform ? 'Frequency-domain algorithm norm' : 'Jacobi constant', color: transform ? '#36e7f2' : '#43df81', points }], {
+      xLabel: transform ? 'σ (s⁻¹)' : 't (s)',
+      yLabel: transform ? '‖g̃γ(σ)‖' : 'Cⱼ',
+      xDomain: telemetryDomain(points),
+      empty: transform ? 'Waiting for equation (184) transform…' : 'Waiting for Jacobi samples…',
     });
   }
   function renderPerformance(performance) {
@@ -799,7 +783,6 @@ window.ryuguPlanningProgress = (planning) => ({
       // The fullscreen benchmark covers these charts. Keep state snapshots,
       // but do not rebuild invisible SVGs/tables while it is open.
       if (!snapshot.planning.visible) {
-        renderResidual(snapshot.eq106Residual);
         renderTelemetryFallback(snapshot);
         renderPlanning(snapshot.planning);
         renderInversion(snapshot.inversion, snapshot.method);

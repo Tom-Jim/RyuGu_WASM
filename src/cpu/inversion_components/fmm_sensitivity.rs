@@ -37,8 +37,8 @@ struct FmmNode {
     points: Vec<(DVec3, f64)>,
 }
 
-/// Source-count-independent nonlinear field used to close planning Picard
-/// trajectories.  It reuses the same quadrupole FMM implementation as the FMM
+/// Source-count-independent nonlinear field used for planning propagation. It
+/// reuses the same quadrupole FMM implementation as the FMM
 /// sensitivity path instead of maintaining another hand-written tree.
 pub(crate) struct PlanningDynamicsTree(FmmNode);
 
@@ -47,7 +47,7 @@ impl PlanningDynamicsTree {
         // Candidate generation needs a closed nonlinear field, but it is not
         // the independent certification oracle below.  Use the production FMM
         // opening criterion here; the stricter reference criterion would
-        // collapse most near-body nodes to direct sums on every Picard sweep.
+        // collapse most near-body nodes to direct sums during propagation.
         let acceleration = evaluate_fmm(&self.0, body_position, FMM_THETA) * f64::from(G);
         acceleration.is_finite().then_some(acceleration)
     }

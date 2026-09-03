@@ -13,7 +13,7 @@ use bevy::shader::Shader;
 pub(crate) enum EmbeddedShader {
     Gravity,
     Werner,
-    Eq106,
+    FrequencyDomain,
     Mmfft,
     Fmm,
     Normals,
@@ -28,7 +28,7 @@ pub(crate) fn load(server: &AssetServer, shader: EmbeddedShader) -> Handle<Shade
     match shader {
         EmbeddedShader::Gravity => load_embedded_asset!(server, "gravity.wgsl"),
         EmbeddedShader::Werner => load_embedded_asset!(server, "werner_gravity.wgsl"),
-        EmbeddedShader::Eq106 => load_embedded_asset!(server, "eq106_complex.wgsl"),
+        EmbeddedShader::FrequencyDomain => load_embedded_asset!(server, "frequency_domain.wgsl"),
         EmbeddedShader::Mmfft => load_embedded_asset!(server, "mmfft_compressed.wgsl"),
         EmbeddedShader::Fmm => load_embedded_asset!(server, "fmm_gravity.wgsl"),
         EmbeddedShader::Normals => load_embedded_asset!(server, "normals.wgsl"),
@@ -48,7 +48,7 @@ impl Plugin for WgslPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "gravity.wgsl");
         embedded_asset!(app, "werner_gravity.wgsl");
-        embedded_asset!(app, "eq106_complex.wgsl");
+        embedded_asset!(app, "frequency_domain.wgsl");
         embedded_asset!(app, "mmfft_compressed.wgsl");
         embedded_asset!(app, "fmm_gravity.wgsl");
         embedded_asset!(app, "normals.wgsl");
@@ -64,7 +64,7 @@ impl Plugin for WgslPlugin {
 // version. This catches helper-function errors before they cascade into
 // misleading "entry point does not exist" messages for every GPU pipeline.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod planning_shader_tests {
+mod shader_validation_tests {
     use wgpu29::naga;
 
     #[test]
@@ -144,5 +144,70 @@ mod planning_shader_tests {
             bindings.sort_unstable();
             assert_eq!(bindings, (0..binding_count).collect::<Vec<_>>(), "{name}");
         }
+    }
+
+    #[test]
+    fn frequency_domain_variants_validate_with_the_runtime_shader_frontend() {
+        let original = include_str!("frequency_domain.wgsl");
+        assert!(original.contains(&format!(
+            "const WAVE_VECTOR_COUNT: u32 = {}u;",
+            crate::cpu::frequency_domain::EQ184_QUADRATURE_COUNT,
+        )));
+        for (definition, entry_names) in [
+            (
+                "FREQUENCY_DOMAIN_SOURCE",
+                &[
+                    "assemble_density_spectrum",
+                    "assemble_voxel_density_spectrum",
+                ][..],
+            ),
+            (
+                "FREQUENCY_DOMAIN_SPECTRUM",
+                &[
+                    "publish_density_spectrum",
+                    "publish_voxel_density_spectrum",
+                    "combine_density_spectrum",
+                ][..],
+            ),
+            (
+                "FREQUENCY_DOMAIN_EVALUATOR",
+                &["evaluate_trajectory_field"][..],
+            ),
+        ] {
+            let source = select_shader_definition(original, definition);
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{definition}: {}", error.emit_to_string(&source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{definition}: {}", error.emit_to_string(&source)));
+            assert_eq!(module.entry_points.len(), entry_names.len(), "{definition}");
+            for entry in entry_names {
+                assert!(
+                    module.entry_points.iter().any(|point| {
+                        point.name == *entry && point.stage == naga::ShaderStage::Compute
+                    }),
+                    "{definition}: missing compute entry {entry}",
+                );
+            }
+        }
+    }
+
+    fn select_shader_definition(source: &str, enabled: &str) -> String {
+        let mut include = true;
+        let mut selected = String::with_capacity(source.len());
+        for line in source.lines() {
+            if let Some(definition) = line.trim().strip_prefix("#ifdef ") {
+                include = definition == enabled;
+            } else if line.trim() == "#endif" {
+                include = true;
+            } else if include {
+                selected.push_str(line);
+                selected.push('\n');
+            }
+        }
+        selected
     }
 }

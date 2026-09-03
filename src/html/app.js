@@ -118,7 +118,6 @@ const useViewportNavigation = () => {
     if (!isCanvasTarget(event.target)) return;
     stopEvent(event);
   };
-
   onMounted(() => {
     viewportFrame = document.getElementById('viewport-frame');
     canvas = document.getElementById('bevy');
@@ -194,13 +193,18 @@ const LIVE_SAMPLE_WINDOW = 96;
 const chartNumber = (value) => Number(value).toExponential(3).replace(/\.?(?:0+)e/, 'e').replace('e+', 'e');
 const chartAxisNumber = (value) => Number(value).toExponential(5).replace(/\.?(?:0+)e/, 'e').replace('e+', 'e');
 
-function recentTelemetryPoints(snapshot, kind) {
-  const source = kind === 'jacobi'
-    ? snapshot?.jacobi ?? []
-    : snapshot?.eq106Residual?.samples ?? [];
-  const points = source
-    .map((sample) => kind === 'jacobi' ? [Number(sample[0]), Number(sample[1])] : [Number(sample.time), Number(sample.epsilon)])
-    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value) && (kind !== 'residual' || value > 0));
+function frequencyDisplayScale(points) {
+  const maximum = Math.max(0, ...points.map(([, value]) => Math.abs(value)));
+  if (!Number.isFinite(maximum) || maximum === 0) return { factor: 1, exponent: 0 };
+  const exponent = Math.floor(Math.log10(maximum));
+  return { factor: 10 ** exponent, exponent };
+}
+
+function recentTelemetryPoints(snapshot) {
+  const transform = snapshot?.method === 'frequency_domain';
+  const points = (transform ? snapshot?.frequencyDomain ?? [] : snapshot?.jacobi ?? [])
+    .map((sample) => [Number(sample[0]), Number(sample[1])])
+    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));
   return points.slice(-LIVE_SAMPLE_WINDOW);
 }
 
@@ -229,11 +233,14 @@ function paddedTimeDomain(points) {
   return [low - pad, high + pad];
 }
 
-function telemetryOption(points, kind) {
-  const isResidual = kind === 'residual';
-  const domain = paddedDomain(points, isResidual);
+function telemetryOption(points, transform) {
+  const frequencyScale = transform ? frequencyDisplayScale(points) : { factor: 1, exponent: 0 };
+  const plottedPoints = transform
+    ? points.map(([frequency, magnitude]) => [frequency, magnitude / frequencyScale.factor])
+    : points;
+  const domain = paddedDomain(plottedPoints, false);
   const timeDomain = paddedTimeDomain(points);
-  const color = isResidual ? '#36e7f2' : '#43df81';
+  const color = transform ? '#36e7f2' : '#43df81';
   const last = points.at(-1);
   return {
     animation: false,
@@ -249,7 +256,9 @@ function telemetryOption(points, kind) {
       formatter: (items) => {
         const item = items?.[0];
         if (!item) return 'Waiting for samples';
-        return `t ${chartNumber(item.value[0])} s<br/>${isResidual ? 'ε max' : 'Cⱼ'} ${chartNumber(item.value[1])}`;
+        return transform
+          ? `σ ${chartNumber(item.value[0])} s⁻¹<br/>‖g̃γ(σ)‖ ${chartNumber(item.value[1] * frequencyScale.factor)}`
+          : `t ${chartNumber(item.value[0])} s<br/>Cⱼ ${chartNumber(item.value[1])}`;
       },
     },
     xAxis: {
@@ -257,7 +266,7 @@ function telemetryOption(points, kind) {
       min: timeDomain?.[0],
       max: timeDomain?.[1],
       scale: true,
-      name: 't (s)',
+      name: transform ? 'σ (s⁻¹)' : 't (s)',
       nameLocation: 'middle',
       nameGap: 20,
       nameTextStyle: { color: '#789097', fontSize: 9, fontFamily: 'ui-monospace, monospace' },
@@ -267,9 +276,9 @@ function telemetryOption(points, kind) {
       axisLabel: { color: '#7e9aa0', fontSize: 9, fontFamily: 'ui-monospace, monospace', formatter: chartNumber, hideOverlap: true },
     },
     yAxis: {
-      type: isResidual ? 'log' : 'value',
+      type: 'value',
       logBase: 10,
-      name: isResidual ? 'ε max' : 'Cⱼ',
+      name: transform ? `‖g̃γ(σ)‖ × 10^${frequencyScale.exponent}` : 'Cⱼ',
       nameLocation: 'middle',
       nameGap: 37,
       nameTextStyle: { color: '#789097', fontSize: 9, fontFamily: 'ui-monospace, monospace' },
@@ -279,24 +288,33 @@ function telemetryOption(points, kind) {
       axisLine: { lineStyle: { color: 'rgba(120, 208, 213, .36)' } },
       axisTick: { show: false },
       splitLine: { show: true, lineStyle: { color: 'rgba(103, 193, 198, .10)' } },
-      axisLabel: { color: '#7e9aa0', fontSize: 9, fontFamily: 'ui-monospace, monospace', formatter: chartAxisNumber, hideOverlap: true },
+      axisLabel: {
+        color: '#7e9aa0',
+        fontSize: 9,
+        fontFamily: 'ui-monospace, monospace',
+        formatter: transform ? (value) => Number(value).toFixed(3) : chartAxisNumber,
+        hideOverlap: true,
+      },
     },
     series: [{
       type: 'line',
-      name: isResidual ? 'Eq.106 residual' : 'Jacobi constant',
-      data: points,
-      showSymbol: false,
+      name: transform ? 'Frequency-domain algorithm norm' : 'Jacobi constant',
+      data: plottedPoints,
+      showSymbol: transform,
+      symbol: 'circle',
+      symbolSize: transform ? 4 : 0,
       clip: true,
-      sampling: 'lttb',
+      sampling: transform ? undefined : 'lttb',
+      smooth: false,
       lineStyle: { color, width: 2 },
       itemStyle: { color },
-      areaStyle: { color: isResidual ? 'rgba(54, 231, 242, .08)' : 'rgba(67, 223, 129, .07)' },
+      areaStyle: { color: transform ? 'rgba(54, 231, 242, .08)' : 'rgba(67, 223, 129, .07)' },
       markPoint: last ? { symbol: 'circle', symbolSize: 7, itemStyle: { color, borderColor: '#02090b', borderWidth: 1 }, label: { show: false }, data: [{ coord: last }] } : undefined,
     }],
   };
 }
 
-function mountTelemetryChart(target, kind) {
+function mountTelemetryChart(target) {
   createApp({
     components: { VChart },
     setup() {
@@ -304,14 +322,31 @@ function mountTelemetryChart(target, kind) {
       // the most recent UI snapshot immediately instead of waiting for the
       // next render tick.
       const snapshot = ref(window.ryuguUi?.snapshot ?? null);
-      const update = (event) => { snapshot.value = event.detail ?? null; };
-      const points = computed(() => recentTelemetryPoints(snapshot.value, kind));
-      const option = computed(() => telemetryOption(points.value, kind));
+      const update = (event) => {
+        const next = event.detail;
+        if (!next) return;
+        const previous = snapshot.value;
+        const sameMethod = previous?.method === next.method;
+        const retainIfEmpty = (field) => {
+          const incoming = Array.isArray(next[field]) ? next[field] : [];
+          if (incoming.length > 0 || !sameMethod) return incoming;
+          return Array.isArray(previous?.[field]) ? previous[field] : [];
+        };
+        snapshot.value = {
+          ...next,
+          jacobi: retainIfEmpty('jacobi'),
+          frequencyDomain: retainIfEmpty('frequencyDomain'),
+        };
+      };
+      const points = computed(() => recentTelemetryPoints(snapshot.value));
+      const transform = computed(() => snapshot.value?.method === 'frequency_domain');
+      const option = computed(() => telemetryOption(points.value, transform.value));
       const windowLabel = computed(() => {
         if (!points.value.length) return 'WAITING FOR SAMPLES';
         const [start] = points.value[0];
         const [end] = points.value.at(-1);
-        return `${points.value.length} SAMPLES · ${chartNumber(start)}–${chartNumber(end)} s`;
+        const unit = transform.value ? 's⁻¹' : 's';
+        return `${points.value.length} SAMPLES · ${chartNumber(start)}–${chartNumber(end)} ${unit}`;
       });
       onMounted(() => window.addEventListener('ryugu-snapshot', update));
       onBeforeUnmount(() => window.removeEventListener('ryugu-snapshot', update));
@@ -321,12 +356,11 @@ function mountTelemetryChart(target, kind) {
   }).mount(target);
 }
 
-mountTelemetryChart('#residual-chart', 'residual');
-mountTelemetryChart('#jacobi-chart', 'jacobi');
+mountTelemetryChart('#jacobi-chart');
 window.ryuguTelemetryReady = true;
 
 const benchmarkColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77', '#a8f7bd'];
-const benchmarkLabels = ['Radial', 'Werner', 'Eq.106', 'Packed FFT', 'FMM'];
+const benchmarkLabels = ['Radial', 'Werner', 'Frequency-domain algorithm', 'Packed FFT', 'FMM'];
 
 const modalAxisStyle = {
   axisLine: { lineStyle: { color: 'rgba(120, 208, 213, .38)' } },

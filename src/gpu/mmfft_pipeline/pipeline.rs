@@ -248,7 +248,7 @@ pub(crate) fn voxel_basis_sensitivities(
 
 pub fn build_mmfft_compressed_source_system(
     mut commands: Commands,
-    aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
+    aggregated: Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>,
     existing: Option<Res<MmfftCompressedSource>>,
     active_method: Res<ActiveGravityMethod>,
     planning: Res<PlanningComparisonState>,
@@ -319,12 +319,8 @@ fn poll_mmfft_readback(
     if total.xyz().is_finite() && total.w.is_finite() && total.w > 0.0 {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
-            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
-            #[cfg(feature = "eq106-dual-certificate")]
-            independent_positive_potential: None,
-            body_acceleration_jacobian: None,
         });
     } else {
         warn!("[mmfft] discarded non-finite compressed GPU result");
@@ -337,7 +333,7 @@ fn extract_mmfft_input_system(
     active_method: Extract<Res<ActiveGravityMethod>>,
     planning: Extract<Res<PlanningComparisonState>>,
     clock: Extract<Res<SimulationClock>>,
-    cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
+    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
     extracted.enabled = **active_method == ActiveGravityMethod::MmfftCompressed
@@ -345,7 +341,7 @@ fn extract_mmfft_input_system(
     if !extracted.enabled {
         return;
     }
-    let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
+    let (Some(source), Ok(cassini), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
         return;
@@ -355,10 +351,6 @@ fn extract_mmfft_input_system(
         request_id: clock.request_id,
         epoch: clock.epoch,
         simulation_time_seconds: clock.elapsed_seconds,
-        body_position: extracted.probe,
-        ryugu_transform: *ryugu,
-        probe_position: cassini.translation,
-        probe_velocity: velocity.0,
     });
     extracted.grid_sizes = source.grid_sizes;
     extracted.level_count = source.level_count;

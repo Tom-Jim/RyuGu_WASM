@@ -3,10 +3,7 @@
 //! The web UI owns controls, text, SVG, and dialogs. This module only consumes
 //! typed requests and advances Bevy resources used by physics and GPU work.
 
-use crate::cpu::curved_arc::{
-    AggregatedGravitySource, CurvedArcPlannerState, CurvedArcResidualHistory,
-};
-use crate::cpu::eq106_operator::Eq106OperatorTensorResource;
+use crate::cpu::frequency_domain::{AggregatedGravitySource, EQ184_QUADRATURE_COUNT};
 use crate::gpu::werner::{WernerAcceleration, WernerPotential};
 use crate::interface::components::*;
 use bevy::prelude::*;
@@ -26,10 +23,7 @@ pub fn method_selection_system(
     mut clock: ResMut<SimulationClock>,
     mut jacobi: ResMut<JacobiHistory>,
     mut inversion: ResMut<TrajectoryInversionState>,
-    mut curved_arc: ParamSet<(
-        ResMut<CurvedArcPlannerState>,
-        ResMut<CurvedArcResidualHistory>,
-    )>,
+    mut frequency_domain_result: ResMut<FrequencyDomainTrajectoryBatchResult>,
     mut cassini_query: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         With<CassiniMarker>,
@@ -52,8 +46,6 @@ pub fn method_selection_system(
     }
     clock.reset_state();
     jacobi.reset();
-    curved_arc.p0().reset();
-    curved_arc.p1().reset();
     if let Ok((mut transform, mut velocity, mut history)) = cassini_query.single_mut() {
         transform.translation = probe.position;
         velocity.0 = probe.velocity();
@@ -69,12 +61,13 @@ pub fn method_selection_system(
     inversion.optimizer = None;
     inversion.ready = false;
     inversion.start_requested = queued_inversion;
+    frequency_domain_result.capture_id = None;
+    frequency_domain_result.observations.clear();
 }
 
 pub fn clear_gpu_histories_on_method_change(
     active: Res<ActiveGravityMethod>,
     mut werner: Option<ResMut<WernerGravityHistory>>,
-    mut eq106: Option<ResMut<Eq106GpuHistory>>,
     mut mmfft: Option<ResMut<MmfftCompressedHistory>>,
     mut fmm: Option<ResMut<FmmGravityHistory>>,
 ) {
@@ -85,9 +78,6 @@ pub fn clear_gpu_histories_on_method_change(
     // shared by the three inverse-capable methods. Probe changes clear it in
     // `apply_probe_input_system`, which starts a genuinely new experiment.
     if let Some(value) = werner.as_deref_mut() {
-        value.0.clear();
-    }
-    if let Some(value) = eq106.as_deref_mut() {
         value.0.clear();
     }
     if let Some(value) = mmfft.as_deref_mut() {
@@ -110,7 +100,6 @@ pub fn reset_inversion_on_method_change(
     inversion.capture_id = None;
     inversion.capture_source_hash = 0;
     inversion.ready = false;
-    inversion.raw_samples.clear();
     inversion.knots.clear();
     inversion.optimizer = None;
     inversion.start_requested = queued_inversion;
@@ -120,8 +109,7 @@ pub fn reset_inversion_on_method_change(
 pub fn update_gpu_memory_estimate_system(
     aggregated: Option<Res<AggregatedGravitySource>>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
-    eq106_tensor: Option<Res<Eq106OperatorTensorResource>>,
-    eq106_performance: Res<Eq106PerformanceMetrics>,
+    frequency_domain_performance: Res<FrequencyDomainPerformanceMetrics>,
     mmfft: Option<Res<MmfftCompressedSource>>,
     fmm: Option<Res<FmmSource>>,
     mut estimate: ResMut<GpuMemoryEstimate>,
@@ -137,18 +125,17 @@ pub fn update_gpu_memory_estimate_system(
         let item_count = edge_count.max(face_count) as u32;
         bytes[1] = edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
     }
-    if let (Some(source), Some(tensor)) = (aggregated.as_ref(), eq106_tensor) {
-        let timing = eq106_performance.latest.unwrap_or_default();
+    if let Some(source) = aggregated.as_ref() {
+        let timing = frequency_domain_performance.latest.unwrap_or_default();
         let target_count = u64::from(timing.target_count.max(1));
+        let quadrature_count = EQ184_QUADRATURE_COUNT as u64;
         bytes[2] = source.sources.len() as u64 * 16
-            + source.fourier_modes.len() as u64 * 16
-            + 64 * (129 + 1) * 8
-            + tensor.tensor.coefficients.len() as u64 * 4
+            + quadrature_count * 16
             + 96 * 256
-            + 45 * 64 * 16
-            + 45 * 129 * 32
+            + quadrature_count * 16
+            + quadrature_count * 32
             + target_count * 16
-            + 2 * target_count * 9 * 16;
+            + 2 * target_count * 11 * 16;
     }
     if let Some(source) = mmfft {
         bytes[3] = source.bytes.len() as u64 + 64 + 32;
@@ -225,7 +212,7 @@ fn method_for_phase(phase: usize) -> ActiveGravityMethod {
     match phase {
         0 => ActiveGravityMethod::RadialAnalytic,
         1 => ActiveGravityMethod::HomogeneousWerner,
-        2 => ActiveGravityMethod::CurvedArcEq106,
+        2 => ActiveGravityMethod::FrequencyDomain,
         3 => ActiveGravityMethod::MmfftCompressed,
         _ => ActiveGravityMethod::Fmm,
     }

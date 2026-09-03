@@ -2,18 +2,15 @@
 name = "ryugu_wasm"
 version = "0.1.0"
 edition = "2024"
+description = "Browser-based WebGPU gravity and trajectory laboratory for asteroid Ryugu"
+license = "MIT"
+repository = "https://github.com/Tom-Jim/RyuGu_WASM"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-regenerate-operators = []
-eq106-dual-certificate = []
-
-[[example]]
-name = "generate_eq106_psi_table"
-required-features = ["regenerate-operators"]
 
 [dependencies]
 bevy = { version = "0.19.1", features = ["webgpu","debug"] }
@@ -51,3 +48,6 @@ codegen-units = 1
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

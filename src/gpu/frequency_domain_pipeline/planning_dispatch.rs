@@ -1,14 +1,14 @@
 use std::sync::atomic::AtomicU32;
 
 #[derive(Resource)]
-struct PlanningEq106DispatchState {
+struct PlanningFrequencyDomainDispatchState {
     last_request_id: u64,
     active_request_id: u64,
     next_stage: usize,
     active_started: Option<Instant>,
     active_method_preprocess_ms: f64,
     active_command_submission_ms: f64,
-    active_elements: Vec<Eq106BatchElement>,
+    active_elements: Vec<FrequencyDomainBatchElement>,
     active_invalid_candidates: Vec<u32>,
     active_maximum_elements_per_candidate: u32,
     active_build_spectrum: bool,
@@ -32,25 +32,23 @@ struct PlanningEq106DispatchState {
     layout: Option<BindGroupLayout>,
     sources: Option<Buffer>,
     quadrature: Option<Buffer>,
-    operator: Option<Buffer>,
-    dummy_modes: Option<Buffer>,
     spectrum: Option<Buffer>,
-    line_samples: Option<Buffer>,
+    density_spectra: Option<Buffer>,
     source_groups: Option<Buffer>,
     output: Option<Buffer>,
     baseline: Option<Buffer>,
     metrics: Option<Buffer>,
     staging: Option<Buffer>,
-    canonical_elements: Vec<Eq106BatchElement>,
+    canonical_elements: Vec<FrequencyDomainBatchElement>,
     spectrum_ready: bool,
     basis_spectrum_ready: bool,
     last_block_key: Option<(u64, u8)>,
-    /// Number of Eq.106 stages allowed in the next submission. The map
+    /// Number of Frequency-domain algorithm stages allowed in the next submission. The map
     /// callback updates this from the previous request's GPU timestamps.
     adaptive_stage_budget: Arc<AtomicU32>,
 }
 
-impl Default for PlanningEq106DispatchState {
+impl Default for PlanningFrequencyDomainDispatchState {
     fn default() -> Self {
         Self {
             last_request_id: 0,
@@ -79,10 +77,8 @@ impl Default for PlanningEq106DispatchState {
             layout: None,
             sources: None,
             quadrature: None,
-            operator: None,
-            dummy_modes: None,
             spectrum: None,
-            line_samples: None,
+            density_spectra: None,
             source_groups: None,
             output: None,
             baseline: None,
@@ -97,7 +93,7 @@ impl Default for PlanningEq106DispatchState {
     }
 }
 
-impl PlanningEq106DispatchState {
+impl PlanningFrequencyDomainDispatchState {
     fn clear_active(&mut self) {
         self.active_request_id = 0;
         self.next_stage = 0;
@@ -117,20 +113,20 @@ impl PlanningEq106DispatchState {
     }
 }
 
-fn dispatch_planning_eq106(
+fn dispatch_planning_frequency_domain(
     planning: Res<crate::gpu::planning::ExtractedPlanningInput>,
     shared: Res<crate::gpu::planning::PlanningSharedGpuBuffers>,
-    pipelines: Option<Res<Eq106ComputePipeline>>,
+    pipelines: Option<Res<FrequencyDomainComputePipeline>>,
     reduction: Res<crate::gpu::planning_reduction::PlanningReductionPipeline>,
     cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     channel: Res<PlanningGpuReadbackChannel>,
-    mut state: ResMut<PlanningEq106DispatchState>,
+    mut state: ResMut<PlanningFrequencyDomainDispatchState>,
     timestamp_pool: Res<crate::gpu::planning_timestamps::PlanningTimestampPool>,
 ) {
     let request = &planning.request;
-    let request_matches = request.method == Some(ActiveGravityMethod::CurvedArcEq106)
+    let request_matches = request.method == Some(ActiveGravityMethod::FrequencyDomain)
         && planning.payload.method == request.method
         && planning.payload.density_model == request.density_model;
     if state.active_request_id != 0
@@ -162,7 +158,7 @@ fn dispatch_planning_eq106(
         return;
     };
     let Some(shared) = shared.0.as_ref().filter(|shared| shared.matches(batch)) else {
-        report_eq106_block(
+        report_frequency_domain_block(
             &mut state,
             request.request_id,
             1,
@@ -171,11 +167,11 @@ fn dispatch_planning_eq106(
         return;
     };
     let Some(pipelines) = pipelines else {
-        report_eq106_block(
+        report_frequency_domain_block(
             &mut state,
             request.request_id,
             2,
-            "Eq.106 planning pipeline resource is unavailable",
+            "Frequency-domain algorithm planning pipeline resource is unavailable",
         );
         return;
     };
@@ -184,7 +180,7 @@ fn dispatch_planning_eq106(
         &[
             (
                 "voxel line samples",
-                pipelines.planning_voxel_line_samples_id,
+                pipelines.planning_voxel_density_spectrum_id,
             ),
             ("voxel basis spectrum", pipelines.planning_voxel_spectrum_id),
             (
@@ -192,13 +188,13 @@ fn dispatch_planning_eq106(
                 pipelines.planning_combine_spectrum_id,
             ),
             (
-                "Chebyshev Taylor evaluation",
+                "frequency-domain evaluation",
                 pipelines.planning_evaluate_id,
             ),
             ("planning reduction", reduction.0),
         ],
     ) {
-        fail_planning_eq106(
+        fail_planning_frequency_domain(
             &mut state,
             &channel,
             &render_queue,
@@ -208,27 +204,27 @@ fn dispatch_planning_eq106(
         return;
     }
     let (
-        Some(voxel_line_samples_pipeline),
+        Some(voxel_density_spectrum_pipeline),
         Some(voxel_spectrum_pipeline),
         Some(combine_spectrum_pipeline),
         Some(evaluate_pipeline),
     ) = (
-        cache.get_compute_pipeline(pipelines.planning_voxel_line_samples_id),
+        cache.get_compute_pipeline(pipelines.planning_voxel_density_spectrum_id),
         cache.get_compute_pipeline(pipelines.planning_voxel_spectrum_id),
         cache.get_compute_pipeline(pipelines.planning_combine_spectrum_id),
         cache.get_compute_pipeline(pipelines.planning_evaluate_id),
     )
     else {
-        report_eq106_block(
+        report_frequency_domain_block(
             &mut state,
             request.request_id,
             3,
-            "Eq.106 planning shader pipelines are not cached",
+            "Frequency-domain algorithm planning shader pipelines are not cached",
         );
         return;
     };
     let Some(reduction_pipeline) = cache.get_compute_pipeline(reduction.0) else {
-        report_eq106_block(
+        report_frequency_domain_block(
             &mut state,
             request.request_id,
             4,
@@ -236,17 +232,16 @@ fn dispatch_planning_eq106(
         );
         return;
     };
-    if planning.eq106_operator.is_empty()
-        || planning.source_radius <= 0.0
+    if planning.source_radius <= 0.0
         || planning.payload.primary.is_empty()
         || planning.payload.secondary.len() != 113 * 16
         || planning.payload.secondary_count != 56
     {
-        report_eq106_block(
+        report_frequency_domain_block(
             &mut state,
             request.request_id,
             5,
-            "Eq.106 payload/operator prerequisites are incomplete",
+            "Frequency-domain algorithm payload prerequisites are incomplete",
         );
         return;
     }
@@ -261,7 +256,7 @@ fn dispatch_planning_eq106(
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            report_eq106_block(
+            report_frequency_domain_block(
                 &mut state,
                 request.request_id,
                 6,
@@ -287,23 +282,14 @@ fn dispatch_planning_eq106(
             .iter()
             .map(|state| state.body_position())
             .collect::<Vec<_>>();
-        let velocities = batch
-            .reference_states
-            .iter()
-            .map(|state| state.body_velocity())
-            .collect::<Vec<_>>();
         let times = batch
             .reference_states
             .iter()
             .map(|state| state.position_time[3])
             .collect::<Vec<_>>();
-        state.canonical_elements = build_canonical_tube_elements(
+        state.canonical_elements = build_known_trajectory_elements(
             &positions,
-            &velocities,
             &times,
-            planning.source_radius,
-            4.0 * planning.source_radius,
-            PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
         );
         let mut expected_offset = 0_u32;
         let complete = state.canonical_elements.iter().all(|element| {
@@ -313,17 +299,17 @@ fn dispatch_planning_eq106(
         }) && expected_offset == batch.samples_per_candidate;
         if !complete || state.canonical_elements.is_empty() {
             error!(
-                target: "planning::eq106",
+                target: "planning::frequency_domain",
                 expected = batch.samples_per_candidate,
                 covered = expected_offset,
-                "canonical Eq.106 tube segmentation did not cover the frozen centre arc"
+                "frequency-domain trajectory samples did not cover the frozen reference trajectory"
             );
             state.clear_active();
             channel.in_flight.store(false, Ordering::Release);
             return;
         }
         state.spectrum = None;
-        state.line_samples = None;
+        state.density_spectra = None;
         state.sources = None;
         state.source_groups = None;
         state.spectrum_ready = false;
@@ -344,19 +330,9 @@ fn dispatch_planning_eq106(
             let end = start + samples_per_candidate;
             let local_offset = local_candidate as u32 * batch.samples_per_candidate;
             let candidate_states = &batch.states[start..end];
-            let covered = state.canonical_elements.iter().all(|element| {
-                let range_start = element.target_offset as usize;
-                let range_end = range_start + element.target_count as usize;
-                candidate_states[range_start..range_end]
-                    .iter()
-                    .all(|candidate| {
-                        canonical_element_accepts(
-                            element,
-                            candidate.body_position(),
-                            planning.source_radius,
-                        )
-                    })
-            });
+            let covered = candidate_states
+                .iter()
+                .all(|candidate| candidate.body_position().is_finite());
             if !covered {
                 invalid_candidates.push(local_candidate as u32);
                 continue;
@@ -380,38 +356,21 @@ fn dispatch_planning_eq106(
             .clone_from(&invalid_candidates);
         state.active_maximum_elements_per_candidate = maximum_elements_per_candidate;
     }
-    let common_changed = batch_changed
-        || state.quadrature.is_none()
-        || state.operator.is_none()
-        || state.dummy_modes.is_none();
+    let common_changed = batch_changed || state.quadrature.is_none();
     if common_changed {
         state.batch_id = batch.batch_id;
         state.quadrature = Some(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("planning_eq106_quadrature"),
-                contents: &planning_chebyshev_quadrature_bytes(),
+                label: Some("planning_frequency_domain_quadrature"),
+                contents: &reciprocal_space_quadrature_bytes(planning.source_radius),
                 usage: BufferUsages::STORAGE,
-            }),
-        );
-        state.operator = Some(
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("planning_eq106_operator"),
-                contents: &planning.eq106_operator,
-                usage: BufferUsages::UNIFORM,
-            }),
-        );
-        state.dummy_modes = Some(
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("planning_eq106_unused_modes"),
-                contents: &vec![0_u8; 544 * 16],
-                usage: BufferUsages::UNIFORM,
             }),
         );
     }
     if batch_changed || state.sources.is_none() {
         state.sources = Some(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("planning_eq106_volume_sources"),
+                label: Some("planning_frequency_domain_volume_sources"),
                 contents: &planning.payload.primary,
                 usage: BufferUsages::STORAGE,
             }),
@@ -419,7 +378,6 @@ fn dispatch_planning_eq106(
         state.basis_spectrum_ready = false;
         state.spectrum_ready = false;
     }
-    let coefficient_count = taylor_coefficient_count(TAYLOR_MAX_ORDER) as u64;
     let canonical_count = state.canonical_elements.len().max(1) as u64;
     if state.payload_request_id != planning.payload.request_id || state.source_groups.is_none() {
         state.payload_request_id = planning.payload.request_id;
@@ -427,11 +385,11 @@ fn dispatch_planning_eq106(
         let mut metadata = vec![0_u8; 544 * 16];
         metadata[..planning.payload.secondary.len()].copy_from_slice(&planning.payload.secondary);
         let low_basis_offset_vec4 =
-            (coefficient_count * QUADRATURE_COUNT as u64 * canonical_count * 56) as f32;
+            (QUADRATURE_COUNT as u64 * canonical_count * 56) as f32;
         metadata[112 * 16..112 * 16 + 4].copy_from_slice(&low_basis_offset_vec4.to_le_bytes());
         state.source_groups = Some(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("planning_eq106_source_groups_and_densities"),
+                label: Some("planning_frequency_domain_source_groups_and_densities"),
                 contents: &metadata,
                 usage: BufferUsages::UNIFORM,
             }),
@@ -439,29 +397,29 @@ fn dispatch_planning_eq106(
     }
     if state.spectrum.is_none() {
         state.spectrum = Some(render_device.create_buffer(&BufferDescriptor {
-            label: Some("planning_eq106_spectrum"),
-            size: coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count,
+            label: Some("planning_frequency_domain_spectrum"),
+            size: FREQUENCY_COUNT as u64 * 32 * canonical_count,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
     }
-    if state.line_samples.is_none() {
+    if state.density_spectra.is_none() {
         let line_sample_bytes =
-            coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56;
+            QUADRATURE_COUNT as u64 * 16 * canonical_count * 56;
         let basis_bank_bytes =
-            coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count * 28;
-        state.line_samples = Some(render_device.create_buffer(&BufferDescriptor {
-            label: Some("planning_eq106_voxel_lines_and_low_basis"),
+            FREQUENCY_COUNT as u64 * 16 * canonical_count * 28;
+        state.density_spectra = Some(render_device.create_buffer(&BufferDescriptor {
+            label: Some("planning_frequency_domain_voxel_lines_and_low_basis"),
             size: line_sample_bytes + basis_bank_bytes,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
     }
-    let basis_bank_size = coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count * 28;
+    let basis_bank_size = FREQUENCY_COUNT as u64 * 16 * canonical_count * 28;
     let output_size = target_count as u64 * OUTPUT_BYTES;
     let verification_targets = if starting_request {
         // Use exactly the same verification population as MMFFT/FMM.  An
-        // Eq.106 rejection is a measured failure, not a reason to shrink the
+        // Frequency-domain algorithm rejection is a measured failure, not a reason to shrink the
         // denominator after seeing the result.
         let targets = crate::gpu::planning_reduction::planning_verification_targets(request, batch);
         state.active_verification_targets.clone_from(&targets);
@@ -478,7 +436,7 @@ fn dispatch_planning_eq106(
     if state.output_storage_size != output_storage_size || state.output.is_none() {
         state.output_storage_size = output_storage_size;
         state.output = Some(render_device.create_buffer(&BufferDescriptor {
-            label: Some("planning_eq106_output_and_high_basis"),
+            label: Some("planning_frequency_domain_output_and_high_basis"),
             size: output_storage_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -491,7 +449,7 @@ fn dispatch_planning_eq106(
     if state.baseline_size != baseline_size || state.baseline.is_none() {
         state.baseline_size = baseline_size;
         state.baseline = Some(render_device.create_buffer(&BufferDescriptor {
-            label: Some("planning_eq106_baseline"),
+            label: Some("planning_frequency_domain_baseline"),
             size: baseline_size,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
@@ -500,7 +458,7 @@ fn dispatch_planning_eq106(
     if state.metric_size != metric_size || state.metrics.is_none() {
         state.metric_size = metric_size;
         state.metrics = Some(render_device.create_buffer(&BufferDescriptor {
-            label: Some("planning_eq106_metrics"),
+            label: Some("planning_frequency_domain_metrics"),
             size: metric_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
@@ -509,7 +467,7 @@ fn dispatch_planning_eq106(
     if state.staging_size != staging_size || state.staging.is_none() {
         state.staging_size = staging_size;
         state.staging = Some(render_device.create_buffer(&BufferDescriptor {
-            label: Some("planning_eq106_staging"),
+            label: Some("planning_frequency_domain_staging"),
             size: staging_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -518,63 +476,57 @@ fn dispatch_planning_eq106(
     let sources = state
         .sources
         .as_ref()
-        .expect("planning Eq.106 sources")
+        .expect("planning Frequency-domain algorithm sources")
         .clone();
     let quadrature = state
         .quadrature
         .as_ref()
-        .expect("planning Eq.106 quadrature")
-        .clone();
-    let operator = state
-        .operator
-        .as_ref()
-        .expect("planning Eq.106 operator")
+        .expect("planning Frequency-domain algorithm quadrature")
         .clone();
     let spectrum = state
         .spectrum
         .as_ref()
-        .expect("planning Eq.106 spectrum")
+        .expect("planning Frequency-domain algorithm spectrum")
         .clone();
-    let line_samples = state
-        .line_samples
+    let density_spectra = state
+        .density_spectra
         .as_ref()
-        .expect("planning Eq.106 samples")
+        .expect("planning Frequency-domain algorithm samples")
         .clone();
     let source_groups = state
         .source_groups
         .as_ref()
-        .expect("planning Eq.106 source groups")
+        .expect("planning Frequency-domain algorithm source groups")
         .clone();
     let output = state
         .output
         .as_ref()
-        .expect("planning Eq.106 output")
+        .expect("planning Frequency-domain algorithm output")
         .clone();
     let baseline = state
         .baseline
         .as_ref()
-        .expect("planning Eq.106 baseline")
+        .expect("planning Frequency-domain algorithm baseline")
         .clone();
     let metrics = state
         .metrics
         .as_ref()
-        .expect("planning Eq.106 metrics")
+        .expect("planning Frequency-domain algorithm metrics")
         .clone();
     let staging = state
         .staging
         .as_ref()
-        .expect("planning Eq.106 staging")
+        .expect("planning Frequency-domain algorithm staging")
         .clone();
     if state.layout.is_none() {
         state.layout = Some(render_device.create_bind_group_layout(
-            "planning_eq106_bgl",
+            "planning_frequency_domain_bgl",
             &[
                 storage_ro_entry(0),
                 storage_ro_entry(1),
                 storage_ro_entry(2),
                 storage_rw_entry(3),
                 storage_rw_entry(4),
-                uniform_entry(5),
                 storage_rw_entry(6),
                 uniform_entry(7),
                 storage_ro_entry(9),
@@ -584,19 +536,19 @@ fn dispatch_planning_eq106(
     let layout = state
         .layout
         .as_ref()
-        .expect("planning Eq.106 layout")
+        .expect("planning Frequency-domain algorithm layout")
         .clone();
     state.active_method_preprocess_ms += method_preprocess_started.elapsed().as_secs_f64() * 1.0e3;
     if starting_request {
         state.active_build_spectrum = !state.spectrum_ready;
         state.active_build_basis_spectrum = !state.basis_spectrum_ready;
-        let uniform_size = 96_u64;
+        let uniform_size = 48_u64;
         let mut uniform_data = vec![0_u8; uniform_size as usize * 256];
         if elements.len() > 256 {
             error!(
-                target: "planning::eq106",
+                target: "planning::frequency_domain",
                 evaluator_elements = elements.len(),
-                "canonical Eq.106 evaluator exceeded the 256-element uniform capacity"
+                "canonical Frequency-domain algorithm evaluator exceeded the 256-element uniform capacity"
             );
             state.clear_active();
             channel.in_flight.store(false, Ordering::Release);
@@ -604,31 +556,24 @@ fn dispatch_planning_eq106(
         }
         for (element_index, element) in elements.iter().enumerate() {
             let mut bytes = uniform_bytes(
-                element.line_origin,
-                element.line_origin,
-                element.line_direction,
+                element.trajectory_origin,
                 planning.payload.item_count,
-                planning.source_radius,
-                element.line_limit,
-                element.taylor_order,
-                0,
                 element.spectrum_index,
-                request.eq106_certified,
                 3,
                 element.target_count,
                 element.target_offset,
             );
-            bytes[92..96].copy_from_slice(&(global_state_start as u32).to_le_bytes());
+            bytes[28..32].copy_from_slice(&(global_state_start as u32).to_le_bytes());
             let offset = element_index * uniform_size as usize;
             uniform_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
         }
         let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("planning_eq106_uniforms"),
+            label: Some("planning_frequency_domain_uniforms"),
             contents: &uniform_data,
             usage: BufferUsages::STORAGE,
         });
         let bind_group = render_device.create_bind_group(
-            "planning_eq106_batch_bg",
+            "planning_frequency_domain_batch_bg",
             &layout,
             &[
                 BindGroupEntry {
@@ -652,12 +597,8 @@ fn dispatch_planning_eq106(
                     resource: output.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 5,
-                    resource: operator.as_entire_binding(),
-                },
-                BindGroupEntry {
                     binding: 6,
-                    resource: line_samples.as_entire_binding(),
+                    resource: density_spectra.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding: 7,
@@ -674,9 +615,8 @@ fn dispatch_planning_eq106(
     }
     let build_spectrum = state.active_build_spectrum;
     let build_basis_spectrum = state.active_build_basis_spectrum;
-    // Planning uses one coherent Chebyshev expansion for all Taylor
-    // coefficients, including longitudinal derivatives. No inverse-Laplace
-    // quotient or NUFFT grid is needed; real-time modes keep those paths.
+    // Geometry spectra are built once, combined with the selected voxel
+    // densities, and evaluated at every known trajectory sample.
     let total_stages = if build_basis_spectrum {
         4
     } else if build_spectrum {
@@ -687,7 +627,7 @@ fn dispatch_planning_eq106(
     if starting_request && let Some(queries) = &mut state.active_timestamps {
         queries.set_pass_count(total_stages as u32);
     }
-    let stage_budget = planning_eq106_stage_budget(
+    let stage_budget = planning_frequency_domain_stage_budget(
         request.compute_benchmark,
         total_stages,
         state.adaptive_stage_budget.load(Ordering::Acquire) as usize,
@@ -701,20 +641,15 @@ fn dispatch_planning_eq106(
     let bind_groups = state.active_bind_groups.clone();
     let encode_started = Instant::now();
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("planning_eq106_paced_encoder"),
+        label: Some("planning_frequency_domain_paced_encoder"),
     });
     if state.next_stage == 0 {
         // Preserve the high voxel-basis bank stored after the fixed evaluator
         // prefix while clearing only the target rows for this request.
         encoder.clear_buffer(&output, 0, Some(output_size));
     }
-    let canonical_segment_count = state.canonical_elements.len() as u32;
+    let canonical_trajectory_block_count = state.canonical_elements.len() as u32;
     let evaluator_element_count = elements.len() as u32;
-    let max_targets = elements
-        .iter()
-        .map(|element| element.target_count)
-        .max()
-        .unwrap_or(1);
     for stage in state.next_stage..stage_end {
         let physical_stage = if build_basis_spectrum {
             [0, 1, 3, 4][stage]
@@ -725,32 +660,30 @@ fn dispatch_planning_eq106(
         };
         let (label, pipeline, width, height, depth) = match physical_stage {
             0 => (
-                "planning_eq106_voxel_line",
-                voxel_line_samples_pipeline,
+                "planning_frequency_domain_voxel_density_spectrum",
+                voxel_density_spectrum_pipeline,
                 QUADRATURE_COUNT,
-                canonical_segment_count,
+                canonical_trajectory_block_count,
                 56,
             ),
             1 => (
-                "planning_eq106_voxel_basis_spectrum",
+                "planning_frequency_domain_voxel_basis_spectrum",
                 voxel_spectrum_pipeline,
-                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES)
-                    .div_ceil(64),
-                canonical_segment_count,
+                QUADRATURE_COUNT.div_ceil(64),
+                canonical_trajectory_block_count,
                 56,
             ),
             3 => (
-                "planning_eq106_combine_voxel_spectrum",
+                "planning_frequency_domain_combine_voxel_spectrum",
                 combine_spectrum_pipeline,
-                (taylor_coefficient_count(TAYLOR_MAX_ORDER) * PLANNING_CHEBYSHEV_MODES)
-                    .div_ceil(64),
-                canonical_segment_count,
+                QUADRATURE_COUNT.div_ceil(64),
+                canonical_trajectory_block_count,
                 1,
             ),
             _ => {
-                let (width, height) = target_dispatch_grid(max_targets);
+                let (width, height) = (1, batch.samples_per_candidate);
                 (
-                    "planning_eq106_evaluate",
+                    "planning_frequency_domain_evaluate",
                     evaluate_pipeline,
                     width,
                     height,
@@ -828,7 +761,7 @@ fn dispatch_planning_eq106(
     let mapped = staging.clone();
     let canonical_element_count = state.canonical_elements.len() as u32;
     let evaluator_element_count = elements.len() as u32;
-    let reported_segment_count = maximum_elements_per_candidate;
+    let reported_trajectory_block_count = maximum_elements_per_candidate;
     let source_count = planning.payload.item_count;
     let state_indices = verification_targets;
     let request_candidate_count = request.candidate_count;
@@ -838,23 +771,22 @@ fn dispatch_planning_eq106(
     // allocations and the target buffer shared by all planning methods are not
     // observable here and are intentionally excluded.
     let estimated_gpu_buffer_bytes = planning.payload.primary.len() as u64
-        + QUADRATURE_COUNT as u64 * (FREQUENCY_COUNT as u64 + 1) * 8
-        + planning.eq106_operator.len() as u64
+        + QUADRATURE_COUNT as u64 * 16
         + 2 * 544 * 16
-        + coefficient_count * FREQUENCY_COUNT as u64 * 32 * canonical_count
-        + coefficient_count * QUADRATURE_COUNT as u64 * 16 * canonical_count * 56
+        + FREQUENCY_COUNT as u64 * 32 * canonical_count
+        + QUADRATURE_COUNT as u64 * 16 * canonical_count * 56
         + basis_bank_size
         + output_storage_size
         + baseline_size
         + metric_size
         + staging_size
-        + 96 * 256;
+        + 48 * 256;
     info!(
-        target: "planning::eq106",
+        target: "planning::frequency_domain",
         request_id = request.request_id,
         candidate_count = request.candidate_count,
         target_count,
-        canonical_spectral_elements = canonical_element_count,
+        trajectory_blocks = canonical_element_count,
         evaluator_elements = evaluator_element_count,
         spectrum_cache_hit = !build_spectrum,
         voxel_basis_cache_hit = !build_basis_spectrum,
@@ -863,11 +795,9 @@ fn dispatch_planning_eq106(
         payload_source_count = source_count,
         payload_source_ratio = f64::from(source_count) / f64::from(batch.source_count.max(1)),
         voxel_basis_count = 56,
-        chebyshev_modes = PLANNING_CHEBYSHEV_MODES,
-        analytic_zero_correction = false,
         estimated_gpu_buffer_bytes,
-        maximum_elements_per_candidate = reported_segment_count,
-        "Eq.106 Taylor/Chebyshev variant: finite-arc basis shared across candidates and tiles"
+        maximum_elements_per_candidate = reported_trajectory_block_count,
+        "Frequency-domain algorithm: reciprocal-space density basis shared across known trajectory samples"
     );
     let timestamps = state.active_timestamps.take();
     let adaptive_stage_budget = Arc::clone(&state.adaptive_stage_budget);
@@ -916,9 +846,6 @@ fn dispatch_planning_eq106(
                 }
                 let compact_rows = &full_rows[request_candidate_count as usize..];
                 let mut valid_targets = Vec::with_capacity(state_indices.len());
-                let mut rejection_counts = [0_u64; 6];
-                let mut self_fd_step_maxima = [0.0_f32; 5];
-                let mut first_rejection = None;
                 for (target_index, target_rows) in state_indices.iter().copied().zip(
                     compact_rows
                         .as_chunks::<8>()
@@ -926,7 +853,6 @@ fn dispatch_planning_eq106(
                         .iter()
                         .take(state_indices.len()),
                 ) {
-                    let certificate = target_rows[1];
                     let finite = [
                         target_rows[0],
                         target_rows[2],
@@ -936,56 +862,9 @@ fn dispatch_planning_eq106(
                     .into_iter()
                     .flatten()
                     .all(f32::is_finite);
-                    let fd_errors = [
-                        target_rows[6][0],
-                        target_rows[6][1],
-                        target_rows[6][2],
-                        target_rows[6][3],
-                        target_rows[7][0],
-                    ];
-                    for (maximum, error) in self_fd_step_maxima.iter_mut().zip(fd_errors) {
-                        if error.is_finite() {
-                            *maximum = maximum.max(error);
-                        }
-                    }
                     let local_candidate = target_index / samples_per_candidate;
-                    let outside_tube = invalid_candidates_for_readback.contains(&local_candidate);
-                    let rejection = if outside_tube {
-                        Some(3)
-                    } else if !finite || certificate.iter().copied().any(|value| !value.is_finite())
-                    {
-                        Some(5)
-                    } else if certificate[0] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE {
-                        Some(0)
-                    } else if certificate[1] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE {
-                        Some(1)
-                    } else if certificate[2] > GRAVITY_BENCHMARK_RELATIVE_TOLERANCE {
-                        Some(2)
-                    } else if certificate[3] > 0.30 {
-                        Some(3)
-                    } else {
-                        None
-                    };
-                    // The f32 self-FD scan is an internal consistency warning,
-                    // not an accuracy oracle. Cancellation at small step sizes
-                    // must not zero otherwise finite fields; f64 truth below
-                    // remains the common qualification criterion.
-                    if fd_errors.iter().copied().any(|value| !value.is_finite())
-                        || fd_errors[2] > PLANNING_GRADIENT_ERROR_LIMIT
-                    {
-                        rejection_counts[4] += 1;
-                    }
-                    if let Some(reason) = rejection {
-                        rejection_counts[reason] += 1;
-                        first_rejection.get_or_insert([
-                            packet_request.density_model,
-                            packet_request.candidate_start + target_index / samples_per_candidate,
-                            target_index % samples_per_candidate,
-                            target_rows[5][3].max(0.0) as u32,
-                            reason as u32,
-                        ]);
-                    }
-                    let valid = rejection.is_none();
+                    let valid = finite
+                        && !invalid_candidates_for_readback.contains(&local_candidate);
                     valid_targets.push(valid);
                     if !valid {
                         let candidate = local_candidate;
@@ -997,14 +876,6 @@ fn dispatch_planning_eq106(
                         }
                     }
                 }
-                let maximum_gradient_self_fd_relative_error = compact_rows
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .take(state_indices.len())
-                    .map(|target_rows| target_rows[4][3])
-                    .filter(|error| error.is_finite())
-                    .fold(0.0_f32, f32::max);
                 let mut common_indices = Vec::with_capacity(state_indices.len());
                 let mut rows = Vec::with_capacity(state_indices.len() * 4);
                 let mut raw_rows = Vec::with_capacity(state_indices.len() * 4);
@@ -1038,7 +909,7 @@ fn dispatch_planning_eq106(
                     } else {
                         // Keep the point and charge the rejected candidate a full
                         // reference-relative error instead of survivor-biasing
-                        // Eq.106 by silently omitting it.
+                        // Frequency-domain algorithm by silently omitting it.
                         rows.extend([[0.0; 4]; 4]);
                     }
                 }
@@ -1055,10 +926,6 @@ fn dispatch_planning_eq106(
                     raw_rows,
                     candidate_metrics,
                     common_indices,
-                    maximum_gradient_self_fd_relative_error,
-                    rejection_counts,
-                    self_fd_step_maxima,
-                    first_rejection,
                     rejected_sample_count,
                 )
             } else {
@@ -1067,10 +934,6 @@ fn dispatch_planning_eq106(
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    f32::NAN,
-                    [0; 6],
-                    [f32::NAN; 5],
-                    None,
                     0,
                 )
             };
@@ -1081,10 +944,7 @@ fn dispatch_planning_eq106(
                     rows: rows.0,
                     raw_rows: rows.1,
                     candidate_metrics: rows.2,
-                    rejection_counts: rows.5,
-                    self_fd_step_maxima: rows.6,
-                    first_rejection: rows.7,
-                    rejected_sample_count: rows.8,
+                    rejected_sample_count: rows.4,
                     readback_valid: result.is_ok(),
                     timing: PlanningGpuTiming {
                         method_preprocess_ms,
@@ -1102,7 +962,7 @@ fn dispatch_planning_eq106(
                                 0.0
                             }
                         }),
-                        // First geometry: voxel line + coherent sampled spectrum
+                        // First geometry: voxel density spectrum
                         // + combine + evaluate + reduction. New density: combine
                         // + evaluate + reduction.
                         dispatch_count: if build_basis_spectrum {
@@ -1119,24 +979,21 @@ fn dispatch_planning_eq106(
                             + (u64::from(build_basis_spectrum) * u64::from(QUADRATURE_COUNT)
                                 + u64::from(build_spectrum))
                                 * 56
-                                * u64::from(PLANNING_CHEBYSHEV_MODES)
-                                * u64::from(taylor_coefficient_count(TAYLOR_MAX_ORDER))
+                                * u64::from(QUADRATURE_COUNT)
                                 * u64::from(canonical_element_count)
                             + target_count as u64
-                                * u64::from(PLANNING_CHEBYSHEV_MODES)
-                                * u64::from(taylor_coefficient_count(TAYLOR_MAX_ORDER)),
-                        spectral_element_count: reported_segment_count,
-                        gradient_self_fd_relative_error: rows.4,
+                                * u64::from(QUADRATURE_COUNT),
+                        trajectory_block_count: reported_trajectory_block_count,
                     },
-                    backend: PlanningExecutionBackend::GpuEq106,
+                    backend: PlanningExecutionBackend::GpuFrequencyDomain,
                 });
             }
             in_flight.store(false, Ordering::Release);
         });
 }
 
-fn report_eq106_block(
-    state: &mut PlanningEq106DispatchState,
+fn report_frequency_domain_block(
+    state: &mut PlanningFrequencyDomainDispatchState,
     request_id: u64,
     code: u8,
     reason: &'static str,
@@ -1145,7 +1002,7 @@ fn report_eq106_block(
         return;
     }
     state.last_block_key = Some((request_id, code));
-    warn!(target: "planning::eq106", request_id, code, reason);
+    warn!(target: "planning::frequency_domain", request_id, code, reason);
 }
 
 fn first_planning_pipeline_error(
@@ -1163,19 +1020,19 @@ fn first_planning_pipeline_error(
             return None;
         }
         Some(format!(
-            "Eq.106 {name} GPU pipeline failed to compile: {error}"
+            "Frequency-domain algorithm {name} GPU pipeline failed to compile: {error}"
         ))
     })
 }
 
-fn fail_planning_eq106(
-    state: &mut PlanningEq106DispatchState,
+fn fail_planning_frequency_domain(
+    state: &mut PlanningFrequencyDomainDispatchState,
     channel: &PlanningGpuReadbackChannel,
     queue: &RenderQueue,
     request_id: u64,
     message: String,
 ) {
-    error!(target: "planning::eq106", request_id, error = %message);
+    error!(target: "planning::frequency_domain", request_id, error = %message);
     let timestamps = state.active_timestamps.take();
     let has_submitted_stages = state.next_stage > 0;
     state.clear_active();
@@ -1197,30 +1054,7 @@ fn fail_planning_eq106(
     }
 }
 
-fn canonical_element_accepts(
-    element: &Eq106BatchElement,
-    position: Vec3,
-    source_radius: f32,
-) -> bool {
-    if !position.is_finite() {
-        return false;
-    }
-    let relative = position - element.line_origin;
-    let h = relative.dot(element.line_direction);
-    if !h.is_finite() || h < -1.0e-3 || h > element.line_limit {
-        return false;
-    }
-    let line_point = element.line_origin + h.max(0.0) * element.line_direction;
-    let distance_lower_bound = line_point.length() - source_radius;
-    if !distance_lower_bound.is_finite() || distance_lower_bound <= 0.0 {
-        return false;
-    }
-    let transverse = position.distance(line_point);
-    let epsilon = transverse / distance_lower_bound;
-    select_batch_taylor_order(epsilon).is_some_and(|order| order <= element.taylor_order)
-}
-
-fn planning_eq106_stage_budget(
+fn planning_frequency_domain_stage_budget(
     compute_benchmark: bool,
     total_stages: usize,
     adaptive_budget: usize,

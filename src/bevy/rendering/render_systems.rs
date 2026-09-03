@@ -1,5 +1,5 @@
 pub fn render_section_system(
-    mut gizmos: Gizmos,
+    mut gizmos: Gizmos<ScientificGizmos>,
     ryugu_query: Query<&Transform, With<RyuguMarker>>,
     camera_query: Query<&Transform, (With<Camera3d>, Without<RyuguMarker>)>,
     show_section: Res<ShowSection>,
@@ -57,7 +57,7 @@ pub fn render_section_system(
     let tangent_v = plane_normal.cross(tangent_u).normalize();
 
     // Linear normalization for the shared rho(r)=C ln(1+r/epsilon) field. The
-    // radial, Eq.106, and MMFFT paths all use this same source law.
+    // radial, Frequency-domain algorithm, and MMFFT paths all use this same source law.
     let min_density = logarithmic_radial_density(0.0, c);
     let max_density = logarithmic_radial_density(SECTION_CLIP_RADIUS, c);
     let density_range = (max_density - min_density).max(1e-6);
@@ -139,7 +139,7 @@ pub fn render_section_system(
                     // single color is the only faithful normalized visualization.
                     (0.5, Color::srgb(0.15, 0.8, 1.0))
                 } else {
-                    // Radial, Eq.106, MMFFT, and FMM all consume the same
+                    // Radial, Frequency-domain algorithm, MMFFT, and FMM all consume the same
                     // mass-preserving logarithmic radial source. Use the actual
                     // normalized density at this section sample for every one of
                     // those modes; only the method-specific palette changes.
@@ -156,7 +156,20 @@ pub fn render_section_system(
             } else {
                 color
             };
-            gizmos.sphere(point, dot_radius, marker_color);
+            // Two in-plane strokes preserve the density sample and color while
+            // avoiding a three-circle sphere for every grid point. At 31x31
+            // samples this reduces transient gizmo geometry by over an order
+            // of magnitude and prevents WebGPU line-buffer wraparound.
+            gizmos.line(
+                point - tangent_u * dot_radius,
+                point + tangent_u * dot_radius,
+                marker_color,
+            );
+            gizmos.line(
+                point - tangent_v * dot_radius,
+                point + tangent_v * dot_radius,
+                marker_color,
+            );
         }
     }
 
@@ -177,7 +190,7 @@ pub fn render_section_system(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_section_contours(
-    gizmos: &mut Gizmos,
+    gizmos: &mut Gizmos<ScientificGizmos>,
     values: &[f32],
     inside: &[bool],
     grid_size: usize,
@@ -354,7 +367,7 @@ fn heterogeneous_density_color(t: f32, method: ActiveGravityMethod) -> Color {
             Vec3::new(1.0, 0.95, 0.12),
         ),
         // Violet trajectory: green/teal density complement.
-        ActiveGravityMethod::CurvedArcEq106 => (
+        ActiveGravityMethod::FrequencyDomain => (
             Vec3::new(0.02, 0.35, 0.45),
             Vec3::new(0.02, 0.9, 0.42),
             Vec3::new(0.82, 1.0, 0.12),

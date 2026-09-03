@@ -1,14 +1,13 @@
-use crate::cpu::curved_arc::AggregatedGravitySource;
+use crate::cpu::frequency_domain::AggregatedGravitySource;
 use crate::cpu::inversion::{
     PlanningDynamicsTree, build_planning_dynamics_tree, build_voxel_basis_sources,
 };
-use crate::cpu::volterra::{VolterraConfig, VolterraForceInput, propagate_reference_line_batched};
 use crate::interface::components::*;
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::*;
 use std::sync::Arc;
 
-const PLANNING_INITIAL_TUBE_FRACTION: f32 = 0.70;
+const PLANNING_INITIAL_PERTURBATION_FRACTION: f32 = 0.70;
 
 pub(crate) struct PlanningBatchBuilder {
     profile: PlanningWorkloadProfile,
@@ -18,7 +17,7 @@ pub(crate) struct PlanningBatchBuilder {
     source_hash: u64,
     source_count: u32,
     body_radius: f32,
-    eq106_source_radius: f32,
+    frequency_domain_source_radius: f32,
     candidate_count: u32,
     density_model_count: u32,
     samples_per_candidate: u32,
@@ -73,6 +72,9 @@ impl PlanningBatchBuilder {
             return None;
         }
         let basis = build_voxel_basis_sources(voxels, source, voxel_size)?;
+        // All planning backends use the same fixed-length samples generated
+        // from the equation-(185) reference arc.  Candidates are perturbed
+        // copies of this arc; no backend-specific radial sampling is involved.
         let reference_samples = crate::cpu::inversion::sample_frozen_trajectory_at_count(
             reference_knots,
             samples_per_candidate as usize,
@@ -112,20 +114,8 @@ impl PlanningBatchBuilder {
             source.radius as f32,
             requested_source_count,
         )?;
-        let reference_body_positions = reference_states
-            .iter()
-            .map(|state| state.body_position())
-            .collect::<Vec<_>>();
-        let eq106_compressed_records = compress_refined_basis_moments(
-            &canonical_basis_records,
-            &basis_records,
-            requested_source_count,
-            &reference_body_positions,
-            PLANNING_TRAJECTORY_TUBE_RADIUS_METERS,
-        )?;
-        let eq106_source_radius = basis_records.iter().chain(&eq106_compressed_records).fold(
-            0.0_f32,
-            |radius, record| {
+        let frequency_domain_source_radius =
+            basis_records.iter().fold(0.0_f32, |radius, record| {
                 radius.max(
                     Vec3::new(
                         record.position_volume[0],
@@ -134,9 +124,8 @@ impl PlanningBatchBuilder {
                     )
                     .length(),
                 )
-            },
-        );
-        if !eq106_source_radius.is_finite() || eq106_source_radius <= 0.0 {
+            });
+        if !frequency_domain_source_radius.is_finite() || frequency_domain_source_radius <= 0.0 {
             return None;
         }
         let basis_hash = basis_records.iter().fold(
@@ -153,7 +142,7 @@ impl PlanningBatchBuilder {
         );
         let density_seed = mix_hash(
             mix_hash(source_hash, basis.hash),
-            mix_hash(capture_id, 0x1060_d315_7a11_5eed),
+            mix_hash(capture_id, 0x1840_d315_7a11_5eed),
         );
         let target_mass = source.total_mass;
         let (density_models, density_model_masses) = uniform_random_equal_mass_models(
@@ -165,7 +154,7 @@ impl PlanningBatchBuilder {
         // Candidate dynamics must not change merely because the crossover
         // benchmark refines the same mass distribution from 32K to 8192K
         // quadrature records. Build one nonlinear FMM field from the canonical
-        // mass/centroid representation and close every Picard sweep against it.
+        // mass/centroid representation for candidate propagation.
         let dynamics_tree =
             build_planning_dynamics_tree(&canonical_basis_records, density_models.get(..56)?)?;
         let reference_jets = build_planning_reference_jets(&reference_samples);
@@ -177,7 +166,7 @@ impl PlanningBatchBuilder {
             source_hash,
             source_count: requested_source_count,
             body_radius: source.radius as f32,
-            eq106_source_radius,
+            frequency_domain_source_radius,
             candidate_count,
             density_model_count,
             samples_per_candidate,
@@ -316,7 +305,7 @@ impl PlanningBatchBuilder {
                 density_model_count: self.density_model_count,
                 samples_per_candidate: self.samples_per_candidate,
                 body_radius: self.body_radius,
-                eq106_source_radius: self.eq106_source_radius,
+                frequency_domain_source_radius: self.frequency_domain_source_radius,
                 reference_states: Arc::from(self.reference_states),
                 states: Arc::from(self.states),
                 gpu_position_bytes: Arc::from(self.gpu_position_bytes),
@@ -527,8 +516,8 @@ fn spatially_refine_basis_records(
             }
             // Both antithetic children remain inside the conservative body
             // sphere as well as the occupied density cell. The exact radius
-            // is nevertheless recomputed after refinement and used by every
-            // Eq.106 Taylor certificate.
+            // is nevertheless recomputed after refinement and used by the
+            // reciprocal-space quadrature.
             let centre2 = centre.length_squared();
             let projected = centre.dot(direction).abs();
             let sphere_extent = (-projected
@@ -558,162 +547,6 @@ fn spatially_refine_basis_records(
         }
     }
     (refined.len() == requested).then_some(refined)
-}
-
-/// Compress each deterministic antithetic child cloud to a positive six-point
-/// sigma rule. The rule preserves zeroth, first, second, and (by central
-/// symmetry) third moments. Each cluster is checked against its certified
-/// minimum distance to the complete trajectory tube before it is accepted.
-fn compress_refined_basis_moments(
-    canonical: &[PlanningBasisRecord],
-    refined: &[PlanningBasisRecord],
-    requested: u32,
-    trajectory_positions: &[Vec3],
-    trajectory_tube_radius: f32,
-) -> Option<Vec<PlanningBasisRecord>> {
-    if canonical.is_empty()
-        || refined.len() != requested as usize
-        || requested < canonical.len() as u32
-        || trajectory_positions.is_empty()
-        || !trajectory_tube_radius.is_finite()
-        || trajectory_tube_radius < 0.0
-    {
-        return None;
-    }
-    let base = refined.len() / canonical.len();
-    let remainder = refined.len() % canonical.len();
-    let mut cursor = 0_usize;
-    let mut compressed = Vec::with_capacity(canonical.len().saturating_mul(6));
-    for (parent_index, parent) in canonical.iter().copied().enumerate() {
-        let count = base + usize::from(parent_index < remainder);
-        let children = refined.get(cursor..cursor + count)?;
-        cursor += count;
-        if children
-            .iter()
-            .any(|child| child.voxel_index != parent.voxel_index)
-        {
-            return None;
-        }
-        if count <= 6 {
-            compressed.extend_from_slice(children);
-            continue;
-        }
-        let total_volume = children
-            .iter()
-            .map(|child| f64::from(child.position_volume[3]))
-            .sum::<f64>();
-        if !total_volume.is_finite() || total_volume <= 0.0 {
-            return None;
-        }
-        let centroid = children.iter().try_fold(DVec3::ZERO, |sum, child| {
-            let position = DVec3::new(
-                f64::from(child.position_volume[0]),
-                f64::from(child.position_volume[1]),
-                f64::from(child.position_volume[2]),
-            );
-            position
-                .is_finite()
-                .then_some(sum + position * f64::from(child.position_volume[3]))
-        })? / total_volume;
-        let covariance = children.iter().fold(DMat3::ZERO, |sum, child| {
-            let position = DVec3::new(
-                f64::from(child.position_volume[0]),
-                f64::from(child.position_volume[1]),
-                f64::from(child.position_volume[2]),
-            );
-            let delta = position - centroid;
-            sum + DMat3::from_cols(delta * delta.x, delta * delta.y, delta * delta.z)
-                * f64::from(child.position_volume[3])
-        }) / total_volume;
-        let columns = positive_semidefinite_cholesky_columns(covariance)?;
-        let sigma_scale = 3.0_f64.sqrt();
-        let sigma_volume = total_volume / 6.0;
-        for column in columns {
-            let offset = sigma_scale * column;
-            for position in [centroid + offset, centroid - offset] {
-                compressed.push(PlanningBasisRecord {
-                    position_volume: [
-                        position.x as f32,
-                        position.y as f32,
-                        position.z as f32,
-                        sigma_volume as f32,
-                    ],
-                    voxel_index: parent.voxel_index,
-                });
-            }
-        }
-        let support_radius = children
-            .iter()
-            .map(|child| {
-                DVec3::new(
-                    f64::from(child.position_volume[0]),
-                    f64::from(child.position_volume[1]),
-                    f64::from(child.position_volume[2]),
-                )
-                .distance(centroid)
-            })
-            .chain(
-                columns
-                    .into_iter()
-                    .map(|column| sigma_scale * column.length()),
-            )
-            .fold(0.0_f64, f64::max);
-        let distance_to_tube = trajectory_positions
-            .iter()
-            .map(|position| position.as_dvec3().distance(centroid))
-            .fold(f64::INFINITY, f64::min)
-            - f64::from(trajectory_tube_radius)
-            - support_radius;
-        if !distance_to_tube.is_finite() || distance_to_tube <= 0.0 {
-            return None;
-        }
-    }
-    (cursor == refined.len()).then_some(compressed)
-}
-
-fn positive_semidefinite_cholesky_columns(matrix: DMat3) -> Option<[DVec3; 3]> {
-    let rows = matrix.transpose();
-    let tolerance = 1.0e-12
-        * matrix
-            .to_cols_array()
-            .into_iter()
-            .map(f64::abs)
-            .fold(1.0, f64::max);
-    let l00 = rows.x_axis.x.max(0.0).sqrt();
-    let l10 = if l00 > tolerance {
-        rows.y_axis.x / l00
-    } else {
-        0.0
-    };
-    let l20 = if l00 > tolerance {
-        rows.z_axis.x / l00
-    } else {
-        0.0
-    };
-    let l11_squared = rows.y_axis.y - l10 * l10;
-    if l11_squared < -tolerance {
-        return None;
-    }
-    let l11 = l11_squared.max(0.0).sqrt();
-    let l21 = if l11 > tolerance {
-        (rows.z_axis.y - l20 * l10) / l11
-    } else {
-        0.0
-    };
-    let l22_squared = rows.z_axis.z - l20 * l20 - l21 * l21;
-    if l22_squared < -tolerance {
-        return None;
-    }
-    let l22 = l22_squared.max(0.0).sqrt();
-    let columns = [
-        DVec3::new(l00, l10, l20),
-        DVec3::new(0.0, l11, l21),
-        DVec3::new(0.0, 0.0, l22),
-    ];
-    columns
-        .iter()
-        .all(|column| column.is_finite())
-        .then_some(columns)
 }
 
 fn radical_inverse_vdc(value: u32) -> f32 {
@@ -778,37 +611,19 @@ fn append_dynamical_candidate_states(
         return None;
     }
     let (requested_radius, phase, harmonic, phase_rate) =
-        candidate_tube_parameters(candidate, candidate_count);
-    // A fixed initial offset can leave the 15 m Taylor tube on a captured arc
-    // whose transverse variational dynamics are locally unstable.  That is
-    // not a reason to cancel the entire quadrature sweep.  Contract only this
-    // candidate's initial perturbation, re-propagating it from scratch each
-    // time, until the complete Volterra trajectory is certified inside the
-    // same tube.  The zero-radius final attempt also distinguishes a bad
-    // perturbation from a genuinely unusable reference arc.
-    for contraction in [1.0_f32, 0.5, 0.25, 0.125, 0.0625, 0.0] {
-        let mut candidate_states = Vec::with_capacity(reference.len());
-        let mut candidate_bytes = Vec::with_capacity(reference.len() * 16);
-        if append_dynamical_candidate_at_radius(
-            candidate,
-            reference,
-            reference_jets,
-            dynamics_tree,
-            requested_radius * contraction,
-            phase,
-            harmonic,
-            phase_rate,
-            &mut candidate_states,
-            &mut candidate_bytes,
-        )
-        .is_some()
-        {
-            states.extend(candidate_states);
-            gpu_position_bytes.extend(candidate_bytes);
-            return Some(());
-        }
-    }
-    None
+        candidate_perturbation_parameters(candidate, candidate_count);
+    append_dynamical_candidate_at_radius(
+        candidate,
+        reference,
+        reference_jets,
+        dynamics_tree,
+        requested_radius,
+        phase,
+        harmonic,
+        phase_rate,
+        states,
+        gpu_position_bytes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -828,63 +643,51 @@ fn append_dynamical_candidate_at_radius(
     let first = *reference.first()?;
     let first_offset =
         candidate_initial_offset(first, 0, sample_count, radius, phase, harmonic, phase_rate)?;
-    let initial_position = (first.position + first_offset).as_dvec3();
+    let mut world_position = (first.position + first_offset).as_dvec3();
     // Candidates differ through their initial transverse displacement.  The
-    // velocity is not differentiated from an arbitrary drawn tube; it is the
+    // velocity is not differentiated from an arbitrary drawn perturbation; it is the
     // captured physical velocity and the propagated field determines every
     // subsequent state.
-    let initial_velocity = first.velocity.as_dvec3();
-    let final_time = reference.last()?.simulation_time_seconds;
-    let duration = final_time - first.simulation_time_seconds;
-    let solution = propagate_reference_line_batched(
-        initial_position,
-        initial_velocity,
-        initial_velocity,
-        duration,
-        VolterraConfig {
-            node_count: reference.len().max(33),
-            maximum_picard_iterations: 24,
-            maximum_endpoint_iterations: 8,
-            damping: 0.70,
-            relative_tolerance: 1.0e-6,
-            minimum_longitudinal_speed: 1.0e-5,
-            maximum_transverse_distance: f64::INFINITY,
-        },
-        |inputs, accelerations| {
-            fill_planning_reference_accelerations(
-                reference_jets,
-                dynamics_tree,
-                first.simulation_time_seconds,
-                inputs,
-                accelerations,
-            )
-        },
-    )
-    .ok()?;
+    let mut world_velocity = first.velocity.as_dvec3();
 
     let angular_velocity =
         RYUGU_SPIN_AXIS.normalize_or_zero() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
     let first_time = first.simulation_time_seconds;
-    let mut solution_cursor = 1;
     for sample in 0..sample_count {
         let reference_state = reference[sample as usize];
-        let propagated = solution.sample_at_ordered(
-            reference_state.simulation_time_seconds - first.simulation_time_seconds,
-            &mut solution_cursor,
-        )?;
-        let world_position = propagated.position.as_vec3();
-        let world_velocity = propagated.velocity.as_vec3();
-        let transverse_distance = world_position.distance(reference_state.position);
-        if !transverse_distance.is_finite()
-            || transverse_distance > PLANNING_TRAJECTORY_TUBE_RADIUS_METERS + 1.0e-3
-        {
+        if sample > 0 {
+            let previous = reference[sample as usize - 1];
+            let dt = reference_state.simulation_time_seconds - previous.simulation_time_seconds;
+            if !dt.is_finite() || dt <= 0.0 {
+                return None;
+            }
+            let acceleration_start = planning_reference_acceleration(
+                reference_jets,
+                dynamics_tree,
+                previous.simulation_time_seconds,
+                world_position,
+            )?;
+            world_velocity += acceleration_start * (0.5 * dt);
+            world_position += world_velocity * dt;
+            let acceleration_end = planning_reference_acceleration(
+                reference_jets,
+                dynamics_tree,
+                reference_state.simulation_time_seconds,
+                world_position,
+            )?;
+            world_velocity += acceleration_end * (0.5 * dt);
+        }
+        let world_position_f32 = world_position.as_vec3();
+        let world_velocity_f32 = world_velocity.as_vec3();
+        let transverse_distance = world_position_f32.distance(reference_state.position);
+        if !transverse_distance.is_finite() {
             return None;
         }
         let time = reference_state.simulation_time_seconds as f32;
         let rotation = reference_state.body_rotation;
-        let body_position = rotation.inverse() * world_position;
+        let body_position = rotation.inverse() * world_position_f32;
         let body_velocity =
-            rotation.inverse() * (world_velocity - angular_velocity.cross(world_position));
+            rotation.inverse() * (world_velocity_f32 - angular_velocity.cross(world_position_f32));
         let position_time = [body_position.x, body_position.y, body_position.z, time];
         gpu_position_bytes.extend_from_slice(bytemuck::cast_slice(&position_time));
         states.push(PlanningCandidateState {
@@ -928,67 +731,48 @@ fn candidate_initial_offset(
     let normalized_time = sample as f32 / sample_count.saturating_sub(1) as f32 - 0.5;
     let angle = phase + harmonic * std::f32::consts::TAU * normalized_time + phase_rate;
     let envelope = 0.82 + 0.18 * (std::f32::consts::TAU * normalized_time + phase).cos();
-    let offset_radius = (radius * envelope).min(PLANNING_TRAJECTORY_TUBE_RADIUS_METERS);
+    let offset_radius = (radius * envelope).min(PLANNING_PERTURBATION_RADIUS_METERS);
     Some(normal * (offset_radius * angle.cos()) + binormal * (offset_radius * angle.sin()))
 }
 
-fn fill_planning_reference_accelerations(
+fn planning_reference_acceleration(
     jets: &[PlanningReferenceJet],
     dynamics_tree: Option<&PlanningDynamicsTree>,
-    start_time_seconds: f64,
-    inputs: &[VolterraForceInput],
-    accelerations: &mut [DVec3],
-) -> Result<(), ()> {
-    if inputs.len() != accelerations.len() || jets.is_empty() {
-        return Err(());
-    }
+    simulation_time_seconds: f64,
+    position: DVec3,
+) -> Option<DVec3> {
     let first = jets[0];
     let last = jets[jets.len() - 1];
-    let mut upper_index = usize::from(jets.len() > 1);
-    for (input, acceleration) in inputs.iter().zip(accelerations) {
-        let simulation_time_seconds = start_time_seconds + input.elapsed_seconds;
-        let jet = if simulation_time_seconds <= first.simulation_time_seconds {
-            first
-        } else if simulation_time_seconds >= last.simulation_time_seconds {
-            last
-        } else {
-            // Picard's h grid is monotone, so its elapsed times are monotone as
-            // well.  Advance one shared cursor for the whole sweep instead of
-            // performing M independent binary searches.
-            while upper_index + 1 < jets.len()
-                && jets[upper_index].simulation_time_seconds < simulation_time_seconds
-            {
-                upper_index += 1;
-            }
-            let lower = jets[upper_index - 1];
-            let upper = jets[upper_index];
-            let interval = (upper.simulation_time_seconds - lower.simulation_time_seconds)
-                .max(f64::MIN_POSITIVE);
-            let weight = ((simulation_time_seconds - lower.simulation_time_seconds) / interval)
-                .clamp(0.0, 1.0);
-            PlanningReferenceJet {
-                simulation_time_seconds,
-                body_rotation: lower.body_rotation.slerp(upper.body_rotation, weight),
-                world_position: lower.world_position.lerp(upper.world_position, weight),
-                world_acceleration: lower
-                    .world_acceleration
-                    .lerp(upper.world_acceleration, weight),
-                world_jacobian: lower.world_jacobian * (1.0 - weight)
-                    + upper.world_jacobian * weight,
-            }
-        };
-        *acceleration = if let Some(tree) = dynamics_tree {
-            // Nonlinear Picard closure: every updated world position is
-            // transformed into the rotating density frame and reevaluated by
-            // the FMM field, rather than being frozen to a+J*delta_r.
-            let body_position = jet.body_rotation.inverse() * input.position;
-            jet.body_rotation * tree.acceleration(body_position).ok_or(())?
-        } else {
-            // Retained only for focused affine-field unit tests.
-            jet.world_acceleration + jet.world_jacobian * (input.position - jet.world_position)
-        };
-    }
-    Ok(())
+    let jet = if simulation_time_seconds <= first.simulation_time_seconds {
+        first
+    } else if simulation_time_seconds >= last.simulation_time_seconds {
+        last
+    } else {
+        let upper_index = jets
+            .partition_point(|jet| jet.simulation_time_seconds < simulation_time_seconds)
+            .clamp(1, jets.len() - 1);
+        let lower = jets[upper_index - 1];
+        let upper = jets[upper_index];
+        let interval =
+            (upper.simulation_time_seconds - lower.simulation_time_seconds).max(f64::MIN_POSITIVE);
+        let weight =
+            ((simulation_time_seconds - lower.simulation_time_seconds) / interval).clamp(0.0, 1.0);
+        PlanningReferenceJet {
+            simulation_time_seconds,
+            body_rotation: lower.body_rotation.slerp(upper.body_rotation, weight),
+            world_position: lower.world_position.lerp(upper.world_position, weight),
+            world_acceleration: lower
+                .world_acceleration
+                .lerp(upper.world_acceleration, weight),
+            world_jacobian: lower.world_jacobian * (1.0 - weight) + upper.world_jacobian * weight,
+        }
+    };
+    Some(if let Some(tree) = dynamics_tree {
+        let body_position = jet.body_rotation.inverse() * position;
+        jet.body_rotation * tree.acceleration(body_position)?
+    } else {
+        jet.world_acceleration + jet.world_jacobian * (position - jet.world_position)
+    })
 }
 
 fn build_planning_reference_jets(
@@ -1017,7 +801,7 @@ fn build_planning_reference_jets(
 }
 
 /// Direct source sum retained as the independent certified reference.  It is
-/// intentionally not used by Picard propagation: certification needs an
+/// retained for method-independent accuracy checks: certification needs an
 /// exact, method-independent field/gradient, while candidate dynamics use the
 /// source-count-independent FMM tree and reevaluate every updated position.
 #[cfg(test)]
@@ -1076,14 +860,14 @@ pub(crate) fn accumulate_planning_reference_chunk(
     (acceleration.is_finite() && gradient.is_finite()).then_some(())
 }
 
-fn candidate_tube_parameters(candidate: u32, candidate_count: u32) -> (f32, f32, f32, f32) {
+fn candidate_perturbation_parameters(candidate: u32, candidate_count: u32) -> (f32, f32, f32, f32) {
     let golden = 0.618_033_95_f32;
     let radial_fraction = ((candidate as f32 + 0.5) / candidate_count.max(1) as f32).sqrt();
-    // Reserve part of the certified tube for differential-force drift over the
-    // complete propagated arc. Final states are still checked against the full
-    // 15 m trust radius before they enter any GPU batch.
-    let radius =
-        PLANNING_TRAJECTORY_TUBE_RADIUS_METERS * PLANNING_INITIAL_TUBE_FRACTION * radial_fraction;
+    // Reserve part of the perturbation radius for differential-force drift over
+    // the complete propagated trajectory.
+    let radius = PLANNING_PERTURBATION_RADIUS_METERS
+        * PLANNING_INITIAL_PERTURBATION_FRACTION
+        * radial_fraction;
     let phase = std::f32::consts::TAU * ((candidate as f32 * golden).fract());
     let harmonic = 1.0 + (candidate % 5) as f32;
     let phase_rate = ((candidate.wrapping_mul(747_796_405) ^ 2_891_336_453) as f32) * f32::EPSILON;

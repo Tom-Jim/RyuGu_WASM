@@ -286,14 +286,14 @@ fn extract_werner_input_system(
     source: Extract<Option<Res<WernerSource>>>,
     clock: Extract<Res<SimulationClock>>,
     planning: Extract<Res<PlanningComparisonState>>,
-    cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
+    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
     extracted.enabled = !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }
-    let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
+    let (Some(source), Ok(cassini), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
         return;
@@ -303,10 +303,6 @@ fn extract_werner_input_system(
         request_id: clock.request_id,
         epoch: clock.epoch,
         simulation_time_seconds: clock.elapsed_seconds,
-        body_position: extracted.probe,
-        ryugu_transform: *ryugu,
-        probe_position: cassini.translation,
-        probe_velocity: velocity.0,
     });
     extracted.edge_count = source.edge_count;
     extracted.face_count = source.face_count;
@@ -523,12 +519,8 @@ fn poll_werner_readback(
     if acceleration_is_valid && potential_is_valid {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
-            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
-            #[cfg(feature = "eq106-dual-certificate")]
-            independent_positive_potential: None,
-            body_acceleration_jacobian: None,
         });
     }
 }

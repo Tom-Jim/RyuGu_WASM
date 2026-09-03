@@ -1,6 +1,10 @@
 use bevy::math::{DMat3, DQuat, DVec3};
 use std::collections::HashMap;
 
+use crate::cpu::frequency_domain::{
+    eq184_laplace_sigma, eq184_time_weight,
+};
+
 // Independent of foreground/background frame rate. Long scheduling gaps are
 // suspension, not evidence that a GPU request failed to make progress.
 const PLANNING_GPU_WAIT_TIMEOUT_SECONDS: f64 = 300.0;
@@ -10,6 +14,7 @@ pub(crate) struct PlanningReferenceCache {
     identity: Option<(u64, u64, u64)>,
     fields: HashMap<(u64, u64, u32, [u32; 3]), (DVec3, DMat3)>,
     packet_id: Option<u64>,
+    target_indices: Vec<u32>,
     target_cursor: usize,
     source_cursor: usize,
     partial_field: DVec3,
@@ -23,7 +28,7 @@ pub fn planning_batch_evaluator_system(
     mut payload: ResMut<PlanningMethodPayload>,
     mut gpu_result: ResMut<PlanningGpuResult>,
     mut planning: ResMut<PlanningComparisonState>,
-    mut eq106_workspace: Local<crate::gpu::eq106::PlanningEq106Workspace>,
+    mut frequency_domain_workspace: Local<crate::gpu::frequency_domain::PlanningFrequencyDomainWorkspace>,
     mut mmfft_workspace: Local<crate::gpu::mmfft::PlanningMmfftWorkspace>,
     mut reference_cache: Local<PlanningReferenceCache>,
 ) {
@@ -98,18 +103,20 @@ pub fn planning_batch_evaluator_system(
         {
             // Validation must not turn a GPU callback into millions of
             // synchronous CPU source interactions before the browser can paint.
-            if packet.readback_valid && (!job.warm_repetition || job.certified_repetition) {
+            if packet.readback_valid
+                && (!job.warm_repetition || job.certified_repetition)
+            {
                 let started = bevy::platform::time::Instant::now();
                 let ready = prepare_planning_references(&batch, &packet, &mut reference_cache);
                 job.verification_ms += started.elapsed().as_secs_f64() * 1.0e3;
                 if !ready {
                     let fraction = (reference_cache.target_cursor as f64
                         + reference_cache.source_cursor as f64 / batch.basis_records.len().max(1) as f64)
-                        / packet.state_indices.len().max(1) as f64;
+                        / reference_cache.target_indices.len().max(1) as f64;
                     job.reference_inflight_fraction = f64::from(packet.request.candidate_count) * fraction.clamp(0.0, 1.0);
                     planning.status = format!("{} independent f64 verification: target {}/{}, source {}/{} (time-sliced)",
                         job.method.planning_label(), reference_cache.target_cursor + 1,
-                        packet.state_indices.len(), reference_cache.source_cursor, batch.basis_records.len());
+                        reference_cache.target_indices.len(), reference_cache.source_cursor, batch.basis_records.len());
                     job.awaiting_gpu_seconds = 0.0;
                     job.awaiting_gpu_last_poll = None;
                     gpu_result.0 = Some(packet);
@@ -155,15 +162,15 @@ pub fn planning_batch_evaluator_system(
                 *payload = PlanningMethodPayload::default();
                 if job.method_order_index + 1 == job.method_order.len() {
                     if planning.source_curve_active {
-                        let eq106 = planning.results[2].expect("completed Eq.106 curve result");
+                        let frequency_domain = planning.results[2].expect("completed Frequency-domain algorithm curve result");
                         let mmfft = planning.results[3].expect("completed FFT curve result");
                         let fmm = planning.results[4].expect("completed FMM curve result");
                         let source_count = planning.requested_source_count;
                         let repeat = planning.source_curve_repeat + 1;
-                        let outputs = [(eq106, false), (eq106, true), (mmfft, false),
+                        let outputs = [(frequency_domain, false), (frequency_domain, true), (mmfft, false),
                             (mmfft, true), (fmm, false), (fmm, true)];
-                        let common_samples = eq106.verification_sample_count == mmfft.verification_sample_count
-                            && eq106.verification_sample_count == fmm.verification_sample_count;
+                        let common_samples = frequency_domain.verification_sample_count == mmfft.verification_sample_count
+                            && frequency_domain.verification_sample_count == fmm.verification_sample_count;
                         let failure_masks = |profile| outputs.map(|(result, certified)|
                             result.accuracy_failure_mask(profile, certified)
                                 | if common_samples { 0 } else { 1 << 8 });
@@ -179,42 +186,42 @@ pub fn planning_batch_evaluator_system(
                             order_seed,
                             method_order: job.method_order.map(|method| method.performance_index()),
                             times_ms: [
-                                eq106.total_ms,
-                                eq106.certified_estimated_total_ms,
+                                frequency_domain.total_ms,
+                                frequency_domain.certified_estimated_total_ms,
                                 mmfft.total_ms,
                                 mmfft.certified_estimated_total_ms,
                                 fmm.total_ms,
                                 fmm.certified_estimated_total_ms,
                             ],
-                            kernel_times_ms: [eq106.raw_kernels.all_ms, eq106.checked_kernels.all_ms,
+                            kernel_times_ms: [frequency_domain.raw_kernels.all_ms, frequency_domain.checked_kernels.all_ms,
                                 mmfft.raw_kernels.all_ms, mmfft.checked_kernels.all_ms,
                                 fmm.raw_kernels.all_ms, fmm.checked_kernels.all_ms],
-                            evaluation_kernel_times_ms: [eq106.raw_kernels.evaluation_ms, eq106.checked_kernels.evaluation_ms,
+                            evaluation_kernel_times_ms: [frequency_domain.raw_kernels.evaluation_ms, frequency_domain.checked_kernels.evaluation_ms,
                                 mmfft.raw_kernels.evaluation_ms, mmfft.checked_kernels.evaluation_ms,
                                 fmm.raw_kernels.evaluation_ms, fmm.checked_kernels.evaluation_ms],
-                            basis_kernel_times_ms: [eq106.raw_kernels.basis_ms, mmfft.raw_kernels.basis_ms, fmm.raw_kernels.basis_ms],
+                            basis_kernel_times_ms: [frequency_domain.raw_kernels.basis_ms, mmfft.raw_kernels.basis_ms, fmm.raw_kernels.basis_ms],
                             geometry_basis_build_ms: [
-                                eq106.geometry_basis_build_ms,
+                                frequency_domain.geometry_basis_build_ms,
                                 mmfft.geometry_basis_build_ms,
                                 fmm.geometry_basis_build_ms,
                             ],
                             density_model_ms: [
-                                eq106.density_model_ms,
+                                frequency_domain.density_model_ms,
                                 mmfft.density_model_ms,
                                 fmm.density_model_ms,
                             ],
                             target_point_ms: [
-                                eq106.target_point_ms,
+                                frequency_domain.target_point_ms,
                                 mmfft.target_point_ms,
                                 fmm.target_point_ms,
                             ],
                             eligible: strict_failures.map(|mask| mask == 0),
                             strict_failures,
                             screening_failures: failure_masks(PlanningAccuracyProfile::Screening),
-                            gravity_errors: [eq106.relative_gravity_error, eq106.certified_relative_gravity_error,
+                            gravity_errors: [frequency_domain.relative_gravity_error, frequency_domain.certified_relative_gravity_error,
                                 mmfft.relative_gravity_error, mmfft.certified_relative_gravity_error,
                                 fmm.relative_gravity_error, fmm.certified_relative_gravity_error],
-                            gradient_errors: [eq106.gradient_relative_error, eq106.certified_gradient_relative_error,
+                            gradient_errors: [frequency_domain.gradient_relative_error, frequency_domain.certified_gradient_relative_error,
                                 mmfft.gradient_relative_error, mmfft.certified_gradient_relative_error,
                                 fmm.gradient_relative_error, fmm.certified_gradient_relative_error],
                         });
@@ -243,7 +250,7 @@ pub fn planning_batch_evaluator_system(
                     planning.run_requested = false;
                     planning.computation_complete = true;
                     planning.status = format!(
-                        "{} screening complete: all methods used identical nominal-density Volterra-propagated candidates inside the certified 15 m tube. Density rows share those trajectories; model-specific repropagation is not claimed.",
+                        "{} screening complete: all methods used identical nominal-density leapfrog-propagated candidates. Density rows share those trajectories; model-specific repropagation is not claimed.",
                         job.profile.label()
                     );
                     return;
@@ -302,12 +309,12 @@ pub fn planning_batch_evaluator_system(
         || payload.density_model != job.density_model
     {
         let prepared = match job.method {
-            ActiveGravityMethod::CurvedArcEq106 => {
-                crate::gpu::eq106::build_planning_eq106_payload(
+            ActiveGravityMethod::FrequencyDomain => {
+                crate::gpu::frequency_domain::build_planning_frequency_domain_payload(
                     &batch,
                     job.density_model,
                     payload_key,
-                    &mut eq106_workspace,
+                    &mut frequency_domain_workspace,
                 )
             }
             ActiveGravityMethod::MmfftCompressed => {
@@ -365,8 +372,6 @@ pub fn planning_batch_evaluator_system(
         candidate_start: job.candidate_start,
         candidate_count: request_candidate_count,
         warm_repetition: job.warm_repetition,
-        eq106_certified: job.method == ActiveGravityMethod::CurvedArcEq106
-            && job.certified_repetition,
         compute_benchmark: job.profile.is_compute_benchmark(),
     };
     job.awaiting_gpu = true;
@@ -391,28 +396,6 @@ fn reduce_planning_packet(
     job.rejected_sample_count = job
         .rejected_sample_count
         .saturating_add(packet.rejected_sample_count);
-    if job.first_rejection.is_none() {
-        job.first_rejection = packet.first_rejection;
-    }
-    for (total, count) in job
-        .rejection_counts
-        .iter_mut()
-        .zip(packet.rejection_counts)
-    {
-        *total = total.saturating_add(count);
-    }
-    for (maximum, value) in job
-        .self_fd_step_maxima
-        .iter_mut()
-        .zip(packet.self_fd_step_maxima)
-    {
-        if value.is_finite() {
-            *maximum = maximum.max(value);
-        }
-    }
-    job.maximum_gradient_self_fd_relative_error = job
-        .maximum_gradient_self_fd_relative_error
-        .max(packet.timing.gradient_self_fd_relative_error);
     if !packet.readback_valid
         || packet.rows.len() != packet.state_indices.len() * 4
         || packet.raw_rows.len() != packet.state_indices.len() * 4
@@ -440,9 +423,9 @@ fn reduce_planning_packet(
         job.forward_kernel_evaluations = job
             .forward_kernel_evaluations
             .saturating_add(packet.timing.forward_kernel_evaluations);
-        job.spectral_element_count = job
-            .spectral_element_count
-            .max(packet.timing.spectral_element_count);
+        job.trajectory_block_count = job
+            .trajectory_block_count
+            .max(packet.timing.trajectory_block_count);
         return;
     }
     for (local_candidate, metric) in packet.candidate_metrics.iter().enumerate() {
@@ -520,6 +503,43 @@ fn reduce_planning_packet(
                 f64::from(packet.raw_rows[verification_index * 4 + 3][2]),
             ),
         );
+        if packet.request.method == Some(ActiveGravityMethod::FrequencyDomain) {
+            let local_candidate = local / batch.samples_per_candidate as usize;
+            let observation_index = local % batch.samples_per_candidate as usize;
+            let verification_started = bevy::platform::time::Instant::now();
+            let (aggregate_field, aggregate_gradient) = frequency_domain_reference_integral(
+                batch,
+                packet.request.candidate_start as usize + local_candidate,
+                observation_index,
+                packet.request.density_model,
+                reference_cache,
+            );
+            verification_ms += verification_started.elapsed().as_secs_f64() * 1.0e3;
+            if !method_field.is_finite()
+                || !method_gradient.is_finite()
+                || !aggregate_field.is_finite()
+                || !aggregate_gradient.is_finite()
+            {
+                job.gravity_error_sum = f64::NAN;
+                continue;
+            }
+            job.gravity_error_sum += (method_field - aggregate_field).length_squared();
+            job.gravity_reference_sum += aggregate_field.length_squared();
+            job.gravity_samples += 1;
+            job.gradient_error_sum += matrix_norm_squared(method_gradient - aggregate_gradient);
+            job.gradient_reference_sum += matrix_norm_squared(aggregate_gradient);
+            job.gradient_samples += 1;
+            job.pointwise_gravity_errors.push(
+                ((method_field - aggregate_field).length()
+                    / aggregate_field.length().max(f64::MIN_POSITIVE)) as f32,
+            );
+            job.pointwise_gradient_errors.push(
+                (matrix_norm_squared(method_gradient - aggregate_gradient).sqrt()
+                    / matrix_norm_squared(aggregate_gradient).sqrt().max(f64::MIN_POSITIVE))
+                    as f32,
+            );
+            continue;
+        }
         let verification_started = bevy::platform::time::Instant::now();
         let (reference_field, reference_gradient) = direct_planning_reference_cached(
             state.body_position().as_dvec3(),
@@ -592,9 +612,9 @@ fn reduce_planning_packet(
     job.forward_kernel_evaluations = job
         .forward_kernel_evaluations
         .saturating_add(packet.timing.forward_kernel_evaluations);
-    job.spectral_element_count = job
-        .spectral_element_count
-        .max(packet.timing.spectral_element_count);
+    job.trajectory_block_count = job
+        .trajectory_block_count
+        .max(packet.timing.trajectory_block_count);
     let total_reduction_ms = reduction_started.elapsed().as_secs_f64() * 1.0e3;
     job.verification_ms += verification_ms;
     job.reduction_ms += (total_reduction_ms - verification_ms).max(0.0);
@@ -608,21 +628,15 @@ fn reduce_certified_packet(
 ) {
     let reduction_started = bevy::platform::time::Instant::now();
     let mut verification_ms = 0.0;
+    // Every frequency-domain row is an independent whole-trajectory
+    // equation-(184) observation at its own Laplace frequency.
+    let frequency_domain = packet.request.method == Some(ActiveGravityMethod::FrequencyDomain);
     job.certified_verification_sample_count = job
         .certified_verification_sample_count
         .saturating_add(packet.state_indices.len() as u64);
     job.certified_rejected_sample_count = job
         .certified_rejected_sample_count
         .saturating_add(packet.rejected_sample_count);
-    for (maximum, value) in job
-        .self_fd_step_maxima
-        .iter_mut()
-        .zip(packet.self_fd_step_maxima)
-    {
-        if value.is_finite() {
-            *maximum = maximum.max(value);
-        }
-    }
     for (local_candidate, metric) in packet.candidate_metrics.iter().enumerate() {
         if (metric[0] < 0.0 || metric.iter().any(|value| !value.is_finite()))
             && let Some(valid) = job.certified_candidate_valid.get_mut(
@@ -640,6 +654,58 @@ fn reduce_certified_packet(
     }
     let global_start = packet.request.candidate_start as usize
         * batch.samples_per_candidate as usize;
+    if frequency_domain {
+        // Verify every selected Laplace-frequency observation against the same
+        // aggregate spectral operator. Never compare with an instantaneous
+        // direct field or integrate the transform as a physical acceleration.
+        for (verification_index, local_target) in packet.state_indices.iter().copied().enumerate() {
+            let local = local_target as usize;
+            let local_candidate = local / batch.samples_per_candidate as usize;
+            let observation_index = local % batch.samples_per_candidate as usize;
+            let row = verification_index * 4;
+            let method_field = DVec3::new(
+                f64::from(packet.rows[row][0]),
+                f64::from(packet.rows[row][1]),
+                f64::from(packet.rows[row][2]),
+            );
+            let method_gradient = DMat3::from_cols(
+                DVec3::new(f64::from(packet.rows[row + 1][0]), f64::from(packet.rows[row + 1][1]), f64::from(packet.rows[row + 1][2])),
+                DVec3::new(f64::from(packet.rows[row + 2][0]), f64::from(packet.rows[row + 2][1]), f64::from(packet.rows[row + 2][2])),
+                DVec3::new(f64::from(packet.rows[row + 3][0]), f64::from(packet.rows[row + 3][1]), f64::from(packet.rows[row + 3][2])),
+            );
+            let verification_started = bevy::platform::time::Instant::now();
+            let (reference_field, reference_gradient) = frequency_domain_reference_integral(
+                batch, packet.request.candidate_start as usize + local_candidate,
+                observation_index,
+                packet.request.density_model, reference_cache,
+            );
+            verification_ms += verification_started.elapsed().as_secs_f64() * 1.0e3;
+            if !method_field.is_finite() || !method_gradient.is_finite()
+                || !reference_field.is_finite() || !reference_gradient.is_finite()
+            {
+                job.certified_gravity_error_sum = f64::NAN;
+                job.certified_gradient_error_sum = f64::NAN;
+                continue;
+            }
+            job.certified_gravity_error_sum += (method_field - reference_field).length_squared();
+            job.certified_gravity_reference_sum += reference_field.length_squared();
+            job.certified_gradient_error_sum += matrix_norm_squared(method_gradient - reference_gradient);
+            job.certified_gradient_reference_sum += matrix_norm_squared(reference_gradient);
+            job.certified_pointwise_gravity_errors.push((
+                (method_field - reference_field).length() / reference_field.length().max(f64::MIN_POSITIVE)
+            ) as f32);
+            job.certified_pointwise_gradient_errors.push((
+                matrix_norm_squared(method_gradient - reference_gradient).sqrt()
+                    / matrix_norm_squared(reference_gradient).sqrt().max(f64::MIN_POSITIVE)
+            ) as f32);
+            job.certified_gravity_samples += 1;
+            job.certified_gradient_samples += 1;
+        }
+        job.verification_ms += verification_ms;
+        job.certified_reduction_ms +=
+            (reduction_started.elapsed().as_secs_f64() * 1.0e3 - verification_ms).max(0.0);
+        return;
+    }
     for (verification_index, local_target) in packet.state_indices.iter().copied().enumerate() {
         let state = batch.states[global_start + local_target as usize];
         let row = verification_index * 4;
@@ -715,6 +781,15 @@ fn prepare_planning_references(
     }
     if cache.packet_id != Some(packet.request.request_id) {
         cache.packet_id = Some(packet.request.request_id);
+        cache.target_indices = if packet.request.method
+            == Some(ActiveGravityMethod::FrequencyDomain)
+        {
+            let count = packet.request.candidate_count as usize
+                * batch.samples_per_candidate as usize;
+            (0..count).map(|index| index as u32).collect()
+        } else {
+            packet.state_indices.clone()
+        };
         cache.target_cursor = 0;
         cache.source_cursor = 0;
         cache.partial_field = DVec3::ZERO;
@@ -723,8 +798,8 @@ fn prepare_planning_references(
     let started = bevy::platform::time::Instant::now();
     let global_start = packet.request.candidate_start as usize * batch.samples_per_candidate as usize;
     let row = packet.request.density_model as usize * 56;
-    while cache.target_cursor < packet.state_indices.len() {
-        let state_index = global_start + packet.state_indices[cache.target_cursor] as usize;
+    while cache.target_cursor < cache.target_indices.len() {
+        let state_index = global_start + cache.target_indices[cache.target_cursor] as usize;
         let Some(state) = batch.states.get(state_index) else { return true; }; // reduction rejects malformed output
         let target = state.body_position().as_dvec3();
         let key = reference_key(target, batch, packet.request.density_model);
@@ -761,6 +836,64 @@ fn direct_planning_reference_cached(
         .unwrap_or((DVec3::NAN, DMat3::NAN))
 }
 
+/// Reference form of the known-trajectory equation-(184) observation.  It is
+/// the time-domain identity corresponding to the same discrete Fourier--
+/// Laplace transform used by the shader: integrate the instantaneous reference
+/// field and Jacobian with the identical trapezoid weights and absolute-time
+/// factor exp(-s t).
+fn frequency_domain_reference_integral(
+    batch: &PlanningCandidateBatch,
+    candidate_index: usize,
+    observation_index: usize,
+    density_model: u32,
+    cache: &mut PlanningReferenceCache,
+) -> (DVec3, DMat3) {
+    let samples = batch.samples_per_candidate as usize;
+    let start = candidate_index.saturating_mul(samples);
+    if start + samples > batch.states.len() {
+        return (DVec3::NAN, DMat3::NAN);
+    }
+    let laplace_frequency = eq184_laplace_sigma(observation_index, samples);
+    let mut result_field = DVec3::ZERO;
+    let mut result_gradient = DMat3::ZERO;
+    for sample_index in 0..samples {
+        let sample = batch.states[start + sample_index];
+        let previous_time = if sample_index > 0 {
+            f64::from(batch.states[start + sample_index - 1].position_time[3])
+        } else {
+            f64::from(sample.position_time[3])
+        };
+        let time = f64::from(sample.position_time[3]);
+        let next_time = if sample_index + 1 < samples {
+            f64::from(batch.states[start + sample_index + 1].position_time[3])
+        } else {
+            time
+        };
+        let Some(weight) = eq184_time_weight(
+            previous_time,
+            time,
+            next_time,
+            sample_index,
+            samples,
+            laplace_frequency,
+        ) else {
+            return (DVec3::NAN, DMat3::NAN);
+        };
+        let (field, gradient) = direct_planning_reference_cached(
+            sample.body_position().as_dvec3(),
+            batch,
+            density_model,
+            cache,
+        );
+        if !field.is_finite() || !gradient.is_finite() {
+            return (DVec3::NAN, DMat3::NAN);
+        }
+        result_field += weight * field;
+        result_gradient += weight * gradient;
+    }
+    (result_field, result_gradient)
+}
+
 fn matrix_norm_squared(matrix: DMat3) -> f64 {
     matrix.x_axis.length_squared() + matrix.y_axis.length_squared() + matrix.z_axis.length_squared()
 }
@@ -785,7 +918,7 @@ fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) 
     let can_grow = request_ms < PLANNING_TARGET_REQUEST_MS
         && frame_rate.is_none_or(|fps| fps >= 59.0)
         && recent_frame_ms.is_none_or(|milliseconds| milliseconds <= 17.2);
-    let (minimum, maximum) = if job.method == ActiveGravityMethod::CurvedArcEq106 {
+    let (minimum, maximum) = if job.method == ActiveGravityMethod::FrequencyDomain {
         (
             PLANNING_GPU_TILE_MIN_CANDIDATES,
             PLANNING_GPU_TILE_MAX_CANDIDATES,
@@ -944,7 +1077,7 @@ fn finish_planning_method(
         + job.readback_decode_ms
         + job.reduction_ms;
     // Cumulative checked total, not a warm pass plus a CPU-only approximation
-    // of cold setup. This includes the actual Eq.106 GPU basis once, just as
+    // of cold setup. This includes the actual Frequency-domain algorithm GPU basis once, just as
     // it includes the FFT/FMM GPU bases once for fixed-target batches. Warm calibration is not charged.
     let certified_estimated_total_ms = total_ms
         + job.certified_density_payload_preparation_ms
@@ -960,7 +1093,8 @@ fn finish_planning_method(
     .sqrt() as f32;
     let verified = gravity_error.is_finite()
         && gradient_error.is_finite()
-        && job.pericenter_error_m.is_finite()
+        && (job.method == ActiveGravityMethod::FrequencyDomain
+            || job.pericenter_error_m.is_finite())
         && minimum_altitude_m.is_finite()
         && minimum_altitude_m > 0.0
         && model_discrimination.is_finite()
@@ -972,8 +1106,8 @@ fn finish_planning_method(
         && matches!(
             (job.method, backend),
             (
-                ActiveGravityMethod::CurvedArcEq106,
-                PlanningExecutionBackend::GpuEq106
+                ActiveGravityMethod::FrequencyDomain,
+                PlanningExecutionBackend::GpuFrequencyDomain
             ) | (
                 ActiveGravityMethod::MmfftCompressed,
                 PlanningExecutionBackend::GpuMmfft
@@ -1009,8 +1143,8 @@ fn finish_planning_method(
         minimum_altitude_m,
         model_discrimination,
         planning_objective,
-        segment_count: if job.method == ActiveGravityMethod::CurvedArcEq106 {
-            job.spectral_element_count
+        segment_count: if job.method == ActiveGravityMethod::FrequencyDomain {
+            job.trajectory_block_count
         } else {
             0
         },
@@ -1064,7 +1198,6 @@ fn finish_planning_method(
         gradient_error_p95,
         gradient_error_p99,
         gradient_error_max,
-        gradient_self_fd_error = job.maximum_gradient_self_fd_relative_error,
         valid_candidates = job.candidate_valid.iter().filter(|valid| **valid).count(),
         gpu_requests = raw_gpu_request_count,
         certified_probe_requests = certified_gpu_request_count,
@@ -1125,10 +1258,6 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.certified_rejected_sample_count = 0;
     job.certified_candidate_valid.fill(true);
     job.rejected_sample_count = 0;
-    job.rejection_counts = [0; 6];
-    job.self_fd_step_maxima = [0.0; 5];
-    job.first_rejection = None;
-    job.maximum_gradient_self_fd_relative_error = 0.0;
     job.pericenter_error_m = 0.0;
     job.minimum_altitude_m = f32::INFINITY;
     job.discrimination_sum = 0.0;
@@ -1157,7 +1286,7 @@ fn advance_planning_method(job: &mut PlanningBatchJob) {
     job.certified_kernels = PlanningKernelTotals::default();
     job.dispatch_count = 0;
     job.forward_kernel_evaluations = 0;
-    job.spectral_element_count = 0;
+    job.trajectory_block_count = 0;
 }
 
 fn planning_progress_text(job: &PlanningBatchJob) -> String {

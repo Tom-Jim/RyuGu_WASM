@@ -141,8 +141,7 @@ pub(crate) fn encode_planning_reduction(
     baseline: &Buffer,
     metrics: &Buffer,
 ) -> (Buffer, BindGroup) {
-    let mut bytes = Vec::with_capacity(48);
-    for value in [
+    let integer_fields = [
         request.candidate_start * batch.samples_per_candidate,
         request.candidate_count * batch.samples_per_candidate,
         batch.samples_per_candidate,
@@ -151,17 +150,11 @@ pub(crate) fn encode_planning_reduction(
         request.candidate_count,
         0,
         0,
-    ] {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [
-        batch.body_radius,
-        GRAVITY_BENCHMARK_RELATIVE_TOLERANCE,
-        0.30,
-        0.0,
-    ] {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
+    ];
+    let scalar_fields = [batch.body_radius, 0.0, 0.0, 0.0];
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(bytemuck::cast_slice(&integer_fields));
+    bytes.extend_from_slice(bytemuck::cast_slice(&scalar_fields));
     let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("planning_reduction_uniform"),
         contents: &bytes,

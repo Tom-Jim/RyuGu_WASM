@@ -1,4 +1,3 @@
-use crate::cpu::curved_arc::CurvedArcResidualHistory;
 use crate::interface::components::*;
 use crate::interface::select_history;
 use bevy::prelude::*;

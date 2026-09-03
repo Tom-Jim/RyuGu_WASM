@@ -69,7 +69,7 @@ impl FmmReadbackChannel {
 }
 
 
-impl Default for Eq106GpuReadbackChannel {
+impl Default for FrequencyDomainGpuReadbackChannel {
     fn default() -> Self {
         Self {
             data: Arc::new(Mutex::new(None)),
@@ -82,7 +82,7 @@ impl Default for Eq106GpuReadbackChannel {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Eq106TimingSample {
+pub struct FrequencyDomainTimingSample {
     pub spectrum_build_ms: Option<f64>,
     pub target_evaluation_ms: Option<f64>,
     pub cpu_readback_wait_ms: f64,
@@ -92,7 +92,7 @@ pub struct Eq106TimingSample {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Eq106InversionTiming {
+pub struct FrequencyDomainInversionTiming {
     pub source_preparation_ms: f64,
     pub spectrum_build_ms: Option<f64>,
     pub target_evaluation_ms: Option<f64>,
@@ -106,10 +106,10 @@ pub struct Eq106InversionTiming {
 }
 
 #[derive(Resource, Default)]
-pub struct Eq106PerformanceMetrics {
-    pub latest: Option<Eq106TimingSample>,
+pub struct FrequencyDomainPerformanceMetrics {
+    pub latest: Option<FrequencyDomainTimingSample>,
     pub full_inversion_iteration_ms: Option<f64>,
-    pub inversion: Option<Eq106InversionTiming>,
+    pub inversion: Option<FrequencyDomainInversionTiming>,
 }
 
 /// Snapshot-aligned history populated by the dedicated compressed readback
@@ -210,9 +210,8 @@ pub enum ActiveGravityMethod {
     #[default]
     RadialAnalytic,
     HomogeneousWerner,
-    /// Eq. (106) adaptive curved-arc mode; it starts non-periodic and promotes
-    /// itself to periodic only after the planner sees stable orbit closures.
-    CurvedArcEq106,
+    /// Known-trajectory reciprocal-space gravity evaluation.
+    FrequencyDomain,
     /// Fourth method: CPU-preprocessed FFT grids with scale-normalized packed
     /// binary16 GPU potential samples and a snapshot-tagged readback channel.
     MmfftCompressed,
@@ -224,9 +223,11 @@ pub const PERFORMANCE_PHASE_SIMULATION_SECONDS: f64 = BENCHMARK_DURATION_SECONDS
 pub const PERFORMANCE_HISTORY_CAPACITY: usize = 180;
 
 /// Quarter-turn rotation applied to the complete browser display frame.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct DisplayRotation(pub u8);
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl DisplayRotation {
     pub fn advance(&mut self) -> u8 {
         self.0 = (self.0 + 1) % 4;
@@ -234,6 +235,7 @@ impl DisplayRotation {
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Resource, Debug)]
 pub struct PerformanceComparisonState {
     pub active: bool,
@@ -248,12 +250,13 @@ pub struct PerformanceComparisonState {
     /// user's throughput setting when leaving the comparison view.
     pub return_simulation_acceleration: u32,
     pub fps_history: [VecDeque<f32>; 5],
-    /// Jacobi histories map to Radial, Werner, Eq.106, MMFFT, and FMM.
-    /// Each series contains only samples emitted by that algorithm.
+    /// Jacobi histories map to Radial, Werner, a reserved transform-only slot,
+    /// MMFFT, and FMM. Each populated series contains only physical pointwise
+    /// samples emitted by that algorithm.
     pub jacobi_history: [VecDeque<JacobiSample>; 5],
     pub jacobi_last_request_ids: [Option<u64>; 5],
     /// Algorithms included in the performance rotation. The five entries map
-    /// to Radial, Werner, Eq.106, MMFFT, and FMM respectively.
+    /// to Radial, Werner, Frequency-domain algorithm, MMFFT, and FMM respectively.
     pub enabled_methods: [bool; 5],
     /// One benchmark pass visits each enabled method once. Keeping this
     /// separate from `enabled_methods` prevents phase wrap-around from
@@ -280,14 +283,19 @@ impl Default for PerformanceComparisonState {
                 VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
             }),
             jacobi_last_request_ids: [None; 5],
-            enabled_methods: [true; 5],
+            // Equation (184) is transform-only and cannot participate in a
+            // pointwise FPS/Jacobi benchmark without substituting another
+            // method's force. It has a separate GPU quadrature benchmark.
+            enabled_methods: [true, true, false, true, true],
             completed_methods: [false; 5],
         }
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl PerformanceComparisonState {
     pub fn start(&mut self, return_method: ActiveGravityMethod) {
+        self.enabled_methods[ActiveGravityMethod::FrequencyDomain.performance_index()] = false;
         self.active = true;
         self.measuring = self.enabled_methods.iter().any(|enabled| *enabled);
         self.phase = 0;
@@ -341,7 +349,7 @@ impl ActiveGravityMethod {
         match self {
             Self::RadialAnalytic => 0,
             Self::HomogeneousWerner => 1,
-            Self::CurvedArcEq106 => 2,
+            Self::FrequencyDomain => 2,
             Self::MmfftCompressed => 3,
             Self::Fmm => 4,
         }
@@ -351,7 +359,7 @@ impl ActiveGravityMethod {
         match index {
             0 => Self::RadialAnalytic,
             1 => Self::HomogeneousWerner,
-            2 => Self::CurvedArcEq106,
+            2 => Self::FrequencyDomain,
             3 => Self::MmfftCompressed,
             4 => Self::Fmm,
             // Keep malformed UI state deterministic instead of silently
@@ -364,7 +372,7 @@ impl ActiveGravityMethod {
         match self {
             Self::RadialAnalytic => "GPU Radial Analytic",
             Self::HomogeneousWerner => "GPU Werner Polyhedron",
-            Self::CurvedArcEq106 => "Eq.106 Adaptive Curved-Arc",
+            Self::FrequencyDomain => "GPU Frequency-domain Algorithm",
             Self::MmfftCompressed => "Packed MMFFT + GPU Interpolation",
             Self::Fmm => "GPU Order-2 Target-Cell FMM",
         }
@@ -372,7 +380,7 @@ impl ActiveGravityMethod {
 
     pub fn planning_label(self) -> &'static str {
         match self {
-            Self::CurvedArcEq106 => "Eq.106 Taylor/Chebyshev variant",
+            Self::FrequencyDomain => "GPU Frequency-domain Algorithm reciprocal evaluation",
             Self::MmfftCompressed => "GPU FFT 56-basis convolution + quintic interpolation",
             Self::Fmm => "GPU order-2 FMM + 56 density bases",
             _ => self.as_str(),

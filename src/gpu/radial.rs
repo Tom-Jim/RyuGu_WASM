@@ -263,29 +263,25 @@ fn poll_gravity_readback(
     if acceleration_is_valid && potential_is_valid {
         history.0.push(GravityFieldSample {
             snapshot: packet.snapshot,
-            predictive: false,
             body_acceleration: total.xyz(),
             positive_potential: total.w,
-            #[cfg(feature = "eq106-dual-certificate")]
-            independent_positive_potential: None,
-            body_acceleration_jacobian: None,
         });
     }
 }
 
 fn extract_gravity_input_system(
     mut extracted: ResMut<ExtractedGravityInput>,
-    source: Extract<Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>>,
+    source: Extract<Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>>,
     clock: Extract<Res<SimulationClock>>,
     planning: Extract<Res<PlanningComparisonState>>,
-    cassini: Extract<Query<(&Transform, &Velocity), With<CassiniMarker>>>,
+    cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
     extracted.enabled = !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }
-    let (Some(source), Ok((cassini, velocity)), Ok(ryugu)) =
+    let (Some(source), Ok(cassini), Ok(ryugu)) =
         (source.as_ref(), cassini.single(), ryugu.single())
     else {
         return;
@@ -296,23 +292,18 @@ fn extract_gravity_input_system(
         request_id: clock.request_id,
         epoch: clock.epoch,
         simulation_time_seconds: clock.elapsed_seconds,
-        body_position: extracted.probe,
-        ryugu_transform: *ryugu,
-        probe_position: cassini.translation,
-        probe_velocity: velocity.0,
     });
     extracted.source_count = source.sources.len() as u32;
     if extracted.source_bytes.is_none() {
         let mut bytes = Vec::with_capacity(source.sources.len() * 16);
         for item in &source.sources {
-            for value in [
+            let record = [
                 item.position.x as f32,
                 item.position.y as f32,
                 item.position.z as f32,
                 item.mass as f32,
-            ] {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
+            ];
+            bytes.extend_from_slice(bytemuck::bytes_of(&record));
         }
         extracted.source_bytes = Some(bytes);
     }

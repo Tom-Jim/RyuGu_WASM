@@ -19,7 +19,6 @@ pub(crate) struct ExtractedPlanningInput {
     pub batch: Option<PlanningCandidateBatch>,
     pub request: PlanningGpuRequest,
     pub payload: PlanningMethodPayload,
-    pub eq106_operator: Arc<[u8]>,
     pub source_radius: f32,
 }
 
@@ -152,7 +151,6 @@ fn extract_planning_input(
     batch: Extract<Res<PlanningCandidateBatch>>,
     request: Extract<Res<PlanningGpuRequest>>,
     payload: Extract<Res<PlanningMethodPayload>>,
-    operator: Extract<Option<Res<crate::cpu::eq106_operator::Eq106OperatorTensorResource>>>,
 ) {
     if batch.batch_id == 0 || request.batch_id != batch.batch_id {
         extracted.batch = None;
@@ -169,12 +167,7 @@ fn extract_planning_input(
     }
     extracted.request = request.clone();
     extracted.payload = payload.clone();
-    if extracted.eq106_operator.is_empty()
-        && let Some(operator) = operator.as_ref()
-    {
-        extracted.eq106_operator = Arc::from(operator.tensor.as_le_bytes());
-    }
-    extracted.source_radius = batch.eq106_source_radius;
+    extracted.source_radius = batch.frequency_domain_source_radius;
 }
 
 fn prepare_planning_shared_buffers(
@@ -538,10 +531,7 @@ fn dispatch_planning_method(
                     state_indices,
                     raw_rows: rows.0.clone(),
                     rows: rows.0,
-                    rejection_counts: [0; 6],
                     rejected_sample_count: 0,
-                    self_fd_step_maxima: [0.0; 5],
-                    first_rejection: None,
                     candidate_metrics: rows.1,
                     readback_valid: result.is_ok(),
                     timing: PlanningGpuTiming {
@@ -559,8 +549,7 @@ fn dispatch_planning_method(
                         basis_kernel_ms: kernel_ms.and(preparation_cost.basis_ms),
                         dispatch_count: 2 + preparation_cost.dispatches,
                         forward_kernel_evaluations: kernel_evaluations,
-                        spectral_element_count: 0,
-                        gradient_self_fd_relative_error: 0.0,
+                        trajectory_block_count: 0,
                     },
                     backend,
                 });
@@ -600,16 +589,13 @@ fn fmm_planning_uniform(
     batch: &PlanningCandidateBatch,
     response_start: u32,
 ) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(16);
-    for value in [
+    bytemuck::cast_slice(&[
         request.candidate_start * batch.samples_per_candidate,
         request.candidate_count * batch.samples_per_candidate,
         response_start,
         request.density_model,
-    ] {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
+    ])
+    .to_vec()
 }
 
 fn mmfft_planning_uniform(
@@ -621,8 +607,7 @@ fn mmfft_planning_uniform(
     // Params structure occupies 80 bytes even though its scalar payload ends
     // at byte 64. Keep the shader offsets unchanged and provide the required
     // tail padding explicitly.
-    let mut bytes = Vec::with_capacity(80);
-    for value in [
+    let integer_fields = [
         request.candidate_start * batch.samples_per_candidate,
         request.candidate_count * batch.samples_per_candidate,
         request.density_model,
@@ -631,10 +616,8 @@ fn mmfft_planning_uniform(
         payload.grid_sizes[1],
         0,
         0,
-    ] {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [
+    ];
+    let scalar_fields = [
         payload.half_extents[0],
         payload.half_extents[1],
         payload.total_mass,
@@ -643,9 +626,10 @@ fn mmfft_planning_uniform(
         payload.grid_scales[1],
         G,
         0.0,
-    ] {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
+    ];
+    let mut bytes = Vec::with_capacity(80);
+    bytes.extend_from_slice(bytemuck::cast_slice(&integer_fields));
+    bytes.extend_from_slice(bytemuck::cast_slice(&scalar_fields));
     bytes.resize(80, 0);
     bytes
 }

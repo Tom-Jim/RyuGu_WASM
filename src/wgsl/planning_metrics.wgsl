@@ -7,9 +7,9 @@ struct PlanningMetricsParams {
     pl_candidate_count: u32,
     pl_padding0: vec2<u32>,
     pl_body_radius: f32,
-    pl_certificate_tolerance: f32,
-    pl_transverse_limit: f32,
     pl_padding1: f32,
+    pl_padding2: f32,
+    pl_padding3: f32,
 };
 
 @group(0) @binding(0) var<uniform> pl_params: PlanningMetricsParams;
@@ -46,16 +46,6 @@ fn main(
         let pl_global_index = pl_params.pl_state_offset + pl_local_index;
         let pl_row_index = pl_local_index * pl_params.pl_row_stride;
         let pl_field_value = pl_fields[pl_row_index];
-        if pl_params.pl_row_stride == 9u {
-            let pl_certificate_value = pl_fields[pl_row_index + 1u];
-            if pl_certificate_value.x > pl_params.pl_certificate_tolerance
-                || pl_certificate_value.y > pl_params.pl_certificate_tolerance
-                || pl_certificate_value.z > pl_params.pl_certificate_tolerance
-                || pl_certificate_value.w > pl_params.pl_transverse_limit
-            {
-                pl_invalid_count = 1u;
-            }
-        }
         var pl_baseline_value = pl_field_value;
         if pl_params.pl_density_model == 0u {
             pl_baseline[pl_global_index] = pl_field_value;
@@ -66,7 +56,7 @@ fn main(
         pl_difference_energy += dot(pl_delta, pl_delta);
         pl_reference_energy += dot(pl_baseline_value.xyz, pl_baseline_value.xyz);
         var pl_gradient_row = 1u;
-        if pl_params.pl_row_stride == 9u { pl_gradient_row = 2u; }
+        if pl_params.pl_row_stride == 11u { pl_gradient_row = 2u; }
         pl_jacobian_energy += dot(
             pl_fields[pl_row_index + pl_gradient_row].xyz,
             pl_fields[pl_row_index + pl_gradient_row].xyz,

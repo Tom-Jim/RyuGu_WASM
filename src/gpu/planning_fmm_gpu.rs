@@ -378,7 +378,7 @@ impl PlanningFmmGpu {
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        for value in [batch.eq106_source_radius, G, 0.05, 0.0] {
+        for value in [batch.frequency_domain_source_radius, G, 0.05, 0.0] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         let uniform = device.create_buffer_with_data(&BufferInitDescriptor {

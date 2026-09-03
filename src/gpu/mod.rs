@@ -1,7 +1,7 @@
 //! GPU backends and render-world compute adapters.
 
-pub(crate) mod eq106;
 pub(crate) mod fmm;
+pub(crate) mod frequency_domain;
 pub(crate) mod mmfft;
 pub(crate) mod normals;
 pub(crate) mod planning;

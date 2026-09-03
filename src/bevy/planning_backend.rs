@@ -2,7 +2,7 @@ pub fn update_planning_results_from_inversion_system(
     mut commands: Commands,
     inversion: Res<TrajectoryInversionState>,
     radial: Option<Res<RadialGravitySource>>,
-    aggregated: Option<Res<crate::cpu::curved_arc::AggregatedGravitySource>>,
+    aggregated: Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>,
     mut planning: ResMut<PlanningComparisonState>,
     mut batch_builder: Local<Option<crate::cpu::planning::PlanningBatchBuilder>>,
 ) {
@@ -46,12 +46,12 @@ pub fn update_planning_results_from_inversion_system(
         };
         let Some(aggregated) = aggregated else {
             planning.status =
-                "Planning queued: the common 1024-source geometry is not ready.".into();
+                "Planning queued: the common mass-preserving source geometry is not ready.".into();
             return;
         };
         let Some((voxels, voxel_size)) = crate::cpu::inversion::build_density_voxels(
             &radial,
-            ActiveGravityMethod::CurvedArcEq106,
+            ActiveGravityMethod::FrequencyDomain,
         ) else {
             planning.status =
                 "Planning batch could not build the independent 56-region truth geometry.".into();
@@ -95,7 +95,7 @@ pub fn update_planning_results_from_inversion_system(
             .min(u32::MAX as usize) as u32
     };
     if !builder.advance(candidate_budget) {
-        planning.status = "Planning candidate generation left the certified 15 m tube.".into();
+        planning.status = "Planning candidate propagation failed.".into();
         planning.run_requested = false;
         *batch_builder = None;
         return;
@@ -194,10 +194,6 @@ pub fn update_planning_results_from_inversion_system(
         certified_rejected_sample_count: 0,
         certified_candidate_valid: vec![true; dimensions.0 as usize],
         rejected_sample_count: 0,
-        rejection_counts: [0; 6],
-        self_fd_step_maxima: [0.0; 5],
-        first_rejection: None,
-        maximum_gradient_self_fd_relative_error: 0.0,
         pericenter_error_m: 0.0,
         minimum_altitude_m: f32::INFINITY,
         discrimination_sum: 0.0,
@@ -227,7 +223,7 @@ pub fn update_planning_results_from_inversion_system(
         certified_full_pass_ms: 0.0,
         dispatch_count: 0,
         forward_kernel_evaluations: 0,
-        spectral_element_count: 0,
+        trajectory_block_count: 0,
     });
     planning.status = format!(
         "{} batch planning started: 0/{} evaluations, order {} -> {} -> {}.",
@@ -245,7 +241,7 @@ pub fn update_planning_results_from_inversion_system(
 fn planning_method_order(seed: u64) -> [ActiveGravityMethod; 3] {
     use rand::{SeedableRng, seq::SliceRandom};
     let mut order = [
-        ActiveGravityMethod::CurvedArcEq106,
+        ActiveGravityMethod::FrequencyDomain,
         ActiveGravityMethod::MmfftCompressed,
         ActiveGravityMethod::Fmm,
     ];

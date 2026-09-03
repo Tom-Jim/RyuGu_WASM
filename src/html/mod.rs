@@ -1,5 +1,3 @@
-use crate::cpu::curved_arc::{CurvedArcPlannerState, CurvedArcResidualHistory};
-use crate::cpu::volterra::VolterraPropagationStatus;
 use crate::interface::components::*;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -72,7 +70,7 @@ pub(crate) fn browser_ui_action_system(
                 let next = match value.and_then(Value::as_str) {
                     Some("radial") => Some(ActiveGravityMethod::RadialAnalytic),
                     Some("werner") => Some(ActiveGravityMethod::HomogeneousWerner),
-                    Some("eq106") => Some(ActiveGravityMethod::CurvedArcEq106),
+                    Some("frequency_domain") => Some(ActiveGravityMethod::FrequencyDomain),
                     Some("fft") => Some(ActiveGravityMethod::MmfftCompressed),
                     Some("fmm") => Some(ActiveGravityMethod::Fmm),
                     _ => None,
@@ -118,6 +116,7 @@ pub(crate) fn browser_ui_action_system(
             "performance-method" => {
                 if !performance.measuring
                     && let Some(index) = value.and_then(Value::as_u64).map(|value| value as usize)
+                    && index != ActiveGravityMethod::FrequencyDomain.performance_index()
                     && let Some(enabled) = performance.enabled_methods.get_mut(index)
                 {
                     *enabled = !*enabled;
@@ -419,7 +418,7 @@ fn queue_planning_run(
     *payload = PlanningMethodPayload::default();
     result.0 = None;
     planning.status = format!(
-        "{} selected: full Eq.106, packed FFT, and FMM evaluation queued.",
+        "{} selected: full Frequency-domain algorithm, packed FFT, and FMM evaluation queued.",
         planning.workload_profile.label(),
     );
 }
@@ -485,9 +484,7 @@ pub(crate) struct BrowserUiSnapshot<'w> {
     probe: Res<'w, ProbeInitialConditions>,
     memory: Res<'w, GpuMemoryEstimate>,
     jacobi: Res<'w, JacobiHistory>,
-    residual: Res<'w, CurvedArcResidualHistory>,
-    planner: Res<'w, CurvedArcPlannerState>,
-    propagation: Res<'w, VolterraPropagationStatus>,
+    frequency_domain: Res<'w, FrequencyDomainTrajectoryBatchResult>,
 }
 
 pub(crate) fn browser_ui_publish_system(
@@ -582,19 +579,21 @@ pub(crate) fn browser_ui_publish_system(
         .iter()
         .map(|sample| [sample.simulation_time_seconds, sample.jacobi_constant])
         .collect::<Vec<_>>();
-    let residual = state
-        .residual
-        .samples
+    let frequency_domain = state
+        .frequency_domain
+        .observations
         .iter()
-        .filter(|sample| {
-            sample.simulation_time_seconds.is_finite() && sample.epsilon_max.is_finite()
-        })
-        .map(|sample| {
-            json!({
-                "time": sample.simulation_time_seconds,
-                "epsilon": sample.epsilon_max.abs(),
-                "order": sample.taylor_order,
-            })
+        .map(|observation| {
+            let jacobian_norm = (observation.transformed_jacobian.x_axis.length_squared()
+                + observation.transformed_jacobian.y_axis.length_squared()
+                + observation.transformed_jacobian.z_axis.length_squared())
+            .sqrt();
+            [
+                observation.laplace_frequency,
+                observation.transformed_field.length(),
+                jacobian_norm,
+                observation.transformed_potential,
+            ]
         })
         .collect::<Vec<_>>();
     let performance_fps = state
@@ -681,7 +680,8 @@ pub(crate) fn browser_ui_publish_system(
                     "targetPointMs": result.target_point_ms,
                     "gravityError": result.relative_gravity_error,
                     "gradientError": result.gradient_relative_error,
-                    "pericenterError": result.pericenter_error_m,
+                    "pericenterError": (result.method != ActiveGravityMethod::FrequencyDomain)
+                        .then_some(result.pericenter_error_m),
                     "minimumAltitude": result.minimum_altitude_m,
                     "separation": result.model_discrimination,
                     "objective": result.planning_objective,
@@ -691,7 +691,6 @@ pub(crate) fn browser_ui_publish_system(
             })
         })
         .collect::<Vec<_>>();
-    let solve = state.propagation.latest;
     let progress = 100.0 * state.planning.progress_fraction();
     let accuracy = state.planning.batch_job.as_ref().map_or(0.0, |job| {
         let checks = [
@@ -729,8 +728,8 @@ pub(crate) fn browser_ui_publish_system(
             "workCompleted": state.planning.operation_work().0,
             "workTotal": state.planning.operation_work().1,
             "progressUnit": "estimated arithmetic operation units (source/basis/FFT/RHS/target/reference work); not measured FLOPs or an ETA",
-            "implementation": "Eq.106 Taylor/Chebyshev; GPU FFT (compensated f32), 56 GPU density bases + quintic evaluation; GPU order-2 FMM (P2M/M2M/M2L/P2P and 56-basis density mix). Independent f64 validation uses bounded CPU slices.",
-            "timingDefinition": "Raw total = shared CPU preparation + method CPU preparation + GPU preparation/evaluation submission wall times + result processing. Cooperative gaps between submissions are excluded. Checked total = raw total + the additional full checked pass; fixed-target bases charged once, streamed FMM target windows charged whenever rebuilt. Warm calibration and shared f64 references are excluded. GPU views use only pass timestamps; no CPU or readback substitution.",
+            "implementation": "Discrete equation-(184) transform: 64-node finite reciprocal-space point-residue quadrature; GPU FFT (compensated f32), 56 GPU density bases + quintic evaluation; GPU order-2 FMM (P2M/M2M/M2L/P2P and 56-basis density mix). Independent f64 direct-space validation uses bounded CPU slices.",
+            "timingDefinition": "Raw total = shared CPU preparation + method CPU preparation + GPU preparation/evaluation submission wall times + result processing. Cooperative gaps between submissions are excluded. Checked total = raw total + the additional full checked pass; fixed-target bases charged once, streamed FMM target windows charged whenever rebuilt. Warm calibration and shared f64 references are excluded. GPU views use only pass timestamps; no CPU or readback substitution. All methods share source counts, density rows and trajectory samples; equation (184) reports whole-trajectory Laplace observations while FFT/FMM report pointwise fields, so eligibility is checked against each observable's independent f64 reference rather than pretending the raw outputs are identical.",
             "visible": state.planning.source_curve_visible,
             "status": state.planning.status,
             "sourceCount": state.planning.requested_source_count,
@@ -773,21 +772,8 @@ pub(crate) fn browser_ui_publish_system(
             "displayed": displayed_density,
             "trajectory": trajectory,
         },
-        "eq106Residual": {
-            "visible": *state.active_method == ActiveGravityMethod::CurvedArcEq106,
-            "mode": state.planner.mode.as_str(),
-            "order": state.planner.taylor_order,
-            "segments": state.planner.segments.len(),
-            "remainder": state.planner.active_segment.as_ref().map(|segment| segment.remainder_bound),
-            "accepted": state.propagation.accepted_segments,
-            "rejected": state.propagation.rejected_segments,
-            "picardIterations": solve.map(|solve| solve.picard_iterations),
-            "endpointIterations": solve.map(|solve| solve.endpoint_iterations),
-            "relativeResidual": solve.map(|solve| solve.relative_residual),
-            "maximumTransverse": solve.map(|solve| solve.maximum_transverse_distance),
-            "samples": residual,
-        },
         "jacobi": jacobi,
+        "frequencyDomain": frequency_domain,
         "runtimeError": state.runtime_error.message,
     });
     if let Ok(snapshot) = serde_json::to_string(&snapshot) {
@@ -823,7 +809,7 @@ fn method_key(method: ActiveGravityMethod) -> &'static str {
     match method {
         ActiveGravityMethod::RadialAnalytic => "radial",
         ActiveGravityMethod::HomogeneousWerner => "werner",
-        ActiveGravityMethod::CurvedArcEq106 => "eq106",
+        ActiveGravityMethod::FrequencyDomain => "frequency_domain",
         ActiveGravityMethod::MmfftCompressed => "fft",
         ActiveGravityMethod::Fmm => "fmm",
     }

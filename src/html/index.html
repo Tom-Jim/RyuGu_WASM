@@ -17,7 +17,7 @@
                 <div class="method-picker" role="group" aria-label="Gravity method">
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="radial">Radial</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="werner">Werner</button>
-                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="eq106">Eq.106</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="frequency_domain">Frequency-domain algorithm</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="fft">Packed FFT</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="method" data-value="fmm">FMM</button>
                 </div>
@@ -89,14 +89,9 @@
             </aside>
 
             <section class="telemetry-stack" data-float-panel>
-                <article id="residual-card" class="chart-card glass" hidden>
-                    <div class="panel-heading"><span>Eq.106 residual estimate</span><small id="residual-order">WAITING</small></div>
-                    <div id="residual-chart" class="live-chart-host" aria-label="Eq.106 residual estimate over simulation time"></div>
-                    <p id="residual-diagnostics" class="chart-diagnostics">Waiting for Volterra propagation.</p>
-                </article>
                 <article class="chart-card glass">
-                    <div class="panel-heading"><span>Rotating-frame Jacobi constant</span><small>ROLLING WINDOW</small></div>
-                    <div id="jacobi-chart" class="live-chart-host" aria-label="Jacobi constant over simulation time"></div>
+                    <div class="panel-heading"><span>Active-method diagnostic</span><small>PHYSICAL / TRANSFORM</small></div>
+                    <div id="jacobi-chart" class="live-chart-host" aria-label="Active gravity method diagnostic"></div>
                 </article>
             </section>
         </section>
@@ -110,7 +105,7 @@
                 <div class="method-checks" role="group" aria-label="Methods included in benchmark">
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="0">Radial</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="1">Werner</button>
-                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="2">Eq.106</button>
+                    <button data-action="performance-method" data-value="2" disabled title="The frequency-domain algorithm is a whole-trajectory transform; use the quadrature benchmark below.">Frequency-domain algorithm</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="3">Packed FFT</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="4">FMM</button>
                 </div>
@@ -153,6 +148,7 @@
     <script type="importmap">{"imports":{"vue":"./node_modules/vue/dist/vue.esm-browser.prod.js","vue/dist/vue.esm-bundler.js":"./node_modules/vue/dist/vue.esm-browser.prod.js","vue-echarts":"./node_modules/vue-echarts/dist/index.js","echarts/core":"./node_modules/echarts/core.js","echarts/charts":"./node_modules/echarts/charts.js","echarts/components":"./node_modules/echarts/components.js","echarts/renderers":"./node_modules/echarts/renderers.js","echarts/":"./node_modules/echarts/","zrender/":"./node_modules/zrender/","tslib":"./node_modules/tslib/tslib.es6.js"}}</script>
     <script>globalThis.process ??= { env: { NODE_ENV: 'production' } }; globalThis.__VUE_OPTIONS_API__ = true; globalThis.__VUE_PROD_DEVTOOLS__ = false; globalThis.__VUE_PROD_HYDRATION_MISMATCH_DETAILS__ = false;</script>
     <script src="./src/html/capture.js"></script>
+    <script src="./src/html/visit.js"></script>
     <script src="./src/html/ui.js"></script>
     <script type="module" src="./src/html/app.js"></script>
     <script type="module">

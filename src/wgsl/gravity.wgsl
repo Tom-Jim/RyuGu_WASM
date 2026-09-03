@@ -1,4 +1,4 @@
-// Spatial-domain forward model over the common 1024-source aggregation.
+// Spatial-domain forward model over the common mass-preserving point quadrature.
 
 struct GravityParams {
     probe_pos: vec3<f32>,

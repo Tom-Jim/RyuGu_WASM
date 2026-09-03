@@ -1,10 +1,10 @@
-pub(crate) struct PlanningEq106Workspace {
+pub(crate) struct PlanningFrequencyDomainWorkspace {
     batch_id: u64,
     primary: Arc<[u8]>,
     ranges: [[u32; 2]; 56],
 }
 
-impl Default for PlanningEq106Workspace {
+impl Default for PlanningFrequencyDomainWorkspace {
     fn default() -> Self {
         Self {
             batch_id: 0,
@@ -14,17 +14,17 @@ impl Default for PlanningEq106Workspace {
     }
 }
 
-pub(crate) fn build_planning_eq106_payload(
+pub(crate) fn build_planning_frequency_domain_payload(
     batch: &PlanningCandidateBatch,
     model: u32,
     request_id: u64,
-    cache: &mut PlanningEq106Workspace,
+    cache: &mut PlanningFrequencyDomainWorkspace,
 ) -> Option<PlanningMethodPayload> {
     let started = bevy::platform::time::Instant::now();
     let mut geometry_basis_preparation_ms = 0.0;
     if cache.batch_id != batch.batch_id || cache.primary.is_empty() {
         let one_time_started = bevy::platform::time::Instant::now();
-        let (primary, ranges) = uncompressed_eq106_geometry(batch)?;
+        let (primary, ranges) = uncompressed_frequency_domain_geometry(batch)?;
         cache.batch_id = batch.batch_id;
         cache.primary = primary;
         cache.ranges = ranges;
@@ -62,7 +62,7 @@ pub(crate) fn build_planning_eq106_payload(
     }
     Some(PlanningMethodPayload {
         request_id,
-        method: Some(ActiveGravityMethod::CurvedArcEq106),
+        method: Some(ActiveGravityMethod::FrequencyDomain),
         density_model: model,
         primary,
         secondary: Arc::from(metadata),
@@ -78,7 +78,7 @@ pub(crate) fn build_planning_eq106_payload(
     })
 }
 
-fn uncompressed_eq106_geometry(
+fn uncompressed_frequency_domain_geometry(
     batch: &PlanningCandidateBatch,
 ) -> Option<(Arc<[u8]>, [[u32; 2]; 56])> {
     if batch.basis_records.is_empty() || batch.basis_records.len() > u32::MAX as usize {

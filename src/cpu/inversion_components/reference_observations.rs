@@ -67,3 +67,117 @@ fn normalized_field_error(
     }
     error / observations.len() as f64
 }
+
+/// Discrete equation-(184) observation operator used by the frequency-domain
+/// inverse. Every row is the transform of the complete known trajectory at a
+/// distinct positive Laplace frequency; no aggregate row is duplicated or
+/// interpreted as an instantaneous field sample.
+pub(crate) fn frequency_domain_training_and_holdout_reference(
+    knots: &[TrajectoryInversionKnot],
+    training_samples: &[TrajectoryInversionKnot],
+    basis: &VoxelBasisSources,
+    voxels: &[InvertedDensityVoxel],
+    spectral_radius: f64,
+) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
+    if basis.columns.len() != voxels.len() || basis.columns.is_empty() {
+        return None;
+    }
+    let holdout = holdout_frozen_trajectory(knots)?;
+    let (training, training_basis) = frequency_domain_observation_rows(
+        training_samples, &basis.columns, voxels, spectral_radius,
+    )?;
+    let (holdout_observations, holdout_basis) = frequency_domain_observation_rows(
+        &holdout, &basis.columns, voxels, spectral_radius,
+    )?;
+    Some((training, training_basis, holdout_observations, holdout_basis))
+}
+
+fn frequency_domain_observation_rows(
+    samples: &[TrajectoryInversionKnot],
+    columns: &[Vec<VoxelBasisSource>],
+    voxels: &[InvertedDensityVoxel],
+    spectral_radius: f64,
+) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
+    if samples.is_empty() || columns.len() != voxels.len() {
+        return None;
+    }
+    let mut observations = Vec::with_capacity(samples.len());
+    let mut matrix = Vec::with_capacity(samples.len() * columns.len());
+    for observation_index in 0..samples.len() {
+        let laplace_frequency = frequency_domain_laplace_frequency(
+            observation_index, samples.len(),
+        );
+        let row = columns
+            .iter()
+            .map(|column| {
+                frequency_domain_transform_for_column(
+                    samples, column, spectral_radius, laplace_frequency,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        observations.push(
+            row.iter().zip(voxels).fold(Vec3::ZERO, |sum, (field, voxel)| {
+                sum + *field * voxel.reference_density
+            }),
+        );
+        matrix.extend(row);
+    }
+    Some((observations, matrix))
+}
+
+fn frequency_domain_laplace_frequency(index: usize, count: usize) -> f64 {
+    eq184_laplace_sigma(index, count)
+}
+
+fn frequency_domain_transform_for_column(
+    samples: &[TrajectoryInversionKnot],
+    column: &[VoxelBasisSource],
+    spectral_radius: f64,
+    laplace_frequency: f64,
+) -> Option<Vec3> {
+    if samples.is_empty()
+        || column.is_empty()
+        || samples.windows(2).any(|pair| {
+            pair[1].simulation_time_seconds < pair[0].simulation_time_seconds
+        })
+    {
+        return None;
+    }
+    let mut total = Vec3::ZERO;
+    for index in 0..EQ184_QUADRATURE_COUNT {
+        let (k, weight) = eq184_quadrature_node(index, spectral_radius)?;
+        let k2 = k.length_squared().max(1.0e-18);
+        let mut characteristic = Complex64::new(0.0, 0.0);
+        for (sample_index, sample) in samples.iter().enumerate() {
+            let previous = samples.get(sample_index.wrapping_sub(1)).unwrap_or(sample);
+            let next = samples.get(sample_index + 1).unwrap_or(sample);
+            let body_position = sample
+                .body_rotation
+                .inverse()
+                .mul_vec3(sample.position)
+                .as_dvec3();
+            characteristic += eq184_trajectory_term(
+                k,
+                body_position,
+                previous.simulation_time_seconds,
+                sample.simulation_time_seconds,
+                next.simulation_time_seconds,
+                sample_index,
+                samples.len(),
+                laplace_frequency,
+            )?;
+        }
+        let mut density = Complex64::new(0.0, 0.0);
+        for source in column {
+            let phase = -k.dot(source.position);
+            density += Complex64::from_polar(source.volume, phase);
+        }
+        let coefficient = G as f64 * 4.0 * std::f64::consts::PI
+            / std::f64::consts::TAU.powi(3)
+            * weight
+            / k2;
+        let contribution = (-coefficient * (density * characteristic).im * k).as_vec3();
+        total += contribution;
+    }
+    Some(total)
+}

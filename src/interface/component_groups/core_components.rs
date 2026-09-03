@@ -10,12 +10,11 @@ pub const RYUGU_MASS: f32 = 4.5e11;
 pub const TIME_SCALE: f32 = 60.0;
 pub const BENCHMARK_DURATION_SECONDS: f64 = 901.66;
 pub const BENCHMARK_SAMPLE_INTERVAL_SECONDS: f64 = 0.01;
-pub const GRAVITY_BENCHMARK_RELATIVE_TOLERANCE: f32 = 0.04;
 pub const ORBIT_HISTORY_LEN: usize = 27500;
 pub const JACOBI_HISTORY_CAPACITY: usize = 256;
-/// Keep at least two complete maximum-acceleration Eq.106 batches.  A batch
-/// contains the authoritative anchor plus one endpoint for every accelerated
-/// stable step (9 samples at 8x).  A capacity smaller than that silently
+/// Keep at least two complete maximum-acceleration pointwise-field batches.
+/// A batch contains the authoritative anchor plus one endpoint for every
+/// accelerated stable step (9 samples at 8x). A smaller capacity silently
 /// evicts the authoritative sample before the integrator can consume it.
 pub const GRAVITY_SAMPLE_HISTORY_CAPACITY: usize = 2 * (MAX_SIMULATION_ACCELERATION as usize + 1);
 pub const PHYSICS_SUBSTEPS: usize = 100;
@@ -39,7 +38,7 @@ pub const RYUGU_SPIN_AXIS: Vec3 = Vec3::new(-0.043, -0.914, 0.405);
 pub const DENSITY_EPSILON: f32 = 10.0;
 pub const SECTION_CLIP_RADIUS: f32 = 450.0;
 /// Shared outward-increasing logarithmic density law used by the radial,
-/// Equation (106), MMFFT, and FMM modes:
+/// Frequency-domain algorithm, MMFFT, and FMM modes:
 /// `rho(r) = C ln(1 + r / epsilon)`.
 pub fn logarithmic_radial_density(radius: f32, density_c: f32) -> f32 {
     density_c * (1.0 + radius.max(0.0) / DENSITY_EPSILON).ln()
@@ -79,17 +78,10 @@ pub struct TrajectoryInversionKnot {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TrajectoryCaptureSample {
-    pub elapsed_seconds: f64,
-    pub knot: TrajectoryInversionKnot,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct GravityBenchmarkSample {
     pub simulation_time_seconds: f64,
     pub position: Vec3,
     pub velocity: Vec3,
-    pub body_rotation: Quat,
 }
 
 #[derive(Resource)]
@@ -127,6 +119,9 @@ pub struct InvertedDensityVoxel {
     pub grid: [u8; 3],
 }
 
+// Browser/JSON-facing result contract: several fields are consumed only by
+// the WASM snapshot serializer and density overlay.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct DensityInversionResult {
     pub method: ActiveGravityMethod,
@@ -143,7 +138,7 @@ pub struct DensityInversionResult {
     /// assemble the QP. This is distinct from density model RMSE.
     pub training_rmse: f32,
     /// Relative acceleration residual on a deterministic held-out set of
-    /// trajectory states evaluated with the independent reference operator.
+    /// trajectory states evaluated with the CPU frequency-domain reference.
     pub holdout_rmse: f32,
     /// CPU time spent assembling and solving this convex QP.
     pub inversion_time_ms: f64,
@@ -190,7 +185,6 @@ pub struct TrajectoryInversionState {
     pub capture_epoch: u64,
     pub last_capture_request_id: Option<u64>,
     pub wall_elapsed_seconds: f64,
-    pub raw_samples: Vec<TrajectoryCaptureSample>,
     pub knots: Vec<TrajectoryInversionKnot>,
     /// Frozen synthetic truth track generated from the logarithmic-density
     /// radial source. Non-Werner inverse methods reuse this exact track.
@@ -237,7 +231,6 @@ impl Default for TrajectoryInversionState {
             capture_epoch: 0,
             last_capture_request_id: None,
             wall_elapsed_seconds: 0.0,
-            raw_samples: Vec::with_capacity(384),
             knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
             truth_knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
             truth_capture_id: None,
@@ -266,6 +259,8 @@ impl Default for TrajectoryInversionState {
     }
 }
 
+// Browser chart contract; native test builds do not compile the HTML adapter.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub struct JacobiSample {
     pub simulation_time_seconds: f64,
@@ -277,8 +272,6 @@ pub struct JacobiHistory {
     pub samples: VecDeque<JacobiSample>,
     pub elapsed_simulation_seconds: f64,
     pub origin_simulation_seconds: Option<f64>,
-    pub eq106_origin_potential: Option<f64>,
-    pub eq106_origin_curve_work: Option<f64>,
     pub last_request_id: Option<u64>,
     pub last_sample_method: Option<ActiveGravityMethod>,
 }
@@ -289,8 +282,6 @@ impl Default for JacobiHistory {
             samples: VecDeque::with_capacity(JACOBI_HISTORY_CAPACITY),
             elapsed_simulation_seconds: 0.0,
             origin_simulation_seconds: None,
-            eq106_origin_potential: None,
-            eq106_origin_curve_work: None,
             last_request_id: None,
             last_sample_method: None,
         }
@@ -302,8 +293,6 @@ impl JacobiHistory {
         self.samples.clear();
         self.elapsed_simulation_seconds = 0.0;
         self.origin_simulation_seconds = None;
-        self.eq106_origin_potential = None;
-        self.eq106_origin_curve_work = None;
         self.last_request_id = None;
         self.last_sample_method = None;
     }
@@ -347,6 +336,7 @@ impl SimulationAcceleration {
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
 pub enum CameraMode {
     #[default]
@@ -435,10 +425,6 @@ pub struct GravityRequestSnapshot {
     pub request_id: u64,
     pub epoch: u64,
     pub simulation_time_seconds: f64,
-    pub body_position: Vec3,
-    pub ryugu_transform: Transform,
-    pub probe_position: Vec3,
-    pub probe_velocity: Vec3,
 }
 
 #[derive(Clone, Debug)]
@@ -448,36 +434,26 @@ pub struct GravityReadbackPacket {
 }
 
 #[derive(Clone, Debug)]
-pub struct Eq106ReadbackPacket {
+pub struct FrequencyDomainReadbackPacket {
     pub partial_sums: Vec<[f32; 4]>,
-    pub snapshots: Vec<GravityRequestSnapshot>,
+    /// Number of independent equation-(184) observations. Each observation
+    /// integrates the complete uploaded trajectory at one Laplace frequency.
+    pub observation_count: u32,
     pub batch_capture_id: Option<u64>,
     /// Number of compact, column-major sensitivity blocks in `partial_sums`.
-    /// Zero denotes the ordinary nine-row runtime/trajectory output layout.
+    /// Zero denotes the ordinary eleven-row trajectory-observation layout.
     pub sensitivity_column_count: u32,
     pub sensitivity_source_hash: u64,
     pub sensitivity_basis_hash: u64,
     pub sensitivity_configuration_hash: u64,
-    pub timings: Eq106TimingSample,
+    pub timings: FrequencyDomainTimingSample,
 }
 
 #[derive(Clone, Debug)]
 pub struct GravityFieldSample {
     pub snapshot: GravityRequestSnapshot,
-    /// Batch elements after the first are predicted GPU anchors used only by
-    /// the integrator; diagnostics must never treat them as observed states.
-    pub predictive: bool,
     pub body_acceleration: Vec3,
     pub positive_potential: f32,
-    /// Optional independent full-space potential used by Eq. (157). It must
-    /// never replace `positive_potential` in Jacobi calculations because that
-    /// field is paired with the acceleration actually driving the trajectory.
-    #[cfg(feature = "eq106-dual-certificate")]
-    pub independent_positive_potential: Option<f32>,
-    /// Optional body-frame Jacobian d(acceleration)/d(position). Eq.106
-    /// supplies a symmetric potential Hessian so the Volterra/Picard waveform
-    /// can close its position-field loop between GPU readbacks.
-    pub body_acceleration_jacobian: Option<Mat3>,
 }
 
 #[derive(Default)]
@@ -511,54 +487,6 @@ impl GravitySampleHistory {
             .find(|sample| sample.snapshot.epoch == epoch)
     }
 
-    pub fn at_or_before(
-        &self,
-        epoch: u64,
-        simulation_time_seconds: f64,
-    ) -> Option<&GravityFieldSample> {
-        self.samples.iter().rev().find(|sample| {
-            sample.snapshot.epoch == epoch
-                && sample.snapshot.simulation_time_seconds <= simulation_time_seconds + 1.0e-6
-        })
-    }
-
-    /// Returns the temporal anchors surrounding a fixed-update interval. Eq.106
-    /// uses them while evaluating each Volterra/Picard waveform iterate.
-    pub fn bracketing(
-        &self,
-        epoch: u64,
-        simulation_time_seconds: f64,
-    ) -> Option<(&GravityFieldSample, &GravityFieldSample)> {
-        let lower = self.samples.iter().rev().find(|sample| {
-            sample.snapshot.epoch == epoch
-                && sample.snapshot.simulation_time_seconds <= simulation_time_seconds + 1.0e-6
-        })?;
-        let upper = self
-            .samples
-            .iter()
-            .find(|sample| {
-                sample.snapshot.epoch == epoch
-                    && sample.snapshot.simulation_time_seconds >= simulation_time_seconds - 1.0e-6
-            })
-            .unwrap_or(lower);
-        Some((lower, upper))
-    }
-
-    /// Returns the newest completed GPU anchor at or before the requested
-    /// simulation time. Accelerated Eq.106 batches also contain predictive
-    /// anchors; diagnostics must skip over them instead of selecting one and
-    /// then abandoning the whole update.
-    pub fn completed_at_or_before(
-        &self,
-        epoch: u64,
-        simulation_time_seconds: f64,
-    ) -> Option<&GravityFieldSample> {
-        self.samples.iter().rev().find(|sample| {
-            !sample.predictive
-                && sample.snapshot.epoch == epoch
-                && sample.snapshot.simulation_time_seconds <= simulation_time_seconds + 1.0e-6
-        })
-    }
 }
 
 #[derive(Resource, Default)]
@@ -567,45 +495,52 @@ pub struct RadialGravityHistory(pub GravitySampleHistory);
 #[derive(Resource, Default)]
 pub struct WernerGravityHistory(pub GravitySampleHistory);
 
-/// Snapshot-aligned samples produced by the GPU Equation (106) pipeline.
-#[derive(Resource, Default)]
-pub struct Eq106GpuHistory(pub GravitySampleHistory);
-
-#[derive(Resource, Default)]
-pub struct Eq106TrajectoryBatchResult {
-    pub capture_id: Option<u64>,
-    pub samples: Vec<GravityFieldSample>,
+/// One complete equation-(184) transform evaluated at a single positive
+/// Laplace frequency. This is deliberately not a `GravityFieldSample`: it is
+/// an aggregate over the whole known trajectory and cannot drive pointwise
+/// dynamics or snapshot-based diagnostics.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub struct FrequencyDomainObservation {
+    pub laplace_frequency: f32,
+    pub transformed_field: Vec3,
+    pub transformed_jacobian: Mat3,
+    pub transformed_potential: f32,
 }
 
 #[derive(Resource, Default)]
-pub struct Eq106SensitivityMatrix {
+pub struct FrequencyDomainTrajectoryBatchResult {
+    pub capture_id: Option<u64>,
+    pub observations: Vec<FrequencyDomainObservation>,
+}
+
+#[derive(Resource, Default)]
+pub struct FrequencyDomainSensitivityMatrix {
     pub capture_id: Option<u64>,
     pub source_hash: u64,
     pub basis_hash: u64,
-    /// Compile-time Eq.106 frequency, quadrature, and Taylor configuration.
+    /// Compile-time Frequency-domain algorithm reciprocal-space configuration.
     pub configuration_hash: u64,
     pub voxel_count: usize,
     pub sample_count: usize,
-    /// Columns are stored in voxel order; each column contains all frozen
-    /// trajectory acceleration responses for unit voxel density.
+    /// Columns are stored in voxel order; each entry is an independent
+    /// full-trajectory equation-(184) response at one Laplace frequency.
     pub columns: Vec<Vec<Vec3>>,
 }
 
 #[derive(Resource, Clone)]
-pub struct Eq106GpuReadbackChannel {
-    pub data: Arc<Mutex<Option<Eq106ReadbackPacket>>>,
+pub struct FrequencyDomainGpuReadbackChannel {
+    pub data: Arc<Mutex<Option<FrequencyDomainReadbackPacket>>>,
     pub pipeline_error: Arc<Mutex<Option<String>>>,
     pub in_flight: Arc<AtomicBool>,
     /// Wall-clock start of the active command submission. The main world uses
     /// this to turn a lost device or hung shader into an explicit failure.
     pub submitted_at: Arc<Mutex<Option<Instant>>>,
-    /// Set by the main-world certificate check when the cached local spectral
-    /// element must be shortened and rebuilt. The render world consumes it
-    /// before submitting another query for the same simulation snapshot.
+    /// Requests reconstruction after a readback or device error.
     pub rebuild_requested: Arc<AtomicBool>,
 }
 
-impl Eq106GpuReadbackChannel {
+impl FrequencyDomainGpuReadbackChannel {
     pub fn reset_after_device_loss(&self) {
         if let Ok(mut data) = self.data.try_lock() {
             data.take();

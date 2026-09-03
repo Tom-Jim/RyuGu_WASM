@@ -2,8 +2,8 @@
 // hardware FLOPs. Keep the same budget throughout a run: random method order,
 // timestamp support and the displayed chart selection must not move the goal.
 // Constants model scalar arithmetic (including expensive source interactions).
-// Eq.106 assumes one canonical arc and the 45-coefficient capacity; FMM uses
-// a conservative near-field bound. Geometry-dependent branching can differ.
+// Frequency-domain algorithm counts one density transform per reciprocal-space
+// sample; FMM uses a conservative near-field bound.
 #[derive(Clone, Copy)]
 pub struct PlanningOperationBudget {
     pub basis: f64,
@@ -23,11 +23,11 @@ impl PlanningOperationBudget {
         let nt = f64::from(targets.max(1));
         let states = nt * f64::from(candidates.max(1));
         match method {
-            ActiveGravityMethod::CurvedArcEq106 => Self {
-                basis: ns * 64.0 * 45.0 * 32.0 + 56.0 * 64.0 * 32.0 * 45.0 * 4.0,
-                density: 56.0 * 32.0 * 45.0 * 4.0,
-                target: nt * 32.0 * 45.0 * 24.0,
-                checked_target: nt * 32.0 * 45.0 * 28.0,
+            ActiveGravityMethod::FrequencyDomain => Self {
+                basis: ns * 64.0 + 56.0 * 64.0,
+                density: 56.0 * 64.0,
+                target: nt * 64.0 * 24.0,
+                checked_target: nt * 64.0 * 24.0,
             },
             ActiveGravityMethod::MmfftCompressed => {
                 // GPU compensated-complex butterflies: two transforms and
@@ -110,8 +110,10 @@ fn planning_preparation_work(sources: u32, b: u32, k: u32, nt: u32) -> f64 {
 }
 
 fn planning_validation_work(sources: u32, b: u32, k: u32, nt: u32) -> f64 {
-    // Upper estimate for the common reference population (same sampler for all
-    // methods). One reference solve, then six field/Jacobian comparisons.
+    // The frequency-domain oracle needs the direct f64 field along the whole
+    // trajectory before applying its independent Laplace integral. Those
+    // cached fields also cover the sparse pointwise FFT/FMM checks, followed
+    // by six field/Jacobian comparison rows per selected checkpoint.
     let full = b <= PLANNING_FIRST_CANDIDATE_COUNT && k <= 4;
     let models = if full {
         k
@@ -135,8 +137,8 @@ fn planning_validation_work(sources: u32, b: u32, k: u32, nt: u32) -> f64 {
     };
     f64::from(models)
         * f64::from(candidates)
-        * f64::from(targets)
-        * (f64::from(sources) * 50.0 + 6.0 * 100.0)
+        * (f64::from(nt) * f64::from(sources) * 50.0
+            + f64::from(targets) * 6.0 * 100.0)
 }
 
 fn planning_batch_work(sources: u32, b: u32, k: u32, nt: u32) -> f64 {
@@ -144,7 +146,7 @@ fn planning_batch_work(sources: u32, b: u32, k: u32, nt: u32) -> f64 {
     planning_preparation_work(sources, b, k, nt)
         + planning_validation_work(sources, b, k, nt)
         + [
-            ActiveGravityMethod::CurvedArcEq106,
+            ActiveGravityMethod::FrequencyDomain,
             ActiveGravityMethod::MmfftCompressed,
             ActiveGravityMethod::Fmm,
         ]
