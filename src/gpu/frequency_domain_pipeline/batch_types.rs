@@ -93,6 +93,7 @@ struct ExtractedFrequencyDomainInput {
     observation_count: u32,
     batch_elements: Vec<FrequencyDomainBatchElement>,
     batch_capture_id: Option<u64>,
+    runtime_revision: u64,
     sensitivity_sources: Vec<Vec<u8>>,
     sensitivity_source_counts: Vec<u32>,
     sensitivity_source_hash: u64,
@@ -417,6 +418,7 @@ fn poll_frequency_domain_readback(
     // was still the correct result for the active capture.
     batch_result.capture_id = Some(capture_id);
     batch_result.observations = decoded;
+    batch_result.revision = batch_result.revision.wrapping_add(1);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -101,20 +101,91 @@ fn frequency_domain_observation_rows(
     if samples.is_empty() || columns.len() != voxels.len() {
         return None;
     }
+    let quadrature = (0..EQ184_QUADRATURE_COUNT)
+        .map(|index| {
+            let (wave_vector, weight) = eq184_quadrature_node(index, spectral_radius)?;
+            let coefficient = G as f64 * 4.0 * std::f64::consts::PI
+                / std::f64::consts::TAU.powi(3)
+                * weight
+                / wave_vector.length_squared().max(1.0e-18);
+            Some((wave_vector, coefficient))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // T_gamma depends on trajectory and Laplace frequency, never on density.
+    // Compute it once per observation/k node instead of once per voxel column.
+    let trajectory_spectra = (0..samples.len())
+        .map(|observation_index| {
+            let laplace_frequency =
+                frequency_domain_laplace_frequency(observation_index, samples.len());
+            quadrature
+                .iter()
+                .map(|(wave_vector, _)| {
+                    samples
+                        .iter()
+                        .enumerate()
+                        .try_fold(Complex64::new(0.0, 0.0), |sum, (sample_index, sample)| {
+                            let previous = samples
+                                .get(sample_index.wrapping_sub(1))
+                                .unwrap_or(sample);
+                            let next = samples.get(sample_index + 1).unwrap_or(sample);
+                            let body_position = sample
+                                .body_rotation
+                                .inverse()
+                                .mul_vec3(sample.position)
+                                .as_dvec3();
+                            Some(
+                                sum + eq184_trajectory_term(
+                                    *wave_vector,
+                                    body_position,
+                                    previous.simulation_time_seconds,
+                                    sample.simulation_time_seconds,
+                                    next.simulation_time_seconds,
+                                    sample_index,
+                                    samples.len(),
+                                    laplace_frequency,
+                                )?,
+                            )
+                        })
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // rho_hat for a unit-density voxel is independent of Laplace frequency.
+    let density_spectra = columns
+        .iter()
+        .map(|column| {
+            quadrature
+                .iter()
+                .map(|(wave_vector, _)| {
+                    column.iter().fold(Complex64::new(0.0, 0.0), |sum, source| {
+                        sum + Complex64::from_polar(
+                            source.volume,
+                            -wave_vector.dot(source.position),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
     let mut observations = Vec::with_capacity(samples.len());
     let mut matrix = Vec::with_capacity(samples.len() * columns.len());
-    for observation_index in 0..samples.len() {
-        let laplace_frequency = frequency_domain_laplace_frequency(
-            observation_index, samples.len(),
-        );
-        let row = columns
+    for trajectory_spectrum in &trajectory_spectra {
+        let row = density_spectra
             .iter()
-            .map(|column| {
-                frequency_domain_transform_for_column(
-                    samples, column, spectral_radius, laplace_frequency,
-                )
+            .map(|density_spectrum| {
+                quadrature
+                    .iter()
+                    .enumerate()
+                    .fold(DVec3::ZERO, |sum, (index, (wave_vector, coefficient))| {
+                        let product = density_spectrum[index] * trajectory_spectrum[index];
+                        sum - *coefficient * product.im * *wave_vector
+                    })
+                    .as_vec3()
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         observations.push(
             row.iter().zip(voxels).fold(Vec3::ZERO, |sum, (field, voxel)| {
                 sum + *field * voxel.reference_density
@@ -127,57 +198,4 @@ fn frequency_domain_observation_rows(
 
 fn frequency_domain_laplace_frequency(index: usize, count: usize) -> f64 {
     eq184_laplace_sigma(index, count)
-}
-
-fn frequency_domain_transform_for_column(
-    samples: &[TrajectoryInversionKnot],
-    column: &[VoxelBasisSource],
-    spectral_radius: f64,
-    laplace_frequency: f64,
-) -> Option<Vec3> {
-    if samples.is_empty()
-        || column.is_empty()
-        || samples.windows(2).any(|pair| {
-            pair[1].simulation_time_seconds < pair[0].simulation_time_seconds
-        })
-    {
-        return None;
-    }
-    let mut total = Vec3::ZERO;
-    for index in 0..EQ184_QUADRATURE_COUNT {
-        let (k, weight) = eq184_quadrature_node(index, spectral_radius)?;
-        let k2 = k.length_squared().max(1.0e-18);
-        let mut characteristic = Complex64::new(0.0, 0.0);
-        for (sample_index, sample) in samples.iter().enumerate() {
-            let previous = samples.get(sample_index.wrapping_sub(1)).unwrap_or(sample);
-            let next = samples.get(sample_index + 1).unwrap_or(sample);
-            let body_position = sample
-                .body_rotation
-                .inverse()
-                .mul_vec3(sample.position)
-                .as_dvec3();
-            characteristic += eq184_trajectory_term(
-                k,
-                body_position,
-                previous.simulation_time_seconds,
-                sample.simulation_time_seconds,
-                next.simulation_time_seconds,
-                sample_index,
-                samples.len(),
-                laplace_frequency,
-            )?;
-        }
-        let mut density = Complex64::new(0.0, 0.0);
-        for source in column {
-            let phase = -k.dot(source.position);
-            density += Complex64::from_polar(source.volume, phase);
-        }
-        let coefficient = G as f64 * 4.0 * std::f64::consts::PI
-            / std::f64::consts::TAU.powi(3)
-            * weight
-            / k2;
-        let contribution = (-coefficient * (density * characteristic).im * k).as_vec3();
-        total += contribution;
-    }
-    Some(total)
 }

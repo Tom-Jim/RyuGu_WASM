@@ -384,7 +384,7 @@ const modalChartFrame = () => ({
 function performanceOption(snapshot, kind) {
   const histories = kind === 'fps'
     ? snapshot?.performance?.fpsHistory ?? []
-    : snapshot?.performance?.jacobiHistory ?? [];
+    : snapshot?.performance?.diagnosticHistory ?? [];
   const series = histories.map((history, index) => {
     const baseline = Number(history?.[0]?.[1] ?? 0);
     const points = (history ?? []).map((sample, pointIndex) => {
@@ -410,7 +410,7 @@ function performanceOption(snapshot, kind) {
       ...modalAxisStyle,
       type: kind === 'fps' ? 'value' : 'log',
       logBase: 10,
-      name: kind === 'fps' ? 'frames / second' : '|ΔCⱼ / Cⱼ₀|',
+      name: kind === 'fps' ? 'frames / second' : '|ΔD / D₀|',
       min: kind === 'fps' ? 0 : undefined,
       scale: true,
       axisLabel: { ...modalAxisStyle.axisLabel, formatter: chartAxisNumber },

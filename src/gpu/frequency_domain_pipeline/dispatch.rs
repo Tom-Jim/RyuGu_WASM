@@ -170,7 +170,10 @@ fn dispatch_frequency_domain(
         if channel.rebuild_requested.swap(false, Ordering::AcqRel) {
             inner.last_submitted = None;
         }
-        let key = (snapshot.epoch, capture_id);
+        let key = (
+            snapshot.epoch,
+            capture_id ^ extracted.runtime_revision.rotate_left(23),
+        );
         if inner.last_submitted == Some(key) {
             return;
         }

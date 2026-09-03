@@ -250,11 +250,10 @@ pub struct PerformanceComparisonState {
     /// user's throughput setting when leaving the comparison view.
     pub return_simulation_acceleration: u32,
     pub fps_history: [VecDeque<f32>; 5],
-    /// Jacobi histories map to Radial, Werner, a reserved transform-only slot,
-    /// MMFFT, and FMM. Each populated series contains only physical pointwise
-    /// samples emitted by that algorithm.
-    pub jacobi_history: [VecDeque<JacobiSample>; 5],
-    pub jacobi_last_request_ids: [Option<u64>; 5],
+    /// Method-native stability histories. Pointwise methods publish Jacobi
+    /// constants; frequency-domain publishes a repeated transform norm.
+    pub diagnostic_history: [VecDeque<PerformanceDiagnosticSample>; 5],
+    pub diagnostic_last_ids: [Option<u64>; 5],
     /// Algorithms included in the performance rotation. The five entries map
     /// to Radial, Werner, Frequency-domain algorithm, MMFFT, and FMM respectively.
     pub enabled_methods: [bool; 5],
@@ -279,14 +278,11 @@ impl Default for PerformanceComparisonState {
             fps_history: std::array::from_fn(|_| {
                 VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
             }),
-            jacobi_history: std::array::from_fn(|_| {
+            diagnostic_history: std::array::from_fn(|_| {
                 VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY)
             }),
-            jacobi_last_request_ids: [None; 5],
-            // Equation (184) is transform-only and cannot participate in a
-            // pointwise FPS/Jacobi benchmark without substituting another
-            // method's force. It has a separate GPU quadrature benchmark.
-            enabled_methods: [true, true, false, true, true],
+            diagnostic_last_ids: [None; 5],
+            enabled_methods: [true; 5],
             completed_methods: [false; 5],
         }
     }
@@ -295,7 +291,6 @@ impl Default for PerformanceComparisonState {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl PerformanceComparisonState {
     pub fn start(&mut self, return_method: ActiveGravityMethod) {
-        self.enabled_methods[ActiveGravityMethod::FrequencyDomain.performance_index()] = false;
         self.active = true;
         self.measuring = self.enabled_methods.iter().any(|enabled| *enabled);
         self.phase = 0;
@@ -306,12 +301,12 @@ impl PerformanceComparisonState {
             .first_uncompleted_enabled_method()
             .map(|(_, method)| method);
         self.completed_methods = [false; 5];
-        self.jacobi_last_request_ids = [None; 5];
+        self.diagnostic_last_ids = [None; 5];
         self.return_method = return_method;
         for history in &mut self.fps_history {
             history.clear();
         }
-        for history in &mut self.jacobi_history {
+        for history in &mut self.diagnostic_history {
             history.clear();
         }
     }

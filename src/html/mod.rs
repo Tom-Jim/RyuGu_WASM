@@ -116,7 +116,6 @@ pub(crate) fn browser_ui_action_system(
             "performance-method" => {
                 if !performance.measuring
                     && let Some(index) = value.and_then(Value::as_u64).map(|value| value as usize)
-                    && index != ActiveGravityMethod::FrequencyDomain.performance_index()
                     && let Some(enabled) = performance.enabled_methods.get_mut(index)
                 {
                     *enabled = !*enabled;
@@ -602,14 +601,14 @@ pub(crate) fn browser_ui_publish_system(
         .iter()
         .map(|history| history.iter().copied().collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    let performance_jacobi = state
+    let performance_diagnostics = state
         .performance
-        .jacobi_history
+        .diagnostic_history
         .iter()
         .map(|history| {
             history
                 .iter()
-                .map(|sample| [sample.simulation_time_seconds, sample.jacobi_constant])
+                .map(|sample| [sample.simulation_time_seconds, sample.value])
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -728,8 +727,8 @@ pub(crate) fn browser_ui_publish_system(
             "workCompleted": state.planning.operation_work().0,
             "workTotal": state.planning.operation_work().1,
             "progressUnit": "estimated arithmetic operation units (source/basis/FFT/RHS/target/reference work); not measured FLOPs or an ETA",
-            "implementation": "Discrete equation-(184) transform: 64-node finite reciprocal-space point-residue quadrature; GPU FFT (compensated f32), 56 GPU density bases + quintic evaluation; GPU order-2 FMM (P2M/M2M/M2L/P2P and 56-basis density mix). Independent f64 direct-space validation uses bounded CPU slices.",
-            "timingDefinition": "Raw total = shared CPU preparation + method CPU preparation + GPU preparation/evaluation submission wall times + result processing. Cooperative gaps between submissions are excluded. Checked total = raw total + the additional full checked pass; fixed-target bases charged once, streamed FMM target windows charged whenever rebuilt. Warm calibration and shared f64 references are excluded. GPU views use only pass timestamps; no CPU or readback substitution. All methods share source counts, density rows and trajectory samples; equation (184) reports whole-trajectory Laplace observations while FFT/FMM report pointwise fields, so eligibility is checked against each observable's independent f64 reference rather than pretending the raw outputs are identical.",
+            "implementation": "Discrete frequency-domain trajectory transform: 64-node finite reciprocal-space point-residue quadrature; GPU FFT (compensated f32), 56 GPU density bases + quintic evaluation; GPU order-2 FMM (P2M/M2M/M2L/P2P and 56-basis density mix). Independent f64 direct-space validation uses bounded CPU slices.",
+            "timingDefinition": "Raw total = shared CPU preparation + method CPU preparation + GPU preparation/evaluation submission wall times + result processing. Cooperative gaps between submissions are excluded. Checked total = raw total + the additional full checked pass; fixed-target bases charged once, streamed FMM target windows charged whenever rebuilt. Warm calibration and shared f64 references are excluded. GPU views use only pass timestamps; no CPU or readback substitution. All methods share source counts, density rows and trajectory samples; the frequency-domain algorithm reports whole-trajectory Laplace observations while FFT/FMM report pointwise fields, so eligibility is checked against each observable's independent f64 reference rather than pretending the raw outputs are identical.",
             "visible": state.planning.source_curve_visible,
             "status": state.planning.status,
             "sourceCount": state.planning.requested_source_count,
@@ -761,7 +760,7 @@ pub(crate) fn browser_ui_publish_system(
             "enabled": state.performance.enabled_methods,
             "fps": state.performance.frames_per_second,
             "fpsHistory": performance_fps,
-            "jacobiHistory": performance_jacobi,
+            "diagnosticHistory": performance_diagnostics,
         },
         "inversion": {
             "ready": state.inversion.ready,

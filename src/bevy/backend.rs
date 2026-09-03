@@ -158,6 +158,7 @@ pub fn performance_comparison_system(
     clock: Res<SimulationClock>,
     active_method: Res<ActiveGravityMethod>,
     jacobi: Res<JacobiHistory>,
+    frequency_domain: Res<FrequencyDomainTrajectoryBatchResult>,
     mut state: ResMut<PerformanceComparisonState>,
 ) {
     if !state.active || !state.measuring || clock.elapsed_seconds <= 0.0 {
@@ -174,20 +175,54 @@ pub fn performance_comparison_system(
         }
         history.push_back(fps as f32);
     }
-    let request_id = jacobi.last_request_id;
-    if jacobi.last_sample_method == Some(*active_method)
-        && request_id.is_some()
-        && state.jacobi_last_request_ids[phase] != request_id
-        && let Some(sample) = jacobi.samples.back()
-    {
+    let diagnostic = if *active_method == ActiveGravityMethod::FrequencyDomain {
+        let revision = frequency_domain.revision;
+        if frequency_domain.capture_id.is_some()
+            && !frequency_domain.observations.is_empty()
+            && state.diagnostic_last_ids[phase] != Some(revision)
+        {
+            let mean_square = frequency_domain
+                .observations
+                .iter()
+                .map(|sample| f64::from(sample.transformed_field.length_squared()))
+                .sum::<f64>()
+                / frequency_domain.observations.len() as f64;
+            Some((
+                revision,
+                PerformanceDiagnosticSample {
+                    simulation_time_seconds: clock.elapsed_seconds,
+                    value: mean_square.sqrt(),
+                },
+            ))
+        } else {
+            None
+        }
+    } else if jacobi.last_sample_method == Some(*active_method) {
+        jacobi.last_request_id.and_then(|request_id| {
+            (state.diagnostic_last_ids[phase] != Some(request_id)).then(|| {
+                jacobi.samples.back().map(|sample| {
+                    (
+                        request_id,
+                        PerformanceDiagnosticSample {
+                            simulation_time_seconds: sample.simulation_time_seconds,
+                            value: sample.jacobi_constant,
+                        },
+                    )
+                })
+            })?
+        })
+    } else {
+        None
+    };
+    if let Some((identity, sample)) = diagnostic {
         let index = active_method.performance_index();
-        if let Some(history) = state.jacobi_history.get_mut(index) {
+        if let Some(history) = state.diagnostic_history.get_mut(index) {
             if history.len() == PERFORMANCE_HISTORY_CAPACITY {
                 history.pop_front();
             }
-            history.push_back(*sample);
+            history.push_back(sample);
         }
-        state.jacobi_last_request_ids[phase] = request_id;
+        state.diagnostic_last_ids[phase] = Some(identity);
     }
     state.phase_frames = state.phase_frames.saturating_add(1);
     state.phase_elapsed_seconds += time.delta_secs_f64();

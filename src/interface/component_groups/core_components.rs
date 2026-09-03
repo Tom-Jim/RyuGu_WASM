@@ -267,6 +267,13 @@ pub struct JacobiSample {
     pub jacobi_constant: f64,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub struct PerformanceDiagnosticSample {
+    pub simulation_time_seconds: f64,
+    pub value: f64,
+}
+
 #[derive(Resource)]
 pub struct JacobiHistory {
     pub samples: VecDeque<JacobiSample>,
@@ -512,6 +519,7 @@ pub struct FrequencyDomainObservation {
 pub struct FrequencyDomainTrajectoryBatchResult {
     pub capture_id: Option<u64>,
     pub observations: Vec<FrequencyDomainObservation>,
+    pub revision: u64,
 }
 
 #[derive(Resource, Default)]

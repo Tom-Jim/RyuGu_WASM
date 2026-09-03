@@ -20,14 +20,13 @@ truncation, and the selected validation gates.
 | --- | --- |
 | Radial analytic | Mass-preserving radial layers and GPU Gauss–Legendre evaluation. |
 | Werner polyhedron | Homogeneous closed polyhedron evaluation from oriented mesh topology. |
-| Frequency-domain algorithm | Finite reciprocal-space quadrature, spectral evaluation, and asynchronous GPU readback implementing the Eq. (184) path. |
+| Frequency-domain algorithm | Finite reciprocal-space quadrature, trajectory-spectrum evaluation, and asynchronous GPU readback. |
 | MMFFT compressed | CPU zero-padded FFT preparation followed by GPU packed-f16 potential interpolation. |
 | FMM | CPU source/tree preparation and GPU target-cell expansion plus exact near-field P2P. |
 
-Eq. (184) is implemented as a finite numerical realization, not as an
-unbounded exact transform. CPU f64 reference calculations are separate from
-GPU f32 results so the comparison does not validate a method against its own
-approximation.
+The frequency-domain path is a finite numerical realization rather than an
+unbounded exact transform. CPU f64 references remain separate from GPU f32
+results so a method is never validated against its own approximation.
 
 ## Code layout
 
@@ -66,10 +65,11 @@ instead of one high-resolution sphere entity per sample. Radial keeps the
 yellow detector marker, its live trajectory, and section view; only the
 non-yellow initial knot markers are omitted.
 
-The frequency-domain algorithm animates the captured known trajectory while
-its whole-trajectory transform is evaluated. It is a prescribed-path
-visualization, not an instantaneous-force substitute for the pointwise
-integrators.
+The frequency-domain chart evaluates a cumulative prefix of the captured
+trajectory, so the displayed transform evolves without pretending to be a
+pointwise force integrator. Performance tests repeatedly evaluate the complete
+captured trajectory and report transform-norm stability alongside measured
+FPS.
 
 `src/cpu/` prepares mass-preserving sources, integrates the probe, assembles
 planning references, and performs independent f64 checks. It may prepare FFT,

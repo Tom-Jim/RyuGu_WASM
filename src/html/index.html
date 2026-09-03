@@ -99,19 +99,19 @@
         <section id="performance-page" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="performance-title">
             <div class="performance-card glass">
                 <header>
-                    <div><small>REPEATABLE TEST PAGE</small><h1 id="performance-title">Gravity method performance</h1><p>Measured frame rate and Jacobi drift under the same trajectory.</p></div>
+                    <div><small>REPEATABLE TEST PAGE</small><h1 id="performance-title">Gravity method performance</h1><p>Frame rate and method-native numerical stability under the same trajectory.</p></div>
                     <div class="header-actions"><button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-repeat">Repeat benchmark</button><button onclick="window.ryuguUi?.activate?.(this)" class="icon-button" data-action="performance-close" aria-label="Close performance page">×</button></div>
                 </header>
                 <div class="method-checks" role="group" aria-label="Methods included in benchmark">
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="0">Radial</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="1">Werner</button>
-                    <button data-action="performance-method" data-value="2" disabled title="The frequency-domain algorithm is a whole-trajectory transform; use the quadrature benchmark below.">Frequency-domain algorithm</button>
+                    <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="2">Frequency-domain algorithm</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="3">Packed FFT</button>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="performance-method" data-value="4">FMM</button>
                 </div>
                 <div class="performance-charts">
                     <article><div class="panel-heading"><span>Frame rate</span><small>FPS</small></div><div id="performance-fps-chart" class="modal-echart" role="img" aria-label="Frame rate by gravity method"></div></article>
-                    <article><div class="panel-heading"><span>Relative Jacobi drift</span><small>|ΔCⱼ/Cⱼ₀|</small></div><div id="performance-jacobi-chart" class="modal-echart" role="img" aria-label="Relative Jacobi drift by gravity method"></div></article>
+                    <article><div class="panel-heading"><span>Relative diagnostic drift</span><small>|ΔD/D₀|</small></div><div id="performance-jacobi-chart" class="modal-echart" role="img" aria-label="Relative numerical diagnostic drift by gravity method"></div></article>
                 </div>
                 <footer><span id="performance-status">Preparing test…</span><div id="performance-summary" class="summary-row"></div></footer>
             </div>

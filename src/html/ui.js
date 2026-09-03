@@ -650,7 +650,7 @@ window.ryuguPlanningProgress = (planning) => ({
       xLabel: transform ? 'σ (s⁻¹)' : 't (s)',
       yLabel: transform ? '‖g̃γ(σ)‖' : 'Cⱼ',
       xDomain: telemetryDomain(points),
-      empty: transform ? 'Waiting for equation (184) transform…' : 'Waiting for Jacobi samples…',
+      empty: transform ? 'Waiting for frequency-domain transform…' : 'Waiting for Jacobi samples…',
     });
   }
   function renderPerformance(performance) {
@@ -662,7 +662,7 @@ window.ryuguPlanningProgress = (planning) => ({
       color: methodColors[index],
       points: history.map((value, sample) => [sample, value]),
     }));
-    const jacobiSeries = performance.jacobiHistory.map((history, index) => {
+    const diagnosticSeries = (performance.diagnosticHistory ?? []).map((history, index) => {
       const baseline = history[0]?.[1];
       const denominator = Math.max(Math.abs(baseline ?? 0), 1e-12);
       return {
@@ -676,7 +676,7 @@ window.ryuguPlanningProgress = (planning) => ({
         yLabel: 'frames per second',
         minimumYDomain: [0, 60],
       });
-      drawChart($('#performance-jacobi-chart'), jacobiSeries, { yLog: true, xLabel: 'measurement sample', yLabel: '|ΔCⱼ/Cⱼ₀| (log₁₀)' });
+      drawChart($('#performance-jacobi-chart'), diagnosticSeries, { yLog: true, xLabel: 'measurement sample', yLabel: '|ΔD/D₀| (log₁₀)' });
     }
     $('#performance-status').textContent = performance.measuring ? `Measuring ${methodLabels[performance.phase] ?? 'method'}…` : 'Benchmark complete. Repeat uses the same enabled methods.';
     const summaries = methodLabels.map((label, index) => {
