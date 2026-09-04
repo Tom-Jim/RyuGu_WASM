@@ -2,8 +2,9 @@ use bevy::math::{DMat3, DQuat, DVec3};
 use std::collections::HashMap;
 
 use crate::cpu::frequency_domain::{
-    eq184_laplace_sigma, eq184_time_weight,
+    eq184_laplace_sigma, eq184_quadrature_node, eq184_trajectory_term,
 };
+use num_complex::Complex64;
 
 // Independent of foreground/background frame rate. Long scheduling gaps are
 // suspension, not evidence that a GPU request failed to make progress.
@@ -19,6 +20,12 @@ pub(crate) struct PlanningReferenceCache {
     source_cursor: usize,
     partial_field: DVec3,
     partial_gradient: DMat3,
+    frequency_domain_identity: Option<(u64, u64, u32)>,
+    frequency_domain_quadrature: Vec<(DVec3, f64)>,
+    frequency_domain_density_spectrum: Vec<Complex64>,
+    frequency_domain_partial_density_spectrum: Vec<Complex64>,
+    frequency_domain_source_cursor: usize,
+    frequency_domain_observations: HashMap<(usize, usize), (DVec3, DMat3)>,
 }
 
 pub fn planning_batch_evaluator_system(
@@ -511,7 +518,6 @@ fn reduce_planning_packet(
                 batch,
                 packet.request.candidate_start as usize + local_candidate,
                 observation_index,
-                packet.request.density_model,
                 reference_cache,
             );
             verification_ms += verification_started.elapsed().as_secs_f64() * 1.0e3;
@@ -675,9 +681,10 @@ fn reduce_certified_packet(
             );
             let verification_started = bevy::platform::time::Instant::now();
             let (reference_field, reference_gradient) = frequency_domain_reference_integral(
-                batch, packet.request.candidate_start as usize + local_candidate,
+                batch,
+                packet.request.candidate_start as usize + local_candidate,
                 observation_index,
-                packet.request.density_model, reference_cache,
+                reference_cache,
             );
             verification_ms += verification_started.elapsed().as_secs_f64() * 1.0e3;
             if !method_field.is_finite() || !method_gradient.is_finite()
@@ -773,6 +780,9 @@ fn reference_key(target: DVec3, batch: &PlanningCandidateBatch, model: u32) -> (
 fn prepare_planning_references(
     batch: &PlanningCandidateBatch, packet: &PlanningGpuPacket, cache: &mut PlanningReferenceCache,
 ) -> bool {
+    if packet.request.method == Some(ActiveGravityMethod::FrequencyDomain) {
+        return prepare_frequency_domain_reference(batch, packet, cache);
+    }
     let identity = (batch.basis_hash, batch.density_model_hash, batch.sample_hash);
     if cache.identity != Some(identity) {
         cache.fields.clear();
@@ -825,6 +835,82 @@ fn prepare_planning_references(
     true
 }
 
+fn prepare_frequency_domain_reference(
+    batch: &PlanningCandidateBatch,
+    packet: &PlanningGpuPacket,
+    cache: &mut PlanningReferenceCache,
+) -> bool {
+    let identity = (
+        batch.basis_hash,
+        batch.density_model_hash,
+        packet.request.density_model,
+    );
+    if cache.frequency_domain_identity != Some(identity) {
+        let quadrature = (0..EQ184_QUADRATURE_COUNT)
+            .map(|index| {
+                let (wave_vector, volume_weight) = eq184_quadrature_node(
+                    index,
+                    f64::from(batch.frequency_domain_source_radius),
+                )?;
+                let coefficient = f64::from(crate::interface::components::G)
+                    * 4.0
+                    * std::f64::consts::PI
+                    / std::f64::consts::TAU.powi(3)
+                    * volume_weight
+                    / wave_vector.length_squared().max(1.0e-18);
+                Some((wave_vector, coefficient.clamp(-1.0e20, 1.0e20)))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(quadrature) = quadrature else {
+            return false;
+        };
+        cache.frequency_domain_identity = Some(identity);
+        cache.frequency_domain_quadrature = quadrature;
+        cache.frequency_domain_density_spectrum = Vec::new();
+        cache.frequency_domain_partial_density_spectrum =
+            vec![Complex64::new(0.0, 0.0); crate::cpu::frequency_domain::EQ184_QUADRATURE_COUNT];
+        cache.frequency_domain_source_cursor = 0;
+        cache.frequency_domain_observations.clear();
+    }
+
+    let density_row = packet.request.density_model as usize * 56;
+    let Some(densities) = batch.density_models.get(density_row..density_row + 56) else {
+        return false;
+    };
+    let started = bevy::platform::time::Instant::now();
+    while cache.frequency_domain_source_cursor < batch.basis_records.len() {
+        let end = (cache.frequency_domain_source_cursor + 256).min(batch.basis_records.len());
+        for source in &batch.basis_records[cache.frequency_domain_source_cursor..end] {
+            let voxel_density = f64::from(*densities.get(source.voxel_index as usize).unwrap_or(&f32::NAN));
+            let volume_density = f64::from(source.position_volume[3]) * voxel_density;
+            let position = DVec3::new(
+                f64::from(source.position_volume[0]),
+                f64::from(source.position_volume[1]),
+                f64::from(source.position_volume[2]),
+            );
+            if !position.is_finite() || !volume_density.is_finite() {
+                return false;
+            }
+            for (spectrum, (wave_vector, _)) in cache
+                .frequency_domain_partial_density_spectrum
+                .iter_mut()
+                .zip(&cache.frequency_domain_quadrature)
+            {
+                *spectrum += Complex64::from_polar(volume_density, -wave_vector.dot(position));
+            }
+        }
+        cache.frequency_domain_source_cursor = end;
+        if started.elapsed().as_secs_f64() >= 0.003 {
+            return false;
+        }
+    }
+    if cache.frequency_domain_density_spectrum.is_empty() {
+        cache.frequency_domain_density_spectrum =
+            std::mem::take(&mut cache.frequency_domain_partial_density_spectrum);
+    }
+    true
+}
+
 fn direct_planning_reference_cached(
     target: DVec3, batch: &PlanningCandidateBatch, density_model: u32,
     cache: &mut PlanningReferenceCache,
@@ -836,62 +922,81 @@ fn direct_planning_reference_cached(
         .unwrap_or((DVec3::NAN, DMat3::NAN))
 }
 
-/// Reference form of the known-trajectory equation-(184) observation.  It is
-/// the time-domain identity corresponding to the same discrete Fourier--
-/// Laplace transform used by the shader: integrate the instantaneous reference
-/// field and Jacobian with the identical trapezoid weights and absolute-time
-/// factor exp(-s t).
+/// Independent f64 reference for one discrete frequency-domain observation.
+/// This mirrors the shader's rho-hat(k) * T_gamma(s,k) reciprocal-space
+/// operator, including its quadrature, phase convention, Laplace attenuation,
+/// Newton multiplier, and Jacobian column layout.
 fn frequency_domain_reference_integral(
     batch: &PlanningCandidateBatch,
     candidate_index: usize,
     observation_index: usize,
-    density_model: u32,
     cache: &mut PlanningReferenceCache,
 ) -> (DVec3, DMat3) {
+    let key = (candidate_index, observation_index);
+    if let Some(result) = cache.frequency_domain_observations.get(&key) {
+        return *result;
+    }
     let samples = batch.samples_per_candidate as usize;
     let start = candidate_index.saturating_mul(samples);
     if start + samples > batch.states.len() {
         return (DVec3::NAN, DMat3::NAN);
     }
+    if cache.frequency_domain_density_spectrum.len()
+        != crate::cpu::frequency_domain::EQ184_QUADRATURE_COUNT
+        || cache.frequency_domain_quadrature.len()
+            != crate::cpu::frequency_domain::EQ184_QUADRATURE_COUNT
+    {
+        return (DVec3::NAN, DMat3::NAN);
+    }
     let laplace_frequency = eq184_laplace_sigma(observation_index, samples);
     let mut result_field = DVec3::ZERO;
     let mut result_gradient = DMat3::ZERO;
-    for sample_index in 0..samples {
-        let sample = batch.states[start + sample_index];
-        let previous_time = if sample_index > 0 {
-            f64::from(batch.states[start + sample_index - 1].position_time[3])
-        } else {
-            f64::from(sample.position_time[3])
-        };
-        let time = f64::from(sample.position_time[3]);
-        let next_time = if sample_index + 1 < samples {
-            f64::from(batch.states[start + sample_index + 1].position_time[3])
-        } else {
-            time
-        };
-        let Some(weight) = eq184_time_weight(
-            previous_time,
-            time,
-            next_time,
-            sample_index,
-            samples,
-            laplace_frequency,
-        ) else {
+    for (index, (wave_vector, coefficient)) in cache
+        .frequency_domain_quadrature
+        .iter()
+        .enumerate()
+    {
+        let trajectory = (0..samples).try_fold(Complex64::new(0.0, 0.0), |sum, sample_index| {
+            let sample = batch.states[start + sample_index];
+            let previous = if sample_index > 0 {
+                batch.states[start + sample_index - 1]
+            } else {
+                sample
+            };
+            let next = if sample_index + 1 < samples {
+                batch.states[start + sample_index + 1]
+            } else {
+                sample
+            };
+            Some(
+                sum + eq184_trajectory_term(
+                    *wave_vector,
+                    sample.body_position().as_dvec3(),
+                    f64::from(previous.position_time[3]),
+                    f64::from(sample.position_time[3]),
+                    f64::from(next.position_time[3]),
+                    sample_index,
+                    samples,
+                    laplace_frequency,
+                )?,
+            )
+        });
+        let Some(trajectory) = trajectory else {
             return (DVec3::NAN, DMat3::NAN);
         };
-        let (field, gradient) = direct_planning_reference_cached(
-            sample.body_position().as_dvec3(),
-            batch,
-            density_model,
-            cache,
-        );
-        if !field.is_finite() || !gradient.is_finite() {
-            return (DVec3::NAN, DMat3::NAN);
-        }
-        result_field += weight * field;
-        result_gradient += weight * gradient;
+        let product = cache.frequency_domain_density_spectrum[index] * trajectory;
+        result_field += -*coefficient * product.im * *wave_vector;
+        let hessian_scale = -*coefficient * product.re;
+        let jacobian_x = hessian_scale * *wave_vector * wave_vector.x;
+        let jacobian_y = hessian_scale * *wave_vector * wave_vector.y;
+        let jacobian_z = hessian_scale * *wave_vector * wave_vector.z;
+        result_gradient += DMat3::from_cols(jacobian_x, jacobian_y, jacobian_z);
     }
-    (result_field, result_gradient)
+    let result = (result_field, result_gradient);
+    if result_field.is_finite() && result_gradient.is_finite() {
+        cache.frequency_domain_observations.insert(key, result);
+    }
+    result
 }
 
 fn matrix_norm_squared(matrix: DMat3) -> f64 {

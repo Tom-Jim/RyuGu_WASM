@@ -1,18 +1,22 @@
 # RyuGu WASM
 
+[![CI/CD](https://github.com/Tom-jim/RyuGu_WASM/actions/workflows/deploy.yml/badge.svg)](https://github.com/Tom-jim/RyuGu_WASM/actions/workflows/deploy.yml)
 [![Live demo](https://img.shields.io/badge/Live_demo-WebGPU-success)](https://tom-jim.github.io/RyuGu_WASM/)
 [![Bevy](https://img.shields.io/badge/Bevy-0.19.1-purple)](https://bevy.org/)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-RyuGu WASM is a research prototype for evaluating gravity around asteroid
-(162173) Ryugu and propagating a probe trajectory in the browser. Rust and
-Bevy own the simulation; WebGPU/WGSL owns the parallel field kernels; the
-browser layer provides controls, charts, and WebAssembly startup.
+RyuGu WASM is a WebGPU/WASM research platform for experimenting with gravity
+and probe trajectories around asteroid (162173) Ryugu. It combines a Rust/Bevy
+simulation core with GPU compute kernels and a small HTML/JavaScript control
+and visualization layer. The current implementation is an engineering and
+numerical demonstrator, not flight software or evidence of mission
+suitability.
 
-This is a numerical demonstrator, not flight software or evidence of mission
-suitability. Results depend on discretization, GPU precision, interpolation,
-truncation, and the selected validation gates.
+The current build has paths for Radial, Werner, the frequency-domain
+algorithm, Packed FFT, FMM, trajectory inversion, live diagnostics, and the
+source-crossover/performance views. Results still depend on discretization,
+GPU precision, interpolation, truncation, and the selected validation gates.
 
 ## Methods
 
@@ -21,14 +25,14 @@ truncation, and the selected validation gates.
 | Radial analytic | Mass-preserving radial layers and GPU Gauss–Legendre evaluation. |
 | Werner polyhedron | Homogeneous closed polyhedron evaluation from oriented mesh topology. |
 | Frequency-domain algorithm | Finite reciprocal-space quadrature, trajectory-spectrum evaluation, and asynchronous GPU readback. |
-| MMFFT compressed | CPU zero-padded FFT preparation followed by GPU packed-f16 potential interpolation. |
+| Packed FFT | CPU zero-padded FFT preparation followed by GPU packed-f16 potential interpolation. |
 | FMM | CPU source/tree preparation and GPU target-cell expansion plus exact near-field P2P. |
 
 The frequency-domain path is a finite numerical realization rather than an
 unbounded exact transform. CPU f64 references remain separate from GPU f32
 results so a method is never validated against its own approximation.
 
-## Code layout
+## Project structure
 
 ```text
 src/
@@ -53,10 +57,10 @@ mesh → shared source contract → CPU preparation / GPU extraction
      → WGSL dispatch → async readback → Bevy state → JSON snapshot → UI
 ```
 
-`src/interface/` is the boundary between numerical code and presentation. It
-contains snapshot identities, capture IDs, workload identities, metric rows,
-and history buffers, preventing stale GPU packets or mismatched source meshes
-from being silently compared.
+`src/interface/` is the contract boundary between numerical code and
+presentation. It carries snapshot identities, capture IDs, workload
+identities, metric rows, and history buffers so stale GPU packets or mismatched
+source meshes cannot be silently compared.
 
 `src/bevy/` schedules ECS systems and owns the visible scene. Gizmos are
 budgeted presentation primitives: live trajectories are capped to a fixed
@@ -96,10 +100,19 @@ and certified timing separately. Methods use common source/target workloads
 where their mathematical scope permits it. Werner remains homogeneous while
 the heterogeneous methods use the shared logarithmic source profile.
 
-Frequency-domain, MMFFT, and FMM planning rows share target counts, density
-model counts, repeats, source-size sweeps, and f64 reference observations.
-Failed accuracy or incomplete workload gates remain visible as failures; they
-are not converted into attractive timing numbers.
+Frequency-domain, Packed FFT, and FMM planning rows share target counts,
+density-model counts, repeats, source-size sweeps, and f64 reference
+observations. The frequency-domain path uses a finite reciprocal-space
+quadrature and a complete trajectory transform; its GPU result is checked by
+an independent f64 implementation of the same discrete operator. Inversion
+uses the same frequency-domain observation contract and frozen trajectory
+identity as the forward path.
+
+Accuracy and workload gates are part of the result, not decoration:
+frequency-domain, Packed FFT, and FMM rows remain failed or pending when their
+independent reference or required repetitions are incomplete. Timing is only
+published for a complete, eligible workload, which keeps algorithm comparisons
+auditable.
 
 The benchmark is an end-to-end browser workload, not a claim about asymptotic
 complexity. GPU preprocessing, cache rebuilds, readback, and CPU integration
@@ -122,26 +135,7 @@ The repository does not require a browser or preview server for source-level
 shader and contract tests. WebGPU behavior still depends on the browser
 adapter and device limits available at runtime.
 
-## Page-open telemetry
-
-`src/html/visit.js` sends one event per tab session only when the exact
-canonical URL `https://tom-jim.github.io/RyuGu_WASM/` is opened. It does not
-run for localhost, previews, README images, asset requests, or query-string
-variants.
-
-The event contains a browser-generated random visitor ID and an ISO-8601 UTC
-timestamp. This is an anonymous pseudonymous identifier, not a name, email,
-IP address, or claim of real-world identity. The server may record request
-time and user-agent according to its privacy policy.
-
-GitHub Pages is static and cannot persist `/api/visit` by itself. Production
-counting therefore requires a privacy-reviewed endpoint at
-`/RyuGu_WASM/api/visit` (for example, a separately managed Worker or
-serverless function). Until that endpoint is configured, the hook fails
-silently and no counter is claimed. The old HITS image-request workflow was
-removed.
-
-## Current limitations
+## Known limitations
 
 - GPU arithmetic is primarily f32 and readback is asynchronous.
 - Frequency-domain evaluation is finite-band and finite-quadrature; validity

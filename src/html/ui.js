@@ -81,7 +81,7 @@ window.ryuguPlanningProgress = (planning) => ({
   const methodLabels = ['Radial', 'Werner', 'Frequency-domain algorithm', 'Packed FFT', 'FMM'];
   const methodColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77'];
   const curveColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
-  const curveLabels = ['Eq. (184) raw total', 'Eq. (184) checked total', 'FFT raw total', 'FFT checked total', 'FMM raw total', 'FMM checked total'];
+  const curveLabels = ['Frequency-domain raw total', 'Frequency-domain checked total', 'FFT raw total', 'FFT checked total', 'FMM raw total', 'FMM checked total'];
   const quadratureSourceCounts = [32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000];
   const metricFields = {
     density: ['density', ''],
