@@ -6,6 +6,8 @@
 [![Rust](https://img.shields.io/badge/Rust-2024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+<img src="https://github.com/user-attachments/assets/84ac0b30-d669-4a40-99a5-31ef39b3f8c0" width="100%" alt="algorithm comparison" /> 
+
 RyuGu WASM is a WebGPU/WASM research platform for experimenting with gravity
 and probe trajectories around asteroid (162173) Ryugu. It combines a Rust/Bevy
 simulation core with GPU compute kernels and a small HTML/JavaScript control
