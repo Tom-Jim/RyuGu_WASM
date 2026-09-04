@@ -295,7 +295,15 @@ pub fn render_gizmos_system(
             );
         }
     }
+    // Equation-(184) input knots are a complete known observation trajectory,
+    // not the live inertial orbit. The frequency-domain mode now displays its
+    // continuous rotating-body integration above; drawing the frozen knots on
+    // top of it would create a second, misleading orbit.
     let display_knots: &[TrajectoryInversionKnot] = if *active_method
+        == ActiveGravityMethod::FrequencyDomain
+    {
+        &[]
+    } else if *active_method
         != ActiveGravityMethod::HomogeneousWerner
         && inversion.truth_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT
     {

@@ -155,41 +155,6 @@ fn gpu_world_acceleration(
     Some(rotation * body_acceleration)
 }
 
-fn prescribed_trajectory_state(
-    knots: &[TrajectoryInversionKnot],
-    time_seconds: f64,
-) -> Option<(Vec3, Vec3)> {
-    let first = *knots.first()?;
-    let last = *knots.last()?;
-    let duration = last.simulation_time_seconds - first.simulation_time_seconds;
-    if !duration.is_finite() || duration <= 0.0 {
-        return None;
-    }
-    let local_time = first.simulation_time_seconds
-        + (time_seconds - first.simulation_time_seconds).rem_euclid(duration);
-    let upper_index = knots
-        .partition_point(|knot| knot.simulation_time_seconds < local_time)
-        .min(knots.len() - 1);
-    if upper_index == 0 {
-        return Some((first.position, first.velocity));
-    }
-    let lower = knots[upper_index - 1];
-    let upper = knots[upper_index];
-    let interval =
-        (upper.simulation_time_seconds - lower.simulation_time_seconds).max(f64::MIN_POSITIVE);
-    let t = ((local_time - lower.simulation_time_seconds) / interval).clamp(0.0, 1.0) as f32;
-    Some((
-        hermite_vector(
-            lower.position,
-            upper.position,
-            lower.velocity * interval as f32,
-            upper.velocity * interval as f32,
-            t,
-        ),
-        hermite_vector(lower.velocity, upper.velocity, Vec3::ZERO, Vec3::ZERO, t),
-    ))
-}
-
 pub fn physics_system(
     ryugu_query: Query<&Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
     mut cassini_query: Query<
@@ -230,30 +195,6 @@ pub fn physics_system(
         benchmark.complete = false;
     }
 
-    // Equation (184) maps a complete prescribed trajectory to Laplace-space
-    // observations, so it is not used as an instantaneous force law. The
-    // visible probe follows that same prescribed trajectory while selected.
-    if *active_method == ActiveGravityMethod::FrequencyDomain {
-        blend.0 = 1.0;
-        if let Some((body_position, body_velocity)) =
-            prescribed_trajectory_state(&inversion.knots, clock.elapsed_seconds)
-        {
-            let body_rotation = ryugu_transform.rotation;
-            probe_transform.translation = body_rotation * body_position;
-            probe_velocity.0 = body_rotation * body_velocity;
-            if orbit_history.0.len() >= ORBIT_HISTORY_LEN {
-                orbit_history.0.pop_front();
-            }
-            orbit_history.0.push_back(probe_transform.translation);
-            clock.advance(
-                time.delta_secs_f64()
-                    * TIME_SCALE as f64
-                    * simulation_acceleration.stable_steps() as f64,
-            );
-        }
-        return;
-    }
-
     let active_history = select_history(
         *active_method,
         radial_history.as_deref(),
@@ -261,11 +202,20 @@ pub fn physics_system(
         mmfft_history.as_deref(),
         fmm_history.as_deref(),
     );
-    let integration_history = active_history;
+    // Equation (184) is an aggregate trajectory observation operator and has
+    // no instantaneous force history. For the Bevy scene only, use the
+    // already-running radial GPU field as the physical display reference;
+    // this preserves continuous shape-dependent motion without introducing a
+    // second CPU point-source integrator or changing the benchmark scenario.
+    let integration_history = if *active_method == ActiveGravityMethod::FrequencyDomain {
+        radial_history.as_ref().map(|history| &history.0)
+    } else {
+        active_history
+    };
     let maximum_extrapolation_intervals = match *active_method {
         ActiveGravityMethod::RadialAnalytic => MAX_EXTRAPOLATION_INTERVALS,
         ActiveGravityMethod::HomogeneousWerner => MAX_EXTRAPOLATION_INTERVALS,
-        ActiveGravityMethod::FrequencyDomain => unreachable!("handled above"),
+        ActiveGravityMethod::FrequencyDomain => MAX_EXTRAPOLATION_INTERVALS,
         ActiveGravityMethod::MmfftCompressed => MAX_EXTRAPOLATION_INTERVALS,
         ActiveGravityMethod::Fmm => MAX_EXTRAPOLATION_INTERVALS,
     };
@@ -290,7 +240,7 @@ pub fn physics_system(
         });
     }
 
-    let acceleration_at = |sample_time: f64| -> Result<Vec3, &'static str> {
+    let acceleration_at = |sample_time: f64, _world_position: Vec3| -> Result<Vec3, &'static str> {
         let Some(history) = integration_history else {
             return Err("The selected GPU gravity evaluator is not registered.");
         };
@@ -319,7 +269,8 @@ pub fn physics_system(
         for substep in 0..PHYSICS_SUBSTEPS {
             let start_time = stable_step_start + substep as f64 * substep_dt;
             let end_time = start_time + substep_dt;
-            let acceleration_start = match acceleration_at(start_time) {
+            let acceleration_start = match acceleration_at(start_time, probe_transform.translation)
+            {
                 Ok(acceleration) => acceleration,
                 Err("Waiting for a valid gravity readback snapshot.") => {
                     return;
@@ -331,7 +282,7 @@ pub fn physics_system(
             };
             probe_velocity.0 += acceleration_start * (0.5 * substep_dt as f32);
             probe_transform.translation += probe_velocity.0 * substep_dt as f32;
-            let acceleration_end = match acceleration_at(end_time) {
+            let acceleration_end = match acceleration_at(end_time, probe_transform.translation) {
                 Ok(acceleration) => acceleration,
                 Err("Waiting for a valid gravity readback snapshot.") => {
                     return;
