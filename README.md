@@ -78,7 +78,7 @@ $$
 \overline{\mathbf q}(h)=\mathbf q_0+h\mathbf e_z,
 \qquad h\ge0,
 \qquad
-\inf_{h\ge0}\operatorname{dist}(\overline{\mathbf q}(h),V)>0.
+\inf_{h\ge0}\mathrm{dist}(\overline{\mathbf q}(h),V)>0.
 $$
 
 For the cylindrical component form, take $\mathbf q_0=\varrho\mathbf e_\varrho$ at azimuth $\phi$. Write a source point in spherical coordinates $(\lambda,\theta',\phi')$ and define
@@ -91,7 +91,7 @@ a^2&=\varrho^2+(r'_\perp)^2-2\varrho r'_\perp\cos\Delta\phi,
 \end{aligned}
 $$
 
-The spatial Laplace parameter satisfies $\operatorname{Re}s_h>0$. Define the scalar kernel and its derivatives by
+The spatial Laplace parameter satisfies $\mathrm{Re}\,s_h>0.$ Define the scalar kernel and its derivatives by
 
 $$
 \begin{aligned}
@@ -177,7 +177,7 @@ $$
 The multi-index factorial is $\boldsymbol\alpha!=\alpha_1!\alpha_2!\alpha_3!$. The residue extracts the polynomial-weighted cell spectrum exactly for that finite density model:
 
 $$
-\operatorname*{Res}_{\boldsymbol\zeta=\mathbf0}
+\mathop{\mathrm{Res}}\limits_{\boldsymbol\zeta=\mathbf0}
 \left[E_a(-i\boldsymbol\kappa+\boldsymbol\zeta)\Omega_a(\boldsymbol\zeta)\right]
 =\int_{K_a-\mathbf p_a}P_a(\mathbf x)e^{-i\boldsymbol\kappa\cdot\mathbf x}\,dV_{\mathbf x}.
 $$
@@ -193,7 +193,7 @@ $$
 \frac{4\pi i\boldsymbol\kappa}{\kappa^2}
 \mathcal T_\gamma(s_t,\boldsymbol\kappa)\\
 &\quad\times\sum_{a=1}^{N_K}e^{-i\boldsymbol\kappa\cdot\mathbf p_a}
-\operatorname*{Res}_{\boldsymbol\zeta=\mathbf0}
+\mathop{\mathrm{Res}}\limits_{\boldsymbol\zeta=\mathbf0}
 \left[E_a(-i\boldsymbol\kappa+\boldsymbol\zeta)\Omega_a(\boldsymbol\zeta)\right]
 \,d^3\boldsymbol\kappa.
 \end{aligned}
