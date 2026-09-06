@@ -146,7 +146,33 @@ pub(crate) fn browser_ui_action_system(
                             &mut surface_controls.state,
                             &mut surface_controls.compute,
                         );
+                    } else if metric == SurfaceFieldMetric::Error {
+                        if let Some(comparison) = surface_controls.state.comparison.as_ref() {
+                            surface_controls.state.status = format!(
+                                "Error map ready: {} compared with {}. Positive is overestimation; negative is underestimation.",
+                                comparison.comparison.method.as_str(),
+                                comparison.baseline.method.as_str()
+                            );
+                        }
+                    } else if !surface_controls.state.computing {
+                        // A comparison may have completed while Relative error
+                        // was selected.  Switching back to a scalar metric must
+                        // replace the comparison-only status text so the panel
+                        // describes the product currently being displayed.
+                        surface_controls.state.status = surface_controls
+                            .state
+                            .latest
+                            .as_ref()
+                            .map(|dataset| {
+                                format!(
+                                    "{} surface product ready: gravity, gradient, effective slope.",
+                                    dataset.method.as_str()
+                                )
+                            })
+                            .unwrap_or_else(|| "Surface field is ready to compute.".into());
                     }
+                    surface_controls.state.revision =
+                        surface_controls.state.revision.wrapping_add(1);
                 }
             }
             "surface-field-select-patch" => {
@@ -176,16 +202,38 @@ pub(crate) fn browser_ui_action_system(
             }
             "surface-field-baseline" => {
                 if let Some(method) = value.and_then(Value::as_str).and_then(method_from_key) {
+                    if surface_controls.state.computing {
+                        cancel_surface_field(
+                            &mut surface_controls.state,
+                            &mut surface_controls.compute,
+                            "Algorithm pair changed; choose Relative error or Compare again.",
+                        );
+                    }
                     surface_controls.state.baseline_method = method;
                     surface_controls.state.comparison = None;
+                    surface_controls.state.latest = None;
+                    surface_controls.state.selected_patch = None;
+                    surface_controls.state.status =
+                        "Algorithm pair changed; choose Relative error or Compare again.".into();
                     surface_controls.state.revision =
                         surface_controls.state.revision.wrapping_add(1);
                 }
             }
             "surface-field-comparison" => {
                 if let Some(method) = value.and_then(Value::as_str).and_then(method_from_key) {
+                    if surface_controls.state.computing {
+                        cancel_surface_field(
+                            &mut surface_controls.state,
+                            &mut surface_controls.compute,
+                            "Algorithm pair changed; choose Relative error or Compare again.",
+                        );
+                    }
                     surface_controls.state.comparison_method = method;
                     surface_controls.state.comparison = None;
+                    surface_controls.state.latest = None;
+                    surface_controls.state.selected_patch = None;
+                    surface_controls.state.status =
+                        "Algorithm pair changed; choose Relative error or Compare again.".into();
                     surface_controls.state.revision =
                         surface_controls.state.revision.wrapping_add(1);
                 }

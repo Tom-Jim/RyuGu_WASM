@@ -711,7 +711,7 @@ window.ryuguPlanningProgress = (planning) => ({
       `g_eff ${formatRange(latest.effectiveGravityRange, ' m/s²')}`,
       `|∇g| ${formatRange(latest.gradientRange, ' s⁻²')} · slope ${formatRange(latest.slopeRange, '°')}`,
     ];
-    if (compare) {
+    if (compare && surface.metric === 'error') {
       lines.push(`effective-g error ${formatRange(compare.errorRange, '')} · ${compare.sampleCount} common patches`);
     }
     range.textContent = lines.join('\n');
@@ -726,7 +726,7 @@ window.ryuguPlanningProgress = (planning) => ({
       : '--';
     const scalar = (value, suffix = '') => Number.isFinite(Number(value))
       ? `${Number(value).toExponential(3)}${suffix}` : '--';
-    const error = Number.isFinite(Number(selected.relativeError))
+    const error = surface.metric === 'error' && Number.isFinite(Number(selected.relativeError))
       ? `\nΔg_eff/g_eff ${scalar(selected.relativeError)}` : '';
     patchDetails.textContent = [
       `Patch ${selected.index + 1}/${latest.sampleCount} · ${methodLabel(selected.method)} · ${selected.densityMode === 'constant' ? 'uniform density' : 'ln radial density'}`,
