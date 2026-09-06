@@ -10,7 +10,10 @@ pub const RYUGU_MASS: f32 = 4.5e11;
 pub const TIME_SCALE: f32 = 60.0;
 pub const BENCHMARK_DURATION_SECONDS: f64 = 901.66;
 pub const BENCHMARK_SAMPLE_INTERVAL_SECONDS: f64 = 0.01;
-pub const ORBIT_HISTORY_LEN: usize = 27500;
+/// Number of real detector positions retained for the visible trajectory.
+/// This is deliberately large enough to preserve several long orbital arcs;
+/// the renderer still decimates the history to a bounded gizmo stream.
+pub const ORBIT_HISTORY_LEN: usize = 100_000;
 pub const JACOBI_HISTORY_CAPACITY: usize = 256;
 /// Keep at least two complete maximum-acceleration pointwise-field batches.
 /// A batch contains the authoritative anchor plus one endpoint for every
@@ -458,7 +461,6 @@ pub struct SurfaceFieldState {
     pub computing: bool,
     pub status: String,
     pub revision: u64,
-    pub density_mode: DensityMode,
     pub metric: SurfaceFieldMetric,
     pub baseline_method: ActiveGravityMethod,
     pub comparison_method: ActiveGravityMethod,
@@ -473,7 +475,6 @@ impl Default for SurfaceFieldState {
             computing: false,
             status: "Surface field is ready to compute.".into(),
             revision: 0,
-            density_mode: DensityMode::Variable,
             metric: SurfaceFieldMetric::Gravity,
             baseline_method: ActiveGravityMethod::Fmm,
             comparison_method: ActiveGravityMethod::MmfftCompressed,
@@ -494,6 +495,11 @@ pub struct AsteroidTopologyGpuData {
     pub indices: Vec<u32>,
 }
 
+/// GPU-produced vertex normals are retained for the normals compute/readback
+/// path. The scene overlay now derives one authoritative normal per triangle
+/// directly from topology, so this cache is intentionally not read by the
+/// gizmo renderer.
+#[allow(dead_code)]
 #[derive(Resource)]
 pub struct AsteroidNormalsGpuData(pub Vec<Vec3>);
 

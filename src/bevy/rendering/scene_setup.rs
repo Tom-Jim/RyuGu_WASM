@@ -251,7 +251,6 @@ pub fn render_gizmos_system(
     global_transforms: Query<&GlobalTransform>,
     show_normals: Res<ShowNormals>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
-    normals_data: Option<Res<AsteroidNormalsGpuData>>,
     active_method: Res<ActiveGravityMethod>,
     time: Res<Time>,
     inversion: Res<TrajectoryInversionState>,
@@ -271,7 +270,7 @@ pub fn render_gizmos_system(
             // The main trail always follows the detector's actual integrated
             // path. Frozen inversion samples are rendered separately below and
             // must never replace or hide this bounded live history. Decimate
-            // only the display polyline: retaining all 27,500 simulation
+            // only the display polyline: retaining all 100,000 simulation
             // samples in the resource preserves the physical history while a
             // bounded gizmo stream avoids rebuilding tens of thousands of
             // transient line vertices every frame.
@@ -286,6 +285,7 @@ pub fn render_gizmos_system(
                     .map(|index| history.0[index]),
                 orbit_color,
             );
+
         }
 
         if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
@@ -368,20 +368,41 @@ pub fn render_gizmos_system(
         }
     }
     if show_normals.0
-        && let (Some(topo), Some(normals)) = (topo, normals_data)
+        && let Some(topo) = topo
         && let Some(mesh_entity) = topo.mesh_entity
         && let Ok(mesh_gtf) = global_transforms.get(mesh_entity)
     {
         let rot = mesh_gtf.compute_transform().rotation;
-        const MAX_VISIBLE_NORMALS: usize = 2_048;
-        let available = topo.positions.len().min(normals.0.len());
-        let stride = available.div_ceil(MAX_VISIBLE_NORMALS).max(1);
-        for i in (0..available).step_by(stride) {
-            let local_pos = topo.positions[i];
-            let world_pos = mesh_gtf.transform_point(local_pos);
-            let world_normal = (rot * normals.0[i]).normalize_or_zero();
-            let tip = world_pos + world_normal * NORMAL_ARROW_LENGTH;
-            gizmos.line(world_pos, tip, Color::srgb(0.2, 1.0, 0.8));
+        // Draw one outward face normal for every triangular face. Vertex-normal
+        // sampling hid entire regions on coarse meshes and made the display
+        // depend on an arbitrary visibility cap.
+        for triangle in topo.triangles.as_chunks::<3>().0 {
+            let Some(p0) = topo.positions.get(triangle[0] as usize).copied() else {
+                continue;
+            };
+            let Some(p1) = topo.positions.get(triangle[1] as usize).copied() else {
+                continue;
+            };
+            let Some(p2) = topo.positions.get(triangle[2] as usize).copied() else {
+                continue;
+            };
+            let local_normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+            if local_normal == Vec3::ZERO {
+                continue;
+            }
+            let centroid = (p0 + p1 + p2) / 3.0;
+            let outward_normal = if local_normal.dot(centroid) < 0.0 {
+                -local_normal
+            } else {
+                local_normal
+            };
+            let world_pos = mesh_gtf.transform_point(centroid);
+            let world_normal = (rot * outward_normal).normalize_or_zero();
+            gizmos.line(
+                world_pos,
+                world_pos + world_normal * NORMAL_ARROW_LENGTH,
+                Color::srgb(0.2, 1.0, 0.8),
+            );
         }
     }
 }

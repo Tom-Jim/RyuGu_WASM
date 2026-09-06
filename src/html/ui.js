@@ -672,7 +672,6 @@ window.ryuguPlanningProgress = (planning) => ({
 
   function renderSurfaceField(surface) {
     if (!surface) return;
-    pressed('[data-action="density-mode"]', (button) => button.dataset.value === surface.densityMode);
     pressed('[data-action="surface-field-metric"]', (button) => button.dataset.value === surface.metric);
     const computing = Boolean(surface.computing);
     $$('[data-action="surface-field-compute"], [data-action="surface-field-compare"]')
@@ -681,9 +680,7 @@ window.ryuguPlanningProgress = (planning) => ({
     const comparison = $('#surface-comparison');
     if (baseline && baseline.value !== surface.baseline) baseline.value = surface.baseline;
     if (comparison && comparison.value !== surface.comparison) comparison.value = surface.comparison;
-    const densityNote = surface.densityMode === 'variable'
-      ? ' Variable-density Werner surface values use the point-source reference, not the homogeneous polyhedral formula.' : '';
-    $('#surface-field-status').textContent = (surface.status ?? 'Surface field is ready to compute.') + densityNote;
+    $('#surface-field-status').textContent = surface.status ?? 'Surface field is ready to compute.';
     const latest = surface.latest;
     const compare = surface.comparisonResult;
     const formatRange = (range, suffix = '') => Array.isArray(range) && range.length === 2
@@ -692,14 +689,25 @@ window.ryuguPlanningProgress = (planning) => ({
     const patchCount = $('#surface-patch-count');
     const patchDetails = $('#surface-patch-details');
     if (!range || !patchDetails) return;
+    if (surface.metric === 'error' && !compare) {
+      range.textContent = surface.computing
+        ? 'Computing relative error for the selected algorithm pair...'
+        : 'Choose two different algorithms to build a relative-error map.';
+      patchCount.textContent = '--';
+      patchDetails.textContent = surface.computing
+        ? 'The comparison uses the same surface patches for both algorithms.'
+        : 'Select baseline and comparison algorithms, then choose Relative error again.';
+      return;
+    }
     if (!latest) {
       range.textContent = 'No surface product yet.';
       patchCount.textContent = '--';
       patchDetails.textContent = 'Calculate a field, then inspect a surface patch.';
       return;
     }
+    const densityLabel = latest.densityMode === 'constant' ? 'uniform density' : 'ln radial density';
     const lines = [
-      `${methodLabel(latest.method)} · ${latest.densityMode} · ${latest.sampleCount} patches`,
+      `${methodLabel(latest.method)} · ${densityLabel} · ${latest.sampleCount} patches`,
       `g_eff ${formatRange(latest.effectiveGravityRange, ' m/s²')}`,
       `|∇g| ${formatRange(latest.gradientRange, ' s⁻²')} · slope ${formatRange(latest.slopeRange, '°')}`,
     ];
@@ -721,7 +729,7 @@ window.ryuguPlanningProgress = (planning) => ({
     const error = Number.isFinite(Number(selected.relativeError))
       ? `\nΔg_eff/g_eff ${scalar(selected.relativeError)}` : '';
     patchDetails.textContent = [
-      `Patch ${selected.index + 1}/${latest.sampleCount} · ${methodLabel(selected.method)} · ${selected.densityMode}`,
+      `Patch ${selected.index + 1}/${latest.sampleCount} · ${methodLabel(selected.method)} · ${selected.densityMode === 'constant' ? 'uniform density' : 'ln radial density'}`,
       `position [${vector(selected.position)}] m`,
       `normal [${vector(selected.normal)}]`,
       `g [${vector(selected.gravity)}] · |g| ${scalar(selected.gravityMagnitude, ' m/s²')}`,

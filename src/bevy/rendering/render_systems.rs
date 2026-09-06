@@ -35,7 +35,7 @@ pub fn render_section_system(
     // continuous. Updating it every other frame prevents its CPU clipping and
     // Gizmo generation from competing with the fixed-step simulation.
     *frame = frame.wrapping_add(1);
-    if *frame % 2 != 0 {
+    if !(*frame).is_multiple_of(2) {
         return;
     }
     let Some(ryugu_tf) = ryugu_query.iter().next() else {

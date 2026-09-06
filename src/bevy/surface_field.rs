@@ -61,7 +61,6 @@ struct SurfaceFieldJob {
     methods: Vec<ActiveGravityMethod>,
     method_index: usize,
     patch_index: usize,
-    density_mode: DensityMode,
     evaluator: Option<SurfaceEvaluator>,
     datasets: Vec<SurfaceFieldDataset>,
 }
@@ -173,7 +172,6 @@ pub(crate) fn queue_surface_field(
         methods: vec![method],
         method_index: 0,
         patch_index: 0,
-        density_mode: state.density_mode,
         evaluator: None,
         datasets: Vec::new(),
     });
@@ -219,7 +217,6 @@ pub(crate) fn queue_surface_comparison(
         methods: vec![state.baseline_method, state.comparison_method],
         method_index: 0,
         patch_index: 0,
-        density_mode: state.density_mode,
         evaluator: None,
         datasets: Vec::new(),
     });
@@ -248,7 +245,7 @@ pub(crate) fn build_surface_field_geometry_system(
     let mut patches = Vec::with_capacity(triangle_count.div_ceil(stride));
     let mut sampled_triangle_indices = Vec::with_capacity(triangle_count.div_ceil(stride));
     let mut render_triangles = Vec::with_capacity(triangle_count);
-    for (triangle_index, triangle) in topology.triangles.chunks_exact(3).enumerate() {
+    for (triangle_index, triangle) in topology.triangles.as_chunks::<3>().0.iter().enumerate() {
         let Some((&a, rest)) = triangle.split_first() else {
             continue;
         };
@@ -377,12 +374,20 @@ pub(crate) fn surface_field_compute_system(
 
     if job.evaluator.is_none() {
         let method = job.methods[job.method_index];
-        if job.density_mode == DensityMode::Variable && aggregated.is_none() {
+        // The public surface model has one density profile: the default
+        // logarithmic radial distribution. Werner is the sole exception and
+        // always uses its homogeneous closed-polyhedron density.
+        let method_density_mode = if method == ActiveGravityMethod::HomogeneousWerner {
+            DensityMode::Constant
+        } else {
+            DensityMode::Variable
+        };
+        if method_density_mode == DensityMode::Variable && aggregated.is_none() {
             state.status = "Waiting for the variable-density source distribution...".into();
             return;
         }
         let sources = build_surface_sources(
-            job.density_mode,
+            method_density_mode,
             &topology,
             aggregated.as_deref(),
             geometry.scale,
@@ -398,11 +403,11 @@ pub(crate) fn surface_field_compute_system(
             sources,
             &topology,
             geometry.scale,
-            job.density_mode,
+            method_density_mode,
         ));
         job.datasets.push(SurfaceFieldDataset {
             method,
-            density_mode: job.density_mode,
+            density_mode: method_density_mode,
             samples: Vec::with_capacity(geometry.patches.len()),
             gravity_range: (f32::INFINITY, f32::NEG_INFINITY),
             effective_gravity_range: (f32::INFINITY, f32::NEG_INFINITY),
@@ -672,7 +677,7 @@ fn build_surface_sources(
 }
 
 fn build_constant_sources(topology: &AsteroidTopologyGpuData, scale: f32) -> Vec<PointMass> {
-    let faces = topology.triangles.chunks_exact(3).collect::<Vec<_>>();
+    let faces = topology.triangles.as_chunks::<3>().0;
     if faces.is_empty() {
         return Vec::new();
     }
@@ -720,7 +725,7 @@ fn build_radial_surface_sources(
     const LAYERS: usize = 4;
     let mut raw = Vec::new();
     let mut total_volume = 0.0_f64;
-    for triangle in topology.triangles.chunks_exact(3) {
+    for triangle in topology.triangles.as_chunks::<3>().0 {
         let p0 = topology.positions.get(triangle[0] as usize)?.to_owned() * scale;
         let p1 = topology.positions.get(triangle[1] as usize)?.to_owned() * scale;
         let p2 = topology.positions.get(triangle[2] as usize)?.to_owned() * scale;
@@ -777,7 +782,7 @@ fn build_werner_evaluator(
     let mut edge_sides: HashMap<(u32, u32), Vec<WernerSurfaceEdgeSide>> = HashMap::new();
     let mut faces = Vec::new();
     let mut volume = 0.0_f64;
-    for triangle in topology.triangles.chunks_exact(3) {
+    for triangle in topology.triangles.as_chunks::<3>().0 {
         let mut indices = [triangle[0], triangle[1], triangle[2]];
         let mut points = [
             *topology.positions.get(indices[0] as usize)? * scale,
@@ -1283,12 +1288,12 @@ fn sample_mmfft_potential(field: &[[f32; 4]], position: Vec3, half_extent: f32, 
     let wy = weights(fraction.y);
     let wz = weights(fraction.z);
     let mut potential = 0.0;
-    for z in 0..4 {
-        for y in 0..4 {
-            for x in 0..4 {
+    for (z, &z_weight) in wz.iter().enumerate() {
+        for (y, &y_weight) in wy.iter().enumerate() {
+            for (x, &x_weight) in wx.iter().enumerate() {
                 let index =
                     ((base.z as usize + z) * n + base.y as usize + y) * n + base.x as usize + x;
-                potential += field[index][3] * wx[x] * wy[y] * wz[z];
+                potential += field[index][3] * x_weight * y_weight * z_weight;
             }
         }
     }

@@ -15,11 +15,17 @@ $$
 
 The sign convention is fixed throughout the application: potential is positive and its gradient points toward the source. Geometry, density, and total mass are kept consistent across the forward methods so that differences measure numerical method behavior rather than different physical inputs.
 
-## 2. Source representation and density modes
+## 2. Source representation and density profiles
 
 The shared source representation is a star-shaped angular mesh with radial shells. Each angular cell stores a representative direction, its solid angle, the surface radius, and shell density values. Shell boundaries are chosen by equal volume, so the source mass is preserved when the number of radial layers changes.
 
-The **constant** mode assigns one homogeneous density to all occupied cells and normalizes it to the requested total mass. The **variable** mode evaluates the configured radial density profile and preserves each shell's integrated mass. The UI uses these same representations for field display, surface sampling, orbit propagation, and inversion; switching modes invalidates cached field products and schedules a bounded recomputation.
+The default source profile is the mass-preserving logarithmic radial distribution
+
+$$
+\rho(r)=C\ln\left(1+\frac{r}{\varepsilon}\right),
+$$
+
+used by Radial, FFT, FMM, and Frequency-domain methods. Werner is the sole exception: it uses one homogeneous density normalized to the requested total mass. The **Section** control displays the active method's density field; it does not switch the source profile or launch a surface-field calculation.
 
 The Werner method is the homogeneous closed-polyhedron reference. It is mathematically independent of the shell quadrature. A heterogeneous surface request uses the heterogeneous source representation of the selected method rather than silently displaying a homogeneous reference result.
 

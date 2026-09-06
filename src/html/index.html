@@ -45,13 +45,6 @@
                 <label class="range-row"><span>Z <output id="probe-z-out">--</output></span><input id="probe-z" data-probe="z" type="range" min="-1300" max="1300" step="1" /></label>
                 <label class="range-row"><span>Speed <output id="probe-speed-out">--</output></span><input id="probe-speed" data-probe="speed" type="range" min="0.2" max="1.8" step="0.001" /></label>
                 <div class="button-grid"><button onclick="window.ryuguUi?.activate?.(this)" data-action="normals">Normals</button><button onclick="window.ryuguUi?.activate?.(this)" data-action="section">Section</button></div>
-                <section class="surface-density-control" aria-label="Surface field density model">
-                    <div class="panel-heading"><span>Surface density</span><small>MODEL INPUT</small></div>
-                    <div class="segmented">
-                        <button onclick="window.ryuguUi?.activate?.(this)" data-action="density-mode" data-value="constant">Constant</button>
-                        <button onclick="window.ryuguUi?.activate?.(this)" data-action="density-mode" data-value="variable">Variable</button>
-                    </div>
-                </section>
                 <section class="surface-field-panel" aria-label="Surface gravity and slope products">
                     <div class="panel-heading"><span>Surface gravity / slope</span><small>3D PRODUCT</small></div>
                     <div class="surface-action-row">

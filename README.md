@@ -12,7 +12,7 @@ The public mathematical and algorithmic description is maintained in [mathpub.md
 
 ## Workbench
 
-- **Left rail:** probe initial conditions, camera controls, normals and section view, constant or variable density, surface fields, patch inspection, and trajectory-knot editing.
+- **Left rail:** probe initial conditions, camera controls, normals and density-section display, surface fields, patch inspection, and trajectory-knot editing.
 - **Center:** the Bevy 3D scene, live orbit, and diagnostics for the selected method.
 - **Right rail:** density inversion, trajectory-design comparisons, accuracy limits, run state, and background-execution settings.
 - **Top bar:** FMM, FFT, Werner, Radial, and Frequency-domain selection, performance comparison, gesture mode, and layout reset.
@@ -29,7 +29,7 @@ Mobile devices use simplified materials, disable scene MSAA, and cap the canvas 
 
 ## Density and surface fields
 
-Choose a density model and a solver, then click **Calculate field** to display effective gravity, gravity gradient, or effective slope. The constant-density view is homogeneous and mass-preserving, matching the uniform-density interpretation used by the Werner reference. The variable-density view retains the radial density profile and its corresponding field values. Changing the density mode invalidates the affected cached field work and recomputes it in bounded chunks so the UI remains responsive.
+Choose a solver, then click **Calculate field** to display effective gravity, gravity gradient, or effective slope. The default source profile is the mass-preserving logarithmic radial distribution for Radial, FFT, FMM, and Frequency-domain methods. Werner uses its homogeneous closed-polyhedron density. The **Section** button displays the active method's density field without changing the source model or starting a surface-field calculation.
 
 Surface inspection uses a shared patch index for position, normal, field, and error. Comparison signs are reported as comparison minus baseline. Werner remains a homogeneous-polyhedron reference; heterogeneous modes use their own volume representation and are not silently substituted with the Werner result.
 

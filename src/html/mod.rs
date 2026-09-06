@@ -34,12 +34,6 @@ pub(crate) struct BrowserSurfaceControls<'w> {
 }
 
 #[derive(SystemParam)]
-pub(crate) struct DensityControls<'w> {
-    density_mode: ResMut<'w, DensityMode>,
-    clock: ResMut<'w, SimulationClock>,
-}
-
-#[derive(SystemParam)]
 pub(crate) struct BrowserUiActions<'w> {
     camera: ResMut<'w, CameraMode>,
     normals: ResMut<'w, ShowNormals>,
@@ -62,7 +56,6 @@ pub(crate) struct BrowserUiActions<'w> {
 pub(crate) fn browser_ui_action_system(
     actions: BrowserUiActions,
     mut surface_controls: BrowserSurfaceControls,
-    mut density_controls: DensityControls,
 ) {
     let BrowserUiActions {
         mut camera,
@@ -115,8 +108,9 @@ pub(crate) fn browser_ui_action_system(
                     Some("fmm") => Some(ActiveGravityMethod::Fmm),
                     _ => None,
                 };
-                if next.is_some() && next != Some(*active_method) {
-                    let next = next.expect("checked above");
+                if let Some(next) = next
+                    && next != *active_method
+                {
                     performance.pending_method = Some(next);
                     // Selecting a gravity method changes the live trajectory.
                     // Surface products are an explicit, potentially expensive
@@ -128,43 +122,31 @@ pub(crate) fn browser_ui_action_system(
                     );
                 }
             }
-            "density-mode" => {
-                let next = match value.and_then(Value::as_str) {
-                    Some("constant") => Some(DensityMode::Constant),
-                    Some("variable") => Some(DensityMode::Variable),
-                    _ => None,
-                };
-                if let Some(next) = next
-                    && next != *density_controls.density_mode
-                {
-                    *density_controls.density_mode = next;
-                    surface_controls.state.density_mode = next;
-                    // A density switch starts a new physical experiment. GPU
-                    // samples from the previous model must not be interpolated
-                    // into the new trajectory.
-                    density_controls.clock.reset_state();
-                    // Changing the density model invalidates the displayed
-                    // product, but must not synchronously launch a full
-                    // 4096-patch CPU evaluation from a small toggle.
-                    cancel_surface_field(
-                        &mut surface_controls.state,
-                        &mut surface_controls.compute,
-                        "Density model changed; press Calculate field to recompute.",
-                    );
-                    let method = performance.pending_method.unwrap_or(*active_method);
-                    queue_surface_field(
-                        &mut surface_controls.state,
-                        &mut surface_controls.compute,
-                        method,
-                    );
-                }
-            }
             "surface-field-metric" => {
                 if let Some(metric) = value
                     .and_then(Value::as_str)
                     .and_then(surface_metric_from_key)
                 {
                     surface_controls.state.metric = metric;
+                    // Relative error is a comparison product, not a scalar
+                    // field. Selecting it must make the requested product
+                    // available instead of leaving the overlay hidden until
+                    // the user discovers the separate Compare button.
+                    if metric == SurfaceFieldMetric::Error
+                        && surface_controls.state.comparison.is_none()
+                    {
+                        if surface_controls.state.computing {
+                            cancel_surface_field(
+                                &mut surface_controls.state,
+                                &mut surface_controls.compute,
+                                "Switching to the relative-error comparison...",
+                            );
+                        }
+                        queue_surface_comparison(
+                            &mut surface_controls.state,
+                            &mut surface_controls.compute,
+                        );
+                    }
                 }
             }
             "surface-field-select-patch" => {
