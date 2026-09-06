@@ -50,6 +50,7 @@ fn dispatch_frequency_domain(
     if buffers.0.as_ref().is_some_and(|inner| {
         inner.source_count != extracted.source_count
             || inner.source_radius.to_bits() != extracted.radius.to_bits()
+            || inner.source_layout != extracted.source_layout
             || inner.target_count != extracted.observation_count
             || inner.element_capacity != element_capacity
     }) {
@@ -136,12 +137,17 @@ fn dispatch_frequency_domain(
             source_radius: extracted.radius,
             element_capacity,
             source_hash: extracted.source_hash,
+            source_layout: extracted.source_layout,
             target_count,
             last_submitted: None,
+            density_spectrum_ready: false,
         });
     }
 
-    let inner = buffers.0.as_mut().expect("FrequencyDomain GPU buffers initialized");
+    let inner = buffers
+        .0
+        .as_mut()
+        .expect("FrequencyDomain GPU buffers initialized");
     if !extracted.sensitivity_sources.is_empty() {
         dispatch_frequency_domain_sensitivity_matrix(
             inner,
@@ -163,6 +169,7 @@ fn dispatch_frequency_domain(
         render_queue.write_buffer(&inner.sources, 0, source_bytes);
         inner.source_hash = extracted.source_hash;
         inner.last_submitted = None;
+        inner.density_spectrum_ready = false;
     }
     if let Some(capture_id) = extracted.batch_capture_id
         && !extracted.batch_elements.is_empty()
@@ -192,7 +199,7 @@ fn dispatch_frequency_domain(
         // The WGSL uniform block has a fixed 256-element array. Keep the
         // binding range large enough for the declared block even when a
         // request contains fewer active trajectory elements.
-        let mut parameter_bytes = vec![0_u8; 48 * 256];
+        let mut parameter_bytes = vec![0_u8; 52 * 256];
         for (element_index, element) in extracted.batch_elements.iter().enumerate() {
             let bytes = uniform_bytes(
                 element.trajectory_origin,
@@ -201,8 +208,10 @@ fn dispatch_frequency_domain(
                 0,
                 element.target_count,
                 element.target_offset,
+                extracted.source_layout,
+                0,
             );
-            let offset = element_index * 48;
+            let offset = element_index * 52;
             parameter_bytes[offset..offset + bytes.len()].copy_from_slice(&bytes);
         }
         let parameter_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -214,28 +223,55 @@ fn dispatch_frequency_domain(
             "frequency_domain_trajectory_batch_bg",
             &inner.layout,
             &[
-                BindGroupEntry { binding: 0, resource: parameter_buffer.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: inner.sources.as_entire_binding() },
-                BindGroupEntry { binding: 2, resource: inner.quadrature.as_entire_binding() },
-                BindGroupEntry { binding: 3, resource: inner.spectrum.as_entire_binding() },
-                BindGroupEntry { binding: 4, resource: inner.output.as_entire_binding() },
-                BindGroupEntry { binding: 6, resource: inner.density_spectra.as_entire_binding() },
-                BindGroupEntry { binding: 7, resource: inner.density_modes.as_entire_binding() },
-                BindGroupEntry { binding: 9, resource: inner.targets.as_entire_binding() },
+                BindGroupEntry {
+                    binding: 0,
+                    resource: parameter_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: inner.sources.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: inner.quadrature.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: inner.spectrum.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: inner.output.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: inner.density_spectra.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: inner.density_modes.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 9,
+                    resource: inner.targets.as_entire_binding(),
+                },
             ],
         );
         let trajectory_block_count = extracted.batch_elements.len() as u32;
-        {
+        let rebuild_spectrum = !inner.density_spectrum_ready;
+        if rebuild_spectrum {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("frequency_domain_trajectory_density_spectra_batch"), timestamp_writes: None,
+                label: Some("frequency_domain_trajectory_density_spectra_batch"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(density_spectra);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(QUADRATURE_COUNT, trajectory_block_count, 1);
         }
-        {
+        if rebuild_spectrum {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("frequency_domain_trajectory_spectrum_batch"), timestamp_writes: None,
+                label: Some("frequency_domain_trajectory_spectrum_batch"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(assemble);
             pass.set_bind_group(0, &bind_group, &[]);
@@ -243,7 +279,8 @@ fn dispatch_frequency_domain(
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("frequency_domain_trajectory_evaluate_batch"), timestamp_writes: None,
+                label: Some("frequency_domain_trajectory_evaluate_batch"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(evaluate);
             pass.set_bind_group(0, &bind_group, &[]);
@@ -255,6 +292,7 @@ fn dispatch_frequency_domain(
         }
         encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);
         render_queue.submit([encoder.finish()]);
+        inner.density_spectrum_ready = true;
 
         let shared = Arc::clone(&channel.data);
         let in_flight = Arc::clone(&channel.in_flight);
@@ -278,13 +316,16 @@ fn dispatch_frequency_domain(
                     Ok(()) => {
                         let view = staging.slice(..).get_mapped_range();
                         let values = bytes_to_f32x4(&view[..output_size]);
-                        let cpu_readback_wait_ms =
-                            readback_started.elapsed().as_secs_f64() * 1.0e3;
+                        let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
                         let timings = FrequencyDomainTimingSample {
                             cpu_readback_wait_ms,
                             target_count,
-                            dispatch_count: 1,
-                            spectrum_rebuild_count: element_count,
+                            dispatch_count: if rebuild_spectrum { 3 } else { 1 },
+                            spectrum_rebuild_count: if rebuild_spectrum {
+                                element_count
+                            } else {
+                                0
+                            },
                             ..default()
                         };
                         if let Ok(mut guard) = shared.lock() {

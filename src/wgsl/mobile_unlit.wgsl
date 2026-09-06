@@ -14,5 +14,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let normal = normalize(in.world_normal);
     let light_direction = normalize(vec3<f32>(0.35, 0.70, 0.55));
     let brightness = 0.24 + 0.76 * max(dot(normal, light_direction), 0.0);
-    return vec4<f32>(material.color.rgb * brightness, material.color.a);
+    var vertex_color = vec4<f32>(1.0);
+#ifdef VERTEX_COLORS
+    vertex_color = in.color;
+#endif
+    return vec4<f32>(material.color.rgb * vertex_color.rgb * brightness, material.color.a * vertex_color.a);
 }

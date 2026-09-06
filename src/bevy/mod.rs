@@ -4,3 +4,4 @@ pub(crate) mod backend;
 pub(crate) mod energy;
 pub(crate) mod render;
 pub(crate) mod scale;
+pub(crate) mod surface_field;

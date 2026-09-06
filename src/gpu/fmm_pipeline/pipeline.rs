@@ -75,6 +75,7 @@ struct ExtractedFmmInput {
     node_count: u32,
     particle_count: u32,
     maximum_level: u32,
+    density_mode: DensityMode,
 }
 
 #[derive(Resource, Default)]
@@ -88,6 +89,7 @@ struct FmmGpuBuffersInner {
     workgroup_count: u32,
     output_size: u64,
     last_submitted: Option<(u64, u64)>,
+    density_mode: DensityMode,
 }
 
 #[derive(Resource)]
@@ -155,15 +157,32 @@ pub fn build_fmm_source_system(
     existing: Option<Res<FmmSource>>,
     active_method: Res<ActiveGravityMethod>,
     planning: Res<PlanningComparisonState>,
+    density_mode: Res<DensityMode>,
 ) {
-    if planning.blocks_realtime_gpu() || existing.is_some() || *active_method != ActiveGravityMethod::Fmm {
+    if planning.blocks_realtime_gpu() || *active_method != ActiveGravityMethod::Fmm {
+        return;
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|source| source.density_mode == *density_mode)
+    {
+        return;
+    }
+    if existing.is_some() {
+        commands.remove_resource::<FmmSource>();
         return;
     }
     let Some(aggregated) = aggregated else {
         return;
     };
-    let records = aggregated
-        .sources
+    let source_points = match *density_mode {
+        DensityMode::Variable => &aggregated.sources,
+        DensityMode::Constant => &aggregated.constant_sources,
+    };
+    if source_points.is_empty() {
+        return;
+    }
+    let records = source_points
         .iter()
         .map(|source| (source.position, source.mass))
         .collect::<Vec<_>>();
@@ -329,6 +348,7 @@ pub fn build_fmm_source_system(
         node_count: offset,
         particle_count: records.len() as u32,
         maximum_level: MAXIMUM_LEVEL,
+        density_mode: *density_mode,
     });
 }
 
@@ -392,11 +412,10 @@ fn extract_fmm_input(
     extracted.node_count = source.node_count;
     extracted.particle_count = source.particle_count;
     extracted.maximum_level = source.maximum_level;
-    if extracted.node_bytes.is_none() {
+    if extracted.node_bytes.is_none() || extracted.density_mode != source.density_mode {
         extracted.node_bytes = Some(source.bytes.clone());
-    }
-    if extracted.particle_bytes.is_none() {
         extracted.particle_bytes = Some(source.particle_bytes.clone());
+        extracted.density_mode = source.density_mode;
     }
 }
 
@@ -416,6 +435,13 @@ fn dispatch_fmm(
     };
     if !extracted.enabled || extracted.node_count == 0 {
         return;
+    }
+    if buffers
+        .0
+        .as_ref()
+        .is_some_and(|inner| inner.density_mode != extracted.density_mode)
+    {
+        buffers.0 = None;
     }
     if buffers.0.is_none() {
         let (Some(node_bytes), Some(particle_bytes)) = (
@@ -493,6 +519,7 @@ fn dispatch_fmm(
             workgroup_count,
             output_size,
             last_submitted: None,
+            density_mode: extracted.density_mode,
         });
     }
     let inner = buffers.0.as_mut().expect("FMM buffers initialized");

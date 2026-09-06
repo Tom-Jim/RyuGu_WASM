@@ -1,3 +1,6 @@
+use crate::bevy_app::surface_field::{
+    SurfaceFieldComputeState, cancel_surface_field, queue_surface_comparison, queue_surface_field,
+};
 use crate::interface::components::*;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -24,24 +27,61 @@ extern "C" {
     fn ryugu_page_visible() -> bool;
 }
 
+#[derive(SystemParam)]
+pub(crate) struct BrowserSurfaceControls<'w> {
+    state: ResMut<'w, SurfaceFieldState>,
+    compute: ResMut<'w, SurfaceFieldComputeState>,
+}
+
+#[derive(SystemParam)]
+pub(crate) struct DensityControls<'w> {
+    density_mode: ResMut<'w, DensityMode>,
+    clock: ResMut<'w, SimulationClock>,
+}
+
+#[derive(SystemParam)]
+pub(crate) struct BrowserUiActions<'w> {
+    camera: ResMut<'w, CameraMode>,
+    normals: ResMut<'w, ShowNormals>,
+    section: ResMut<'w, ShowSection>,
+    acceleration: ResMut<'w, SimulationAcceleration>,
+    active_method: Res<'w, ActiveGravityMethod>,
+    performance: ResMut<'w, PerformanceComparisonState>,
+    rotation: ResMut<'w, DisplayRotation>,
+    planning: ResMut<'w, PlanningComparisonState>,
+    inversion: ResMut<'w, TrajectoryInversionState>,
+    request: ResMut<'w, PlanningGpuRequest>,
+    payload: ResMut<'w, PlanningMethodPayload>,
+    result: ResMut<'w, PlanningGpuResult>,
+    channel: Res<'w, PlanningGpuReadbackChannel>,
+    runtime_error: ResMut<'w, GravityRuntimeError>,
+    probe: ResMut<'w, ProbeInitialConditions>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn browser_ui_action_system(
-    mut camera: ResMut<CameraMode>,
-    mut normals: ResMut<ShowNormals>,
-    mut section: ResMut<ShowSection>,
-    mut acceleration: ResMut<SimulationAcceleration>,
-    active_method: Res<ActiveGravityMethod>,
-    mut performance: ResMut<PerformanceComparisonState>,
-    mut rotation: ResMut<DisplayRotation>,
-    mut planning: ResMut<PlanningComparisonState>,
-    mut inversion: ResMut<TrajectoryInversionState>,
-    mut request: ResMut<PlanningGpuRequest>,
-    mut payload: ResMut<PlanningMethodPayload>,
-    mut result: ResMut<PlanningGpuResult>,
-    channel: Res<PlanningGpuReadbackChannel>,
-    mut runtime_error: ResMut<GravityRuntimeError>,
-    mut probe: ResMut<ProbeInitialConditions>,
+    actions: BrowserUiActions,
+    mut surface_controls: BrowserSurfaceControls,
+    mut density_controls: DensityControls,
 ) {
+    let BrowserUiActions {
+        mut camera,
+        mut normals,
+        mut section,
+        mut acceleration,
+        active_method,
+        mut performance,
+        mut rotation,
+        mut planning,
+        mut inversion,
+        mut request,
+        mut payload,
+        mut result,
+        channel,
+        mut runtime_error,
+        mut probe,
+    } = actions;
+
     for _ in 0..32 {
         let action = take_ryugu_ui_action();
         if action.is_empty() {
@@ -76,8 +116,103 @@ pub(crate) fn browser_ui_action_system(
                     _ => None,
                 };
                 if next.is_some() && next != Some(*active_method) {
-                    performance.pending_method = next;
+                    let next = next.expect("checked above");
+                    performance.pending_method = Some(next);
+                    // Selecting a gravity method changes the live trajectory.
+                    // Surface products are an explicit, potentially expensive
+                    // analysis job and are refreshed only by Calculate field.
+                    cancel_surface_field(
+                        &mut surface_controls.state,
+                        &mut surface_controls.compute,
+                        "Method changed; press Calculate field to refresh the surface product.",
+                    );
                 }
+            }
+            "density-mode" => {
+                let next = match value.and_then(Value::as_str) {
+                    Some("constant") => Some(DensityMode::Constant),
+                    Some("variable") => Some(DensityMode::Variable),
+                    _ => None,
+                };
+                if let Some(next) = next
+                    && next != *density_controls.density_mode
+                {
+                    *density_controls.density_mode = next;
+                    surface_controls.state.density_mode = next;
+                    // A density switch starts a new physical experiment. GPU
+                    // samples from the previous model must not be interpolated
+                    // into the new trajectory.
+                    density_controls.clock.reset_state();
+                    // Changing the density model invalidates the displayed
+                    // product, but must not synchronously launch a full
+                    // 4096-patch CPU evaluation from a small toggle.
+                    cancel_surface_field(
+                        &mut surface_controls.state,
+                        &mut surface_controls.compute,
+                        "Density model changed; press Calculate field to recompute.",
+                    );
+                    let method = performance.pending_method.unwrap_or(*active_method);
+                    queue_surface_field(
+                        &mut surface_controls.state,
+                        &mut surface_controls.compute,
+                        method,
+                    );
+                }
+            }
+            "surface-field-metric" => {
+                if let Some(metric) = value
+                    .and_then(Value::as_str)
+                    .and_then(surface_metric_from_key)
+                {
+                    surface_controls.state.metric = metric;
+                }
+            }
+            "surface-field-select-patch" => {
+                let Some(index) = value.and_then(Value::as_u64).map(|value| value as usize) else {
+                    continue;
+                };
+                let sample_count = surface_controls
+                    .state
+                    .latest
+                    .as_ref()
+                    .map_or(0, |dataset| dataset.samples.len());
+                if index < sample_count {
+                    surface_controls.state.selected_patch = Some(index);
+                    surface_controls.state.status =
+                        format!("Inspecting surface patch {}/{}.", index + 1, sample_count);
+                    surface_controls.state.revision =
+                        surface_controls.state.revision.wrapping_add(1);
+                }
+            }
+            "surface-field-compute" => {
+                let method = performance.pending_method.unwrap_or(*active_method);
+                queue_surface_field(
+                    &mut surface_controls.state,
+                    &mut surface_controls.compute,
+                    method,
+                );
+            }
+            "surface-field-baseline" => {
+                if let Some(method) = value.and_then(Value::as_str).and_then(method_from_key) {
+                    surface_controls.state.baseline_method = method;
+                    surface_controls.state.comparison = None;
+                    surface_controls.state.revision =
+                        surface_controls.state.revision.wrapping_add(1);
+                }
+            }
+            "surface-field-comparison" => {
+                if let Some(method) = value.and_then(Value::as_str).and_then(method_from_key) {
+                    surface_controls.state.comparison_method = method;
+                    surface_controls.state.comparison = None;
+                    surface_controls.state.revision =
+                        surface_controls.state.revision.wrapping_add(1);
+                }
+            }
+            "surface-field-compare" => {
+                queue_surface_comparison(
+                    &mut surface_controls.state,
+                    &mut surface_controls.compute,
+                );
             }
             "camera" => {
                 *camera = if value.and_then(Value::as_str) == Some("follow") {
@@ -201,7 +336,10 @@ pub(crate) fn browser_ui_action_system(
                     .map(Value::as_f64)
                     .collect::<Option<Vec<_>>>()
                     .filter(|values| {
-                        values.len() == 3 && values.iter().all(|value| value.is_finite())
+                        values.len() == 3
+                            && values
+                                .iter()
+                                .all(|value| value.is_finite() && (*value as f32).is_finite())
                     })
                     .map(|values| Vec3::new(values[0] as f32, values[1] as f32, values[2] as f32))
                 else {
@@ -484,6 +622,8 @@ pub(crate) struct BrowserUiSnapshot<'w> {
     memory: Res<'w, GpuMemoryEstimate>,
     jacobi: Res<'w, JacobiHistory>,
     frequency_domain: Res<'w, FrequencyDomainTrajectoryBatchResult>,
+    surface: Res<'w, SurfaceFieldState>,
+    density_mode: Res<'w, DensityMode>,
 }
 
 pub(crate) fn browser_ui_publish_system(
@@ -773,6 +913,7 @@ pub(crate) fn browser_ui_publish_system(
         },
         "jacobi": jacobi,
         "frequencyDomain": frequency_domain,
+        "surfaceField": surface_snapshot(&state.surface, *state.density_mode),
         "runtimeError": state.runtime_error.message,
     });
     if let Ok(snapshot) = serde_json::to_string(&snapshot) {
@@ -812,4 +953,80 @@ fn method_key(method: ActiveGravityMethod) -> &'static str {
         ActiveGravityMethod::MmfftCompressed => "fft",
         ActiveGravityMethod::Fmm => "fmm",
     }
+}
+
+fn method_from_key(key: &str) -> Option<ActiveGravityMethod> {
+    Some(match key {
+        "radial" => ActiveGravityMethod::RadialAnalytic,
+        "werner" => ActiveGravityMethod::HomogeneousWerner,
+        "frequency_domain" => ActiveGravityMethod::FrequencyDomain,
+        "fft" => ActiveGravityMethod::MmfftCompressed,
+        "fmm" => ActiveGravityMethod::Fmm,
+        _ => return None,
+    })
+}
+
+fn surface_metric_from_key(key: &str) -> Option<SurfaceFieldMetric> {
+    Some(match key {
+        "gravity" => SurfaceFieldMetric::Gravity,
+        "gradient" => SurfaceFieldMetric::Gradient,
+        "slope" => SurfaceFieldMetric::Slope,
+        "error" => SurfaceFieldMetric::Error,
+        _ => return None,
+    })
+}
+
+fn surface_dataset_snapshot(dataset: &SurfaceFieldDataset) -> Value {
+    json!({
+        "method": method_key(dataset.method),
+        "densityMode": dataset.density_mode.key(),
+        "sampleCount": dataset.samples.len(),
+        "gravityRange": dataset.gravity_range,
+        "effectiveGravityRange": dataset.effective_gravity_range,
+        "gradientRange": dataset.gradient_range,
+        "slopeRange": dataset.slope_range,
+    })
+}
+
+fn surface_snapshot(surface: &SurfaceFieldState, density_mode: DensityMode) -> Value {
+    let selected = surface.latest.as_ref().and_then(|dataset| {
+        surface.selected_patch.and_then(|index| {
+            dataset
+                .samples
+                .get(index)
+                .map(|sample| (dataset, index, sample))
+        })
+    });
+    json!({
+        "computing": surface.computing,
+        "status": surface.status,
+        "revision": surface.revision,
+        "densityMode": density_mode.key(),
+        "metric": surface.metric.key(),
+        "metricLabel": surface.metric.label(),
+        "baseline": method_key(surface.baseline_method),
+        "comparison": method_key(surface.comparison_method),
+        "selectedPatch": selected.map(|(dataset, index, sample)| json!({
+            "index": index,
+            "method": method_key(dataset.method),
+            "densityMode": dataset.density_mode.key(),
+            "position": sample.position.to_array(),
+            "normal": sample.normal.to_array(),
+            "gravity": sample.gravity.to_array(),
+            "gravityMagnitude": sample.gravity_magnitude,
+            "effectiveGravity": sample.effective_gravity.to_array(),
+            "effectiveGravityMagnitude": sample.effective_gravity_magnitude,
+            "gradientMagnitude": sample.gradient_magnitude,
+            "slopeDegrees": sample.slope_degrees,
+            "relativeError": surface.comparison.as_ref().and_then(|comparison|
+                comparison.signed_errors.get(index).copied()),
+        })),
+        "latest": surface.latest.as_ref().map(surface_dataset_snapshot),
+        "comparisonResult": surface.comparison.as_ref().map(|comparison| json!({
+            "baseline": surface_dataset_snapshot(&comparison.baseline),
+            "comparison": surface_dataset_snapshot(&comparison.comparison),
+            "sampleCount": comparison.signed_errors.len(),
+            "errorRange": comparison.error_range,
+        })),
+    })
 }

@@ -35,7 +35,9 @@ pub fn planning_batch_evaluator_system(
     mut payload: ResMut<PlanningMethodPayload>,
     mut gpu_result: ResMut<PlanningGpuResult>,
     mut planning: ResMut<PlanningComparisonState>,
-    mut frequency_domain_workspace: Local<crate::gpu::frequency_domain::PlanningFrequencyDomainWorkspace>,
+    mut frequency_domain_workspace: Local<
+        crate::gpu::frequency_domain::PlanningFrequencyDomainWorkspace,
+    >,
     mut mmfft_workspace: Local<crate::gpu::mmfft::PlanningMmfftWorkspace>,
     mut reference_cache: Local<PlanningReferenceCache>,
 ) {
@@ -105,25 +107,28 @@ pub fn planning_batch_evaluator_system(
                 job.method.planning_label(),
                 job.request_id
             );
-        } else if packet.request.request_id == job.request_id
-            && packet_belongs_to_job
-        {
+        } else if packet.request.request_id == job.request_id && packet_belongs_to_job {
             // Validation must not turn a GPU callback into millions of
             // synchronous CPU source interactions before the browser can paint.
-            if packet.readback_valid
-                && (!job.warm_repetition || job.certified_repetition)
-            {
+            if packet.readback_valid && (!job.warm_repetition || job.certified_repetition) {
                 let started = bevy::platform::time::Instant::now();
                 let ready = prepare_planning_references(&batch, &packet, &mut reference_cache);
                 job.verification_ms += started.elapsed().as_secs_f64() * 1.0e3;
                 if !ready {
                     let fraction = (reference_cache.target_cursor as f64
-                        + reference_cache.source_cursor as f64 / batch.basis_records.len().max(1) as f64)
+                        + reference_cache.source_cursor as f64
+                            / batch.basis_records.len().max(1) as f64)
                         / reference_cache.target_indices.len().max(1) as f64;
-                    job.reference_inflight_fraction = f64::from(packet.request.candidate_count) * fraction.clamp(0.0, 1.0);
-                    planning.status = format!("{} independent f64 verification: target {}/{}, source {}/{} (time-sliced)",
-                        job.method.planning_label(), reference_cache.target_cursor + 1,
-                        reference_cache.target_indices.len(), reference_cache.source_cursor, batch.basis_records.len());
+                    job.reference_inflight_fraction =
+                        f64::from(packet.request.candidate_count) * fraction.clamp(0.0, 1.0);
+                    planning.status = format!(
+                        "{} independent f64 verification: target {}/{}, source {}/{} (time-sliced)",
+                        job.method.planning_label(),
+                        reference_cache.target_cursor + 1,
+                        reference_cache.target_indices.len(),
+                        reference_cache.source_cursor,
+                        batch.basis_records.len()
+                    );
                     job.awaiting_gpu_seconds = 0.0;
                     job.awaiting_gpu_last_poll = None;
                     gpu_result.0 = Some(packet);
@@ -169,69 +174,115 @@ pub fn planning_batch_evaluator_system(
                 *payload = PlanningMethodPayload::default();
                 if job.method_order_index + 1 == job.method_order.len() {
                     if planning.source_curve_active {
-                        let frequency_domain = planning.results[2].expect("completed Frequency-domain algorithm curve result");
-                        let mmfft = planning.results[3].expect("completed FFT curve result");
-                        let fmm = planning.results[4].expect("completed FMM curve result");
+                        let frequency_domain = planning.results
+                            [ActiveGravityMethod::FrequencyDomain.performance_index()]
+                        .expect("completed Frequency-domain algorithm curve result");
+                        let mmfft = planning.results
+                            [ActiveGravityMethod::MmfftCompressed.performance_index()]
+                        .expect("completed FFT curve result");
+                        let fmm = planning.results[ActiveGravityMethod::Fmm.performance_index()]
+                            .expect("completed FMM curve result");
                         let source_count = planning.requested_source_count;
                         let repeat = planning.source_curve_repeat + 1;
-                        let outputs = [(frequency_domain, false), (frequency_domain, true), (mmfft, false),
-                            (mmfft, true), (fmm, false), (fmm, true)];
-                        let common_samples = frequency_domain.verification_sample_count == mmfft.verification_sample_count
-                            && frequency_domain.verification_sample_count == fmm.verification_sample_count;
-                        let failure_masks = |profile| outputs.map(|(result, certified)|
-                            result.accuracy_failure_mask(profile, certified)
-                                | if common_samples { 0 } else { 1 << 8 });
+                        let outputs = [
+                            (frequency_domain, false),
+                            (frequency_domain, true),
+                            (mmfft, false),
+                            (mmfft, true),
+                            (fmm, false),
+                            (fmm, true),
+                        ];
+                        let common_samples = frequency_domain.verification_sample_count
+                            == mmfft.verification_sample_count
+                            && frequency_domain.verification_sample_count
+                                == fmm.verification_sample_count;
+                        let failure_masks = |profile| {
+                            outputs.map(|(result, certified)| {
+                                result.accuracy_failure_mask(profile, certified)
+                                    | if common_samples { 0 } else { 1 << 8 }
+                            })
+                        };
                         let strict_failures = failure_masks(PlanningAccuracyProfile::Strict);
                         let order_seed = planning.source_curve_order_seed
                             ^ (planning.source_curve_samples.len() as u64)
                                 .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                        planning.source_curve_samples.push(PlanningSourceCurveSample {
-                            source_count,
-                            density_model_count: job.density_model_count,
-                            target_count: job.samples_per_candidate,
-                            repeat,
-                            order_seed,
-                            method_order: job.method_order.map(|method| method.performance_index()),
-                            times_ms: [
-                                frequency_domain.total_ms,
-                                frequency_domain.certified_estimated_total_ms,
-                                mmfft.total_ms,
-                                mmfft.certified_estimated_total_ms,
-                                fmm.total_ms,
-                                fmm.certified_estimated_total_ms,
-                            ],
-                            kernel_times_ms: [frequency_domain.raw_kernels.all_ms, frequency_domain.checked_kernels.all_ms,
-                                mmfft.raw_kernels.all_ms, mmfft.checked_kernels.all_ms,
-                                fmm.raw_kernels.all_ms, fmm.checked_kernels.all_ms],
-                            evaluation_kernel_times_ms: [frequency_domain.raw_kernels.evaluation_ms, frequency_domain.checked_kernels.evaluation_ms,
-                                mmfft.raw_kernels.evaluation_ms, mmfft.checked_kernels.evaluation_ms,
-                                fmm.raw_kernels.evaluation_ms, fmm.checked_kernels.evaluation_ms],
-                            basis_kernel_times_ms: [frequency_domain.raw_kernels.basis_ms, mmfft.raw_kernels.basis_ms, fmm.raw_kernels.basis_ms],
-                            geometry_basis_build_ms: [
-                                frequency_domain.geometry_basis_build_ms,
-                                mmfft.geometry_basis_build_ms,
-                                fmm.geometry_basis_build_ms,
-                            ],
-                            density_model_ms: [
-                                frequency_domain.density_model_ms,
-                                mmfft.density_model_ms,
-                                fmm.density_model_ms,
-                            ],
-                            target_point_ms: [
-                                frequency_domain.target_point_ms,
-                                mmfft.target_point_ms,
-                                fmm.target_point_ms,
-                            ],
-                            eligible: strict_failures.map(|mask| mask == 0),
-                            strict_failures,
-                            screening_failures: failure_masks(PlanningAccuracyProfile::Screening),
-                            gravity_errors: [frequency_domain.relative_gravity_error, frequency_domain.certified_relative_gravity_error,
-                                mmfft.relative_gravity_error, mmfft.certified_relative_gravity_error,
-                                fmm.relative_gravity_error, fmm.certified_relative_gravity_error],
-                            gradient_errors: [frequency_domain.gradient_relative_error, frequency_domain.certified_gradient_relative_error,
-                                mmfft.gradient_relative_error, mmfft.certified_gradient_relative_error,
-                                fmm.gradient_relative_error, fmm.certified_gradient_relative_error],
-                        });
+                        planning
+                            .source_curve_samples
+                            .push(PlanningSourceCurveSample {
+                                source_count,
+                                density_model_count: job.density_model_count,
+                                target_count: job.samples_per_candidate,
+                                repeat,
+                                order_seed,
+                                method_order: job
+                                    .method_order
+                                    .map(|method| method.performance_index()),
+                                times_ms: [
+                                    frequency_domain.total_ms,
+                                    frequency_domain.certified_estimated_total_ms,
+                                    mmfft.total_ms,
+                                    mmfft.certified_estimated_total_ms,
+                                    fmm.total_ms,
+                                    fmm.certified_estimated_total_ms,
+                                ],
+                                kernel_times_ms: [
+                                    frequency_domain.raw_kernels.all_ms,
+                                    frequency_domain.checked_kernels.all_ms,
+                                    mmfft.raw_kernels.all_ms,
+                                    mmfft.checked_kernels.all_ms,
+                                    fmm.raw_kernels.all_ms,
+                                    fmm.checked_kernels.all_ms,
+                                ],
+                                evaluation_kernel_times_ms: [
+                                    frequency_domain.raw_kernels.evaluation_ms,
+                                    frequency_domain.checked_kernels.evaluation_ms,
+                                    mmfft.raw_kernels.evaluation_ms,
+                                    mmfft.checked_kernels.evaluation_ms,
+                                    fmm.raw_kernels.evaluation_ms,
+                                    fmm.checked_kernels.evaluation_ms,
+                                ],
+                                basis_kernel_times_ms: [
+                                    frequency_domain.raw_kernels.basis_ms,
+                                    mmfft.raw_kernels.basis_ms,
+                                    fmm.raw_kernels.basis_ms,
+                                ],
+                                geometry_basis_build_ms: [
+                                    frequency_domain.geometry_basis_build_ms,
+                                    mmfft.geometry_basis_build_ms,
+                                    fmm.geometry_basis_build_ms,
+                                ],
+                                density_model_ms: [
+                                    frequency_domain.density_model_ms,
+                                    mmfft.density_model_ms,
+                                    fmm.density_model_ms,
+                                ],
+                                target_point_ms: [
+                                    frequency_domain.target_point_ms,
+                                    mmfft.target_point_ms,
+                                    fmm.target_point_ms,
+                                ],
+                                eligible: strict_failures.map(|mask| mask == 0),
+                                strict_failures,
+                                screening_failures: failure_masks(
+                                    PlanningAccuracyProfile::Screening,
+                                ),
+                                gravity_errors: [
+                                    frequency_domain.relative_gravity_error,
+                                    frequency_domain.certified_relative_gravity_error,
+                                    mmfft.relative_gravity_error,
+                                    mmfft.certified_relative_gravity_error,
+                                    fmm.relative_gravity_error,
+                                    fmm.certified_relative_gravity_error,
+                                ],
+                                gradient_errors: [
+                                    frequency_domain.gradient_relative_error,
+                                    frequency_domain.certified_gradient_relative_error,
+                                    mmfft.gradient_relative_error,
+                                    mmfft.certified_gradient_relative_error,
+                                    fmm.gradient_relative_error,
+                                    fmm.certified_gradient_relative_error,
+                                ],
+                            });
                         if planning.advance_source_curve() {
                             planning.preparation_progress = 0.0;
                             planning.results = std::array::from_fn(|_| None);
@@ -275,20 +326,28 @@ pub fn planning_batch_evaluator_system(
         }
     }
     if job.awaiting_gpu {
-        let preparation = channel.preparation.try_lock().ok()
-            .and_then(|progress| progress.as_ref().filter(|p| p.request_id == job.request_id).cloned());
+        let preparation = channel.preparation.try_lock().ok().and_then(|progress| {
+            progress
+                .as_ref()
+                .filter(|p| p.request_id == job.request_id)
+                .cloned()
+        });
         if let Some(progress) = &preparation {
             if job.gpu_preparation_submission != progress.completed_submissions {
                 job.gpu_preparation_submission = progress.completed_submissions;
                 job.awaiting_gpu_seconds = 0.0; // A completed GPU stage is real progress.
                 job.awaiting_gpu_last_poll = None;
             }
-            if !job.warm_repetition { job.gpu_basis_progress = progress.basis_fraction; }
+            if !job.warm_repetition {
+                job.gpu_basis_progress = progress.basis_fraction;
+            }
         }
         let now = bevy::platform::time::Instant::now();
         if let Some(last) = job.awaiting_gpu_last_poll.replace(now) {
             let elapsed = now.duration_since(last).as_secs_f64();
-            if elapsed <= 2.0 { job.awaiting_gpu_seconds += elapsed; }
+            if elapsed <= 2.0 {
+                job.awaiting_gpu_seconds += elapsed;
+            }
         }
         if job.awaiting_gpu_seconds >= PLANNING_GPU_WAIT_TIMEOUT_SECONDS {
             planning.status = format!(
@@ -304,7 +363,9 @@ pub fn planning_batch_evaluator_system(
             planning.batch_job = None;
             return;
         }
-        planning.status = preparation.map(|p| p.status).unwrap_or_else(|| planning_progress_text(&job));
+        planning.status = preparation
+            .map(|p| p.status)
+            .unwrap_or_else(|| planning_progress_text(&job));
         planning.batch_job = Some(job);
         return;
     }
@@ -354,14 +415,15 @@ pub fn planning_batch_evaluator_system(
             job.method_geometry_basis_ms += prepared.geometry_basis_preparation_ms;
             job.density_payload_preparation_ms += prepared.density_payload_preparation_ms;
         } else if job.certified_repetition {
-            job.certified_density_payload_preparation_ms +=
-                prepared.density_payload_preparation_ms;
+            job.certified_density_payload_preparation_ms += prepared.density_payload_preparation_ms;
         }
         *payload = prepared;
     }
     job.gpu_preparation_submission = 0;
     job.request_id = job.request_id.wrapping_add(1).max(1);
-    job.candidate_tile_size = job.candidate_tile_size.min((8192 / job.samples_per_candidate.max(1)).max(1));
+    job.candidate_tile_size = job
+        .candidate_tile_size
+        .min((8192 / job.samples_per_candidate.max(1)).max(1));
     let request_candidate_count = job
         .candidate_tile_size
         .min(job.candidate_count - job.candidate_start)
@@ -426,7 +488,9 @@ fn reduce_planning_packet(
         job.command_submission_ms += packet.timing.command_submission_ms;
         job.gpu_completion_map_ms += packet.timing.gpu_completion_map_ms;
         job.readback_decode_ms += packet.timing.readback_decode_ms;
-        job.dispatch_count = job.dispatch_count.saturating_add(packet.timing.dispatch_count);
+        job.dispatch_count = job
+            .dispatch_count
+            .saturating_add(packet.timing.dispatch_count);
         job.forward_kernel_evaluations = job
             .forward_kernel_evaluations
             .saturating_add(packet.timing.forward_kernel_evaluations);
@@ -454,12 +518,10 @@ fn reduce_planning_packet(
             job.candidate_reference_sum[candidate_index] += f64::from(metric[1]);
         }
     }
-    let global_start = packet.request.candidate_start as usize
-        * batch.samples_per_candidate as usize;
-    let mut accumulated_position_error =
-        vec![DVec3::ZERO; packet.request.candidate_count as usize];
-    let mut accumulated_velocity_error =
-        vec![DVec3::ZERO; packet.request.candidate_count as usize];
+    let global_start =
+        packet.request.candidate_start as usize * batch.samples_per_candidate as usize;
+    let mut accumulated_position_error = vec![DVec3::ZERO; packet.request.candidate_count as usize];
+    let mut accumulated_velocity_error = vec![DVec3::ZERO; packet.request.candidate_count as usize];
     let mut previous_verified_time = vec![None; packet.request.candidate_count as usize];
     for (verification_index, local_target) in packet.state_indices.iter().copied().enumerate() {
         let local = local_target as usize;
@@ -541,8 +603,9 @@ fn reduce_planning_packet(
             );
             job.pointwise_gradient_errors.push(
                 (matrix_norm_squared(method_gradient - aggregate_gradient).sqrt()
-                    / matrix_norm_squared(aggregate_gradient).sqrt().max(f64::MIN_POSITIVE))
-                    as f32,
+                    / matrix_norm_squared(aggregate_gradient)
+                        .sqrt()
+                        .max(f64::MIN_POSITIVE)) as f32,
             );
             continue;
         }
@@ -605,16 +668,20 @@ fn reduce_planning_packet(
                 f64::from(state.body_rotation[3]),
             );
             let radial = (rotation * state.body_position().as_dvec3()).normalize_or_zero();
-            job.pericenter_error_m = job
-                .pericenter_error_m
-                .max(accumulated_position_error[local_candidate].dot(radial).abs() as f32);
+            job.pericenter_error_m = job.pericenter_error_m.max(
+                accumulated_position_error[local_candidate]
+                    .dot(radial)
+                    .abs() as f32,
+            );
         }
     }
     job.gpu_preprocessing_ms += packet.timing.method_preprocess_ms;
     job.command_submission_ms += packet.timing.command_submission_ms;
     job.gpu_completion_map_ms += packet.timing.gpu_completion_map_ms;
     job.readback_decode_ms += packet.timing.readback_decode_ms;
-    job.dispatch_count = job.dispatch_count.saturating_add(packet.timing.dispatch_count);
+    job.dispatch_count = job
+        .dispatch_count
+        .saturating_add(packet.timing.dispatch_count);
     job.forward_kernel_evaluations = job
         .forward_kernel_evaluations
         .saturating_add(packet.timing.forward_kernel_evaluations);
@@ -645,9 +712,9 @@ fn reduce_certified_packet(
         .saturating_add(packet.rejected_sample_count);
     for (local_candidate, metric) in packet.candidate_metrics.iter().enumerate() {
         if (metric[0] < 0.0 || metric.iter().any(|value| !value.is_finite()))
-            && let Some(valid) = job.certified_candidate_valid.get_mut(
-                packet.request.candidate_start as usize + local_candidate,
-            )
+            && let Some(valid) = job
+                .certified_candidate_valid
+                .get_mut(packet.request.candidate_start as usize + local_candidate)
         {
             *valid = false;
         }
@@ -658,8 +725,8 @@ fn reduce_certified_packet(
         job.certified_reduction_ms += reduction_started.elapsed().as_secs_f64() * 1.0e3;
         return;
     }
-    let global_start = packet.request.candidate_start as usize
-        * batch.samples_per_candidate as usize;
+    let global_start =
+        packet.request.candidate_start as usize * batch.samples_per_candidate as usize;
     if frequency_domain {
         // Verify every selected Laplace-frequency observation against the same
         // aggregate spectral operator. Never compare with an instantaneous
@@ -675,9 +742,21 @@ fn reduce_certified_packet(
                 f64::from(packet.rows[row][2]),
             );
             let method_gradient = DMat3::from_cols(
-                DVec3::new(f64::from(packet.rows[row + 1][0]), f64::from(packet.rows[row + 1][1]), f64::from(packet.rows[row + 1][2])),
-                DVec3::new(f64::from(packet.rows[row + 2][0]), f64::from(packet.rows[row + 2][1]), f64::from(packet.rows[row + 2][2])),
-                DVec3::new(f64::from(packet.rows[row + 3][0]), f64::from(packet.rows[row + 3][1]), f64::from(packet.rows[row + 3][2])),
+                DVec3::new(
+                    f64::from(packet.rows[row + 1][0]),
+                    f64::from(packet.rows[row + 1][1]),
+                    f64::from(packet.rows[row + 1][2]),
+                ),
+                DVec3::new(
+                    f64::from(packet.rows[row + 2][0]),
+                    f64::from(packet.rows[row + 2][1]),
+                    f64::from(packet.rows[row + 2][2]),
+                ),
+                DVec3::new(
+                    f64::from(packet.rows[row + 3][0]),
+                    f64::from(packet.rows[row + 3][1]),
+                    f64::from(packet.rows[row + 3][2]),
+                ),
             );
             let verification_started = bevy::platform::time::Instant::now();
             let (reference_field, reference_gradient) = frequency_domain_reference_integral(
@@ -687,8 +766,10 @@ fn reduce_certified_packet(
                 reference_cache,
             );
             verification_ms += verification_started.elapsed().as_secs_f64() * 1.0e3;
-            if !method_field.is_finite() || !method_gradient.is_finite()
-                || !reference_field.is_finite() || !reference_gradient.is_finite()
+            if !method_field.is_finite()
+                || !method_gradient.is_finite()
+                || !reference_field.is_finite()
+                || !reference_gradient.is_finite()
             {
                 job.certified_gravity_error_sum = f64::NAN;
                 job.certified_gradient_error_sum = f64::NAN;
@@ -696,15 +777,19 @@ fn reduce_certified_packet(
             }
             job.certified_gravity_error_sum += (method_field - reference_field).length_squared();
             job.certified_gravity_reference_sum += reference_field.length_squared();
-            job.certified_gradient_error_sum += matrix_norm_squared(method_gradient - reference_gradient);
+            job.certified_gradient_error_sum +=
+                matrix_norm_squared(method_gradient - reference_gradient);
             job.certified_gradient_reference_sum += matrix_norm_squared(reference_gradient);
-            job.certified_pointwise_gravity_errors.push((
-                (method_field - reference_field).length() / reference_field.length().max(f64::MIN_POSITIVE)
-            ) as f32);
-            job.certified_pointwise_gradient_errors.push((
-                matrix_norm_squared(method_gradient - reference_gradient).sqrt()
-                    / matrix_norm_squared(reference_gradient).sqrt().max(f64::MIN_POSITIVE)
-            ) as f32);
+            job.certified_pointwise_gravity_errors.push(
+                ((method_field - reference_field).length()
+                    / reference_field.length().max(f64::MIN_POSITIVE)) as f32,
+            );
+            job.certified_pointwise_gradient_errors.push(
+                (matrix_norm_squared(method_gradient - reference_gradient).sqrt()
+                    / matrix_norm_squared(reference_gradient)
+                        .sqrt()
+                        .max(f64::MIN_POSITIVE)) as f32,
+            );
             job.certified_gravity_samples += 1;
             job.certified_gradient_samples += 1;
         }
@@ -760,30 +845,54 @@ fn reduce_certified_packet(
         job.certified_gradient_error_sum +=
             matrix_norm_squared(method_gradient - reference_gradient);
         job.certified_gradient_reference_sum += matrix_norm_squared(reference_gradient);
-        job.certified_pointwise_gravity_errors.push(((method_field - reference_field).length()
-            / reference_field.length().max(f64::MIN_POSITIVE)) as f32);
-        job.certified_pointwise_gradient_errors.push((matrix_norm_squared(method_gradient - reference_gradient).sqrt()
-            / matrix_norm_squared(reference_gradient).sqrt().max(f64::MIN_POSITIVE)) as f32);
+        job.certified_pointwise_gravity_errors.push(
+            ((method_field - reference_field).length()
+                / reference_field.length().max(f64::MIN_POSITIVE)) as f32,
+        );
+        job.certified_pointwise_gradient_errors.push(
+            (matrix_norm_squared(method_gradient - reference_gradient).sqrt()
+                / matrix_norm_squared(reference_gradient)
+                    .sqrt()
+                    .max(f64::MIN_POSITIVE)) as f32,
+        );
         job.certified_gravity_samples += 1;
         job.certified_gradient_samples += 1;
     }
     job.verification_ms += verification_ms;
-    job.certified_reduction_ms += (reduction_started.elapsed().as_secs_f64() * 1.0e3 - verification_ms).max(0.0);
-
+    job.certified_reduction_ms +=
+        (reduction_started.elapsed().as_secs_f64() * 1.0e3 - verification_ms).max(0.0);
 }
 
-fn reference_key(target: DVec3, batch: &PlanningCandidateBatch, model: u32) -> (u64, u64, u32, [u32; 3]) {
-    (batch.basis_hash, batch.density_model_hash, model,
-     [(target.x as f32).to_bits(), (target.y as f32).to_bits(), (target.z as f32).to_bits()])
+fn reference_key(
+    target: DVec3,
+    batch: &PlanningCandidateBatch,
+    model: u32,
+) -> (u64, u64, u32, [u32; 3]) {
+    (
+        batch.basis_hash,
+        batch.density_model_hash,
+        model,
+        [
+            (target.x as f32).to_bits(),
+            (target.y as f32).to_bits(),
+            (target.z as f32).to_bits(),
+        ],
+    )
 }
 
 fn prepare_planning_references(
-    batch: &PlanningCandidateBatch, packet: &PlanningGpuPacket, cache: &mut PlanningReferenceCache,
+    batch: &PlanningCandidateBatch,
+    packet: &PlanningGpuPacket,
+    cache: &mut PlanningReferenceCache,
 ) -> bool {
     if packet.request.method == Some(ActiveGravityMethod::FrequencyDomain) {
         return prepare_frequency_domain_reference(batch, packet, cache);
     }
-    let identity = (batch.basis_hash, batch.density_model_hash, batch.sample_hash);
+    let identity = (
+        batch.basis_hash,
+        batch.density_model_hash,
+        batch.sample_hash,
+    );
     if cache.identity != Some(identity) {
         cache.fields.clear();
         cache.identity = Some(identity);
@@ -791,26 +900,28 @@ fn prepare_planning_references(
     }
     if cache.packet_id != Some(packet.request.request_id) {
         cache.packet_id = Some(packet.request.request_id);
-        cache.target_indices = if packet.request.method
-            == Some(ActiveGravityMethod::FrequencyDomain)
-        {
-            let count = packet.request.candidate_count as usize
-                * batch.samples_per_candidate as usize;
-            (0..count).map(|index| index as u32).collect()
-        } else {
-            packet.state_indices.clone()
-        };
+        cache.target_indices =
+            if packet.request.method == Some(ActiveGravityMethod::FrequencyDomain) {
+                let count =
+                    packet.request.candidate_count as usize * batch.samples_per_candidate as usize;
+                (0..count).map(|index| index as u32).collect()
+            } else {
+                packet.state_indices.clone()
+            };
         cache.target_cursor = 0;
         cache.source_cursor = 0;
         cache.partial_field = DVec3::ZERO;
         cache.partial_gradient = DMat3::ZERO;
     }
     let started = bevy::platform::time::Instant::now();
-    let global_start = packet.request.candidate_start as usize * batch.samples_per_candidate as usize;
+    let global_start =
+        packet.request.candidate_start as usize * batch.samples_per_candidate as usize;
     let row = packet.request.density_model as usize * 56;
     while cache.target_cursor < cache.target_indices.len() {
         let state_index = global_start + cache.target_indices[cache.target_cursor] as usize;
-        let Some(state) = batch.states.get(state_index) else { return true; }; // reduction rejects malformed output
+        let Some(state) = batch.states.get(state_index) else {
+            return true;
+        }; // reduction rejects malformed output
         let target = state.body_position().as_dvec3();
         let key = reference_key(target, batch, packet.request.density_model);
         if cache.fields.contains_key(&key) {
@@ -819,18 +930,29 @@ fn prepare_planning_references(
         }
         let end = (cache.source_cursor + 512).min(batch.basis_records.len());
         let valid = crate::cpu::planning::accumulate_planning_reference_chunk(
-            target, &batch.basis_records[cache.source_cursor..end], &batch.density_models[row..row+56],
-            &mut cache.partial_field, &mut cache.partial_gradient).is_some();
+            target,
+            &batch.basis_records[cache.source_cursor..end],
+            &batch.density_models[row..row + 56],
+            &mut cache.partial_field,
+            &mut cache.partial_gradient,
+        )
+        .is_some();
         cache.source_cursor = end;
         if !valid || end == batch.basis_records.len() {
-            let value = if valid {(cache.partial_field, cache.partial_gradient)} else {(DVec3::NAN, DMat3::NAN)};
+            let value = if valid {
+                (cache.partial_field, cache.partial_gradient)
+            } else {
+                (DVec3::NAN, DMat3::NAN)
+            };
             cache.fields.insert(key, value);
             cache.partial_field = DVec3::ZERO;
             cache.partial_gradient = DMat3::ZERO;
             cache.source_cursor = 0;
             cache.target_cursor += 1;
         }
-        if started.elapsed().as_secs_f64() >= 0.003 { return false; }
+        if started.elapsed().as_secs_f64() >= 0.003 {
+            return false;
+        }
     }
     true
 }
@@ -848,16 +970,13 @@ fn prepare_frequency_domain_reference(
     if cache.frequency_domain_identity != Some(identity) {
         let quadrature = (0..EQ184_QUADRATURE_COUNT)
             .map(|index| {
-                let (wave_vector, volume_weight) = eq184_quadrature_node(
-                    index,
-                    f64::from(batch.frequency_domain_source_radius),
-                )?;
-                let coefficient = f64::from(crate::interface::components::G)
-                    * 4.0
-                    * std::f64::consts::PI
-                    / std::f64::consts::TAU.powi(3)
-                    * volume_weight
-                    / wave_vector.length_squared().max(1.0e-18);
+                let (wave_vector, volume_weight) =
+                    eq184_quadrature_node(index, f64::from(batch.frequency_domain_source_radius))?;
+                let coefficient =
+                    f64::from(crate::interface::components::G) * 4.0 * std::f64::consts::PI
+                        / std::f64::consts::TAU.powi(3)
+                        * volume_weight
+                        / wave_vector.length_squared().max(1.0e-18);
                 Some((wave_vector, coefficient.clamp(-1.0e20, 1.0e20)))
             })
             .collect::<Option<Vec<_>>>();
@@ -881,7 +1000,11 @@ fn prepare_frequency_domain_reference(
     while cache.frequency_domain_source_cursor < batch.basis_records.len() {
         let end = (cache.frequency_domain_source_cursor + 256).min(batch.basis_records.len());
         for source in &batch.basis_records[cache.frequency_domain_source_cursor..end] {
-            let voxel_density = f64::from(*densities.get(source.voxel_index as usize).unwrap_or(&f32::NAN));
+            let voxel_density = f64::from(
+                *densities
+                    .get(source.voxel_index as usize)
+                    .unwrap_or(&f32::NAN),
+            );
             let volume_density = f64::from(source.position_volume[3]) * voxel_density;
             let position = DVec3::new(
                 f64::from(source.position_volume[0]),
@@ -912,13 +1035,18 @@ fn prepare_frequency_domain_reference(
 }
 
 fn direct_planning_reference_cached(
-    target: DVec3, batch: &PlanningCandidateBatch, density_model: u32,
+    target: DVec3,
+    batch: &PlanningCandidateBatch,
+    density_model: u32,
     cache: &mut PlanningReferenceCache,
 ) -> (DVec3, DMat3) {
     // Preflight populated every requested reference in bounded frame slices.
     // Missing entries fail accuracy; never hide a synchronous full-source solve
     // here, and never validate one GPU algorithm against its own approximation.
-    cache.fields.get(&reference_key(target, batch, density_model)).copied()
+    cache
+        .fields
+        .get(&reference_key(target, batch, density_model))
+        .copied()
         .unwrap_or((DVec3::NAN, DMat3::NAN))
 }
 
@@ -951,10 +1079,7 @@ fn frequency_domain_reference_integral(
     let laplace_frequency = eq184_laplace_sigma(observation_index, samples);
     let mut result_field = DVec3::ZERO;
     let mut result_gradient = DMat3::ZERO;
-    for (index, (wave_vector, coefficient)) in cache
-        .frequency_domain_quadrature
-        .iter()
-        .enumerate()
+    for (index, (wave_vector, coefficient)) in cache.frequency_domain_quadrature.iter().enumerate()
     {
         let trajectory = (0..samples).try_fold(Complex64::new(0.0, 0.0), |sum, sample_index| {
             let sample = batch.states[start + sample_index];
@@ -1017,9 +1142,7 @@ fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) 
     let recent_frame_ms = crate::browser_recent_frame_ms();
     let should_shrink = request_ms > PLANNING_MAX_REQUEST_MS
         || frame_rate.is_some_and(|fps| fps < PLANNING_MIN_INTERACTIVE_FPS)
-        || recent_frame_ms.is_some_and(|milliseconds| {
-            milliseconds > PLANNING_MAX_RECENT_FRAME_MS
-        });
+        || recent_frame_ms.is_some_and(|milliseconds| milliseconds > PLANNING_MAX_RECENT_FRAME_MS);
     let can_grow = request_ms < PLANNING_TARGET_REQUEST_MS
         && frame_rate.is_none_or(|fps| fps >= 59.0)
         && recent_frame_ms.is_none_or(|milliseconds| milliseconds <= 17.2);
@@ -1078,8 +1201,8 @@ fn top_candidate_scores(
     job: &PlanningBatchJob,
     accuracy_penalty: f32,
 ) -> [PlanningCandidateScore; 5] {
-    let normalization = f64::from(job.density_model_count.max(1))
-        * f64::from(job.samples_per_candidate.max(1));
+    let normalization =
+        f64::from(job.density_model_count.max(1)) * f64::from(job.samples_per_candidate.max(1));
     let mut scores = (0..job.candidate_count as usize)
         .filter_map(|candidate_index| {
             if !job.candidate_valid[candidate_index] {
@@ -1088,17 +1211,20 @@ fn top_candidate_scores(
             let reference = job.candidate_reference_sum[candidate_index];
             let altitude = job.candidate_minimum_altitude_m[candidate_index];
             if (job.density_model_count > 1 && reference <= f64::MIN_POSITIVE)
-                || !altitude.is_finite() || altitude <= 0.0 {
+                || !altitude.is_finite()
+                || altitude <= 0.0
+            {
                 return None;
             }
-            let separation =
-                (job.candidate_discrimination_sum[candidate_index] / reference.max(f64::MIN_POSITIVE)).sqrt() as f32;
+            let separation = (job.candidate_discrimination_sum[candidate_index]
+                / reference.max(f64::MIN_POSITIVE))
+            .sqrt() as f32;
             let gradient_information =
                 (job.candidate_gradient_sum[candidate_index] / normalization).sqrt() as f32;
             let objective = separation * gradient_information / accuracy_penalty;
-            objective.is_finite().then_some(PlanningCandidateScore {
-                objective,
-            })
+            objective
+                .is_finite()
+                .then_some(PlanningCandidateScore { objective })
         })
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| right.objective.total_cmp(&left.objective));
@@ -1123,7 +1249,11 @@ fn error_distribution(values: &[f32]) -> (f32, f32, f32) {
         let index = ((finite.len() - 1) * numerator).div_ceil(denominator);
         finite[index.min(finite.len() - 1)]
     };
-    (quantile(95, 100), quantile(99, 100), finite[finite.len() - 1])
+    (
+        quantile(95, 100),
+        quantile(99, 100),
+        finite[finite.len() - 1],
+    )
 }
 
 fn finish_planning_method(
@@ -1140,38 +1270,35 @@ fn finish_planning_method(
         error_distribution(&job.certified_pointwise_gravity_errors);
     let (_, certified_gradient_error_p99, certified_gradient_error_max) =
         error_distribution(&job.certified_pointwise_gradient_errors);
-    let gravity_error = (job.gravity_error_sum
-        / job.gravity_reference_sum.max(f64::MIN_POSITIVE))
-    .sqrt() as f32;
-    let gradient_error = (job.gradient_error_sum
-        / job.gradient_reference_sum.max(f64::MIN_POSITIVE))
-    .sqrt() as f32;
+    let gravity_error =
+        (job.gravity_error_sum / job.gravity_reference_sum.max(f64::MIN_POSITIVE)).sqrt() as f32;
+    let gradient_error =
+        (job.gradient_error_sum / job.gradient_reference_sum.max(f64::MIN_POSITIVE)).sqrt() as f32;
     let model_discrimination = (job.discrimination_sum
-        / job
-            .discrimination_reference_sum
-            .max(f64::MIN_POSITIVE))
+        / job.discrimination_reference_sum.max(f64::MIN_POSITIVE))
     .sqrt() as f32;
     let minimum_altitude_m = job.minimum_altitude_m;
-    let gradient_information = (job.gradient_information_sum
-        / job.total_evaluations.max(1) as f64)
-        .sqrt() as f32;
+    let gradient_information =
+        (job.gradient_information_sum / job.total_evaluations.max(1) as f64).sqrt() as f32;
     let planning_objective = model_discrimination * gradient_information
         / (1.0 + gravity_error.max(0.0) + gradient_error.max(0.0));
     let accuracy_penalty = 1.0 + gravity_error.max(0.0) + gradient_error.max(0.0);
     let top_candidates = top_candidate_scores(job, accuracy_penalty);
     let warm_per_candidate =
         job.warm_evaluation_ms / f64::from(job.last_request_candidate_count.max(1));
-    let cold_amortization_candidates =
-        ((job.density_payload_preparation_ms + job.gpu_preprocessing_ms)
-            / warm_per_candidate.max(f64::MIN_POSITIVE))
-        .ceil() as u32;
-    let raw_gpu_ms =
-        job.gpu_preprocessing_ms + job.command_submission_ms + job.gpu_completion_map_ms + job.readback_decode_ms;
+    let cold_amortization_candidates = ((job.density_payload_preparation_ms
+        + job.gpu_preprocessing_ms)
+        / warm_per_candidate.max(f64::MIN_POSITIVE))
+    .ceil() as u32;
+    let raw_gpu_ms = job.gpu_preprocessing_ms
+        + job.command_submission_ms
+        + job.gpu_completion_map_ms
+        + job.readback_decode_ms;
     // CPU preparation and GPU kernel timestamps are separate ledgers. Do not
     // infer a basis cost by subtracting a noisy warm request from cold wall time.
     let geometry_basis_build_ms = job.common_geometry_basis_ms + job.method_geometry_basis_ms;
-    let density_model_ms = job.density_payload_preparation_ms
-        / f64::from(job.density_model_count.max(1));
+    let density_model_ms =
+        job.density_payload_preparation_ms / f64::from(job.density_model_count.max(1));
     // Request wall cost per output, including amortized GPU setup and readback.
     let target_point_ms = raw_gpu_ms / job.total_evaluations.max(1) as f64;
     let total_ms = geometry_basis_build_ms

@@ -77,9 +77,9 @@ window.ryuguPlanningProgress = (planning) => ({
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
   const push = (type, value, extra = {}) => queue.push(JSON.stringify({ type, value, ...extra }));
-  const methodKeys = ['radial', 'werner', 'frequency_domain', 'fft', 'fmm'];
-  const methodLabels = ['Radial', 'Werner', 'Frequency-domain algorithm', 'Packed FFT', 'FMM'];
-  const methodColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77'];
+  const methodKeys = ['fmm', 'fft', 'werner', 'radial', 'frequency_domain'];
+  const methodLabels = ['FMM', 'FFT', 'Werner', 'Radial', 'Frequency-domain'];
+  const methodColors = ['#42dc77', '#ffb23d', '#ff7d89', '#58c8ff', '#36e7f2'];
   const curveColors = ['#36e7f2', '#9af8ff', '#ffb23d', '#ffe071', '#42dc77', '#a8f7bd'];
   const curveLabels = ['Frequency-domain raw total', 'Frequency-domain checked total', 'FFT raw total', 'FFT checked total', 'FMM raw total', 'FMM checked total'];
   const quadratureSourceCounts = [32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000];
@@ -105,35 +105,6 @@ window.ryuguPlanningProgress = (planning) => ({
   let openDialog = null;
   let returnFocus = null;
 
-  // Panels start in a non-overlapping grid, then can be repositioned by their
-  // heading without changing the DOM order or blocking their internal scroll.
-  document.addEventListener('pointerdown', (event) => {
-    const handle = event.target.closest?.('.drag-handle');
-    const panel = handle?.closest?.('[data-float-panel]');
-    if (!panel || event.button !== 0) return;
-    const start = { x: event.clientX, y: event.clientY };
-    const origin = panel._ryuguOffset ?? { x: 0, y: 0 };
-    panel.classList.add('is-dragging');
-    handle.setPointerCapture?.(event.pointerId);
-    const move = (moveEvent) => {
-      const x = origin.x + moveEvent.clientX - start.x;
-      const y = origin.y + moveEvent.clientY - start.y;
-      panel._ryuguOffset = { x, y };
-      panel.style.transform = `translate(${x}px, ${y}px)`;
-    };
-    const end = () => {
-      panel.classList.remove('is-dragging');
-      handle.removeEventListener('pointermove', move);
-      handle.removeEventListener('pointerup', end);
-      handle.removeEventListener('pointercancel', end);
-    };
-    handle.addEventListener('pointermove', move);
-    handle.addEventListener('pointerup', end);
-    handle.addEventListener('pointercancel', end);
-    event.stopPropagation();
-    event.preventDefault();
-  });
-
   // Closing the quadrature page is a cancellation, not merely a visual hide.
   // The Rust action drops its job and prevents any later GPU dispatch.
   document.addEventListener('click', (event) => {
@@ -156,6 +127,12 @@ window.ryuguPlanningProgress = (planning) => ({
     if (event.target.dataset.probe) {
       push('probe', Number(event.target.value), { parameter: event.target.dataset.probe });
       editingProbe = false;
+    }
+    if (event.target.id === 'surface-baseline') push('surface-field-baseline', event.target.value);
+    if (event.target.id === 'surface-comparison') push('surface-field-comparison', event.target.value);
+    if (event.target.id === 'surface-patch-index') {
+      const index = Number(event.target.value);
+      if (Number.isInteger(index) && index >= 1) push('surface-field-select-patch', index - 1);
     }
   });
   document.addEventListener('focusin', (event) => {
@@ -570,10 +547,16 @@ window.ryuguPlanningProgress = (planning) => ({
     const inversionButton = $('[data-action="inversion-start"]');
     const results = (inversion.results ?? []).filter(Boolean);
     const inversionSupported = method !== 'radial' && method !== 'werner';
-    inversionButton.hidden = !inversionSupported;
+    // Keep the action discoverable even for forward-only methods. The button
+    // is disabled there and the status text explains why; switching to FFT,
+    // FMM, or Frequency-domain enables it without changing the layout.
+    inversionButton.hidden = false;
+    inversionButton.title = inversionSupported
+      ? 'Invert the captured trajectory density'
+      : 'Density inversion is available for Frequency-domain, FFT, and FMM';
     if (!inversionSupported) {
       status.dataset.state = 'forward-only';
-      status.textContent = 'Forward-only method. Switch to the frequency-domain algorithm, Packed FFT, or FMM to invert the shared Radial trajectory.';
+      status.textContent = 'Forward-only method. Switch to the frequency-domain algorithm, Packed FFT, or FMM to invert the selected observation trajectory.';
     } else if (inversion.error) {
       status.dataset.state = 'error';
       status.textContent = inversion.error;
@@ -687,6 +670,71 @@ window.ryuguPlanningProgress = (planning) => ({
     $('#performance-summary').replaceChildren(...summaries);
   }
 
+  function renderSurfaceField(surface) {
+    if (!surface) return;
+    pressed('[data-action="density-mode"]', (button) => button.dataset.value === surface.densityMode);
+    pressed('[data-action="surface-field-metric"]', (button) => button.dataset.value === surface.metric);
+    const computing = Boolean(surface.computing);
+    $$('[data-action="surface-field-compute"], [data-action="surface-field-compare"]')
+      .forEach((button) => { button.disabled = computing; });
+    const baseline = $('#surface-baseline');
+    const comparison = $('#surface-comparison');
+    if (baseline && baseline.value !== surface.baseline) baseline.value = surface.baseline;
+    if (comparison && comparison.value !== surface.comparison) comparison.value = surface.comparison;
+    const densityNote = surface.densityMode === 'variable'
+      ? ' Variable-density Werner surface values use the point-source reference, not the homogeneous polyhedral formula.' : '';
+    $('#surface-field-status').textContent = (surface.status ?? 'Surface field is ready to compute.') + densityNote;
+    const latest = surface.latest;
+    const compare = surface.comparisonResult;
+    const formatRange = (range, suffix = '') => Array.isArray(range) && range.length === 2
+      ? `${Number(range[0]).toExponential(3)}–${Number(range[1]).toExponential(3)}${suffix}` : '--';
+    const range = $('#surface-field-range');
+    const patchCount = $('#surface-patch-count');
+    const patchDetails = $('#surface-patch-details');
+    if (!range || !patchDetails) return;
+    if (!latest) {
+      range.textContent = 'No surface product yet.';
+      patchCount.textContent = '--';
+      patchDetails.textContent = 'Calculate a field, then inspect a surface patch.';
+      return;
+    }
+    const lines = [
+      `${methodLabel(latest.method)} · ${latest.densityMode} · ${latest.sampleCount} patches`,
+      `g_eff ${formatRange(latest.effectiveGravityRange, ' m/s²')}`,
+      `|∇g| ${formatRange(latest.gradientRange, ' s⁻²')} · slope ${formatRange(latest.slopeRange, '°')}`,
+    ];
+    if (compare) {
+      lines.push(`effective-g error ${formatRange(compare.errorRange, '')} · ${compare.sampleCount} common patches`);
+    }
+    range.textContent = lines.join('\n');
+    patchCount.textContent = `${latest.sampleCount} PATCHES`;
+    const selected = surface.selectedPatch;
+    if (!selected) {
+      patchDetails.textContent = 'Enter a patch index and press Enter to inspect it.';
+      return;
+    }
+    const vector = (values) => Array.isArray(values)
+      ? values.map((value) => Number(value).toExponential(3)).join(', ')
+      : '--';
+    const scalar = (value, suffix = '') => Number.isFinite(Number(value))
+      ? `${Number(value).toExponential(3)}${suffix}` : '--';
+    const error = Number.isFinite(Number(selected.relativeError))
+      ? `\nΔg_eff/g_eff ${scalar(selected.relativeError)}` : '';
+    patchDetails.textContent = [
+      `Patch ${selected.index + 1}/${latest.sampleCount} · ${methodLabel(selected.method)} · ${selected.densityMode}`,
+      `position [${vector(selected.position)}] m`,
+      `normal [${vector(selected.normal)}]`,
+      `g [${vector(selected.gravity)}] · |g| ${scalar(selected.gravityMagnitude, ' m/s²')}`,
+      `g_eff [${vector(selected.effectiveGravity)}] · |g_eff| ${scalar(selected.effectiveGravityMagnitude, ' m/s²')}`,
+      `|∇g| ${scalar(selected.gradientMagnitude, ' s⁻²')} · slope ${scalar(selected.slopeDegrees, '°')}${error}`,
+    ].join('\n');
+  }
+
+  function methodLabel(key) {
+    const index = ['fmm', 'fft', 'werner', 'radial', 'frequency_domain'].indexOf(key);
+    return index >= 0 ? methodLabels[index] : key ?? 'method';
+  }
+
   window.ryuguUi = {
     exportQuadrature,
     curveSelection: () => ({
@@ -703,6 +751,8 @@ window.ryuguPlanningProgress = (planning) => ({
         ? button.getAttribute('aria-pressed') !== 'true'
         : action === 'section'
           ? button.getAttribute('aria-pressed') !== 'true'
+          : action === 'surface-field-select-patch'
+            ? Math.max(0, Number($('#surface-patch-index')?.value || 1) - 1)
           : button.dataset.value ?? null;
       push(action, value, action === 'quadrature-start' ? window.ryuguUi.curveSelection() : {});
     },
@@ -743,6 +793,9 @@ window.ryuguPlanningProgress = (planning) => ({
       $('#fps').textContent = 'FPS ' + snapshot.fps.toFixed(0);
       $('#health-dot').style.background = snapshot.runtimeError ? '#ff6262' : '#43e58a';
       $('#method-label').textContent = snapshot.methodLabel;
+      $('#operator-chain').textContent = snapshot.method === 'frequency_domain'
+        ? 'Eq.106 → computed orbit → Eq.184 → density inversion'
+        : `${snapshot.methodLabel} → orbit → physical diagnostics`;
       const activeMemoryIndex = methodKeys.indexOf(snapshot.method);
       const activeMemory = Number.isFinite(snapshot.activeVramBytes)
         ? snapshot.activeVramBytes
@@ -763,6 +816,7 @@ window.ryuguPlanningProgress = (planning) => ({
         });
       }
       $('#planning-status').textContent = snapshot.planning.status;
+      renderSurfaceField(snapshot.surfaceField);
       $('#modal-status').textContent = snapshot.planning.workload === 'quadrature'
         ? snapshot.planning.status : 'Choose parameters, then press Run to start the quadrature task.';
       $('#quadrature-state').textContent = snapshot.planning.running ? Math.round(snapshot.planning.sourceCount / 1000) + 'K · R' + snapshot.planning.repeat : 'IDLE';

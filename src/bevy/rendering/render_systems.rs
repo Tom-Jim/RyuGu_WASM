@@ -1,13 +1,23 @@
+#[derive(Default)]
+pub(crate) struct SectionClipCache {
+    topology_node_count: u32,
+    vertex_count: usize,
+    vertices: Vec<Vec3>,
+}
+
 pub fn render_section_system(
     mut gizmos: Gizmos<ScientificGizmos>,
     ryugu_query: Query<&Transform, With<RyuguMarker>>,
     camera_query: Query<&Transform, (With<Camera3d>, Without<RyuguMarker>)>,
     show_section: Res<ShowSection>,
     active_method: Res<ActiveGravityMethod>,
+    density_mode: Res<DensityMode>,
     density_c: Option<Res<DensityC>>,
     werner_density: Option<Res<WernerDensity>>,
     inversion: Res<TrajectoryInversionState>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
+    mut frame: Local<u8>,
+    mut clip_cache: Local<SectionClipCache>,
 ) {
     // D remains an explicit view of the forward model's prior density. With D
     // off, a completed inversion samples its independently recovered 3-D
@@ -18,6 +28,14 @@ pub fn render_section_system(
         inversion.displayed_density.as_ref()
     };
     if !show_section.0 && inferred.is_none() {
+        *frame = 0;
+        return;
+    }
+    // The section is a diagnostic overlay, while the orbit and camera remain
+    // continuous. Updating it every other frame prevents its CPU clipping and
+    // Gizmo generation from competing with the fixed-step simulation.
+    *frame = frame.wrapping_add(1);
+    if *frame % 2 != 0 {
         return;
     }
     let Some(ryugu_tf) = ryugu_query.iter().next() else {
@@ -32,12 +50,15 @@ pub fn render_section_system(
         .filter(|result| result.method != ActiveGravityMethod::HomogeneousWerner)
         .map(|result| result.density)
         .unwrap_or_else(|| density_c.map(|r| r.0).unwrap_or(1.0));
+    let uniform_forward_density = inferred.is_none() && *density_mode == DensityMode::Constant;
     let uniform_density = inferred
         .filter(|result| result.method == ActiveGravityMethod::HomogeneousWerner)
         .map(|result| result.density)
         .unwrap_or_else(|| werner_density.map(|r| r.0).unwrap_or(0.0));
-    if (display_method != ActiveGravityMethod::HomogeneousWerner && c <= 0.0)
-        || (display_method == ActiveGravityMethod::HomogeneousWerner && uniform_density <= 0.0)
+    let homogeneous_display = display_method == ActiveGravityMethod::HomogeneousWerner
+        || uniform_forward_density;
+    if (!homogeneous_display && c <= 0.0)
+        || (homogeneous_display && uniform_density <= 0.0)
     {
         return;
     }
@@ -62,10 +83,18 @@ pub fn render_section_system(
     let max_density = logarithmic_radial_density(SECTION_CLIP_RADIUS, c);
     let density_range = (max_density - min_density).max(1e-6);
 
-    // Stride-sampled local vertices for mesh-boundary clipping (limits to ~2000 samples)
-    let n_verts = topo.positions.len();
-    let stride = (n_verts / 2000).max(1);
-    let local_verts: Vec<Vec3> = topo.positions.iter().step_by(stride).copied().collect();
+    // Stride-sampled local vertices for mesh-boundary clipping. This test is
+    // intentionally bounded: a diagnostic section should not scan the entire
+    // asteroid mesh for every one of its 31x31 samples.
+    if clip_cache.topology_node_count != topo.node_count
+        || clip_cache.vertex_count != topo.positions.len()
+    {
+        let stride = (topo.positions.len() / 512).max(1);
+        clip_cache.vertices = topo.positions.iter().step_by(stride).copied().collect();
+        clip_cache.topology_node_count = topo.node_count;
+        clip_cache.vertex_count = topo.positions.len();
+    }
+    let local_verts = &clip_cache.vertices;
 
     // Decompose inverse transform: world -> body metres -> local mesh space.
     // The recovered voxels live in body metres, while topology vertices retain
@@ -134,9 +163,11 @@ pub fn render_section_system(
                     let density = interpolated_inverted_density(result, body_pt);
                     let t = (0.5 + (density - mean) / (2.0 * half_span)).clamp(0.0, 1.0);
                     (t, inverted_density_color(t, result.method))
-                } else if display_method == ActiveGravityMethod::HomogeneousWerner {
-                    // Every interior point has rho=M/V in the Werner model, so a
-                    // single color is the only faithful normalized visualization.
+                } else if homogeneous_display {
+                    // Constant-density forward models use exactly the same
+                    // M/V field as Werner. A single color is the faithful
+                    // visualization; variable density is the only branch with
+                    // radial variation.
                     (0.5, Color::srgb(0.15, 0.8, 1.0))
                 } else {
                     // Radial, Frequency-domain algorithm, MMFFT, and FMM all consume the same
@@ -184,7 +215,7 @@ pub fn render_section_system(
         tangent_u,
         tangent_v,
         plane_normal,
-        display_method != ActiveGravityMethod::HomogeneousWerner,
+        !homogeneous_display,
     );
 }
 

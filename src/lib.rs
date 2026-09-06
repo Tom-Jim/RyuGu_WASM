@@ -36,11 +36,17 @@ use bevy_app::{
         render_section_system, section_alpha_system, setup_scene,
     },
     scale::{build_topology_system, normalize_model_scale_system},
+    surface_field::{
+        SurfaceFieldComputeState, SurfaceFieldGeometry, build_surface_field_geometry_system,
+        ensure_surface_field_overlay_system, surface_field_compute_system,
+        surface_field_render_system,
+    },
 };
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use cpu::{
+    density::build_density_quadrature_system,
     frequency_domain::build_aggregated_gravity_source_system,
     inversion::{convex_optimization_system, start_density_inversion_system},
     physics::{physics_system, ryugu_rotation_system},
@@ -51,18 +57,18 @@ use gpu::{
     mmfft::MmfftCompressedComputePlugin,
     normals::NormalsComputePlugin,
     planning::PlanningGpuComputePlugin,
-    radial::{GravityComputePlugin, build_radial_gravity_source_system},
+    radial::GravityComputePlugin,
     werner::{WernerComputePlugin, WernerReadbackChannel},
 };
 use interface::components::{
-    ActiveGravityMethod, CameraMode, DensityC, DensitySensitivityCaches, DisplayRotation,
-    FmmReadbackChannel, FrequencyDomainGpuReadbackChannel, GpuMemoryEstimate, GravityAcceleration,
-    GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential, GravityReadbackChannel,
-    GravityRuntimeError, JacobiHistory, MmfftReadbackChannel, NormalsReadbackChannel,
-    PerformanceComparisonState, PlanningComparisonState, PlanningGpuReadbackChannel,
-    PlanningGpuRequest, PlanningGpuResult, PlanningMethodPayload, ProbeCrashResetRequest,
-    ProbeCrashState, ProbeInitialConditions, ShowNormals, ShowSection, SimulationAcceleration,
-    SimulationClock, TrajectoryInversionState,
+    ActiveGravityMethod, CameraMode, DensityC, DensityMode, DensitySensitivityCaches,
+    DisplayRotation, FmmReadbackChannel, FrequencyDomainGpuReadbackChannel, GpuMemoryEstimate,
+    GravityAcceleration, GravityBenchmarkTrajectory, GravityBlendFactor, GravityPotential,
+    GravityReadbackChannel, GravityRuntimeError, JacobiHistory, MmfftReadbackChannel,
+    NormalsReadbackChannel, PerformanceComparisonState, PlanningComparisonState,
+    PlanningGpuReadbackChannel, PlanningGpuRequest, PlanningGpuResult, PlanningMethodPayload,
+    ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions, ShowNormals, ShowSection,
+    SimulationAcceleration, SimulationClock, SurfaceFieldState, TrajectoryInversionState,
 };
 use std::time::Duration;
 use wgsl::WgslPlugin;
@@ -86,6 +92,10 @@ fn ryugu_render_error_handler(
                 channel.reset_after_device_loss();
             }
             if let Some(channel) = main_world.get_resource::<FrequencyDomainGpuReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) = main_world.get_resource::<gpu::equation106::Equation106Channel>()
+            {
                 channel.reset_after_device_loss();
             }
             if let Some(channel) = main_world.get_resource::<GravityReadbackChannel>() {
@@ -261,7 +271,8 @@ use wasm_bindgen::prelude::*;
     export function is_mobile_browser() {
         if (typeof navigator === "undefined") return false;
         if (navigator.userAgentData?.mobile === true) return true;
-        return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent ?? "");
+        return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent ?? "")
+            || (/Macintosh/i.test(navigator.userAgent ?? "") && navigator.maxTouchPoints > 1);
     }
 
     export function show_webgpu_error() {
@@ -450,6 +461,10 @@ pub fn main() {
         .init_resource::<ProbeCrashResetRequest>()
         .init_resource::<DisplayRotation>()
         .init_resource::<PerformanceComparisonState>()
+        .init_resource::<SurfaceFieldState>()
+        .init_resource::<DensityMode>()
+        .init_resource::<SurfaceFieldComputeState>()
+        .init_resource::<SurfaceFieldGeometry>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             // In browsers, Continuous is driven by requestAnimationFrame.
@@ -486,6 +501,12 @@ pub fn main() {
                     primary_window: Some(Window {
                         canvas: Some("#bevy".into()),
                         fit_canvas_to_parent: true,
+                        resolution: if is_mobile_browser {
+                            // Bound fill-rate on high-DPR phones without scaling UI text.
+                            bevy::window::WindowResolution::default().with_scale_factor_override(1.5)
+                        } else {
+                            bevy::window::WindowResolution::default()
+                        },
                         // Keep browser selection/gesture handling out of the
                         // canvas so PanOrbit receives left-drag and wheel
                         // input whenever the pointer is not over a UI control.
@@ -526,6 +547,7 @@ pub fn main() {
         app.add_plugins(GravityComputePlugin);
         app.add_plugins(WernerComputePlugin);
         app.add_plugins(FrequencyDomainGpuComputePlugin);
+        app.add_plugins(gpu::equation106::Equation106Plugin);
         // MMFFT+compression is the fourth GPU integration slot. Its packed
         // source buffer and tiled reduction are built once and evaluated in
         // the render-world compute pass.
@@ -575,7 +597,24 @@ pub fn main() {
     )
     .add_systems(
         Update,
-        build_aggregated_gravity_source_system.after(build_radial_gravity_source_system),
+        (
+            build_surface_field_geometry_system,
+            ensure_surface_field_overlay_system,
+            surface_field_compute_system,
+            surface_field_render_system,
+        )
+            .chain()
+            .after(build_topology_system)
+            .after(UiComputeOrdering::BrowserActions),
+    )
+    .add_systems(
+        Update,
+        (
+            build_density_quadrature_system,
+            build_aggregated_gravity_source_system,
+        )
+            .chain()
+            .after(build_topology_system),
     )
     .add_systems(
         Update,

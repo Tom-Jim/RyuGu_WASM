@@ -371,6 +371,119 @@ impl Default for DensityC {
 #[derive(Resource, Default)]
 pub struct WernerDensity(pub f32);
 
+/// Density profile used by the surface-field product. The real-time Werner
+/// trajectory path remains homogeneous; this switch controls the explicit
+/// surface validation product and its comparison maps.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DensityMode {
+    #[default]
+    Variable,
+    Constant,
+}
+
+impl DensityMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Variable => "variable",
+            Self::Constant => "constant",
+        }
+    }
+}
+
+/// Quantity used to color the latest surface-field overlay.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfaceFieldMetric {
+    #[default]
+    Gravity,
+    Gradient,
+    Slope,
+    Error,
+}
+
+impl SurfaceFieldMetric {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Gravity => "gravity",
+            Self::Gradient => "gradient",
+            Self::Slope => "slope",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gravity => "Effective gravity",
+            Self::Gradient => "Gravity gradient",
+            Self::Slope => "Effective slope",
+            Self::Error => "Relative error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SurfaceFieldSample {
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub gravity: Vec3,
+    pub effective_gravity: Vec3,
+    pub gravity_magnitude: f32,
+    pub effective_gravity_magnitude: f32,
+    pub gradient_magnitude: f32,
+    pub slope_degrees: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SurfaceFieldDataset {
+    pub method: ActiveGravityMethod,
+    pub density_mode: DensityMode,
+    pub samples: Vec<SurfaceFieldSample>,
+    pub gravity_range: (f32, f32),
+    pub effective_gravity_range: (f32, f32),
+    pub gradient_range: (f32, f32),
+    pub slope_range: (f32, f32),
+}
+
+#[derive(Clone, Debug)]
+pub struct SurfaceFieldComparison {
+    pub baseline: SurfaceFieldDataset,
+    pub comparison: SurfaceFieldDataset,
+    /// Signed relative effective-gravity error at each common surface sample.
+    /// Positive means comparison > baseline; negative means comparison < baseline.
+    pub signed_errors: Vec<f32>,
+    pub error_range: (f32, f32),
+}
+
+#[derive(Resource, Debug)]
+pub struct SurfaceFieldState {
+    pub computing: bool,
+    pub status: String,
+    pub revision: u64,
+    pub density_mode: DensityMode,
+    pub metric: SurfaceFieldMetric,
+    pub baseline_method: ActiveGravityMethod,
+    pub comparison_method: ActiveGravityMethod,
+    pub latest: Option<SurfaceFieldDataset>,
+    pub comparison: Option<SurfaceFieldComparison>,
+    pub selected_patch: Option<usize>,
+}
+
+impl Default for SurfaceFieldState {
+    fn default() -> Self {
+        Self {
+            computing: false,
+            status: "Surface field is ready to compute.".into(),
+            revision: 0,
+            density_mode: DensityMode::Variable,
+            metric: SurfaceFieldMetric::Gravity,
+            baseline_method: ActiveGravityMethod::Fmm,
+            comparison_method: ActiveGravityMethod::MmfftCompressed,
+            latest: None,
+            comparison: None,
+            selected_patch: None,
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct AsteroidTopologyGpuData {
     pub mesh_entity: Option<Entity>,
@@ -405,8 +518,14 @@ impl NormalsReadbackChannel {
 /// and one radial layer as `[direction.xyz, solid_angle]` followed by
 /// `[r_inner, r_outer, density, padding]`.
 #[derive(Resource)]
-pub struct RadialGravitySource {
+pub struct DensityQuadratureSource {
+    /// Two vec4 records per volume cell:
+    /// `[direction.xyz, solid_angle]` and `[r_inner, r_outer, density, _]`.
     pub bytes: Vec<u8>,
+    pub constant_bytes: Vec<u8>,
+    pub radius: f32,
+    pub source_hash: u64,
+    pub constant_hash: u64,
 }
 
 /// Latest GPU-computed gravity acceleration for Cassini (Ryugu body frame).
@@ -493,7 +612,6 @@ impl GravitySampleHistory {
             .rev()
             .find(|sample| sample.snapshot.epoch == epoch)
     }
-
 }
 
 #[derive(Resource, Default)]

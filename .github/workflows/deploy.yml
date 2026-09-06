@@ -62,6 +62,7 @@ jobs:
 
             - name: Verify browser sources
               run: |
+                  node --check src/html/navigation.js
                   node --check src/html/ui.js
                   node --check src/html/capture.js
                   node --check src/html/visit.js
@@ -78,6 +79,7 @@ jobs:
                   cp src/html/index.html site/index.html
                   sed -i "s/__RYUGU_VERSION__/${GITHUB_SHA}/g" site/index.html
                   cp src/html/ui.css src/html/ui.js src/html/tailwind.generated.css site/src/html/
+                  cp src/html/navigation.js site/src/html/
                   cp src/html/capture.js site/src/html/
                   cp src/html/visit.js site/src/html/
                   cp src/html/background.js src/html/background-worker.js site/src/html/
@@ -89,6 +91,7 @@ jobs:
               run: |
                   test -f site/index.html
                   test -f site/src/html/ui.css
+                  test -f site/src/html/navigation.js
                   test -f site/src/html/ui.js
                   test -f site/src/html/capture.js
                   test -f site/src/html/visit.js
@@ -98,7 +101,6 @@ jobs:
                   test -f site/src/html/tailwind.generated.css
                   test -f site/pkg/ryugu_wasm.js
                   test -f site/pkg/ryugu_wasm_bg.wasm
-                  test -f site/assets/shaders/mobile_unlit.wgsl
                   test -f site/assets/models/ryugu.glb
                   test -f site/assets/models/cassini.gltf
                   test -f site/assets/models/cassini.bin

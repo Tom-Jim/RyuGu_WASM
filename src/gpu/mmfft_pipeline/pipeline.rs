@@ -10,14 +10,14 @@ use crate::interface::components::*;
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy::render::{
-    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+    Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
         Buffer, BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
         ComputePipelineDescriptor, MapMode, PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
+    renderer::{RenderDevice, RenderQueue},
 };
 use num_complex::Complex64;
 use rustfft::{Fft, FftPlanner};
@@ -38,6 +38,7 @@ struct ExtractedMmfftInput {
     half_extents: [f32; 2],
     grid_scales: [f32; 2],
     total_mass: f32,
+    density_mode: DensityMode,
 }
 
 #[derive(Resource, Default)]
@@ -50,6 +51,7 @@ struct MmfftGpuBuffersInner {
     bind_group: BindGroup,
     output_size: u64,
     last_submitted: Option<(u64, u64)>,
+    density_mode: DensityMode,
 }
 
 #[derive(Resource)]
@@ -136,11 +138,18 @@ fn cubic_derivatives(t: f32) -> [f32; 4] {
     ]
 }
 
-fn sample_mmfft_grid(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: usize) -> Vec3 {
+pub(crate) fn sample_mmfft_grid(
+    field: &[[f32; 4]],
+    position: Vec3,
+    half_extent: f32,
+    n: usize,
+) -> Vec3 {
     let spacing = 2.0 * half_extent / n as f32;
     let inverse_spacing = spacing.recip();
     let coordinate = (position + Vec3::splat(half_extent)) / spacing - Vec3::splat(0.5);
-    let base_floor = coordinate.floor().clamp(Vec3::ONE, Vec3::splat((n - 3) as f32));
+    let base_floor = coordinate
+        .floor()
+        .clamp(Vec3::ONE, Vec3::splat((n - 3) as f32));
     let fraction = (coordinate - base_floor).clamp(Vec3::ZERO, Vec3::ONE);
     let base = base_floor.as_uvec3() - UVec3::ONE;
     let wx = cubic_weights(fraction.x);
@@ -159,7 +168,8 @@ fn sample_mmfft_grid(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: us
                     base.z as usize + z,
                     n,
                 )][3];
-                gradient += p * inverse_spacing
+                gradient += p
+                    * inverse_spacing
                     * Vec3::new(
                         dx[x] * wy[y] * wz[z],
                         dy[y] * wx[x] * wz[z],
@@ -193,9 +203,7 @@ pub(crate) fn voxel_basis_sensitivities(
                 })
         })
         .collect::<Vec<_>>();
-    let used_levels = std::array::from_fn::<_, 2, _>(|level| {
-        sample_levels.contains(&Some(level))
-    });
+    let used_levels = std::array::from_fn::<_, 2, _>(|level| sample_levels.contains(&Some(level)));
     let mut workspaces = LEVEL_GRID_SIZES
         .into_iter()
         .zip(LEVEL_HALF_EXTENTS)
@@ -218,12 +226,8 @@ pub(crate) fn voxel_basis_sensitivities(
             let field = workspace.build(&records);
             for (sample_index, sample) in samples.iter().enumerate() {
                 if sample_levels[sample_index] == Some(level) {
-                    let acceleration = sample_mmfft_grid(
-                        field,
-                        body_positions[sample_index],
-                        half_extent,
-                        n,
-                    );
+                    let acceleration =
+                        sample_mmfft_grid(field, body_positions[sample_index], half_extent, n);
                     row_major[sample_index * column_count + column_index] =
                         sample.body_rotation * acceleration;
                 }
@@ -252,19 +256,32 @@ pub fn build_mmfft_compressed_source_system(
     existing: Option<Res<MmfftCompressedSource>>,
     active_method: Res<ActiveGravityMethod>,
     planning: Res<PlanningComparisonState>,
+    density_mode: Res<DensityMode>,
 ) {
-    if planning.blocks_realtime_gpu() || existing.is_some() || *active_method != ActiveGravityMethod::MmfftCompressed {
+    if planning.blocks_realtime_gpu() || *active_method != ActiveGravityMethod::MmfftCompressed {
+        return;
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|source| source.density_mode == *density_mode)
+    {
+        return;
+    }
+    if existing.is_some() {
+        commands.remove_resource::<MmfftCompressedSource>();
         return;
     }
     let Some(aggregated) = aggregated else {
         return;
     };
-    if aggregated.sources.is_empty() {
+    let source_points = match *density_mode {
+        DensityMode::Variable => &aggregated.sources,
+        DensityMode::Constant => &aggregated.constant_sources,
+    };
+    if source_points.is_empty() {
         return;
     }
-
-    let records = aggregated
-        .sources
+    let records = source_points
         .iter()
         .map(|source| (source.position, source.mass))
         .collect::<Vec<_>>();
@@ -292,7 +309,11 @@ pub fn build_mmfft_compressed_source_system(
         level_count: LEVEL_HALF_EXTENTS.len() as u32,
         half_extents: LEVEL_HALF_EXTENTS.map(|value| value as f32),
         grid_scales,
-        total_mass: aggregated.total_mass as f32,
+        total_mass: match *density_mode {
+            DensityMode::Variable => aggregated.total_mass,
+            DensityMode::Constant => aggregated.constant_total_mass,
+        } as f32,
+        density_mode: *density_mode,
     });
 }
 
@@ -336,8 +357,8 @@ fn extract_mmfft_input_system(
     cassini: Extract<Query<&Transform, With<CassiniMarker>>>,
     ryugu: Extract<Query<&Transform, With<RyuguMarker>>>,
 ) {
-    extracted.enabled = **active_method == ActiveGravityMethod::MmfftCompressed
-        && !planning.blocks_realtime_gpu();
+    extracted.enabled =
+        **active_method == ActiveGravityMethod::MmfftCompressed && !planning.blocks_realtime_gpu();
     if !extracted.enabled {
         return;
     }
@@ -357,8 +378,9 @@ fn extract_mmfft_input_system(
     extracted.half_extents = source.half_extents;
     extracted.grid_scales = source.grid_scales;
     extracted.total_mass = source.total_mass;
-    if extracted.source_bytes.is_none() {
+    if extracted.source_bytes.is_none() || extracted.density_mode != source.density_mode {
         extracted.source_bytes = Some(source.bytes.clone());
+        extracted.density_mode = source.density_mode;
     }
 }
 
@@ -379,6 +401,13 @@ fn dispatch_mmfft_system(
     };
     if !extracted.enabled || extracted.grid_sizes[0] == 0 || extracted.level_count == 0 {
         return;
+    }
+    if buffers
+        .0
+        .as_ref()
+        .is_some_and(|inner| inner.density_mode != extracted.density_mode)
+    {
+        buffers.0 = None;
     }
     if buffers.0.is_none() {
         let Some(source_bytes) = extracted.source_bytes.as_ref() else {
@@ -437,6 +466,7 @@ fn dispatch_mmfft_system(
             bind_group,
             output_size,
             last_submitted: None,
+            density_mode: extracted.density_mode,
         });
     }
 

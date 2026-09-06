@@ -165,6 +165,7 @@ pub fn physics_system(
     werner_history: Option<Res<WernerGravityHistory>>,
     mmfft_history: Option<Res<MmfftCompressedHistory>>,
     fmm_history: Option<Res<FmmGravityHistory>>,
+    equation106: Option<Res<crate::gpu::equation106::Equation106History>>,
     mut blend: ResMut<GravityBlendFactor>,
     mut runtime_error: ResMut<GravityRuntimeError>,
     mut clock: ResMut<SimulationClock>,
@@ -201,17 +202,11 @@ pub fn physics_system(
         werner_history.as_deref(),
         mmfft_history.as_deref(),
         fmm_history.as_deref(),
+        equation106.as_deref(),
     );
-    // Equation (184) is an aggregate trajectory observation operator and has
-    // no instantaneous force history. For the Bevy scene only, use the
-    // already-running radial GPU field as the physical display reference;
-    // this preserves continuous shape-dependent motion without introducing a
-    // second CPU point-source integrator or changing the benchmark scenario.
-    let integration_history = if *active_method == ActiveGravityMethod::FrequencyDomain {
-        radial_history.as_ref().map(|history| &history.0)
-    } else {
-        active_history
-    };
+    // Eq.106 drives the frequency trajectory; Eq.184 consumes its captured
+    // states afterwards and never masquerades as an instantaneous force.
+    let integration_history = active_history;
     let maximum_extrapolation_intervals = match *active_method {
         ActiveGravityMethod::RadialAnalytic => MAX_EXTRAPOLATION_INTERVALS,
         ActiveGravityMethod::HomogeneousWerner => MAX_EXTRAPOLATION_INTERVALS,
@@ -228,7 +223,32 @@ pub fn physics_system(
 
     let stable_frame_dt = time.delta_secs_f64() * TIME_SCALE as f64;
     let substep_dt = stable_frame_dt / PHYSICS_SUBSTEPS as f64;
-    let stable_steps = simulation_acceleration.stable_steps();
+    let available_steps = integration_history
+        .and_then(|history| {
+            let mut samples = history
+                .samples
+                .iter()
+                .rev()
+                .filter(|sample| sample.snapshot.epoch == clock.epoch);
+            let latest = samples.next()?;
+            let horizon = samples.next().map_or(stable_frame_dt, |previous| {
+                (latest.snapshot.simulation_time_seconds
+                    - previous.snapshot.simulation_time_seconds)
+                    * maximum_extrapolation_intervals
+            });
+            Some(
+                ((latest.snapshot.simulation_time_seconds + horizon - clock.elapsed_seconds)
+                    / stable_frame_dt
+                    + 1.0e-6)
+                    .floor()
+                    .max(0.0) as u32,
+            )
+        })
+        .unwrap_or(1);
+    let stable_steps = simulation_acceleration.stable_steps().min(available_steps);
+    if stable_steps == 0 {
+        return;
+    }
     let presented_frame_dt = stable_frame_dt * stable_steps as f64;
     let frame_start_time = clock.elapsed_seconds;
     let frame_start_rotation = ryugu_transform.rotation;
@@ -261,6 +281,33 @@ pub fn physics_system(
             .ok_or("The selected gravity evaluator returned an invalid acceleration.")
     };
 
+    // Check the full requested interval before mutating any state. Otherwise
+    // an unavailable end snapshot left a half-kick/drift at the old clock time.
+    match acceleration_at(
+        frame_start_time + presented_frame_dt,
+        probe_transform.translation,
+    ) {
+        Ok(_) => {}
+        Err("Waiting for a valid gravity readback snapshot.") => return,
+        Err(message) => {
+            runtime_error.raise(message);
+            return;
+        }
+    }
+    if *active_method == ActiveGravityMethod::FrequencyDomain
+        && !inversion.ready
+        && inversion.knots.is_empty()
+    {
+        inversion.knots.push(TrajectoryInversionKnot {
+            position: probe_transform.translation,
+            velocity: probe_velocity.0,
+            simulation_time_seconds: frame_start_time,
+            baseline_acceleration: acceleration_at(frame_start_time, probe_transform.translation)
+                .unwrap_or(Vec3::ZERO),
+            body_rotation: frame_start_rotation,
+        });
+    }
+
     // Every pointwise evaluator uses the same 100-substep leapfrog integrator.
     // Intermediate states are retained in the orbit trail but are not presented,
     // which accelerates the visualization without enlarging the stable step size.
@@ -280,9 +327,11 @@ pub fn physics_system(
                     return;
                 }
             };
-            probe_velocity.0 += acceleration_start * (0.5 * substep_dt as f32);
-            probe_transform.translation += probe_velocity.0 * substep_dt as f32;
-            let acceleration_end = match acceleration_at(end_time, probe_transform.translation) {
+            let previous_position = probe_transform.translation;
+            let previous_velocity = probe_velocity.0;
+            let half_velocity = previous_velocity + acceleration_start * (0.5 * substep_dt as f32);
+            let next_position = previous_position + half_velocity * substep_dt as f32;
+            let acceleration_end = match acceleration_at(end_time, next_position) {
                 Ok(acceleration) => acceleration,
                 Err("Waiting for a valid gravity readback snapshot.") => {
                     return;
@@ -292,7 +341,35 @@ pub fn physics_system(
                     return;
                 }
             };
-            probe_velocity.0 += acceleration_end * (0.5 * substep_dt as f32);
+            probe_transform.translation = next_position;
+            probe_velocity.0 = half_velocity + acceleration_end * (0.5 * substep_dt as f32);
+            if *active_method == ActiveGravityMethod::FrequencyDomain && !inversion.ready {
+                let interval = TRAJECTORY_INVERSION_CAPTURE_SECONDS
+                    / (TRAJECTORY_INVERSION_SAMPLE_COUNT - 1) as f64;
+                while inversion.knots.len() < TRAJECTORY_INVERSION_SAMPLE_COUNT {
+                    let sample_time = inversion.knots.len() as f64 * interval;
+                    if sample_time > end_time + 1.0e-9 {
+                        break;
+                    }
+                    let fraction = ((sample_time - start_time) / substep_dt).clamp(0.0, 1.0) as f32;
+                    inversion.knots.push(TrajectoryInversionKnot {
+                        position: hermite_vector(
+                            previous_position,
+                            next_position,
+                            previous_velocity * substep_dt as f32,
+                            probe_velocity.0 * substep_dt as f32,
+                            fraction,
+                        ),
+                        velocity: previous_velocity.lerp(probe_velocity.0, fraction),
+                        simulation_time_seconds: sample_time,
+                        baseline_acceleration: acceleration_start.lerp(acceleration_end, fraction),
+                        body_rotation: rotation_after(
+                            frame_start_rotation,
+                            sample_time - frame_start_time,
+                        ),
+                    });
+                }
+            }
             if *active_method == ActiveGravityMethod::RadialAnalytic
                 && inversion.truth_orbit.len() < ORBIT_HISTORY_LEN
             {

@@ -1,4 +1,4 @@
-// Spatial-domain forward model over the common mass-preserving point quadrature.
+// Independent radial-shell volume quadrature. No frequency-domain spectra or point residues.
 
 struct GravityParams {
     probe_pos: vec3<f32>,
@@ -10,24 +10,38 @@ struct GravityParams {
 };
 
 @group(0) @binding(0) var<uniform> params: GravityParams;
-@group(0) @binding(1) var<storage, read> sources: array<vec4<f32>>;
+struct RadialCell {
+    direction_angle: vec4<f32>,
+    radii_density: vec4<f32>,
+};
+@group(0) @binding(1) var<storage, read> sources: array<RadialCell>;
+const NODES = array<f32, 8>(-0.9602898565, -0.7966664774, -0.5255324099, -0.1834346425,
+    0.1834346425, 0.5255324099, 0.7966664774, 0.9602898565);
+const WEIGHTS = array<f32, 8>(0.1012285363, 0.2223810345, 0.3137066459, 0.3626837834,
+    0.3626837834, 0.3137066459, 0.2223810345, 0.1012285363);
 @group(0) @binding(2) var<storage, read_write> output_acc: array<vec4<f32>>;
 
 var<workgroup> shared_acc: array<vec4<f32>, 64>;
 
 fn source_field(index: u32) -> vec4<f32> {
-    let source = sources[index];
-    if source.w <= 0.0 {
-        return vec4<f32>(0.0);
+    let cell = sources[index];
+    let inner = cell.radii_density.x;
+    let outer = cell.radii_density.y;
+    let half_width = 0.5 * (outer - inner);
+    let midpoint = 0.5 * (outer + inner);
+    var value = vec4<f32>(0.0);
+    for (var node = 0u; node < 8u; node += 1u) {
+        let radius = midpoint + half_width * NODES[node];
+        let displacement = radius * cell.direction_angle.xyz - params.probe_pos;
+        let distance2 = dot(displacement, displacement);
+        // A true source collision is invalid, not an epsilon-softened field.
+        let inverse_distance = inverseSqrt(distance2);
+        let mass_weight = cell.radii_density.z * cell.direction_angle.w
+            * radius * radius * half_width * WEIGHTS[node];
+        value += params.g_const * mass_weight * vec4<f32>(
+            displacement * (inverse_distance / distance2), inverse_distance);
     }
-    let displacement = source.xyz - params.probe_pos;
-    let distance2 = max(dot(displacement, displacement), 1.0e-8);
-    let inverse_distance = inverseSqrt(distance2);
-    let inverse_distance3 = inverse_distance / distance2;
-    return params.g_const * source.w * vec4<f32>(
-        displacement * inverse_distance3,
-        inverse_distance,
-    );
+    return value;
 }
 
 @compute @workgroup_size(64, 1, 1)

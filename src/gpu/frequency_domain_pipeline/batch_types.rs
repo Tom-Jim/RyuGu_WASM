@@ -3,15 +3,14 @@
 // evaluated on the device before reciprocal-space reduction.
 
 use crate::cpu::frequency_domain::{
-    AggregatedGravitySource, EQ184_BASE_LAPLACE_SIGMA, EQ184_QUADRATURE_COUNT,
-    eq184_quadrature_node,
+    EQ184_BASE_LAPLACE_SIGMA, EQ184_QUADRATURE_COUNT, eq184_quadrature_node,
 };
 use crate::interface::components::*;
 use bevy::log::{debug, error, info, trace};
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::render::{
-    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+    Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
         BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor,
@@ -19,7 +18,7 @@ use bevy::render::{
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, MapMode,
         PipelineCache, ShaderStages,
     },
-    renderer::{RenderDevice, RenderQueue}, GpuResourceAppExt,
+    renderer::{RenderDevice, RenderQueue},
 };
 use bevy::shader::{ShaderCacheError, ShaderDefVal};
 use std::sync::Arc;
@@ -60,7 +59,10 @@ fn build_known_trajectory_elements(
     build_trajectory_elements(positions, times)
 }
 
-fn build_trajectory_elements(positions: &[Vec3], times: &[f32]) -> Vec<FrequencyDomainBatchElement> {
+fn build_trajectory_elements(
+    positions: &[Vec3],
+    times: &[f32],
+) -> Vec<FrequencyDomainBatchElement> {
     if positions.is_empty()
         || positions.len() != times.len()
         || positions.iter().any(|position| !position.is_finite())
@@ -102,6 +104,7 @@ struct ExtractedFrequencyDomainInput {
     source_count: u32,
     radius: f32,
     source_hash: u64,
+    source_layout: u32,
 }
 
 #[derive(Resource, Default)]
@@ -119,11 +122,13 @@ struct FrequencyDomainGpuBuffersInner {
     density_spectra: Buffer,
     density_modes: Buffer,
     source_count: u32,
+    source_layout: u32,
     source_radius: f32,
     element_capacity: u32,
     source_hash: u64,
     target_count: u32,
     last_submitted: Option<(u64, u64)>,
+    density_spectrum_ready: bool,
 }
 
 #[derive(Resource)]
@@ -154,7 +159,10 @@ impl Plugin for FrequencyDomainGpuComputePlugin {
         render_app.add_systems(ExtractSchedule, extract_frequency_domain_input);
         render_app.add_systems(
             Render,
-            (initialize_frequency_domain_pipeline, dispatch_frequency_domain)
+            (
+                initialize_frequency_domain_pipeline,
+                dispatch_frequency_domain,
+            )
                 .chain()
                 .in_set(RenderSystems::Render),
         );
@@ -169,7 +177,10 @@ impl Plugin for FrequencyDomainGpuComputePlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let channel = app.world().resource::<FrequencyDomainGpuReadbackChannel>().clone();
+        let channel = app
+            .world()
+            .resource::<FrequencyDomainGpuReadbackChannel>()
+            .clone();
         let render_app = app.sub_app_mut(RenderApp);
         render_app.insert_resource(channel);
         // Queue every active entry point during application startup. This
@@ -310,6 +321,8 @@ fn poll_frequency_domain_readback(
     mut sensitivity: ResMut<FrequencyDomainSensitivityMatrix>,
     mut performance: ResMut<FrequencyDomainPerformanceMetrics>,
     mut runtime_error: ResMut<GravityRuntimeError>,
+    inversion: Res<TrajectoryInversionState>,
+    active: Res<ActiveGravityMethod>,
 ) {
     if channel.in_flight.load(Ordering::Acquire)
         && let Ok(mut submitted_at) = channel.submitted_at.try_lock()
@@ -336,7 +349,8 @@ fn poll_frequency_domain_readback(
     performance.latest = Some(packet.timings);
     if packet.sensitivity_column_count > 0 {
         let Some(capture_id) = packet.batch_capture_id else {
-            runtime_error.raise("Frequency-domain algorithm sensitivity readback has no capture identity.");
+            runtime_error
+                .raise("Frequency-domain algorithm sensitivity readback has no capture identity.");
             return;
         };
         let column_count = packet.sensitivity_column_count as usize;
@@ -348,7 +362,7 @@ fn poll_frequency_domain_readback(
         {
             return;
         }
-        if packet.partial_sums.len() != column_count * sample_count {
+        if sample_count == 0 || packet.partial_sums.len() != column_count * sample_count {
             runtime_error.raise(format!(
                 "Frequency-domain algorithm sensitivity batch returned {} vectors; expected {} x {}.",
                 packet.partial_sums.len(),
@@ -373,7 +387,8 @@ fn poll_frequency_domain_readback(
             .flatten()
             .any(|acceleration| !acceleration.is_finite())
         {
-            runtime_error.raise("Frequency-domain algorithm sensitivity matrix contains non-finite values.");
+            runtime_error
+                .raise("Frequency-domain algorithm sensitivity matrix contains non-finite values.");
             return;
         }
         sensitivity.capture_id = Some(capture_id);
@@ -387,6 +402,12 @@ fn poll_frequency_domain_readback(
         inversion.spectrum_rebuild_count = packet.timings.spectrum_rebuild_count;
         inversion.spectrum_build_ms = packet.timings.spectrum_build_ms;
         inversion.target_evaluation_ms = packet.timings.target_evaluation_ms;
+        return;
+    }
+    if *active != ActiveGravityMethod::FrequencyDomain
+        || packet.batch_capture_id != inversion.capture_id
+        || !inversion.ready
+    {
         return;
     }
     let decoded = match decode_frequency_domain_packet(&packet) {
@@ -423,10 +444,7 @@ fn poll_frequency_domain_readback(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FrequencyDomainDecodeError {
-    Incomplete {
-        actual: usize,
-        expected: usize,
-    },
+    Incomplete { actual: usize, expected: usize },
     Invalid { sample: usize, reason: &'static str },
 }
 

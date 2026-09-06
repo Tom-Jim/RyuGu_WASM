@@ -6,3 +6,5 @@ pub(crate) mod frequency_domain;
 pub(crate) mod inversion;
 pub(crate) mod physics;
 pub(crate) mod planning;
+
+pub(crate) mod density;

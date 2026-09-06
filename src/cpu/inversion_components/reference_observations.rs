@@ -2,7 +2,7 @@ fn training_and_holdout_reference(
     knots: &[TrajectoryInversionKnot],
     training_samples: &[TrajectoryInversionKnot],
     voxels: &[InvertedDensityVoxel],
-    radial_source: &RadialGravitySource,
+    radial_source: &DensityQuadratureSource,
 ) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
     if training_samples.is_empty() {
         return None;
@@ -18,7 +18,10 @@ fn training_and_holdout_reference(
     ))
 }
 
-fn reference_observations(samples: &[TrajectoryInversionKnot], tree: &FmmNode) -> Option<Vec<Vec3>> {
+fn reference_observations(
+    samples: &[TrajectoryInversionKnot],
+    tree: &FmmNode,
+) -> Option<Vec<Vec3>> {
     samples
         .iter()
         .map(|sample| evaluate_reference_tree(tree, sample))
@@ -61,8 +64,7 @@ fn normalized_field_error(
         let prediction = (0..voxel_count).fold(Vec3::ZERO, |sum, voxel| {
             sum + sensitivities[sample * voxel_count + voxel] * densities[voxel]
         });
-        let sigma = (observed.length() * OBSERVATION_NOISE_FRACTION)
-            .max(OBSERVATION_NOISE_FLOOR);
+        let sigma = (observed.length() * OBSERVATION_NOISE_FRACTION).max(OBSERVATION_NOISE_FLOOR);
         error += (prediction - *observed).length_squared() as f64 / f64::from(sigma * sigma);
     }
     error / observations.len() as f64
@@ -84,12 +86,19 @@ pub(crate) fn frequency_domain_training_and_holdout_reference(
     }
     let holdout = holdout_frozen_trajectory(knots)?;
     let (training, training_basis) = frequency_domain_observation_rows(
-        training_samples, &basis.columns, voxels, spectral_radius,
+        training_samples,
+        &basis.columns,
+        voxels,
+        spectral_radius,
     )?;
-    let (holdout_observations, holdout_basis) = frequency_domain_observation_rows(
-        &holdout, &basis.columns, voxels, spectral_radius,
-    )?;
-    Some((training, training_basis, holdout_observations, holdout_basis))
+    let (holdout_observations, holdout_basis) =
+        frequency_domain_observation_rows(&holdout, &basis.columns, voxels, spectral_radius)?;
+    Some((
+        training,
+        training_basis,
+        holdout_observations,
+        holdout_basis,
+    ))
 }
 
 fn frequency_domain_observation_rows(
@@ -104,8 +113,7 @@ fn frequency_domain_observation_rows(
     let quadrature = (0..EQ184_QUADRATURE_COUNT)
         .map(|index| {
             let (wave_vector, weight) = eq184_quadrature_node(index, spectral_radius)?;
-            let coefficient = G as f64 * 4.0 * std::f64::consts::PI
-                / std::f64::consts::TAU.powi(3)
+            let coefficient = G as f64 * 4.0 * std::f64::consts::PI / std::f64::consts::TAU.powi(3)
                 * weight
                 / wave_vector.length_squared().max(1.0e-18);
             Some((wave_vector, coefficient))
@@ -121,13 +129,11 @@ fn frequency_domain_observation_rows(
             quadrature
                 .iter()
                 .map(|(wave_vector, _)| {
-                    samples
-                        .iter()
-                        .enumerate()
-                        .try_fold(Complex64::new(0.0, 0.0), |sum, (sample_index, sample)| {
-                            let previous = samples
-                                .get(sample_index.wrapping_sub(1))
-                                .unwrap_or(sample);
+                    samples.iter().enumerate().try_fold(
+                        Complex64::new(0.0, 0.0),
+                        |sum, (sample_index, sample)| {
+                            let previous =
+                                samples.get(sample_index.wrapping_sub(1)).unwrap_or(sample);
                             let next = samples.get(sample_index + 1).unwrap_or(sample);
                             let body_position = sample
                                 .body_rotation
@@ -146,7 +152,8 @@ fn frequency_domain_observation_rows(
                                     laplace_frequency,
                                 )?,
                             )
-                        })
+                        },
+                    )
                 })
                 .collect::<Option<Vec<_>>>()
         })
@@ -187,9 +194,11 @@ fn frequency_domain_observation_rows(
             })
             .collect::<Vec<_>>();
         observations.push(
-            row.iter().zip(voxels).fold(Vec3::ZERO, |sum, (field, voxel)| {
-                sum + *field * voxel.reference_density
-            }),
+            row.iter()
+                .zip(voxels)
+                .fold(Vec3::ZERO, |sum, (field, voxel)| {
+                    sum + *field * voxel.reference_density
+                }),
         );
         matrix.extend(row);
     }

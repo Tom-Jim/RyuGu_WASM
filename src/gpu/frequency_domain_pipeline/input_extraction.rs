@@ -1,16 +1,16 @@
 fn extract_frequency_domain_input(
     mut extracted: ResMut<ExtractedFrequencyDomainInput>,
-    source: Extract<Option<Res<AggregatedGravitySource>>>,
+    volume_source: Extract<Option<Res<DensityQuadratureSource>>>,
     active: Extract<Res<ActiveGravityMethod>>,
     planning: Extract<Res<PlanningComparisonState>>,
     performance: Extract<Res<PerformanceComparisonState>>,
     clock: Extract<Res<SimulationClock>>,
-    time: Extract<Res<Time>>,
     inversion: Extract<Res<TrajectoryInversionState>>,
     sensitivity: Extract<Res<FrequencyDomainSensitivityMatrix>>,
+    density_mode: Extract<Res<DensityMode>>,
 ) {
-    extracted.enabled = **active == ActiveGravityMethod::FrequencyDomain
-        && !planning.blocks_realtime_gpu();
+    extracted.enabled =
+        **active == ActiveGravityMethod::FrequencyDomain && !planning.blocks_realtime_gpu();
     extracted.snapshot = None;
     extracted.target_bytes.clear();
     extracted.observation_count = 0;
@@ -21,12 +21,19 @@ fn extract_frequency_domain_input(
     extracted.sensitivity_source_counts.clear();
     extracted.sensitivity_source_hash = 0;
     extracted.sensitivity_basis_hash = 0;
+    extracted.source_layout = 1;
     if !extracted.enabled {
         return;
     }
-    let Some(source) = source.as_ref() else { return };
-    extracted.source_count = source.sources.len() as u32;
-    extracted.radius = source.radius as f32;
+    let Some(volume_source) = volume_source.as_ref() else {
+        return;
+    };
+    let (volume_bytes, volume_hash) = match **density_mode {
+        DensityMode::Variable => (&volume_source.bytes, volume_source.source_hash),
+        DensityMode::Constant => (&volume_source.constant_bytes, volume_source.constant_hash),
+    };
+    extracted.source_count = (volume_bytes.len() / 32) as u32;
+    extracted.radius = volume_source.radius;
 
     let pending_sensitivity = inversion.optimizer.as_ref().and_then(|job| {
         (job.method == ActiveGravityMethod::FrequencyDomain
@@ -35,7 +42,7 @@ fn extract_frequency_domain_input(
             && sensitivity.basis_hash == job.basis_sources.hash
             && sensitivity.configuration_hash == frequency_domain_sensitivity_configuration_hash()
             && sensitivity.columns.is_empty())
-            .then_some((job.capture_id, job))
+        .then_some((job.capture_id, job))
     });
     if let Some((capture_id, job)) = pending_sensitivity {
         let samples = &job.frozen_samples;
@@ -43,6 +50,7 @@ fn extract_frequency_domain_input(
             extracted.batch_capture_id = Some(capture_id);
             extracted.sensitivity_source_hash = job.source_hash;
             extracted.sensitivity_basis_hash = job.basis_sources.hash;
+            extracted.source_layout = 0;
             extracted
                 .sensitivity_sources
                 .reserve(job.basis_sources.columns.len());
@@ -61,7 +69,9 @@ fn extract_frequency_domain_input(
                     bytes.extend_from_slice(bytemuck::bytes_of(&record));
                 }
                 extracted.sensitivity_sources.push(bytes);
-                extracted.sensitivity_source_counts.push(column.len() as u32);
+                extracted
+                    .sensitivity_source_counts
+                    .push(column.len() as u32);
             }
             if let Some(first) = extracted.sensitivity_sources.first() {
                 extracted.sources = Some(first.clone());
@@ -71,13 +81,14 @@ fn extract_frequency_domain_input(
                     ^ job.basis_sources.hash.rotate_right(7);
             }
         }
-    } else if inversion.ready && let Some(capture_id) = inversion.capture_id {
-        let (sample_count, revision) = if performance.active && performance.measuring {
-            // Benchmark the complete transform on every accepted request so
-            // FPS includes real frequency-domain GPU work.
-            (inversion.knots.len(), clock.request_id)
+    } else if inversion.ready
+        && let Some(capture_id) = inversion.capture_id
+    {
+        let sample_count = inversion.knots.len();
+        let revision = if performance.active && performance.measuring {
+            clock.request_id
         } else {
-            live_trajectory_prefix(&inversion.knots, time.elapsed_secs_f64())
+            0
         };
         if upload_known_trajectory(
             &mut extracted,
@@ -89,45 +100,15 @@ fn extract_frequency_domain_input(
         }
     }
 
-    let source_hash = source.source_hash;
+    let source_hash = volume_hash;
     if extracted.sensitivity_sources.is_empty()
         && (extracted.sources.is_none() || extracted.source_hash != source_hash)
     {
-        let mut bytes = Vec::with_capacity(source.sources.len() * 16);
-        for item in &source.sources {
-            let record = [
-                item.position.x as f32,
-                item.position.y as f32,
-                item.position.z as f32,
-                item.mass as f32,
-            ];
-            bytes.extend_from_slice(bytemuck::bytes_of(&record));
-        }
-        extracted.sources = Some(bytes);
+        extracted.sources = Some(volume_bytes.clone());
     }
     if extracted.sensitivity_sources.is_empty() {
         extracted.source_hash = source_hash;
     }
-}
-
-fn live_trajectory_prefix(samples: &[TrajectoryInversionKnot], wall_seconds: f64) -> (usize, u64) {
-    let Some((first, last)) = samples.first().zip(samples.last()) else {
-        return (0, 0);
-    };
-    let duration = last.simulation_time_seconds - first.simulation_time_seconds;
-    if samples.len() < 2 || !duration.is_finite() || duration <= 0.0 {
-        return (samples.len(), 0);
-    }
-    let elapsed = wall_seconds.max(0.0);
-    let cycle = (elapsed / duration).floor() as u64;
-    let local_time = first.simulation_time_seconds + elapsed.rem_euclid(duration);
-    let sample_count = samples
-        .partition_point(|sample| sample.simulation_time_seconds <= local_time)
-        .clamp(2, samples.len());
-    (
-        sample_count,
-        cycle.wrapping_mul(samples.len() as u64) + sample_count as u64,
-    )
 }
 
 fn upload_known_trajectory(
@@ -136,10 +117,16 @@ fn upload_known_trajectory(
     epoch: u64,
 ) -> bool {
     if samples.len() < 2
-        || samples[0].simulation_time_seconds < 0.0
-        || samples.windows(2).any(|pair| {
-            pair[1].simulation_time_seconds < pair[0].simulation_time_seconds
+        || samples.iter().any(|sample| {
+            !sample.position.is_finite()
+                || !sample.body_rotation.is_finite()
+                || !sample.simulation_time_seconds.is_finite()
+                || !(sample.simulation_time_seconds as f32).is_finite()
         })
+        || samples[0].simulation_time_seconds < 0.0
+        || samples
+            .windows(2)
+            .any(|pair| pair[1].simulation_time_seconds < pair[0].simulation_time_seconds)
     {
         return false;
     }
@@ -150,7 +137,9 @@ fn upload_known_trajectory(
         positions.push(body_position);
         times.push(sample.simulation_time_seconds as f32);
         let record = [
-            body_position.x, body_position.y, body_position.z,
+            body_position.x,
+            body_position.y,
+            body_position.z,
             sample.simulation_time_seconds as f32,
         ];
         extracted

@@ -1,7 +1,7 @@
 pub fn update_planning_results_from_inversion_system(
     mut commands: Commands,
     inversion: Res<TrajectoryInversionState>,
-    radial: Option<Res<RadialGravitySource>>,
+    radial: Option<Res<DensityQuadratureSource>>,
     aggregated: Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>,
     mut planning: ResMut<PlanningComparisonState>,
     mut batch_builder: Local<Option<crate::cpu::planning::PlanningBatchBuilder>>,
@@ -100,8 +100,8 @@ pub fn update_planning_results_from_inversion_system(
         *batch_builder = None;
         return;
     }
-    planning.preparation_progress = f64::from(builder.completed_candidates())
-        / f64::from(dimensions.0.max(1));
+    planning.preparation_progress =
+        f64::from(builder.completed_candidates()) / f64::from(dimensions.0.max(1));
     if !builder.is_complete() {
         planning.status = format!(
             "{} candidate preparation: {} / {} trajectories.",

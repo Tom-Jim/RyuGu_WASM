@@ -43,16 +43,16 @@ components:
 
 ### Creative North Star
 
-The interface should feel like a flight-dynamics test bench: dark instrument glass, thin cyan geometry, compact numerical readouts, and paired telemetry plots. The 3D body remains the visual center; controls frame it instead of covering it.
+The interface should feel like a flight-dynamics test bench: dark instrument glass, thin cyan geometry, compact numerical readouts, and focused telemetry plots. The 3D body remains the visual center; controls frame it instead of covering it.
 
 ### Product context and register
 
 - **Audience and primary job:** numerical-method researchers comparing gravity evaluators, checking Eq.106 propagation quality, and running density inversion.
 - **Target market(s) and evidence:** research and engineering use; no region-specific workflow is encoded.
 - **Locale(s) and language policy:** current controls are concise technical English; the shell supports Chinese user context without changing symbols, units, or method names.
-- **Usage scene:** desktop, GPU-capable browser, information-dense and frequently monitored during long calculations.
+- **Usage scene:** desktop and mobile GPU-capable browsers, with readable controls and explicit gesture ownership during long calculations.
 - **Register:** scientific product UI, not a marketing surface.
-- **Memorable signature:** Eq.106 residual and Jacobi charts form a paired live certification console.
+- **Memorable signature:** The scene caption exposes the active operator chain; telemetry tracks the selected observable.
 - **Restraint:** buttons, sliders, errors, and benchmark controls remain conventional and explicitly labeled.
 - **Anti-references:** avoid game HUD ornament, neon glow overload, pill-heavy dashboards, and decorative motion that competes with measured data.
 - **Token ownership/runtime mapping:** `src/html/ui.css` owns instrument tokens and `src/html/tailwind.css` is compiled by Bun into `src/html/tailwind.generated.css`. This file mirrors accepted values and explains their use.
@@ -67,11 +67,15 @@ Sans text labels controls and hierarchy; monospaced text carries measurements, u
 
 ## Layout
 
-The app uses a stable 16:9 research viewport with a non-overlapping three-column workbench: initial conditions and trajectory editing at left, the asteroid and paired certification plots at center, and inversion/planning at right. At narrower widths the grid stacks into readable work areas. Dialogs preserve geometry while workloads run, and only long internal panels scroll.
+The workbench follows the current viewport dimensions, swapping width and height for quarter-turn display rotation. Desktop uses three columns: initial conditions, surface fields and trajectory editing at left; the asteroid and telemetry at center; inversion and planning at right. Method navigation occupies its own row. Container queries follow the rotated workbench width, not the unrotated screen width. At 820px and below, the scene, telemetry and control rails stack in a scrollable workbench. Safe-area padding keeps controls clear of screen cutouts. Floating panel dragging and resizing remain available, and Reset UI view restores their placement.
+
+Gestures default to the native Bevy camera. The explicit Gestures button transfers scene pinch, wheel and pan input to the whole workbench. A gesture finishes before ownership changes, so camera touches cannot become stuck. Workbench zoom is anchored at the gesture center; panel dragging accounts for rotation and scale. Navigation is a standalone script and remains usable while the Vue interface initializes.
+
+Background calculation retains the Worker/RAF scheduler, visibility recovery and local loopback keepalive. The optional Keep screen awake control requests a screen wake lock while visible and reacquires it after returning; it does not replace background scheduling. Status text reports browser support and acquisition failures.
 
 ## Elevation & Depth
 
-Hierarchy comes from tonal surfaces, thin cyan borders, and restrained backdrop blur. Modal dimming separates test workflows from the live scene. Charts and dense status blocks use flat inner surfaces; they do not receive independent shadows.
+Hierarchy comes from tonal surfaces, thin cyan borders, without costly panel backdrop blur. Modal dimming separates test workflows from the live scene. Charts and dense status blocks use flat inner surfaces; they do not receive independent shadows.
 
 ## Shapes
 

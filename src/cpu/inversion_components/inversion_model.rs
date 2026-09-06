@@ -9,11 +9,11 @@
 // trajectory sample by an f64 reference point-source evaluator; captured
 // acceleration from a previously selected method is never an inverse input.
 
-use crate::interface::components::*;
 use crate::cpu::frequency_domain::{
-    AggregatedGravitySource, EQ184_QUADRATURE_COUNT, eq184_laplace_sigma,
-    eq184_quadrature_node, eq184_trajectory_term,
+    AggregatedGravitySource, EQ184_QUADRATURE_COUNT, eq184_laplace_sigma, eq184_quadrature_node,
+    eq184_trajectory_term,
 };
+use crate::interface::components::*;
 use bevy::math::DVec3;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -51,7 +51,7 @@ fn read_f32(bytes: &[u8], offset: usize) -> f32 {
 }
 
 pub(crate) fn build_density_voxels(
-    source: &RadialGravitySource,
+    source: &DensityQuadratureSource,
     method: ActiveGravityMethod,
 ) -> Option<(Vec<InvertedDensityVoxel>, f32)> {
     let radius = source
@@ -254,8 +254,11 @@ pub(crate) fn quintic_segment_position_acceleration(
         / duration;
     let acceleration =
         (c2 * 2.0 + c3 * (6.0 * u) + c4 * (12.0 * u * u) + c5 * (20.0 * u * u * u)) / h2;
-    (position.is_finite() && velocity.is_finite() && acceleration.is_finite())
-        .then_some((position, velocity, acceleration))
+    (position.is_finite() && velocity.is_finite() && acceleration.is_finite()).then_some((
+        position,
+        velocity,
+        acceleration,
+    ))
 }
 
 /// Expands the immutable sixteen-knot capture into the exact sample array
@@ -274,9 +277,7 @@ pub(crate) fn sample_frozen_trajectory_with_subdivisions(
         return None;
     }
     let accelerations = quintic_knot_accelerations(knots)?;
-    let mut samples = Vec::with_capacity(
-        (knots.len().saturating_sub(1)) * subdivisions + 1,
-    );
+    let mut samples = Vec::with_capacity((knots.len().saturating_sub(1)) * subdivisions + 1);
     for segment in 0..knots.len().saturating_sub(1) {
         let start = knots[segment];
         let end = knots[segment + 1];
@@ -294,8 +295,7 @@ pub(crate) fn sample_frozen_trajectory_with_subdivisions(
             samples.push(TrajectoryInversionKnot {
                 position,
                 velocity,
-                simulation_time_seconds: start.simulation_time_seconds
-                    + duration as f64 * u as f64,
+                simulation_time_seconds: start.simulation_time_seconds + duration as f64 * u as f64,
                 baseline_acceleration: acceleration,
                 body_rotation: start.body_rotation.slerp(end.body_rotation, u),
             });
@@ -355,7 +355,8 @@ fn holdout_frozen_trajectory(
     knots: &[TrajectoryInversionKnot],
 ) -> Option<Vec<TrajectoryInversionKnot>> {
     let accelerations = quintic_knot_accelerations(knots)?;
-    let mut samples = Vec::with_capacity(knots.len().saturating_sub(1) * HOLDOUT_SAMPLES_PER_SEGMENT);
+    let mut samples =
+        Vec::with_capacity(knots.len().saturating_sub(1) * HOLDOUT_SAMPLES_PER_SEGMENT);
     for segment in 0..knots.len().saturating_sub(1) {
         let start = knots[segment];
         let end = knots[segment + 1];
@@ -377,8 +378,7 @@ fn holdout_frozen_trajectory(
             samples.push(TrajectoryInversionKnot {
                 position: position + holdout_offset,
                 velocity,
-                simulation_time_seconds: start.simulation_time_seconds
-                    + duration as f64 * u as f64,
+                simulation_time_seconds: start.simulation_time_seconds + duration as f64 * u as f64,
                 baseline_acceleration: acceleration,
                 body_rotation,
             });
@@ -416,9 +416,7 @@ fn objective_for_density_slice(job: &ConvexOptimizationJob, densities: &[f32]) -
     } else {
         job.neighbours
             .iter()
-            .map(|&(a, b)| {
-                ((densities[a] - densities[b]) as f64 / mean_density).powi(2)
-            })
+            .map(|&(a, b)| ((densities[a] - densities[b]) as f64 / mean_density).powi(2))
             .sum::<f64>()
             / job.neighbours.len() as f64
     };
@@ -446,9 +444,7 @@ fn objective_for_density_slice(job: &ConvexOptimizationJob, densities: &[f32]) -
     } else {
         radial_pairs
             .iter()
-            .map(|&(a, b)| {
-                ((densities[a] - densities[b]) as f64 / mean_density).powi(2)
-            })
+            .map(|&(a, b)| ((densities[a] - densities[b]) as f64 / mean_density).powi(2))
             .sum::<f64>()
             / radial_pairs.len() as f64
     };

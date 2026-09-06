@@ -12,6 +12,7 @@ use bevy::shader::Shader;
 #[derive(Clone, Copy)]
 pub(crate) enum EmbeddedShader {
     Gravity,
+    Equation106,
     Werner,
     FrequencyDomain,
     Mmfft,
@@ -26,6 +27,7 @@ pub(crate) enum EmbeddedShader {
 
 pub(crate) fn load(server: &AssetServer, shader: EmbeddedShader) -> Handle<Shader> {
     match shader {
+        EmbeddedShader::Equation106 => load_embedded_asset!(server, "equation106.wgsl"),
         EmbeddedShader::Gravity => load_embedded_asset!(server, "gravity.wgsl"),
         EmbeddedShader::Werner => load_embedded_asset!(server, "werner_gravity.wgsl"),
         EmbeddedShader::FrequencyDomain => load_embedded_asset!(server, "frequency_domain.wgsl"),
@@ -47,6 +49,7 @@ pub(crate) struct WgslPlugin;
 impl Plugin for WgslPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "gravity.wgsl");
+        embedded_asset!(app, "equation106.wgsl");
         embedded_asset!(app, "werner_gravity.wgsl");
         embedded_asset!(app, "frequency_domain.wgsl");
         embedded_asset!(app, "mmfft_compressed.wgsl");
@@ -57,6 +60,7 @@ impl Plugin for WgslPlugin {
         embedded_asset!(app, "planning_fft_basis.wgsl");
         embedded_asset!(app, "planning_fmm_basis.wgsl");
         embedded_asset!(app, "planning_metrics.wgsl");
+        embedded_asset!(app, "mobile_unlit.wgsl");
     }
 }
 
@@ -69,7 +73,15 @@ mod shader_validation_tests {
 
     #[test]
     fn planning_modules_validate_with_the_runtime_shader_frontend() {
-        let modules: [(&str, &str, &[&str], u32, u32); 4] = [
+        let modules: [(&str, &str, &[&str], u32, u32); 6] = [
+            (
+                "equation106",
+                include_str!("equation106.wgsl"),
+                &["density", "field"],
+                32,
+                5,
+            ),
+            ("radial", include_str!("gravity.wgsl"), &["main"], 32, 3),
             (
                 "planning_fft_basis",
                 include_str!("planning_fft_basis.wgsl"),
@@ -183,6 +195,17 @@ mod shader_validation_tests {
             )
             .validate(&module)
             .unwrap_or_else(|error| panic!("{definition}: {}", error.emit_to_string(&source)));
+            let params = module
+                .types
+                .iter()
+                .find_map(|(_, ty)| {
+                    (ty.name.as_deref() == Some("FrequencyDomainParams")).then_some(ty)
+                })
+                .unwrap_or_else(|| panic!("{definition}: missing FrequencyDomainParams"));
+            let naga::TypeInner::Struct { span, .. } = &params.inner else {
+                panic!("{definition}: FrequencyDomainParams is not a struct");
+            };
+            assert_eq!(*span, 52, "{definition}: host/WGSL parameter stride");
             assert_eq!(module.entry_points.len(), entry_names.len(), "{definition}");
             for entry in entry_names {
                 assert!(

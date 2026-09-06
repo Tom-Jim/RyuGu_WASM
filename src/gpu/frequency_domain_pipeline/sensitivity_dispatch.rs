@@ -36,6 +36,8 @@ fn dispatch_frequency_domain_sensitivity_matrix(
         return;
     }
     inner.last_submitted = Some(key);
+    // Compact columns overwrite the shared spectrum, invalidating the mass spectrum.
+    inner.density_spectrum_ready = false;
     render_queue.write_buffer(&inner.targets, 0, &extracted.target_bytes);
 
     let compact_column_size = target_count as u64 * 16;
@@ -70,11 +72,13 @@ fn dispatch_frequency_domain_sensitivity_matrix(
                 1,
                 element.target_count,
                 element.target_offset,
+                0,
+                0,
             );
             let uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("frequency_domain_sensitivity_element_uniform"),
                 contents: &{
-                    let mut data = vec![0_u8; 48 * 256];
+                    let mut data = vec![0_u8; 52 * 256];
                     data[..bytes.len()].copy_from_slice(&bytes);
                     data
                 },
@@ -127,12 +131,9 @@ fn dispatch_frequency_domain_sensitivity_matrix(
         label: Some("frequency_domain_sensitivity_matrix_encoder"),
     });
     let elements_per_column = extracted.batch_elements.len();
-    let mut spectrum_encoding_ms = 0.0;
-    let mut evaluation_encoding_ms = 0.0;
     for column in 0..column_count {
         for (element_index, _element) in extracted.batch_elements.iter().enumerate() {
             let bind_group = &bind_groups[column * elements_per_column + element_index];
-            let spectrum_encoding_started = Instant::now();
             {
                 let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("frequency_domain_sensitivity_density_spectra_pass"),
@@ -151,8 +152,6 @@ fn dispatch_frequency_domain_sensitivity_matrix(
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.dispatch_workgroups(QUADRATURE_COUNT.div_ceil(64), 1, 1);
             }
-            spectrum_encoding_ms += spectrum_encoding_started.elapsed().as_secs_f64() * 1.0e3;
-            let evaluation_encoding_started = Instant::now();
             {
                 let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("frequency_domain_sensitivity_evaluate_pass"),
@@ -165,7 +164,6 @@ fn dispatch_frequency_domain_sensitivity_matrix(
                 // Laplace frequency.
                 pass.dispatch_workgroups(1, target_count as u32, 1);
             }
-            evaluation_encoding_ms += evaluation_encoding_started.elapsed().as_secs_f64() * 1.0e3;
         }
         encoder.copy_buffer_to_buffer(
             &inner.output,
@@ -199,8 +197,7 @@ fn dispatch_frequency_domain_sensitivity_matrix(
                 Ok(()) => {
                     let view = staging.slice(..).get_mapped_range();
                     let values = bytes_to_f32x4(&view);
-                    let cpu_readback_wait_ms =
-                        readback_started.elapsed().as_secs_f64() * 1.0e3;
+                    let cpu_readback_wait_ms = readback_started.elapsed().as_secs_f64() * 1.0e3;
                     if let Ok(mut guard) = shared.lock() {
                         *guard = Some(FrequencyDomainReadbackPacket {
                             partial_sums: values,
@@ -211,11 +208,11 @@ fn dispatch_frequency_domain_sensitivity_matrix(
                             sensitivity_basis_hash,
                             sensitivity_configuration_hash,
                             timings: FrequencyDomainTimingSample {
-                                spectrum_build_ms: Some(spectrum_encoding_ms),
-                                target_evaluation_ms: Some(evaluation_encoding_ms),
+                                spectrum_build_ms: None,
+                                target_evaluation_ms: None,
                                 cpu_readback_wait_ms,
                                 target_count: target_count as u32,
-                                dispatch_count: 1,
+                                dispatch_count: 3 * column_count as u32 * element_count,
                                 spectrum_rebuild_count: column_count as u32 * element_count,
                             },
                         });

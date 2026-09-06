@@ -21,6 +21,46 @@ export function installBackgroundExecution() {
   let detail = 'Connecting local sleep prevention…';
   const control = document.getElementById('background-toggle');
   const status = document.getElementById('background-status');
+  const screenControl = document.getElementById('screen-awake');
+  const screenStatus = document.getElementById('screen-awake-status');
+  let screenWanted = false;
+  let screenLock = null;
+  let screenRequest = null;
+  async function updateScreenLock() {
+    if (!screenWanted || suspended || frozen || document.visibilityState !== 'visible') {
+      const current = screenLock;
+      screenLock = null;
+      await current?.release().catch(() => {});
+      return;
+    }
+    if (screenLock || screenRequest) return;
+    if (!navigator.wakeLock?.request) {
+      if (screenStatus) screenStatus.textContent = 'Screen wake lock is unavailable in this browser.';
+      return;
+    }
+    try {
+      screenRequest = navigator.wakeLock.request('screen');
+      const lease = await screenRequest;
+      if (!screenWanted || suspended || frozen || document.visibilityState !== 'visible') {
+        await lease.release();
+        return;
+      }
+      screenLock = lease;
+      if (screenStatus) screenStatus.textContent = 'Screen wake lock active while this page is visible.';
+      lease.addEventListener('release', () => {
+        if (screenLock !== lease) return;
+        screenLock = null;
+        if (screenStatus) screenStatus.textContent = 'Screen wake lock released by the browser; resume this page to reacquire.';
+      });
+    } catch (error) {
+      if (screenStatus) screenStatus.textContent = `Screen wake lock unavailable: ${error.message}`;
+    } finally { screenRequest = null; }
+  }
+  screenControl?.addEventListener('change', () => {
+    screenWanted = screenControl.checked;
+    if (!screenWanted && screenStatus) screenStatus.textContent = 'Screen wake lock off; background scheduling is unchanged.';
+    void updateScreenLock();
+  });
   const hiddenMode = () => enabled && !suspended && !frozen && worker && document.visibilityState === 'hidden';
 
   function maintenance() {
@@ -169,13 +209,15 @@ export function installBackgroundExecution() {
   };
   window.ryuguBackground = api;
   control?.addEventListener('change', () => api.setEnabled(control.checked));
-  document.addEventListener('visibilitychange', () => { startWorker(); rearm(); maintenance(); });
+  document.addEventListener('visibilitychange', () => { startWorker(); rearm(); maintenance(); void updateScreenLock(); });
   document.addEventListener('freeze', () => {
     frozen = true;
+    void updateScreenLock();
     rearm();
   });
   document.addEventListener('resume', () => {
     frozen = false;
+    void updateScreenLock();
     startWorker();
     worker?.postMessage({ type: 'reconnect' });
     rearm();
@@ -184,11 +226,12 @@ export function installBackgroundExecution() {
   window.addEventListener('online', () => { worker?.postMessage({ type: 'reconnect' }); maintenance(); });
   window.addEventListener('pagehide', () => {
     suspended = true;
+    void updateScreenLock();
     clearTimeout(restartTimer);
     restartTimer = null;
     stopWorker(); rearm();
   });
-  window.addEventListener('pageshow', () => { suspended = false; frozen = false; startWorker(); rearm(); });
+  window.addEventListener('pageshow', () => { suspended = false; frozen = false; startWorker(); rearm(); void updateScreenLock(); });
   startWorker();
   publishStatus();
   return api;

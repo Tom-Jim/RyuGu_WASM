@@ -453,17 +453,25 @@ impl PlanningMethodMetrics {
             self.valid_candidate_count
         };
         let (gravity_p99, gravity_max, gradient_p99, gradient_max) = if certified {
-            (self.certified_gravity_error_p99, self.certified_gravity_error_max,
-                self.certified_gradient_error_p99, self.certified_gradient_error_max)
+            (
+                self.certified_gravity_error_p99,
+                self.certified_gravity_error_max,
+                self.certified_gradient_error_p99,
+                self.certified_gradient_error_max,
+            )
         } else {
-            (self.gravity_error_p99, self.gravity_error_max, self.gradient_error_p99, self.gradient_error_max)
+            (
+                self.gravity_error_p99,
+                self.gravity_error_max,
+                self.gradient_error_p99,
+                self.gradient_error_max,
+            )
         };
         let failures = [
             !self.gpu_batch_verified || !self.workload.is_complete(),
             !within(gravity, limits.gravity),
             !within(gradient, limits.gradient),
-            !within(gravity_p99, limits.gravity_p99)
-                || !within(gravity_max, limits.gravity_max),
+            !within(gravity_p99, limits.gravity_p99) || !within(gravity_max, limits.gravity_max),
             !within(gradient_p99, limits.gradient_p99)
                 || !within(gradient_max, limits.gradient_max),
             self.method != ActiveGravityMethod::FrequencyDomain
@@ -659,45 +667,101 @@ impl PlanningComparisonState {
         let ns = self.requested_source_count;
         let one_batch = planning_batch_work(ns, b, k, nt);
         let total = if source_curve {
-            PLANNING_SOURCE_COUNTS.iter().map(|&sources| {
-                if self.source_curve_all_parameters {
-                    PLANNING_TARGET_COUNTS.iter().map(|&targets| {
-                        PLANNING_DENSITY_MODEL_COUNTS.iter().map(|&density| {
-                            planning_source_cell_work(sources, density, targets)
-                        }).sum::<f64>()
-                    }).sum::<f64>()
-                } else { planning_source_cell_work(sources, k, nt) }
-            }).sum::<f64>()
-        } else { one_batch };
-        if self.computation_complete { return (total, total); }
+            PLANNING_SOURCE_COUNTS
+                .iter()
+                .map(|&sources| {
+                    if self.source_curve_all_parameters {
+                        PLANNING_TARGET_COUNTS
+                            .iter()
+                            .map(|&targets| {
+                                PLANNING_DENSITY_MODEL_COUNTS
+                                    .iter()
+                                    .map(|&density| {
+                                        planning_source_cell_work(sources, density, targets)
+                                    })
+                                    .sum::<f64>()
+                            })
+                            .sum::<f64>()
+                    } else {
+                        planning_source_cell_work(sources, k, nt)
+                    }
+                })
+                .sum::<f64>()
+        } else {
+            one_batch
+        };
+        if self.computation_complete {
+            return (total, total);
+        }
         let finished = if source_curve {
-            self.source_curve_samples.iter().map(|sample| {
-                planning_repeat_work(sample.source_count, 1, sample.density_model_count, sample.target_count, sample.repeat)
-            }).sum::<f64>()
-        } else { 0.0 };
+            self.source_curve_samples
+                .iter()
+                .map(|sample| {
+                    planning_repeat_work(
+                        sample.source_count,
+                        1,
+                        sample.density_model_count,
+                        sample.target_count,
+                        sample.repeat,
+                    )
+                })
+                .sum::<f64>()
+        } else {
+            0.0
+        };
         let preparation = planning_preparation_work(ns, b, k, nt);
         let current = self.batch_job.as_ref().map_or(
-            preparation * self.preparation_progress.clamp(0.0, 1.0), |job| {
+            preparation * self.preparation_progress.clamp(0.0, 1.0),
+            |job| {
                 let budget = PlanningOperationBudget::for_method(job.method, ns, nt, b);
-                let done = job.method_order[..job.method_order_index].iter().map(|&method| {
-                    PlanningOperationBudget::for_method(method, ns, nt, b)
-                        .total(b, k, job.candidate_tile_size.min(b))
-                }).sum::<f64>();
+                let done = job.method_order[..job.method_order_index]
+                    .iter()
+                    .map(|&method| {
+                        PlanningOperationBudget::for_method(method, ns, nt, b).total(
+                            b,
+                            k,
+                            job.candidate_tile_size.min(b),
+                        )
+                    })
+                    .sum::<f64>();
                 // Reference generation is shared. Credit it during the first
                 // method's raw pass only, after the reference results exist.
-                let reference_fraction = if job.method_order_index > 0 || job.warm_repetition { 1.0 }
-                    else { (f64::from(job.density_model) * f64::from(b)
-                        + f64::from(job.candidate_start) + job.reference_inflight_fraction)
-                        / (f64::from(k) * f64::from(b)).max(1.0) };
-                preparation + done + budget.completed(job)
-                    + reference_fraction * planning_validation_work(
-                        if source_curve && self.source_curve_repeat > 0 { 0 } else { ns }, b, k, nt)
-            });
-        ((finished + current).max(self.stopped_operation_work).min(total), total)
+                let reference_fraction = if job.method_order_index > 0 || job.warm_repetition {
+                    1.0
+                } else {
+                    (f64::from(job.density_model) * f64::from(b)
+                        + f64::from(job.candidate_start)
+                        + job.reference_inflight_fraction)
+                        / (f64::from(k) * f64::from(b)).max(1.0)
+                };
+                preparation
+                    + done
+                    + budget.completed(job)
+                    + reference_fraction
+                        * planning_validation_work(
+                            if source_curve && self.source_curve_repeat > 0 {
+                                0
+                            } else {
+                                ns
+                            },
+                            b,
+                            k,
+                            nt,
+                        )
+            },
+        );
+        (
+            (finished + current)
+                .max(self.stopped_operation_work)
+                .min(total),
+            total,
+        )
     }
 
     pub fn progress_fraction(&self) -> f64 {
-        if self.computation_complete { return 1.0; }
+        if self.computation_complete {
+            return 1.0;
+        }
         let (completed, total) = self.operation_work();
         // The UI also floors the displayed percentage; only an explicit final
         // completion flag can produce 100%, including when a run is cancelled.
@@ -709,12 +773,14 @@ impl PlanningComparisonState {
         // the compute queue. First/Stress must not compete with real-time
         // kernels or trigger a probe collision halfway through validation.
         // Before a First/Stress capture is ready, live integration still runs.
-        self.run_requested && (self.batch_job.is_some()
-            || self.workload_profile == PlanningWorkloadProfile::SourceCrossover)
+        self.run_requested
+            && (self.batch_job.is_some()
+                || self.workload_profile == PlanningWorkloadProfile::SourceCrossover)
     }
 
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
-        let frequency_domain = self.results[ActiveGravityMethod::FrequencyDomain.performance_index()]?;
+        let frequency_domain =
+            self.results[ActiveGravityMethod::FrequencyDomain.performance_index()]?;
         let mmfft = self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?;
         let fmm = self.results[ActiveGravityMethod::Fmm.performance_index()]?;
         let dimensions = self.dimensions();
@@ -735,9 +801,18 @@ impl PlanningComparisonState {
     pub fn fair_verdict(&self) -> Option<String> {
         self.completed_workload()?;
         let methods = [
-            ("Frequency-domain algorithm", self.results[2]?),
-            ("FFT", self.results[3]?),
-            ("FMM", self.results[4]?),
+            (
+                "Frequency-domain algorithm",
+                self.results[ActiveGravityMethod::FrequencyDomain.performance_index()]?,
+            ),
+            (
+                "FFT",
+                self.results[ActiveGravityMethod::MmfftCompressed.performance_index()]?,
+            ),
+            (
+                "FMM",
+                self.results[ActiveGravityMethod::Fmm.performance_index()]?,
+            ),
         ];
         let common_samples = methods[0].1.verification_sample_count > 0
             && methods.iter().all(|(_, result)| {
@@ -905,15 +980,18 @@ mod planning_sweep_tests {
                 };
                 let dimensions = state.dimensions();
                 let repeats = PLANNING_SOURCE_COUNTS.len() * PLANNING_SOURCE_REPEATS as usize;
-                let expected_work = PLANNING_SOURCE_COUNTS.iter().map(|&sources|
-                    planning_source_cell_work(sources, dimensions.1, dimensions.2))
+                let expected_work = PLANNING_SOURCE_COUNTS
+                    .iter()
+                    .map(|&sources| planning_source_cell_work(sources, dimensions.1, dimensions.2))
                     .sum::<f64>();
                 assert_eq!(state.operation_work(), (0.0, expected_work));
                 let mut visited = 0;
                 loop {
                     assert_eq!(state.dimensions(), dimensions);
                     visited += 1;
-                    if !state.advance_source_curve() { break; }
+                    if !state.advance_source_curve() {
+                        break;
+                    }
                 }
                 assert_eq!(visited, repeats);
                 // Exhausting the workload is insufficient: final readback and

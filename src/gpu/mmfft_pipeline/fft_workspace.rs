@@ -25,7 +25,11 @@ impl Fft3dWorkspace {
 
     fn transform(&mut self, values: &mut [Complex64], inverse: bool) {
         debug_assert_eq!(values.len(), self.n.pow(3));
-        let transform = Arc::clone(if inverse { &self.inverse } else { &self.forward });
+        let transform = Arc::clone(if inverse {
+            &self.inverse
+        } else {
+            &self.forward
+        });
         for line in values.chunks_exact_mut(self.n) {
             process_fft_line_with_scratch(line, transform.as_ref(), inverse, &mut self.scratch);
         }
@@ -64,7 +68,7 @@ impl Fft3dWorkspace {
     }
 }
 
-struct MmfftLevelWorkspace {
+pub(crate) struct MmfftLevelWorkspace {
     n: usize,
     p: usize,
     half_extent: f64,
@@ -76,7 +80,7 @@ struct MmfftLevelWorkspace {
 }
 
 impl MmfftLevelWorkspace {
-    fn new(n: usize, half_extent: f64) -> Self {
+    pub(crate) fn new(n: usize, half_extent: f64) -> Self {
         let p = 2 * n;
         let spacing = 2.0 * half_extent / n as f64;
         let mut fft = Fft3dWorkspace::new(p);
@@ -92,8 +96,7 @@ impl MmfftLevelWorkspace {
                         }
                     };
                     let displacement =
-                        DVec3::new(signed(x) as f64, signed(y) as f64, signed(z) as f64)
-                            * spacing;
+                        DVec3::new(signed(x) as f64, signed(y) as f64, signed(z) as f64) * spacing;
                     kernel_spectrum[grid_index(x, y, z, p)].re =
                         displacement.length().max(0.5 * spacing).recip();
                 }
@@ -112,7 +115,7 @@ impl MmfftLevelWorkspace {
         }
     }
 
-    fn build(&mut self, records: &[(DVec3, f64)]) -> &[[f32; 4]] {
+    pub(crate) fn build(&mut self, records: &[(DVec3, f64)]) -> &[[f32; 4]] {
         self.density.fill(Complex64::default());
         deposit_density(
             &mut self.density,
@@ -130,9 +133,8 @@ impl MmfftLevelWorkspace {
         for z in 0..self.n {
             for y in 0..self.n {
                 for x in 0..self.n {
-                    self.field[grid_index(x, y, z, self.n)][3] = (G as f64
-                        * self.density[grid_index(x, y, z, self.p)].re)
-                        as f32;
+                    self.field[grid_index(x, y, z, self.n)][3] =
+                        (G as f64 * self.density[grid_index(x, y, z, self.p)].re) as f32;
                 }
             }
         }
@@ -152,33 +154,52 @@ impl MmfftLevelWorkspace {
         for record in records {
             let voxel = record.voxel_index as usize;
             let volume = f64::from(record.position_volume[3]);
-            if voxel >= 56 || !volume.is_finite() || volume < 0.0 { return None; }
-            let position = DVec3::new(f64::from(record.position_volume[0]),
-                f64::from(record.position_volume[1]), f64::from(record.position_volume[2]));
-            if !position.is_finite() { return None; }
-            visit_deposition_weights(position, self.half_extent, self.spacing, self.n,
+            if voxel >= 56 || !volume.is_finite() || volume < 0.0 {
+                return None;
+            }
+            let position = DVec3::new(
+                f64::from(record.position_volume[0]),
+                f64::from(record.position_volume[1]),
+                f64::from(record.position_volume[2]),
+            );
+            if !position.is_finite() {
+                return None;
+            }
+            visit_deposition_weights(
+                position,
+                self.half_extent,
+                self.spacing,
+                self.n,
                 |x, y, z, weight| {
                     basis[voxel * nodes + grid_index(x, y, z, self.n)] += volume * weight;
-                });
+                },
+            );
         }
         for column in basis.chunks_exact_mut(nodes) {
-            if column.iter().all(|value| *value == 0.0) { continue; }
+            if column.iter().all(|value| *value == 0.0) {
+                continue;
+            }
             self.density.fill(Complex64::default());
             for z in 0..self.n {
                 for y in 0..self.n {
                     for x in 0..self.n {
-                        self.density[grid_index(x, y, z, self.p)].re = column[grid_index(x, y, z, self.n)];
+                        self.density[grid_index(x, y, z, self.p)].re =
+                            column[grid_index(x, y, z, self.n)];
                     }
                 }
             }
             self.fft.transform(&mut self.density, false);
-            for (value, kernel) in self.density.iter_mut().zip(&self.kernel_spectrum) { *value *= *kernel; }
+            for (value, kernel) in self.density.iter_mut().zip(&self.kernel_spectrum) {
+                *value *= *kernel;
+            }
             self.fft.transform(&mut self.density, true);
             for z in 0..self.n {
                 for y in 0..self.n {
                     for x in 0..self.n {
                         let potential = f64::from(G) * self.density[grid_index(x, y, z, self.p)].re;
-                        if !potential.is_finite() { return None; }
+                        if !potential.is_finite() {
+                            return None;
+                        }
                         column[grid_index(x, y, z, self.n)] = potential;
                     }
                 }
@@ -226,9 +247,8 @@ impl MmfftLevelWorkspace {
         for z in 0..self.n {
             for y in 0..self.n {
                 for x in 0..self.n {
-                    self.field[grid_index(x, y, z, self.n)][3] = (G as f64
-                        * self.density[grid_index(x, y, z, self.p)].re)
-                        as f32;
+                    self.field[grid_index(x, y, z, self.n)][3] =
+                        (G as f64 * self.density[grid_index(x, y, z, self.p)].re) as f32;
                 }
             }
         }
@@ -251,21 +271,37 @@ fn deposit_particle(
 }
 
 fn visit_deposition_weights(
-    position: DVec3, half_extent: f64, spacing: f64, n: usize,
+    position: DVec3,
+    half_extent: f64,
+    spacing: f64,
+    n: usize,
     mut visit: impl FnMut(usize, usize, usize, f64),
 ) {
     let grid = (position + DVec3::splat(half_extent)) / spacing - DVec3::splat(0.5);
     let base = grid.floor();
     let fraction = grid - base;
-    let weights = [[1.0 - fraction.x, fraction.x], [1.0 - fraction.y, fraction.y],
-        [1.0 - fraction.z, fraction.z]];
+    let weights = [
+        [1.0 - fraction.x, fraction.x],
+        [1.0 - fraction.y, fraction.y],
+        [1.0 - fraction.z, fraction.z],
+    ];
     for dz in 0..=1 {
         for dy in 0..=1 {
             for dx in 0..=1 {
-                let cell = [base.x as isize + dx, base.y as isize + dy, base.z as isize + dz];
-                if cell.iter().any(|value| *value < 0 || *value >= n as isize) { continue; }
-                visit(cell[0] as usize, cell[1] as usize, cell[2] as usize,
-                    weights[0][dx as usize] * weights[1][dy as usize] * weights[2][dz as usize]);
+                let cell = [
+                    base.x as isize + dx,
+                    base.y as isize + dy,
+                    base.z as isize + dz,
+                ];
+                if cell.iter().any(|value| *value < 0 || *value >= n as isize) {
+                    continue;
+                }
+                visit(
+                    cell[0] as usize,
+                    cell[1] as usize,
+                    cell[2] as usize,
+                    weights[0][dx as usize] * weights[1][dy as usize] * weights[2][dz as usize],
+                );
             }
         }
     }

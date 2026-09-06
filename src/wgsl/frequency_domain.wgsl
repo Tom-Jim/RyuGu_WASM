@@ -1,9 +1,10 @@
 // Frequency-domain spatial kernel used by the known-trajectory evaluator.
 //
-// The source pass constructs rho_hat(k) = sum_a m_a exp(-i k.p_a). The
-// evaluator constructs the complete Fourier-Laplace characteristic
-// T_gamma(s,k) over the uploaded trajectory before applying the Newton
-// multiplier 4*pi*i*k/|k|^2 and reciprocal-space reduction.
+// The source pass constructs rho_hat(k) from the uploaded density cells. The
+// runtime forward path integrates each continuous radial cell in WGSL; the
+// planning/sensitivity paths may use their own unit point records. The
+// evaluator then constructs the complete Fourier-Laplace characteristic
+// T_gamma(s,k) before applying the Newton multiplier and reciprocal reduction.
 
 const PI: f32 = 3.141592653589793;
 const WAVE_VECTOR_COUNT: u32 = 64u;
@@ -22,8 +23,15 @@ struct FrequencyDomainParams {
     target_count: u32,
     target_offset: u32,
     inversion_mode: u32,
+    source_layout: u32,
     input_base: u32,
-    trajectory_origin: vec3<f32>,
+    // Keep every member scalar so the storage-array stride is exactly the
+    // 48-byte layout written by the Rust dispatch code. A vec3 here would be
+    // aligned to 16 bytes by some WebGPU backends and move the Laplace scalar
+    // to a different offset, producing zero/garbage observation frequencies.
+    trajectory_origin_x: f32,
+    trajectory_origin_y: f32,
+    trajectory_origin_z: f32,
     laplace_frequency: f32,
 };
 
@@ -47,14 +55,61 @@ struct SpectrumSample {
 @group(0) @binding(7) var<uniform> density_metadata: DensityModeBuffer;
 @group(0) @binding(9) var<storage, read> trajectory_samples: array<vec4<f32>>;
 
-var<workgroup> complex_reduction: array<vec2<f32>, 128>;
-var<workgroup> field_reduction: array<vec4<f32>, 32>;
-var<workgroup> jacobian_x_reduction: array<vec4<f32>, 32>;
-var<workgroup> jacobian_y_reduction: array<vec4<f32>, 32>;
-var<workgroup> jacobian_z_reduction: array<vec4<f32>, 32>;
+var<workgroup> complex_reduction: array<vec2<f32>, 256>;
+var<workgroup> field_reduction: array<vec4<f32>, 64>;
+var<workgroup> jacobian_x_reduction: array<vec4<f32>, 64>;
+var<workgroup> jacobian_y_reduction: array<vec4<f32>, 64>;
+var<workgroup> jacobian_z_reduction: array<vec4<f32>, 64>;
 
 fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+const GAUSS_NODE_0: f32 = -0.8611363116;
+const GAUSS_NODE_1: f32 = -0.3399810436;
+const GAUSS_NODE_2: f32 = 0.3399810436;
+const GAUSS_NODE_3: f32 = 0.8611363116;
+const GAUSS_WEIGHT_0: f32 = 0.3478548451;
+const GAUSS_WEIGHT_1: f32 = 0.6521451549;
+const GAUSS_WEIGHT_2: f32 = 0.6521451549;
+const GAUSS_WEIGHT_3: f32 = 0.3478548451;
+
+fn volume_cell_spectrum(k: vec3<f32>, cell_index: u32) -> vec2<f32> {
+    let angular = sources[cell_index * 2u];
+    let radial = sources[cell_index * 2u + 1u];
+    let inner = radial.x;
+    let outer = max(radial.y, inner);
+    let density = max(radial.z, 0.0);
+    let half_width = 0.5 * (outer - inner);
+    let midpoint = 0.5 * (outer + inner);
+    if half_width <= 0.0 || density <= 0.0 || angular.w <= 0.0 { return vec2<f32>(0.0); }
+    let nodes = array<f32, 4>(GAUSS_NODE_0, GAUSS_NODE_1, GAUSS_NODE_2, GAUSS_NODE_3);
+    let weights = array<f32, 4>(GAUSS_WEIGHT_0, GAUSS_WEIGHT_1, GAUSS_WEIGHT_2, GAUSS_WEIGHT_3);
+    var result = vec2<f32>(0.0);
+    for (var sample = 0u; sample < 4u; sample += 1u) {
+        let radius = midpoint + half_width * nodes[sample];
+        let weight = density * angular.w * radius * radius * half_width * weights[sample];
+        let phase = -dot(k, angular.xyz * radius);
+        result += weight * vec2<f32>(cos(phase), sin(phase));
+    }
+    return result;
+}
+
+fn source_spectrum(
+    k: vec3<f32>,
+    source_index: u32,
+    source_layout: u32,
+    inversion_mode: u32,
+) -> vec2<f32> {
+    // Planning records reuse the padding word at offset 28 for a global
+    // output offset, so only the runtime forward operator may select the
+    // volume-cell layout.
+    if inversion_mode != 3u && source_layout == 1u {
+        return volume_cell_spectrum(k, source_index);
+    }
+    let source = sources[source_index];
+    let phase = -dot(k, source.xyz);
+    return source.w * vec2<f32>(cos(phase), sin(phase));
 }
 
 fn wave_vector(sample_index: u32) -> vec3<f32> {
@@ -82,11 +137,12 @@ fn trajectory_characteristic(
     k: vec3<f32>,
     p: FrequencyDomainParams,
     laplace_frequency: f32,
+    time_lane: u32,
 ) -> vec2<f32> {
     var result = vec2<f32>(0.0);
     let count = p.target_count;
     if count == 0u { return result; }
-    for (var sample_index = 0u; sample_index < count; sample_index += 1u) {
+    for (var sample_index = time_lane; sample_index < count; sample_index += 4u) {
         let current = trajectory_samples[p.input_base + p.target_offset + sample_index];
         var previous = current;
         var next = current;
@@ -130,9 +186,7 @@ fn assemble_density_spectrum(
     let k = wave_vector(sample_index);
     var sum = vec2<f32>(0.0);
     for (var source_index = lane; source_index < p.source_count; source_index += 128u) {
-        let source = sources[source_index];
-        let phase = -dot(k, source.xyz);
-        sum += source.w * vec2<f32>(cos(phase), sin(phase));
+        sum += source_spectrum(k, source_index, p.source_layout, p.inversion_mode);
     }
     complex_reduction[lane] = sum;
     workgroupBarrier();
@@ -158,9 +212,7 @@ fn assemble_voxel_density_spectrum(
     let k = wave_vector(sample_index);
     var sum = vec2<f32>(0.0);
     for (var source_index = source_begin + lane; source_index < source_end; source_index += 128u) {
-        let source = sources[source_index];
-        let phase = -dot(k, source.xyz);
-        sum += source.w * vec2<f32>(cos(phase), sin(phase));
+        sum += source_spectrum(k, source_index, p.source_layout, p.inversion_mode);
     }
     complex_reduction[lane] = sum;
     workgroupBarrier();
@@ -240,7 +292,7 @@ fn combine_density_spectrum(@builtin(global_invocation_id) id: vec3<u32>) {
 #endif
 
 #ifdef FREQUENCY_DOMAIN_EVALUATOR
-@compute @workgroup_size(32, 1, 1)
+@compute @workgroup_size(256, 1, 1)
 fn evaluate_trajectory_field(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
@@ -256,6 +308,14 @@ fn evaluate_trajectory_field(
         normalized_frequency = f32(observation_index) / f32(p.target_count - 1u);
     }
     let observation_frequency = p.laplace_frequency * (1.0 + 7.0 * normalized_frequency);
+    // 64 wave vectors x 4 disjoint time lanes. All 256 lanes participate in
+    // both barriers, including trajectories shorter than four nodes.
+    let wave_index = lane % WAVE_VECTOR_COUNT;
+    let time_lane = lane / WAVE_VECTOR_COUNT;
+    let wave = spectrum[(p.spectrum_slot - 1u) * SPECTRUM_STRIDE + wave_index];
+    let wave_k = vec3<f32>(wave.wave_vector_xy, wave.wave_vector_z_weight.x);
+    complex_reduction[lane] = trajectory_characteristic(wave_k, p, observation_frequency, time_lane);
+    workgroupBarrier();
     var field = vec4<f32>(0.0);
     var jacobian_x = vec3<f32>(0.0);
     var jacobian_y = vec3<f32>(0.0);
@@ -266,16 +326,16 @@ fn evaluate_trajectory_field(
     // mixed into the frequency-domain result.
     var positive_potential = 0.0;
     let normalization = p.g_const * 4.0 * PI / ((2.0 * PI) * (2.0 * PI) * (2.0 * PI));
-    for (var sample_index = lane; sample_index < WAVE_VECTOR_COUNT; sample_index += 32u) {
+    if lane < WAVE_VECTOR_COUNT {
+        let sample_index = lane;
         let density_mode = spectrum[(p.spectrum_slot - 1u) * SPECTRUM_STRIDE + sample_index];
         let k = vec3<f32>(density_mode.wave_vector_xy, density_mode.wave_vector_z_weight.x);
-        // Keep the reciprocal multiplier bounded when a very small source
-        // radius produces an aggressively high-k quadrature shell. This is a
-        // numerical guard only; the multiplier remains 4*pi*i*k/|k|^2.
-        let k_squared = max(dot(k, k), 1.0e-12);
+        // Midpoint quadrature never samples k=0; preserve the exact multiplier.
+        let k_squared = dot(k, k);
         // Compute the complete k-dependent Fourier--Laplace characteristic
         // over every uploaded trajectory sample before multiplying by rho_hat.
-        let trajectory_factor = trajectory_characteristic(k, p, observation_frequency);
+        let trajectory_factor = complex_reduction[lane] + complex_reduction[lane + 64u]
+            + complex_reduction[lane + 128u] + complex_reduction[lane + 192u];
         // rho_hat(k) T_gamma(s,k), the two scalar factors immediately before
         // d^3k in equation (184). Keep this binding local to the evaluator so
         // no shader variant can accidentally reference a source-pass symbol.
@@ -283,26 +343,24 @@ fn evaluate_trajectory_field(
             density_mode.density_spectrum,
             trajectory_factor,
         );
-        let coefficient = clamp(
-            normalization * density_mode.wave_vector_z_weight.y / k_squared,
-            -1.0e20,
-            1.0e20,
-        );
+        let coefficient = normalization * density_mode.wave_vector_z_weight.y / k_squared;
         let acceleration = -coefficient * rho_hat_times_trajectory.y * k;
         field += vec4<f32>(acceleration, 0.0);
         positive_potential += coefficient * rho_hat_times_trajectory.x;
-        let hessian_scale = clamp(-coefficient * rho_hat_times_trajectory.x, -1.0e20, 1.0e20);
+        let hessian_scale = -coefficient * rho_hat_times_trajectory.x;
         jacobian_x += hessian_scale * k * k.x;
         jacobian_y += hessian_scale * k * k.y;
         jacobian_z += hessian_scale * k * k.z;
     }
+    if lane < WAVE_VECTOR_COUNT {
     field.w = positive_potential;
     field_reduction[lane] = field;
     jacobian_x_reduction[lane] = vec4<f32>(jacobian_x, 0.0);
     jacobian_y_reduction[lane] = vec4<f32>(jacobian_y, 0.0);
     jacobian_z_reduction[lane] = vec4<f32>(jacobian_z, 0.0);
+    }
     workgroupBarrier();
-    var stride = 16u;
+    var stride = 32u;
     loop {
         if stride == 0u { break; }
         if lane < stride {
@@ -330,7 +388,12 @@ fn evaluate_trajectory_field(
     result_buffer[base + 5u] = vec4<f32>(observation_frequency, 0.0, 0.0, f32(p.spectrum_slot));
     result_buffer[base + 6u] = vec4<f32>(field_reduction[0].w, 0.0, 0.0, 0.0);
     result_buffer[base + 7u] = vec4<f32>(trajectory_record.xyz, f32(p.target_count));
-    result_buffer[base + 8u] = vec4<f32>(p.trajectory_origin, 0.0);
+    result_buffer[base + 8u] = vec4<f32>(
+        p.trajectory_origin_x,
+        p.trajectory_origin_y,
+        p.trajectory_origin_z,
+        0.0,
+    );
     result_buffer[base + 9u] = vec4<f32>(0.0);
     result_buffer[base + 10u] = vec4<f32>(0.0);
 }

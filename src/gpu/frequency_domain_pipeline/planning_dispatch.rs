@@ -542,7 +542,7 @@ fn dispatch_planning_frequency_domain(
     if starting_request {
         state.active_build_spectrum = !state.spectrum_ready;
         state.active_build_basis_spectrum = !state.basis_spectrum_ready;
-        let uniform_size = 48_u64;
+        let uniform_size = 52_u64;
         let mut uniform_data = vec![0_u8; uniform_size as usize * 256];
         if elements.len() > 256 {
             error!(
@@ -555,15 +555,16 @@ fn dispatch_planning_frequency_domain(
             return;
         }
         for (element_index, element) in elements.iter().enumerate() {
-            let mut bytes = uniform_bytes(
+            let bytes = uniform_bytes(
                 element.trajectory_origin,
                 planning.payload.item_count,
                 element.spectrum_index,
                 3,
                 element.target_count,
                 element.target_offset,
+                0,
+                global_state_start as u32,
             );
-            bytes[28..32].copy_from_slice(&(global_state_start as u32).to_le_bytes());
             let offset = element_index * uniform_size as usize;
             uniform_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
         }
@@ -780,7 +781,7 @@ fn dispatch_planning_frequency_domain(
         + baseline_size
         + metric_size
         + staging_size
-        + 48 * 256;
+        + 52 * 256;
     info!(
         target: "planning::frequency_domain",
         request_id = request.request_id,

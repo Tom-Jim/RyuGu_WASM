@@ -1,4 +1,3 @@
-
 #[derive(Resource, Default)]
 pub struct FmmGravityHistory(pub GravitySampleHistory);
 
@@ -45,6 +44,7 @@ pub struct FmmSource {
     pub node_count: u32,
     pub particle_count: u32,
     pub maximum_level: u32,
+    pub density_mode: DensityMode,
 }
 
 #[derive(Resource, Clone)]
@@ -63,11 +63,12 @@ impl Default for FmmReadbackChannel {
 }
 impl FmmReadbackChannel {
     pub fn reset_after_device_loss(&self) {
-        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        if let Ok(mut data) = self.data.try_lock() {
+            data.take();
+        }
         self.in_flight.store(false, Ordering::Release);
     }
 }
-
 
 impl Default for FrequencyDomainGpuReadbackChannel {
     fn default() -> Self {
@@ -130,6 +131,7 @@ pub struct MmfftCompressedSource {
     /// Per-level scale used by the packed binary16 potential samples.
     pub grid_scales: [f32; 2],
     pub total_mass: f32,
+    pub density_mode: DensityMode,
 }
 
 #[derive(Resource, Clone)]
@@ -148,7 +150,9 @@ impl Default for MmfftReadbackChannel {
 }
 impl MmfftReadbackChannel {
     pub fn reset_after_device_loss(&self) {
-        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        if let Ok(mut data) = self.data.try_lock() {
+            data.take();
+        }
         self.in_flight.store(false, Ordering::Release);
     }
 }
@@ -200,7 +204,9 @@ impl Default for GravityReadbackChannel {
 }
 impl GravityReadbackChannel {
     pub fn reset_after_device_loss(&self) {
-        if let Ok(mut data) = self.data.try_lock() { data.take(); }
+        if let Ok(mut data) = self.data.try_lock() {
+            data.take();
+        }
         self.in_flight.store(false, Ordering::Release);
     }
 }
@@ -255,7 +261,7 @@ pub struct PerformanceComparisonState {
     pub diagnostic_history: [VecDeque<PerformanceDiagnosticSample>; 5],
     pub diagnostic_last_ids: [Option<u64>; 5],
     /// Algorithms included in the performance rotation. The five entries map
-    /// to Radial, Werner, Frequency-domain algorithm, MMFFT, and FMM respectively.
+    /// to FMM, FFT, Werner, Radial, and Frequency-domain algorithm respectively.
     pub enabled_methods: [bool; 5],
     /// One benchmark pass visits each enabled method once. Keeping this
     /// separate from `enabled_methods` prevents phase wrap-around from
@@ -342,21 +348,21 @@ impl PerformanceComparisonState {
 impl ActiveGravityMethod {
     pub fn performance_index(self) -> usize {
         match self {
-            Self::RadialAnalytic => 0,
-            Self::HomogeneousWerner => 1,
-            Self::FrequencyDomain => 2,
-            Self::MmfftCompressed => 3,
-            Self::Fmm => 4,
+            Self::Fmm => 0,
+            Self::MmfftCompressed => 1,
+            Self::HomogeneousWerner => 2,
+            Self::RadialAnalytic => 3,
+            Self::FrequencyDomain => 4,
         }
     }
 
     pub fn from_performance_index(index: usize) -> Self {
         match index {
-            0 => Self::RadialAnalytic,
-            1 => Self::HomogeneousWerner,
-            2 => Self::FrequencyDomain,
-            3 => Self::MmfftCompressed,
-            4 => Self::Fmm,
+            0 => Self::Fmm,
+            1 => Self::MmfftCompressed,
+            2 => Self::HomogeneousWerner,
+            3 => Self::RadialAnalytic,
+            4 => Self::FrequencyDomain,
             // Keep malformed UI state deterministic instead of silently
             // selecting a different algorithm.
             _ => Self::RadialAnalytic,

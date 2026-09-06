@@ -24,19 +24,21 @@ fn uniform_bytes(
     inversion_mode: u32,
     target_count: u32,
     target_offset: u32,
-) -> [u8; 48] {
-    // The eight scalar fields occupy 32 bytes, followed by the aligned vec3
-    // at offset 32 and the Laplace scalar at offset 44. The resulting WGSL
-    // struct stride is 48 bytes.
-    let mut bytes = [0_u8; 48];
+    source_layout: u32,
+    input_base: u32,
+) -> [u8; 52] {
+    // All members of FrequencyDomainParams are scalar f32/u32 values. This
+    // deliberately avoids vec3 alignment differences across WebGPU backends;
+    // the resulting storage-array stride is exactly 52 bytes.
+    let mut bytes = [0_u8; 52];
     for (offset, value) in [
         (0, G),
-        (32, origin.x),
-        (36, origin.y),
-        (40, origin.z),
+        (36, origin.x),
+        (40, origin.y),
+        (44, origin.z),
         // A small positive s keeps exp(-s t) finite over the captured
         // trajectory while preserving the required Re(s)>0 condition.
-        (44, EQ184_BASE_LAPLACE_SIGMA as f32),
+        (48, EQ184_BASE_LAPLACE_SIGMA as f32),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -47,6 +49,8 @@ fn uniform_bytes(
         (16, target_count.max(1)),
         (20, target_offset),
         (24, inversion_mode),
+        (28, source_layout),
+        (32, input_base),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }

@@ -1,4 +1,4 @@
-import { createApp, computed, ref, onMounted, onBeforeUnmount } from './vue-compiler.js';
+import { createApp, computed, ref, shallowRef, onMounted, onBeforeUnmount } from './vue-compiler.js';
 import VChart from 'vue-echarts';
 import { use } from 'echarts/core';
 import { LineChart } from 'echarts/charts';
@@ -10,138 +10,8 @@ use([LineChart, GridComponent, TooltipComponent, SVGRenderer]);
 const emptyProgress = () => ({ runId: null, progress: 0, accuracy: 0, running: false, completed: false });
 const mergeProgress = (_previous, planning) => window.ryuguPlanningProgress(planning);
 
-const useViewportNavigation = () => {
-  const view = ref({ zoom: 1, x: 0, y: 0 });
-  const minZoom = 0.75;
-  const maxZoom = 2.5;
-  const touchPointers = new Map();
-  const consumedTouches = new Set();
-  let canvas = null;
-  let viewportFrame = null;
-  let rightPan = null;
-  let pinch = null;
-
-  const isCanvasTarget = (target) => target === canvas;
-  const midpoint = (first, second) => ({
-    x: (first.x + second.x) / 2,
-    y: (first.y + second.y) / 2,
-  });
-  const distance = (first, second) => Math.hypot(first.x - second.x, first.y - second.y);
-  const displayCenter = () => ({ x: innerWidth / 2, y: innerHeight / 2 });
-  const applyView = () => {
-    viewportFrame?.style.setProperty('--user-zoom', String(view.value.zoom));
-    viewportFrame?.style.setProperty('--view-offset-x', `${view.value.x}px`);
-    viewportFrame?.style.setProperty('--view-offset-y', `${view.value.y}px`);
-  };
-  const stopEvent = (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-  };
-  const zoomAt = (previousAnchor, nextAnchor, nextZoom) => {
-    const oldZoom = view.value.zoom;
-    const zoom = Math.min(maxZoom, Math.max(minZoom, nextZoom));
-    const ratio = zoom / oldZoom;
-    const center = displayCenter();
-    view.value.x = nextAnchor.x - center.x - ratio * (previousAnchor.x - center.x - view.value.x);
-    view.value.y = nextAnchor.y - center.y - ratio * (previousAnchor.y - center.y - view.value.y);
-    view.value.zoom = zoom;
-    applyView();
-  };
-  const updatePinch = () => {
-    if (touchPointers.size !== 2) return;
-    const [first, second] = [...touchPointers.values()];
-    const nextMidpoint = midpoint(first, second);
-    const nextDistance = Math.max(distance(first, second), 1);
-    if (!pinch) {
-      pinch = { midpoint: nextMidpoint, distance: nextDistance };
-      return;
-    }
-    zoomAt(pinch.midpoint, nextMidpoint, view.value.zoom * nextDistance / pinch.distance);
-    pinch = { midpoint: nextMidpoint, distance: nextDistance };
-  };
-
-  const onPointerDown = (event) => {
-    if (!isCanvasTarget(event.target)) return;
-    if (event.pointerType === 'mouse' && event.button === 2) {
-      rightPan = { id: event.pointerId, x: event.clientX, y: event.clientY };
-      canvas.setPointerCapture?.(event.pointerId);
-      document.documentElement.classList.add('is-view-panning');
-      stopEvent(event);
-      return;
-    }
-    if (event.pointerType !== 'touch') return;
-    touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (touchPointers.size === 2) {
-      touchPointers.forEach((_, pointerId) => consumedTouches.add(pointerId));
-      canvas.setPointerCapture?.(event.pointerId);
-      updatePinch();
-      stopEvent(event);
-    }
-  };
-  const onPointerMove = (event) => {
-    if (rightPan?.id === event.pointerId) {
-      view.value.x += event.clientX - rightPan.x;
-      view.value.y += event.clientY - rightPan.y;
-      rightPan = { id: event.pointerId, x: event.clientX, y: event.clientY };
-      applyView();
-      stopEvent(event);
-      return;
-    }
-    if (!touchPointers.has(event.pointerId)) return;
-    touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (consumedTouches.has(event.pointerId)) {
-      if (touchPointers.size === 2) updatePinch();
-      stopEvent(event);
-    }
-  };
-  const onPointerEnd = (event) => {
-    if (rightPan?.id === event.pointerId) {
-      rightPan = null;
-      document.documentElement.classList.remove('is-view-panning');
-    }
-    if (touchPointers.delete(event.pointerId)) {
-      consumedTouches.delete(event.pointerId);
-      pinch = null;
-    }
-  };
-  const onWheel = (event) => {
-    if (!isCanvasTarget(event.target)) return;
-    const pixels = event.deltaMode === WheelEvent.DOM_DELTA_LINE
-      ? event.deltaY * 16
-      : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-        ? event.deltaY * innerHeight
-        : event.deltaY;
-    zoomAt({ x: event.clientX, y: event.clientY }, { x: event.clientX, y: event.clientY }, view.value.zoom * Math.exp(-pixels * 0.0015));
-    stopEvent(event);
-  };
-  const onContextMenu = (event) => {
-    if (!isCanvasTarget(event.target)) return;
-    stopEvent(event);
-  };
-  onMounted(() => {
-    viewportFrame = document.getElementById('viewport-frame');
-    canvas = document.getElementById('bevy');
-    applyView();
-    document.addEventListener('pointerdown', onPointerDown, { capture: true, passive: false });
-    document.addEventListener('pointermove', onPointerMove, { capture: true, passive: false });
-    document.addEventListener('pointerup', onPointerEnd, { capture: true, passive: true });
-    document.addEventListener('pointercancel', onPointerEnd, { capture: true, passive: true });
-    document.addEventListener('wheel', onWheel, { capture: true, passive: false });
-    document.addEventListener('contextmenu', onContextMenu, { capture: true, passive: false });
-  });
-  onBeforeUnmount(() => {
-    document.removeEventListener('pointerdown', onPointerDown, true);
-    document.removeEventListener('pointermove', onPointerMove, true);
-    document.removeEventListener('pointerup', onPointerEnd, true);
-    document.removeEventListener('pointercancel', onPointerEnd, true);
-    document.removeEventListener('wheel', onWheel, true);
-    document.removeEventListener('contextmenu', onContextMenu, true);
-  });
-};
-
 const app = createApp({
   setup() {
-    useViewportNavigation();
     const tracked = ref({ first: emptyProgress(), stress: emptyProgress() });
     const labels = { first: 'First', stress: 'Stress', quadrature: 'Quadrature' };
     const update = (event) => {
@@ -174,7 +44,7 @@ app.mount('#planning-progress');
 
 createApp({
   setup() {
-    const snapshot = ref(null);
+    const snapshot = shallowRef(null);
     const planning = computed(() => snapshot.value?.planning ?? { progress: 0, accuracy: 0, workload: 'quadrature', running: false });
     const tracked = ref(emptyProgress());
     const update = (event) => {
@@ -321,22 +191,11 @@ function mountTelemetryChart(target) {
       // A phone can finish the WASM boot before its delayed module fetch. Use
       // the most recent UI snapshot immediately instead of waiting for the
       // next render tick.
-      const snapshot = ref(window.ryuguUi?.snapshot ?? null);
+      const snapshot = shallowRef(window.ryuguUi?.snapshot ?? null);
       const update = (event) => {
         const next = event.detail;
         if (!next) return;
-        const previous = snapshot.value;
-        const sameMethod = previous?.method === next.method;
-        const retainIfEmpty = (field) => {
-          const incoming = Array.isArray(next[field]) ? next[field] : [];
-          if (incoming.length > 0 || !sameMethod) return incoming;
-          return Array.isArray(previous?.[field]) ? previous[field] : [];
-        };
-        snapshot.value = {
-          ...next,
-          jacobi: retainIfEmpty('jacobi'),
-          frequencyDomain: retainIfEmpty('frequencyDomain'),
-        };
+        snapshot.value = next;
       };
       const points = computed(() => recentTelemetryPoints(snapshot.value));
       const transform = computed(() => snapshot.value?.method === 'frequency_domain');
@@ -359,8 +218,8 @@ function mountTelemetryChart(target) {
 mountTelemetryChart('#jacobi-chart');
 window.ryuguTelemetryReady = true;
 
-const benchmarkColors = ['#58c8ff', '#ff7d89', '#36e7f2', '#ffb23d', '#42dc77', '#a8f7bd'];
-const benchmarkLabels = ['Radial', 'Werner', 'Frequency-domain algorithm', 'Packed FFT', 'FMM'];
+const benchmarkColors = ['#42dc77', '#ffb23d', '#ff7d89', '#58c8ff', '#36e7f2', '#a8f7bd'];
+const benchmarkLabels = ['FMM', 'FFT', 'Werner', 'Radial', 'Frequency-domain'];
 
 const modalAxisStyle = {
   axisLine: { lineStyle: { color: 'rgba(120, 208, 213, .38)' } },
@@ -427,7 +286,7 @@ function mountBenchmarkChart(target, makeOption) {
   createApp({
     components: { VChart },
     setup() {
-      const snapshot = ref(window.ryuguUi?.snapshot ?? null);
+      const snapshot = shallowRef(window.ryuguUi?.snapshot ?? null);
       const update = (event) => { snapshot.value = event.detail ?? null; };
       onMounted(() => window.addEventListener('ryugu-snapshot', update));
       onBeforeUnmount(() => window.removeEventListener('ryugu-snapshot', update));

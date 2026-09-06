@@ -3,7 +3,7 @@
 //! The web UI owns controls, text, SVG, and dialogs. This module only consumes
 //! typed requests and advances Bevy resources used by physics and GPU work.
 
-use crate::cpu::frequency_domain::{AggregatedGravitySource, EQ184_QUADRATURE_COUNT};
+use crate::cpu::frequency_domain::EQ184_QUADRATURE_COUNT;
 use crate::gpu::werner::{WernerAcceleration, WernerPotential};
 use crate::interface::components::*;
 use bevy::prelude::*;
@@ -36,7 +36,11 @@ pub fn method_selection_system(
     if *active == next {
         return;
     }
-    let preserve_radial_capture = inversion.ready || !inversion.truth_knots.is_empty();
+    // A frequency orbit must be produced by Eq.106 for this experiment.
+    // Never carry an observation arc across the Radial/frequency boundary.
+    let preserve_radial_capture = *active != ActiveGravityMethod::FrequencyDomain
+        && next != ActiveGravityMethod::FrequencyDomain
+        && (inversion.ready || !inversion.truth_knots.is_empty());
     *active = next;
     runtime_error.clear();
     gravity_blend.0 = 0.0;
@@ -74,9 +78,8 @@ pub fn clear_gpu_histories_on_method_change(
     if !active.is_changed() {
         return;
     }
-    // Keep the Radial history: it is the authoritative observation track
-    // shared by the three inverse-capable methods. Probe changes clear it in
-    // `apply_probe_input_system`, which starts a genuinely new experiment.
+    // Radial history belongs only to its pointwise evaluator. Epoch checks
+    // prevent any old sample from participating in a new experiment.
     if let Some(value) = werner.as_deref_mut() {
         value.0.clear();
     }
@@ -107,7 +110,7 @@ pub fn reset_inversion_on_method_change(
 }
 
 pub fn update_gpu_memory_estimate_system(
-    aggregated: Option<Res<AggregatedGravitySource>>,
+    quadrature: Option<Res<DensityQuadratureSource>>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
     frequency_domain_performance: Res<FrequencyDomainPerformanceMetrics>,
     mmfft: Option<Res<MmfftCompressedSource>>,
@@ -115,33 +118,41 @@ pub fn update_gpu_memory_estimate_system(
     mut estimate: ResMut<GpuMemoryEstimate>,
 ) {
     let mut bytes = [0_u64; 5];
-    if let Some(source) = aggregated.as_ref() {
-        let count = source.sources.len() as u32;
-        bytes[0] = count as u64 * 16 + 32 + 2 * reduction_buffer_bytes(count);
+    if let Some(source) = quadrature.as_ref() {
+        let count = (source.bytes.len() / 32) as u32;
+        bytes[ActiveGravityMethod::RadialAnalytic.performance_index()] =
+            source.bytes.len() as u64 + 32 + 2 * reduction_buffer_bytes(count);
     }
     if let Some(topology) = topology {
         let face_count = (topology.triangles.len() / 3) as u64;
         let edge_count = face_count * 3 / 2;
         let item_count = edge_count.max(face_count) as u32;
-        bytes[1] = edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
+        bytes[ActiveGravityMethod::HomogeneousWerner.performance_index()] =
+            edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
     }
-    if let Some(source) = aggregated.as_ref() {
+    if let Some(source) = quadrature.as_ref() {
         let timing = frequency_domain_performance.latest.unwrap_or_default();
         let target_count = u64::from(timing.target_count.max(1));
         let quadrature_count = EQ184_QUADRATURE_COUNT as u64;
-        bytes[2] = source.sources.len() as u64 * 16
+        bytes[ActiveGravityMethod::FrequencyDomain.performance_index()] = source.bytes.len()
+            as u64
             + quadrature_count * 16
             + 96 * 256
             + quadrature_count * 16
             + quadrature_count * 32
             + target_count * 16
-            + 2 * target_count * 11 * 16;
+            + 2 * target_count * 11 * 16
+            // Independent Eq.106 propagation source, nodes, spectrum and readback.
+            + source.bytes.len() as u64
+            + quadrature_count * 24
+            + 64;
     }
     if let Some(source) = mmfft {
-        bytes[3] = source.bytes.len() as u64 + 64 + 32;
+        bytes[ActiveGravityMethod::MmfftCompressed.performance_index()] =
+            source.bytes.len() as u64 + 64 + 32;
     }
     if let Some(source) = fmm {
-        bytes[4] = source.bytes.len() as u64
+        bytes[ActiveGravityMethod::Fmm.performance_index()] = source.bytes.len() as u64
             + source.particle_bytes.len() as u64
             + 32
             + 2 * reduction_buffer_bytes(source.node_count);
@@ -245,10 +256,10 @@ pub fn performance_comparison_system(
 
 fn method_for_phase(phase: usize) -> ActiveGravityMethod {
     match phase {
-        0 => ActiveGravityMethod::RadialAnalytic,
-        1 => ActiveGravityMethod::HomogeneousWerner,
-        2 => ActiveGravityMethod::FrequencyDomain,
-        3 => ActiveGravityMethod::MmfftCompressed,
-        _ => ActiveGravityMethod::Fmm,
+        0 => ActiveGravityMethod::Fmm,
+        1 => ActiveGravityMethod::MmfftCompressed,
+        2 => ActiveGravityMethod::HomogeneousWerner,
+        3 => ActiveGravityMethod::RadialAnalytic,
+        _ => ActiveGravityMethod::FrequencyDomain,
     }
 }

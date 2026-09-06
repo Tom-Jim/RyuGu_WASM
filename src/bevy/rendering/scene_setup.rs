@@ -1,8 +1,6 @@
-use crate::interface::components::*;
 use crate::cpu::frequency_domain::{AggregatedGravitySource, generate_fixed_point_trajectory};
-use crate::cpu::inversion::{
-    quintic_knot_accelerations, quintic_segment_position_acceleration,
-};
+use crate::cpu::inversion::{quintic_knot_accelerations, quintic_segment_position_acceleration};
+use crate::interface::components::*;
 use bevy::prelude::*;
 use bevy_panorbit_camera::PanOrbitCamera;
 use std::collections::hash_map::DefaultHasher;
@@ -39,16 +37,18 @@ pub fn setup_scene(
         Transform::from_xyz(1000.0, 2000.0, 1500.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    let _camera = commands.spawn((
-        Camera3d::default(),
-        Projection::Perspective(PerspectiveProjection {
-            far: 100_000.0,
-            near: 0.1,
-            ..default()
-        }),
-        Transform::from_xyz(0.0, 800.0, 2500.0).looking_at(Vec3::ZERO, Vec3::Y),
-        PanOrbitCamera::default(),
-    )).id();
+    let _camera = commands
+        .spawn((
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection {
+                far: 100_000.0,
+                near: 0.1,
+                ..default()
+            }),
+            Transform::from_xyz(0.0, 800.0, 2500.0).looking_at(Vec3::ZERO, Vec3::Y),
+            PanOrbitCamera::default(),
+        ))
+        .id();
 
     // Mobile Dawn/Vulkan stacks are particularly prone to failing PBR pipeline
     // creation for multisampled targets (reported as VK_ERROR_UNKNOWN). The
@@ -85,6 +85,7 @@ pub fn capture_trajectory_inversion_system(
     clock: Res<SimulationClock>,
     active_method: Res<ActiveGravityMethod>,
     frequency_domain_source: Option<Res<AggregatedGravitySource>>,
+    density_mode: Res<DensityMode>,
     probe_initial: Res<ProbeInitialConditions>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
@@ -105,8 +106,12 @@ pub fn capture_trajectory_inversion_system(
             inversion.truth_orbit.clear();
         }
         inversion.capture_id = None;
-        inversion.capture_source_hash =
-            frequency_domain_source.as_ref().map_or(0, |source| source.source_hash);
+        inversion.capture_source_hash = frequency_domain_source.as_ref().map_or(0, |source| {
+            match *density_mode {
+                DensityMode::Variable => source.source_hash,
+                DensityMode::Constant => source.constant_hash,
+            }
+        });
         inversion.ready = false;
         inversion.inverted = false;
         inversion.start_requested = queued_inversion;
@@ -132,24 +137,37 @@ pub fn capture_trajectory_inversion_system(
     if !inversion.ready
         && let Some(source) = frequency_domain_source.as_ref()
     {
-        inversion.capture_source_hash = source.source_hash;
+        inversion.capture_source_hash = match *density_mode {
+            DensityMode::Variable => source.source_hash,
+            DensityMode::Constant => source.constant_hash,
+        };
     }
     if inversion.ready {
         return;
     }
-    // Equation (185) fixed-point trajectory: all methods receive the same
-    // deterministic finite arc, independent of radial-history readback.
-    let Some(source) = frequency_domain_source.as_ref() else {
-        return;
+    // Frequency-mode knots are accumulated by the causal Eq.106 GPU-driven
+    // integrator, not by the direct reference generator or Radial history.
+    let knots = if *active_method == ActiveGravityMethod::FrequencyDomain {
+        if inversion.knots.len() != TRAJECTORY_INVERSION_SAMPLE_COUNT {
+            return;
+        }
+        inversion.knots.clone()
+    } else {
+        let Some(source) = frequency_domain_source.as_ref() else {
+            return;
+        };
+        let Some(knots) = generate_fixed_point_trajectory(
+            source,
+            *density_mode,
+            probe_initial.position,
+            probe_initial.velocity(),
+            TRAJECTORY_INVERSION_CAPTURE_SECONDS,
+            TRAJECTORY_INVERSION_SAMPLE_COUNT,
+        ) else {
+            return;
+        };
+        knots
     };
-    let knots = generate_fixed_point_trajectory(
-        source,
-        probe_initial.position,
-        probe_initial.velocity(),
-        TRAJECTORY_INVERSION_CAPTURE_SECONDS,
-        TRAJECTORY_INVERSION_SAMPLE_COUNT,
-    );
-    let Some(knots) = knots else { return; };
     inversion.knots = knots;
     if inversion.truth_knots.is_empty() {
         inversion.truth_knots = inversion.knots.clone();
@@ -299,20 +317,18 @@ pub fn render_gizmos_system(
     // not the live inertial orbit. The frequency-domain mode now displays its
     // continuous rotating-body integration above; drawing the frozen knots on
     // top of it would create a second, misleading orbit.
-    let display_knots: &[TrajectoryInversionKnot] = if *active_method
-        == ActiveGravityMethod::FrequencyDomain
-    {
-        &[]
-    } else if *active_method
-        != ActiveGravityMethod::HomogeneousWerner
-        && inversion.truth_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT
-    {
-        &inversion.truth_knots
-    } else if inversion.inverted {
-        &inversion.knots
-    } else {
-        &[]
-    };
+    let display_knots: &[TrajectoryInversionKnot] =
+        if *active_method == ActiveGravityMethod::FrequencyDomain {
+            &[]
+        } else if *active_method != ActiveGravityMethod::HomogeneousWerner
+            && inversion.truth_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT
+        {
+            &inversion.truth_knots
+        } else if inversion.inverted {
+            &inversion.knots
+        } else {
+            &[]
+        };
     if display_knots.len() >= 2 {
         let mut curve = Vec::with_capacity((display_knots.len() - 1) * 25 + 1);
         if let Some(accelerations) = quintic_knot_accelerations(display_knots) {

@@ -102,13 +102,14 @@ pub(crate) fn eq184_trajectory_term(
 
 /// Generate the fixed-length known trajectory used by equation (184).
 ///
-/// This is the discrete Picard/fixed-point step of equation (185): starting
+/// Direct reference orbit for the non-frequency comparison methods: starting
 /// from the probe initial state, evaluate the body-frame Newton field of the
 /// frozen density source and advance a fixed-duration leapfrog arc.  The
-/// returned knots are the sole trajectory input for the frequency-domain,
-/// MMFFT, and FMM forward/inverse paths; no radial-history samples are used.
+/// returned knots serve MMFFT and FMM comparison inputs. Frequency-mode
+/// propagation and capture use the independent Eq.106 GPU pipeline.
 pub fn generate_fixed_point_trajectory(
     source: &AggregatedGravitySource,
+    density_mode: DensityMode,
     initial_position: Vec3,
     initial_velocity: Vec3,
     duration_seconds: f64,
@@ -119,17 +120,19 @@ pub fn generate_fixed_point_trajectory(
         || !initial_velocity.is_finite()
         || !duration_seconds.is_finite()
         || duration_seconds <= 0.0
-        || source.sources.is_empty()
+        || source_points(source, density_mode).is_empty()
     {
         return None;
     }
     let dt = duration_seconds / (knot_count - 1) as f64;
     let acceleration = |position: Vec3| -> Vec3 {
-        source.sources.iter().fold(Vec3::ZERO, |sum, point| {
-            let delta = position - point.position.as_vec3();
-            let r2 = delta.length_squared().max(1.0);
-            sum - G * point.mass as f32 * delta / (r2 * r2.sqrt())
-        })
+        source_points(source, density_mode)
+            .iter()
+            .fold(Vec3::ZERO, |sum, point| {
+                let delta = position - point.position.as_vec3();
+                let r2 = delta.length_squared().max(1.0);
+                sum - G * point.mass as f32 * delta / (r2 * r2.sqrt())
+            })
     };
     let mut position = initial_position;
     let mut velocity = initial_velocity;
@@ -156,7 +159,20 @@ pub fn generate_fixed_point_trajectory(
         .then_some(knots)
 }
 
-/// Mass-preserving point residue used by the equation-184 density spectrum.
+fn source_points(
+    source: &AggregatedGravitySource,
+    density_mode: DensityMode,
+) -> &[FrequencyDomainPointSource] {
+    match density_mode {
+        DensityMode::Variable => &source.sources,
+        DensityMode::Constant => &source.constant_sources,
+    }
+}
+
+/// Mass-preserving centroid residue retained for CPU comparison, planning, and
+/// inversion basis construction. The runtime Eq.106/Eq.184 GPU paths upload
+/// `DensityQuadratureSource` cells directly and do not use this as the asteroid
+/// force model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrequencyDomainPointSource {
     pub position: DVec3,
@@ -166,32 +182,56 @@ pub struct FrequencyDomainPointSource {
 #[derive(Resource, Default)]
 pub struct AggregatedGravitySource {
     pub sources: Vec<FrequencyDomainPointSource>,
+    pub constant_sources: Vec<FrequencyDomainPointSource>,
     pub total_mass: f64,
+    pub constant_total_mass: f64,
     pub radius: f64,
     pub source_hash: u64,
+    pub constant_hash: u64,
 }
 
-/// Converts every radial quadrature cell into one mass-preserving residue
+/// Converts every shared density quadrature cell into one mass-preserving residue
 /// record used to evaluate the discrete density Fourier transform. Cells are
 /// not rebinned: doing so damps high-k content before equation (184) sees it.
 pub fn build_aggregated_gravity_source_system(
     mut commands: Commands,
-    radial: Option<Res<RadialGravitySource>>,
+    quadrature: Option<Res<DensityQuadratureSource>>,
     existing: Option<Res<AggregatedGravitySource>>,
 ) {
     if existing.is_some() {
         return;
     }
-    let Some(radial) = radial else { return };
-    let record_count = radial.bytes.len() / 32;
+    let Some(quadrature) = quadrature else { return };
+    let record_count = quadrature.bytes.len() / 32;
     if record_count == 0 {
         return;
     }
 
-    let mut sources = Vec::with_capacity(record_count);
+    let (sources, total_mass, radius) = parse_quadrature(&quadrature.bytes);
+    let (constant_sources, constant_total_mass, constant_radius) =
+        parse_quadrature(&quadrature.constant_bytes);
+    if sources.is_empty() || !total_mass.is_finite() || radius <= 0.0 {
+        return;
+    }
+    if constant_sources.is_empty() || !constant_total_mass.is_finite() || constant_radius <= 0.0 {
+        return;
+    }
+    commands.insert_resource(AggregatedGravitySource {
+        sources,
+        constant_sources,
+        total_mass,
+        constant_total_mass,
+        radius: radius.max(constant_radius),
+        source_hash: hash_source_bytes(&quadrature.bytes),
+        constant_hash: hash_source_bytes(&quadrature.constant_bytes),
+    });
+}
+
+fn parse_quadrature(bytes: &[u8]) -> (Vec<FrequencyDomainPointSource>, f64, f64) {
+    let mut sources = Vec::with_capacity(bytes.len() / 32);
     let mut total_mass = 0.0;
     let mut radius = 0.0_f64;
-    for chunk in radial.bytes.as_chunks::<32>().0 {
+    for chunk in bytes.as_chunks::<32>().0 {
         let direction = DVec3::new(
             read_f32_le(chunk, 0) as f64,
             read_f32_le(chunk, 4) as f64,
@@ -218,15 +258,7 @@ pub fn build_aggregated_gravity_source_system(
         total_mass += mass;
         radius = radius.max(outer);
     }
-    if sources.is_empty() || !total_mass.is_finite() || radius <= 0.0 {
-        return;
-    }
-    commands.insert_resource(AggregatedGravitySource {
-        sources,
-        total_mass,
-        radius,
-        source_hash: hash_source_bytes(&radial.bytes),
-    });
+    (sources, total_mass, radius)
 }
 
 fn read_f32_le(bytes: &[u8], offset: usize) -> f32 {

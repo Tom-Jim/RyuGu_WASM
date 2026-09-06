@@ -4,6 +4,7 @@ pub fn record_probe_jacobi_system(
     werner_samples: Option<Res<WernerGravityHistory>>,
     mmfft_samples: Option<Res<MmfftCompressedHistory>>,
     fmm_samples: Option<Res<FmmGravityHistory>>,
+    equation106: Option<Res<crate::gpu::equation106::Equation106History>>,
     gravity_blend: Res<GravityBlendFactor>,
     clock: Res<SimulationClock>,
     cassini: Query<(&Transform, &Velocity), With<CassiniMarker>>,
@@ -19,6 +20,7 @@ pub fn record_probe_jacobi_system(
         werner_samples.as_deref(),
         mmfft_samples.as_deref(),
         fmm_samples.as_deref(),
+        equation106.as_deref(),
     );
     let sample = active_history.and_then(|samples| samples.latest_for_epoch(clock.epoch));
     let Some(sample) = sample else {

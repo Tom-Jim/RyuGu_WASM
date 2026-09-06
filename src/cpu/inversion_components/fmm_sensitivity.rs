@@ -70,13 +70,11 @@ pub(crate) fn build_planning_dynamics_tree(
                 f64::from(record.position_volume[1]),
                 f64::from(record.position_volume[2]),
             );
-            (position.is_finite() && mass.is_finite() && mass > 0.0)
-                .then_some((position, mass))
+            (position.is_finite() && mass.is_finite() && mass > 0.0).then_some((position, mass))
         })
         .collect::<Vec<_>>();
-    (!points.is_empty()).then(|| {
-        PlanningDynamicsTree(build_fmm_node(points, 0, REFERENCE_MAX_DEPTH))
-    })
+    (!points.is_empty())
+        .then(|| PlanningDynamicsTree(build_fmm_node(points, 0, REFERENCE_MAX_DEPTH)))
 }
 
 fn build_fmm_node(points: Vec<(DVec3, f64)>, depth: u8, maximum_depth: u8) -> FmmNode {
@@ -139,16 +137,18 @@ fn multipole_acceleration(moment: FmmMoment, center_of_mass: DVec3, target: DVec
     ];
     let trace = central[0] + central[3] + central[5];
     let qd = DVec3::new(
-        (3.0 * central[0] - trace) * displacement.x + 3.0 * central[1] * displacement.y
+        (3.0 * central[0] - trace) * displacement.x
+            + 3.0 * central[1] * displacement.y
             + 3.0 * central[2] * displacement.z,
-        3.0 * central[1] * displacement.x + (3.0 * central[3] - trace) * displacement.y
+        3.0 * central[1] * displacement.x
+            + (3.0 * central[3] - trace) * displacement.y
             + 3.0 * central[4] * displacement.z,
-        3.0 * central[2] * displacement.x + 3.0 * central[4] * displacement.y
+        3.0 * central[2] * displacement.x
+            + 3.0 * central[4] * displacement.y
             + (3.0 * central[5] - trace) * displacement.z,
     );
     let scalar = displacement.dot(qd);
-    moment.mass * displacement * inverse_radius_cubed
-        - qd * (inverse_radius_cubed / radius_squared)
+    moment.mass * displacement * inverse_radius_cubed - qd * (inverse_radius_cubed / radius_squared)
         + displacement * (2.5 * scalar * inverse_radius_cubed / radius_squared.powi(2))
 }
 
@@ -157,21 +157,24 @@ fn evaluate_fmm(node: &FmmNode, target: DVec3, theta: f64) -> DVec3 {
     let opening = (3.0_f64).sqrt() * node.half_width / distance;
     if node.children.is_empty() || opening < theta {
         if node.children.is_empty() {
-            return node.points.iter().fold(DVec3::ZERO, |sum, &(position, mass)| {
-                let displacement = position - target;
-                let radius_squared = displacement.length_squared().max(1.0e-18);
-                let inverse_radius = radius_squared.sqrt().recip();
-                sum + mass * displacement * (inverse_radius / radius_squared)
-            });
+            return node
+                .points
+                .iter()
+                .fold(DVec3::ZERO, |sum, &(position, mass)| {
+                    let displacement = position - target;
+                    let radius_squared = displacement.length_squared().max(1.0e-18);
+                    let inverse_radius = radius_squared.sqrt().recip();
+                    sum + mass * displacement * (inverse_radius / radius_squared)
+                });
         }
         return multipole_acceleration(node.moment, node.center_of_mass, target);
     }
-    node.children
-        .iter()
-        .fold(DVec3::ZERO, |sum, child| sum + evaluate_fmm(child, target, theta))
+    node.children.iter().fold(DVec3::ZERO, |sum, child| {
+        sum + evaluate_fmm(child, target, theta)
+    })
 }
 
-fn high_resolution_reference_tree(source: &RadialGravitySource) -> Option<FmmNode> {
+fn high_resolution_reference_tree(source: &DensityQuadratureSource) -> Option<FmmNode> {
     let points = source
         .bytes
         .as_chunks::<32>()
@@ -209,7 +212,7 @@ fn evaluate_reference_tree(tree: &FmmNode, sample: &TrajectoryInversionKnot) -> 
 
 fn high_resolution_reference_basis_trees(
     voxels: &[InvertedDensityVoxel],
-    source: &RadialGravitySource,
+    source: &DensityQuadratureSource,
 ) -> Option<Vec<FmmNode>> {
     let radius = source
         .bytes
@@ -249,7 +252,11 @@ fn high_resolution_reference_basis_trees(
             (((value + f64::from(radius)) / f64::from(voxel_size)).floor() as isize)
                 .clamp(0, VOXEL_SIDE as isize - 1) as usize
         };
-        let grid = [coordinate(position.x), coordinate(position.y), coordinate(position.z)];
+        let grid = [
+            coordinate(position.x),
+            coordinate(position.y),
+            coordinate(position.z),
+        ];
         let voxel = grid_lookup[(grid[2] * VOXEL_SIDE + grid[1]) * VOXEL_SIDE + grid[0]];
         if voxel != usize::MAX {
             groups[voxel].push((position, volume));
@@ -269,10 +276,7 @@ fn high_resolution_reference_basis_trees(
     )
 }
 
-fn evaluate_reference_basis(
-    trees: &[FmmNode],
-    samples: &[TrajectoryInversionKnot],
-) -> Vec<Vec3> {
+fn evaluate_reference_basis(trees: &[FmmNode], samples: &[TrajectoryInversionKnot]) -> Vec<Vec3> {
     let mut result = Vec::with_capacity(trees.len() * samples.len());
     for sample in samples {
         let body_position = sample.body_rotation.inverse() * sample.position;

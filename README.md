@@ -1,4 +1,4 @@
-# RyuGu WASM
+# Ryugu Dynamics Laboratory
 
 [![CI/CD](https://github.com/Tom-jim/RyuGu_WASM/actions/workflows/deploy.yml/badge.svg)](https://github.com/Tom-jim/RyuGu_WASM/actions/workflows/deploy.yml)
 [![Live demo](https://img.shields.io/badge/Live_demo-WebGPU-success)](https://tom-jim.github.io/RyuGu_WASM/)
@@ -6,149 +6,94 @@
 [![Rust](https://img.shields.io/badge/Rust-2024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-<img src="https://github.com/user-attachments/assets/84ac0b30-d669-4a40-99a5-31ef39b3f8c0" width="100%" alt="algorithm comparison" /> 
+Ryugu Dynamics Laboratory is an in-browser laboratory for gravity, orbit propagation, surface-field inspection, and density inversion around the near-Earth asteroid Ryugu. Rust and Bevy own the physical state and scene, WebGPU/WGSL runs the parallel numerical kernels, and the HTML interface presents the live orbit, diagnostics, density views, and performance comparisons.
 
-RyuGu WASM is a WebGPU/WASM research platform for experimenting with gravity
-and probe trajectories around asteroid (162173) Ryugu. It combines a Rust/Bevy
-simulation core with GPU compute kernels and a small HTML/JavaScript control
-and visualization layer. The current implementation is an engineering and
-numerical demonstrator, not flight software or evidence of mission
-suitability.
+The public mathematical and algorithmic description is maintained in [mathpub.md](mathpub.md). It is the single public reference for the numerical model; implementation notes and working derivations remain outside the GitHub README.
 
-The current build has paths for Radial, Werner, the frequency-domain
-algorithm, Packed FFT, FMM, trajectory inversion, live diagnostics, and the
-source-crossover/performance views. Results still depend on discretization,
-GPU precision, interpolation, truncation, and the selected validation gates.
+## Workbench
 
-## Methods
+- **Left rail:** probe initial conditions, camera controls, normals and section view, constant or variable density, surface fields, patch inspection, and trajectory-knot editing.
+- **Center:** the Bevy 3D scene, live orbit, and diagnostics for the selected method.
+- **Right rail:** density inversion, trajectory-design comparisons, accuracy limits, run state, and background-execution settings.
+- **Top bar:** FMM, FFT, Werner, Radial, and Frequency-domain selection, performance comparison, gesture mode, and layout reset.
 
-| Method | Implementation boundary |
+Panels can be dragged, resized, and scrolled independently. **Reset UI view** restores panel positions and the overall UI scale. Narrow screens switch to a vertical layout instead of shrinking desktop text below a readable size.
+
+### Mobile layout and gestures
+
+The default gesture mode is **Bevy camera**: one finger rotates the camera, two fingers pan or pinch-zoom it, and camera-wheel zoom leaves HTML control dimensions unchanged.
+
+Switching to **whole UI** makes pinch or wheel gestures scale the complete workbench and dragging pan the complete view. The switch waits for the current touch sequence to finish so the camera does not receive a partial gesture. **Rotate 90°** remains available, and panel dragging accounts for rotation and UI scale.
+
+Mobile devices use simplified materials, disable scene MSAA, and cap the canvas pixel ratio. Desktop user agents on iPad are still detected as touch devices. Forms respect safe areas and use large touch targets; trajectory number fields avoid triggering iOS auto-zoom.
+
+## Density and surface fields
+
+Choose a density model and a solver, then click **Calculate field** to display effective gravity, gravity gradient, or effective slope. The constant-density view is homogeneous and mass-preserving, matching the uniform-density interpretation used by the Werner reference. The variable-density view retains the radial density profile and its corresponding field values. Changing the density mode invalidates the affected cached field work and recomputes it in bounded chunks so the UI remains responsive.
+
+Surface inspection uses a shared patch index for position, normal, field, and error. Comparison signs are reported as comparison minus baseline. Werner remains a homogeneous-polyhedron reference; heterogeneous modes use their own volume representation and are not silently substituted with the Werner result.
+
+## Frequency-domain workflow
+
+Frequency-domain propagation first advances the spacecraft with the continuous Ryugu density field and its independent field history. The captured trajectory is then consumed by the whole-trajectory transform and density-inversion stages. A fixed prerecorded track is never played back, and the frequency-domain path does not borrow acceleration history from Radial, FFT, FMM, or Werner.
+
+The public mathematical description, notation, discretization, GPU reductions, inversion model, validation strategy, and numerical limits are in [mathpub.md](mathpub.md).
+
+## Performance comparison
+
+<img src="https://github.com/user-attachments/assets/84ac0b30-d669-4a40-99a5-31ef39b3f8c0" width="100%" alt="algorithm comparison" />
+
+The figure is retained from the original performance record and was not remeasured after the latest implementation changes. It is a historical comparison, not a performance guarantee for every device or workload.
+
+- The performance page retains FPS and method-diagnostic curves.
+- First, Stress, and Quadrature retain controls for density-model count, target count, randomized order, repetitions, source sizes, medians, ranges, and accuracy thresholds.
+- GPU time comes only from GPU timestamps; CPU encoding and readback waits are not presented as GPU kernel time. Samples without timestamps remain missing.
+- Whole-trajectory observations and point-field references are checked in their own output spaces; their errors are not interchangeable.
+
+## Background execution and keep-alive
+
+The existing three-layer mechanism is retained: foreground native RAF, background Worker scheduling, and a local-server WebSocket clock with a macOS sleep-prevention process. The background path keeps one pending tick and never creates a second WASM engine. Page restoration, network reconnection, and device-loss handling remain enabled.
+
+- **Continue scheduling when this tab is hidden** controls background scheduling; the local-server connection also maintains the sleep-prevention lease.
+- **Keep the screen awake while visible** requests the browser Screen Wake Lock for long foreground mobile jobs. It is requested again when the page becomes visible and does not replace the Worker or local keep-alive path.
+- Screenshots, completed results, retryable exports, and recovery after device loss remain handled by the existing capture, background-maintenance, and server paths.
+- Local screenshots are stored in `benchmark-captures/`; the static-hosted page retains its download path.
+
+Browser freeze/discard, forced system sleep, and lid closure cannot be overridden by a web page. Mobile background execution and the static-hosted page also cannot use the server Mac's local sleep-prevention process. The status area reports the capabilities that are actually available.
+
+## Code map
+
+| Path | Responsibility |
 | --- | --- |
-| Radial analytic | Mass-preserving radial layers and GPU Gauss–Legendre evaluation. |
-| Werner polyhedron | Homogeneous closed polyhedron evaluation from oriented mesh topology. |
-| Frequency-domain algorithm | Finite reciprocal-space quadrature, trajectory-spectrum evaluation, and asynchronous GPU readback. |
-| Packed FFT | CPU zero-padded FFT preparation followed by GPU packed-f16 potential interpolation. |
-| FMM | CPU source/tree preparation and GPU target-cell expansion plus exact near-field P2P. |
+| `src/cpu/density.rs` | Shared density geometry and mass-preserving source representation |
+| `src/cpu/physics.rs` | Orbit integration, time consistency, and observation-arc capture |
+| `src/gpu/frequency_domain_pipeline/` | Whole-trajectory transform, sensitivities, planning, and readback |
+| `src/gpu/fmm_pipeline/` | Tree construction and multipole evaluation |
+| `src/gpu/mmfft_pipeline/` | Grid, spectrum, and interpolated field evaluation |
+| `src/gpu/radial.rs` | Radial analytic field evaluation and reductions |
+| `src/cpu/inversion_components/` | Reference operators, density basis, and constrained optimization |
+| `src/bevy/surface_field.rs` | Surface field, slope, and comparison display |
+| `src/html/navigation.js` | Camera or whole-UI gesture switching, scaling, and panel dragging |
+| `src/html/background*.js` | Background scheduling, keep-alive, and mobile Wake Lock |
+| `src/html/ui.js` / `app.js` | Controls, state, and charts |
+| `src/wgsl/` | Unified WGSL shaders loaded by the Rust GPU pipelines |
 
-The frequency-domain path is a finite numerical realization rather than an
-unbounded exact transform. CPU f64 references remain separate from GPU f32
-results so a method is never validated against its own approximation.
-
-## Project structure
-
-```text
-src/
-├── lib.rs                    Bevy app, startup, schedules, WASM exports
-├── bevy/                     ECS adapters, scene setup, rendering, UI snapshots
-├── interface/                Shared resources, requests, histories, contracts
-├── cpu/                      Source preparation, physics, planning, inversion,
-│                             f64 reference and benchmark helpers
-├── gpu/                      Render-world compute pipelines and readback paths
-└── wgsl/                     WebGPU shaders and runtime shader validation
-
-assets/
-├── models/                   Ryugu and probe geometry
-├── operators/                Transform/operator lookup tables
-└── shaders/                  Auxiliary presentation shaders
-```
-
-The dependency direction is intentionally one-way:
-
-```text
-mesh → shared source contract → CPU preparation / GPU extraction
-     → WGSL dispatch → async readback → Bevy state → JSON snapshot → UI
-```
-
-`src/interface/` is the contract boundary between numerical code and
-presentation. It carries snapshot identities, capture IDs, workload
-identities, metric rows, and history buffers so stale GPU packets or mismatched
-source meshes cannot be silently compared.
-
-`src/bevy/` schedules ECS systems and owns the visible scene. Gizmos are
-budgeted presentation primitives: live trajectories are capped to a fixed
-point count, normals are sampled, and density overlays use line segments
-instead of one high-resolution sphere entity per sample. Radial keeps the
-yellow detector marker, its live trajectory, and section view; only the
-non-yellow initial knot markers are omitted.
-
-The frequency-domain chart evaluates a cumulative prefix of the captured
-trajectory, so the displayed transform evolves without pretending to be a
-pointwise force integrator. Performance tests repeatedly evaluate the complete
-captured trajectory and report transform-norm stability alongside measured
-FPS.
-
-`src/cpu/` prepares mass-preserving sources, integrates the probe, assembles
-planning references, and performs independent f64 checks. It may prepare FFT,
-FMM, and inversion data, but it does not replace a failed GPU method with a
-different physical model.
-
-`src/gpu/` contains Bevy RenderApp extraction, bind-group layouts, dispatch,
-timestamp collection, and readback decoding. Frequency-domain nodes use an
-explicit `vec4<f32>(kx, ky, kz, weight)` storage layout shared by Rust and
-WGSL. Shader variants are checked by the runtime shader frontend tests.
-
-`src/wgsl/` contains the parallel kernels. Storage-array parameter blocks are
-used for batched work; output packets carry snapshot identity and diagnostic
-fields so the main world can reject stale results.
-
-Arrow Up/Right zoom the Bevy camera in; Arrow Down/Left zoom it out. These
-keys never resize or translate the HTML overlay. Pointer wheel, right-drag,
-and pinch gestures remain available for the display surface.
-
-## Fair comparison rules
-
-The comparison UI reports preparation, warm evaluation, readback, accuracy,
-and certified timing separately. Methods use common source/target workloads
-where their mathematical scope permits it. Werner remains homogeneous while
-the heterogeneous methods use the shared logarithmic source profile.
-
-Frequency-domain, Packed FFT, and FMM planning rows share target counts,
-density-model counts, repeats, source-size sweeps, and f64 reference
-observations. The frequency-domain path uses a finite reciprocal-space
-quadrature and a complete trajectory transform; its GPU result is checked by
-an independent f64 implementation of the same discrete operator. Inversion
-uses the same frequency-domain observation contract and frozen trajectory
-identity as the forward path.
-
-Accuracy and workload gates are part of the result, not decoration:
-frequency-domain, Packed FFT, and FMM rows remain failed or pending when their
-independent reference or required repetitions are incomplete. Timing is only
-published for a complete, eligible workload, which keeps algorithm comparisons
-auditable.
-
-The benchmark is an end-to-end browser workload, not a claim about asymptotic
-complexity. GPU preprocessing, cache rebuilds, readback, and CPU integration
-are part of the reported path. A warm cached result is meaningful only when
-the same source identity, trajectory, and target workload are retained.
-
-## Build and deployment
+## Build and checks
 
 ```sh
 bun install
 bun run build
-bun run server.ts       # optional local static server
+bun run serve
 ```
 
-GitHub Pages deployment is defined in `.github/workflows/deploy.yml`. The
-generated `pkg/` directory is loaded by `src/html/index.html`; deployment
-injects a cache-busting version so HTML, JS, and WASM stay aligned.
+Deployment is defined in [.github/workflows/deploy.yml](.github/workflows/deploy.yml). The generated WebAssembly package is loaded by `src/html/index.html`; deployment also copies gesture controls, the background Worker, and the required shader assets.
 
-The repository does not require a browser or preview server for source-level
-shader and contract tests. WebGPU behavior still depends on the browser
-adapter and device limits available at runtime.
+## Numerical limits
 
-## Known limitations
+The current source geometry uses a Ryugu-suitable star-shaped angular-cell and shell approximation. Finite wave-number and radial quadrature, f32 arithmetic, FFT grid quantization, FMM order, near-field treatment, and asynchronous extrapolation each introduce separate errors and require separate convergence checks.
 
-- GPU arithmetic is primarily f32 and readback is asynchronous.
-- Frequency-domain evaluation is finite-band and finite-quadrature; validity
-  depends on segment guards and reference checks.
-- MMFFT includes CPU FFT preprocessing, finite grids, interpolation, and
-  packed-f16 quantization.
-- FMM uses a fixed order/depth configuration and needs external convergence
-  studies for broader claims.
-- Density inversion is regularized and non-unique.
-- The radial source model assumes a star-shaped body representation.
+A single external orbit cannot uniquely recover an arbitrary three-dimensional density without priors, gradient measurements, or additional trajectories. Identifiability is therefore discussed only for a specified finite parameterization, feasible constraints, and a regularized optimization problem.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).
