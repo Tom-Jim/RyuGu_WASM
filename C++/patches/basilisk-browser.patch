@@ -1,0 +1,306 @@
+diff --git a/src/architecture/system_model/sim_model.cpp b/src/architecture/system_model/sim_model.cpp
+index 3729ba1..c434d88 100755
+--- a/src/architecture/system_model/sim_model.cpp
++++ b/src/architecture/system_model/sim_model.cpp
+@@ -20,6 +20,7 @@
+ #include "sim_model.h"
+ #include <iostream>
+ 
++#ifndef RYUGU_BROWSER_SERIAL
+ void activateNewThread(void *threadData)
+ {
+ 
+@@ -235,11 +236,19 @@ void SimThreadExecution::addNewProcess(SysProcess* newProc) {
+ 
+ /*! This Constructor is used to initialize the top-level sim model.
+  */
++#endif
++
+ SimModel::SimModel()
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++
++#else
++
+     //Default to single-threaded runtime
+     auto *newThread = new SimThreadExecution(0, 0);
+     this->threadList.push_back(newThread);
++
++#endif
+ }
+ 
+ /*! Nothing to destroy really */
+@@ -255,6 +264,15 @@ SimModel::~SimModel()
+  */
+ void SimModel::StepUntilStop(uint64_t SimStopTime, int64_t stopPri)
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++    while (this->NextTaskTime < SimStopTime ||
++           (this->NextTaskTime == SimStopTime && this->nextProcPriority >= stopPri)) {
++        const auto previous = this->NextTaskTime;
++        this->SingleStepProcesses(this->NextTaskTime < SimStopTime ? -1 : stopPri);
++        if (this->NextTaskTime <= previous) break;
++    }
++#else
++
+     std::cout << std::flush;
+     for(auto const* simThread : this->threadList)
+     {
+@@ -286,6 +304,8 @@ void SimModel::StepUntilStop(uint64_t SimStopTime, int64_t stopPri)
+                                  simThread->CurrentNanos : this->CurrentNanos;
+         }
+     }
++
++#endif
+ }
+ 
+ 
+@@ -315,6 +335,12 @@ void SimModel::addNewProcess(SysProcess *newProc)
+  */
+ void SimModel::selfInitSimulation()
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++    for (auto *process : processList) process->selfInitProcess();
++    this->NextTaskTime = 0;
++    this->CurrentNanos = 0;
++#else
++
+     for(auto const& simThread : this->threadList)
+     {
+         simThread->selfInitNow = true;
+@@ -331,6 +357,8 @@ void SimModel::selfInitSimulation()
+     this->NextTaskTime = 0;
+     this->CurrentNanos = 0;
+ 
++
++#endif
+ }
+ 
+ /*! This method goes through all of the processes in the simulation,
+@@ -339,6 +367,10 @@ void SimModel::selfInitSimulation()
+  */
+ void SimModel::resetInitSimulation() const
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++    for (auto *process : processList) process->resetProcess(0);
++#else
++
+ 
+ 
+     for(auto const& simThread : this->threadList)
+@@ -355,6 +387,8 @@ void SimModel::resetInitSimulation() const
+             std::rethrow_exception(simThread->threadException);
+         }
+     }
++
++#endif
+ }
+ 
+ /*! This method steps all of the processes forward to the current time.  It also
+@@ -402,6 +436,11 @@ void SimModel::SingleStepProcesses(int64_t stopPri)
+  */
+ void SimModel::ResetSimulation()
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++    for (auto *process : processList) process->reInitProcess();
++    NextTaskTime = CurrentNanos = 0;
++#else
++
+     //! - Iterate through model list and call the Task model initializer
+     for(auto const& process : this->processList)
+     {
+@@ -414,6 +453,8 @@ void SimModel::ResetSimulation()
+         simThread->NextTaskTime = 0;
+         simThread->CurrentNanos = 0;
+     }
++
++#endif
+ }
+ 
+ /*! This method removes all of the active processes from the "thread pool" that
+@@ -422,6 +463,10 @@ void SimModel::ResetSimulation()
+ 
+  */
+ void SimModel::clearProcsFromThreads() const {
++#ifdef RYUGU_BROWSER_SERIAL
++    for (auto *process : processList) process->setProcessControlStatus(false);
++#else
++
+ 
+     for(auto const& simThread : this->threadList)
+     {
+@@ -433,6 +478,8 @@ void SimModel::clearProcsFromThreads() const {
+         process->setProcessControlStatus(false);
+     }
+ 
++
++#endif
+ }
+ 
+ /*! This method provides an easy mechanism for allowing the user to change the
+@@ -443,6 +490,11 @@ void SimModel::clearProcsFromThreads() const {
+  */
+ void SimModel::resetThreads(uint64_t threadCount)
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++    if (threadCount > 1) bskLogger.bskError("Browser WASM supports one execution thread");
++    clearProcsFromThreads();
++#else
++
+ 
+     this->clearProcsFromThreads();
+     this->deleteThreads();
+@@ -453,6 +505,8 @@ void SimModel::resetThreads(uint64_t threadCount)
+         this->threadList.push_back(newThread);
+     }
+ 
++
++#endif
+ }
+ 
+ /*! This method walks through all of the child threads that have been created in
+@@ -461,6 +515,10 @@ void SimModel::resetThreads(uint64_t threadCount)
+     clean shutdown of any existing runtime stuff.
+  */
+ void SimModel::deleteThreads() {
++#ifdef RYUGU_BROWSER_SERIAL
++    threadList.clear();
++#else
++
+     for(auto const& simThread : this->threadList)
+     {
+         simThread->killThread();
+@@ -472,6 +530,8 @@ void SimModel::deleteThreads() {
+         delete simThread;
+     }
+     this->threadList.clear();
++
++#endif
+ }
+ 
+ /*! This method provides a seamless allocation of processes onto active threads
+@@ -481,6 +541,10 @@ void SimModel::deleteThreads() {
+ 
+  */
+ void SimModel::assignRemainingProcs() {
++#ifdef RYUGU_BROWSER_SERIAL
++    // Browser execution traverses the ordered process list directly.
++#else
++
+ 
+     std::vector<SysProcess *>::iterator it;
+     std::vector<SimThreadExecution*>::iterator thrIt;
+@@ -511,6 +575,8 @@ void SimModel::assignRemainingProcs() {
+     {
+         simThread->waitOnInit();
+     }
++
++#endif
+ }
+ 
+ /*! This method allows the user to specifically place a given process onto a
+@@ -524,5 +590,12 @@ void SimModel::assignRemainingProcs() {
+  */
+ void SimModel::addProcessToThread(SysProcess *newProc, size_t threadSel)
+ {
++#ifdef RYUGU_BROWSER_SERIAL
++    if (threadSel != 0) bskLogger.bskError("Invalid browser execution thread");
++    newProc->setProcessControlStatus(false);
++#else
++
+     this->threadList.at(threadSel)->addNewProcess(newProc);
++
++#endif
+ }
+diff --git a/src/architecture/system_model/sim_model.h b/src/architecture/system_model/sim_model.h
+index 26a32a8..5b8802b 100755
+--- a/src/architecture/system_model/sim_model.h
++++ b/src/architecture/system_model/sim_model.h
+@@ -20,17 +20,26 @@
+ #define _SimModel_HH_
+ 
+ #include "architecture/utilities/bskLogging.h"
++#ifndef RYUGU_BROWSER_SERIAL
+ #include "architecture/utilities/bskSemaphore.h"
++#endif
+ #include "architecture/system_model/sys_process.h"
++#ifndef RYUGU_BROWSER_SERIAL
+ #include <condition_variable>
++#endif
+ #include <iostream>
++#ifndef RYUGU_BROWSER_SERIAL
+ #include <mutex>
++#endif
+ #include <stdint.h>
+ #include <set>
++#ifndef RYUGU_BROWSER_SERIAL
+ #include <thread>
++#endif
+ #include <vector>
+ 
+ //! This class handles the management of a given "thread" of execution and provides the main mechanism for running concurrent jobs inside BSK
++#ifndef RYUGU_BROWSER_SERIAL
+ class SimThreadExecution
+ {
+ public:
+@@ -81,6 +90,10 @@ private:
+     std::condition_variable initHoldVar; //!< Conditional variable used to prevent race conditions
+ };
+ 
++#else
++class SimThreadExecution;
++#endif
++
+ //! The top-level container for an entire simulation
+ class SimModel
+ {
+diff --git a/src/architecture/utilities/bskLogging.cpp b/src/architecture/utilities/bskLogging.cpp
+index 76e04b7..ceb7b88 100644
+--- a/src/architecture/utilities/bskLogging.cpp
++++ b/src/architecture/utilities/bskLogging.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ /*
+  ISC License
+ 
+@@ -118,7 +119,11 @@ void BSKLogger::bskLog(logLevel_t targetLevel, const char* info, ...)
+     // Raise an error that swig can pipe to python
+     if(targetLevel == BSK_ERROR)
+     {
++        #ifdef RYUGU_BROWSER_SERIAL
++        std::abort();
++#else
+         throw BasiliskError(formatMessage);
++#endif
+     }
+     // Otherwise, print the message accordingly
+     if(targetLevel >= this->_logLevel)
+@@ -148,7 +153,11 @@ BSK_NORETURN void BSKLogger::bskError(const char* info, ...)
+     std::string formatMessage = formatLogMessage(info, args);
+     va_end(args);
+ 
+-    throw BasiliskError(formatMessage);
++    #ifdef RYUGU_BROWSER_SERIAL
++        std::abort();
++#else
++        throw BasiliskError(formatMessage);
++#endif
+ }
+ 
+ /*! Section contains C interfacing to C++ object */
+@@ -198,11 +207,15 @@ EXTERN int _bskLogNoThrow(BSKLogger* bskLogger, logLevel_t logLevel, const char*
+         return 0;
+     }
+ 
++#ifndef RYUGU_BROWSER_SERIAL
+     try {
++#endif
+         bskLogger->bskLog(logLevel, "%s", info == nullptr ? "" : info);
++#ifndef RYUGU_BROWSER_SERIAL
+     } catch (...) {
+         return -1;
+     }
++#endif
+     return 0;
+ }
+ 

@@ -122,8 +122,8 @@
             <div class="scene-caption"><span>LIVE ORBIT</span><p id="operator-chain">Waiting for the gravity operator…</p></div>
             <section class="telemetry-stack" data-float-panel>
                 <article class="chart-card glass">
-                    <div class="panel-heading"><span>Orbit &amp; transform diagnostics</span><small>METHOD OBSERVATION</small></div>
-                    <div id="jacobi-chart" class="live-chart-host" aria-label="Active gravity method diagnostic"></div>
+                    <div class="panel-heading"><span>Orbit &amp; transform diagnostics</span><small>LIVE JACOBI / SPECTRAL</small></div>
+                    <div id="jacobi-chart" class="live-chart-host" aria-label="Live Jacobi constant or frequency-domain diagnostic"></div>
                 </article>
             </section>
         </section>
@@ -237,6 +237,31 @@
             const suffix = cacheVersion ? `?v=${encodeURIComponent(cacheVersion)}` : '';
             const wasm = await import(`./pkg/ryugu_wasm.js${suffix}`);
             await wasm.default({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` });
+            // Do not block first paint on the large numerical module. Bevy
+            // waits for this flag before configuring C++ geometry or advancing
+            // physics, while the controls and WebGPU scene stay responsive.
+            globalThis.ryuguNumericalBackendReady = false;
+            requestAnimationFrame(() => setTimeout(() => {
+                void (async () => {
+                    const { instantiateBackend, createFieldBackend } = await import(`./pkg/backend.mjs${suffix}`);
+                    const backendResponse = await fetch(`./pkg/ryugu_backend.wasm${suffix}`);
+                    if (!backendResponse.ok) throw new Error(`C++ backend download failed: ${backendResponse.status}`);
+                    const numericalModule = await instantiateBackend(await backendResponse.arrayBuffer());
+                    globalThis.ryuguCpp = createFieldBackend(numericalModule);
+                    globalThis.ryuguScheduler = numericalModule.api;
+                    const rustBackend = await import(`./pkg/backend/ryugu_backend.js${suffix}`);
+                    await rustBackend.default({ module_or_path: `./pkg/backend/ryugu_backend_bg.wasm${suffix}` });
+                    if (rustBackend.protocol_version() !== 1) throw new Error('Unsupported backend protocol');
+                    globalThis.ryuguRustBackend = rustBackend;
+                    globalThis.ryuguNumericalBackendReady = true;
+                    document.getElementById('operator-chain').textContent = 'Numerical backend ready.';
+                    window.dispatchEvent(new Event('ryugu-numerical-backend-ready'));
+                })().catch((error) => {
+                    console.error(error);
+                    document.getElementById('operator-chain').textContent =
+                        `Numerical backend failed: ${error instanceof Error ? error.message : String(error)}`;
+                });
+            }, 0));
             try {
                 const resume = JSON.parse(sessionStorage.getItem('ryugu-device-lost-resume') || 'null');
                 if (resume) {

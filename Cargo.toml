@@ -13,21 +13,19 @@ crate-type = ["cdylib", "rlib"]
 default = []
 
 [dependencies]
-bevy = { version = "0.19.1", features = ["webgpu","debug"] }
+bevy = { version = "0.19.1", default-features = false, features = ["3d", "bevy_gizmos", "webgpu"] }
 bevy_panorbit_camera = "0.35"
 bevy_framepace = { version = "0.22.0", default-features = false }
-clarabel = "0.11.1"
+# Clarabel now belongs exclusively to src/backend/rust/Cargo.toml.
 wasm-bindgen = "0.2"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 bytemuck = "1"
-half = "2.7"
+# half and rustfft served the disabled MMFFT implementation.
 num-complex = "0.4"
-rustfft = "6"
 rand = { version = "0.10", default-features = false, features = ["std_rng"] }
 rand_distr = "0.6"
 wgpu29 = { package = "wgpu", version = "=29.0.4" }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
 serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

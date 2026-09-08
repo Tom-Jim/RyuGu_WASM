@@ -258,8 +258,8 @@ impl PlanningWorkloadIdentity {
 #[allow(clippy::enum_variant_names)]
 pub enum PlanningExecutionBackend {
     GpuFrequencyDomain,
-    GpuMmfft,
-    GpuFmm,
+    CppFlups,
+    CppExafmm,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -793,8 +793,8 @@ impl PlanningComparisonState {
             ) == dimensions
             && frequency_domain.workload.is_complete()
             && frequency_domain.backend == PlanningExecutionBackend::GpuFrequencyDomain
-            && mmfft.backend == PlanningExecutionBackend::GpuMmfft
-            && fmm.backend == PlanningExecutionBackend::GpuFmm)
+            && mmfft.backend == PlanningExecutionBackend::CppFlups
+            && fmm.backend == PlanningExecutionBackend::CppExafmm)
             .then_some(frequency_domain.workload)
     }
 
@@ -858,7 +858,7 @@ mod planning_sweep_tests {
     fn measured_row() -> PlanningMethodMetrics {
         PlanningMethodMetrics {
             method: ActiveGravityMethod::Fmm,
-            backend: PlanningExecutionBackend::GpuFmm,
+            backend: PlanningExecutionBackend::CppExafmm,
             gpu_batch_verified: true,
             workload: PlanningWorkloadIdentity {
                 reference_capture_id: 1,

@@ -23,8 +23,8 @@ pub const PLANNING_GPU_TARGET_SUBMISSION_MS: f64 = 8.0;
 pub const PLANNING_GPU_MAX_SUBMISSION_MS: f64 = 20.0;
 pub const PLANNING_GPU_MIN_STAGE_BUDGET: usize = 1;
 pub const PLANNING_GPU_MAX_STAGE_BUDGET: usize = 2;
-pub const PLANNING_GPU_MIN_BATCH: u32 = 1;
-pub const PLANNING_GPU_MAX_BATCH: u32 = 4;
+// pub const PLANNING_GPU_MIN_BATCH: u32 = 1;
+// pub const PLANNING_GPU_MAX_BATCH: u32 = 4;
 pub const PLANNING_MAX_RECENT_FRAME_MS: f64 = 18.5;
 pub const PLANNING_GPU_UPLOAD_BYTES_PER_FRAME: usize = 1024 * 1024;
 pub const PLANNING_REFERENCE_STRIDE: u32 = 32;
@@ -286,11 +286,11 @@ pub struct PlanningMethodPayload {
     pub secondary: Arc<[u8]>,
     pub item_count: u32,
     pub secondary_count: u32,
-    pub maximum_level: u32,
-    pub grid_sizes: [u32; 2],
-    pub half_extents: [f32; 2],
-    pub grid_scales: [f32; 2],
-    pub total_mass: f32,
+//     pub maximum_level: u32,
+//     pub grid_sizes: [u32; 2],
+//     pub half_extents: [f32; 2],
+//     pub grid_scales: [f32; 2],
+//     pub total_mass: f32,
     /// Method-specific immutable geometry/basis work performed once per source
     /// point. Program-lifetime setup such as FFT plans is excluded.
     pub geometry_basis_preparation_ms: f64,

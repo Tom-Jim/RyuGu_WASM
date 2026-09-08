@@ -411,7 +411,7 @@ window.ryuguPlanningProgress = (planning) => ({
     if (lastCurveRenderKey !== null) return;
     const groups = lastCurveGroups;
     $('#quadrature-timing-policy').textContent = timingKey === 'times' ? planning.timingDefinition ?? ''
-      : `${timingTitle}: wgpu pass-boundary timestamps only; checked is raw + the additional checked pass. Excludes CPU preparation, copies, queue waits and metrics reduction. FFT source deposition, 56 basis convolutions and density combinations run on GPU. FMM moment construction, tree traversal, near field and 56-basis density mixing also run on GPU; target-only FMM mixes cached responses. These kernels do different work, so this is not hardware FLOP throughput or an end-to-end algorithm speedup. Missing/zero-resolution timestamps are not replaced by wall time.`;
+      : `${timingTitle}: GPU timestamps apply to the frequency-domain operator. ExaFMM-t and FLUPS execute in C++ WASM and have no GPU timestamps; select Full pipeline total to compare all methods. Missing timestamps are not replaced by wall time.`;
     const required = Math.max(7, planning.requiredRepeats ?? 7);
     const complete = groups.filter((group) => group.methods.every((method) => method.count >= required));
     const plotted = groups.reduce((total, group) => total

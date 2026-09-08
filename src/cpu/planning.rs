@@ -643,42 +643,68 @@ fn append_dynamical_candidate_at_radius(
     let first = *reference.first()?;
     let first_offset =
         candidate_initial_offset(first, 0, sample_count, radius, phase, harmonic, phase_rate)?;
-    let mut world_position = (first.position + first_offset).as_dvec3();
-    // Candidates differ through their initial transverse displacement.  The
-    // velocity is not differentiated from an arbitrary drawn perturbation; it is the
-    // captured physical velocity and the propagated field determines every
-    // subsequent state.
-    let mut world_velocity = first.velocity.as_dvec3();
+    let jets: Vec<_> = reference_jets
+        .iter()
+        .map(|jet| {
+            serde_json::json!({
+                "time": jet.simulation_time_seconds,
+                "rotation": jet.body_rotation.to_array(),
+                "position": jet.world_position.to_array(),
+                "acceleration": jet.world_acceleration.to_array(),
+                "jacobian": jet.world_jacobian.to_cols_array(),
+            })
+        })
+        .collect();
+    let sources: Vec<_> = dynamics_tree
+        .map(|tree| tree.sources())
+        .unwrap_or(&[])
+        .iter()
+        .map(|(p, m)| (p.to_array(), *m))
+        .collect();
+    let request = serde_json::json!({
+        "position": (first.position + first_offset).as_dvec3().to_array(),
+        "velocity": first.velocity.as_dvec3().to_array(),
+        "jets": jets,
+        "sources": sources,
+    });
+    let trajectory = crate::cpp_backend::propagate_candidate(&request.to_string()).ok()?;
+    if trajectory.len() != reference.len() * 6 || !trajectory.iter().all(|v| v.is_finite()) {
+        return None;
+    }
 
     let angular_velocity =
         RYUGU_SPIN_AXIS.normalize_or_zero() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
     let first_time = first.simulation_time_seconds;
     for sample in 0..sample_count {
         let reference_state = reference[sample as usize];
-        if sample > 0 {
-            let previous = reference[sample as usize - 1];
-            let dt = reference_state.simulation_time_seconds - previous.simulation_time_seconds;
-            if !dt.is_finite() || dt <= 0.0 {
-                return None;
-            }
-            let acceleration_start = planning_reference_acceleration(
-                reference_jets,
-                dynamics_tree,
-                previous.simulation_time_seconds,
-                world_position,
-            )?;
-            world_velocity += acceleration_start * (0.5 * dt);
-            world_position += world_velocity * dt;
-            let acceleration_end = planning_reference_acceleration(
-                reference_jets,
-                dynamics_tree,
-                reference_state.simulation_time_seconds,
-                world_position,
-            )?;
-            world_velocity += acceleration_end * (0.5 * dt);
-        }
-        let world_position_f32 = world_position.as_vec3();
-        let world_velocity_f32 = world_velocity.as_vec3();
+        //         if sample > 0 {
+        //             let previous = reference[sample as usize - 1];
+        //             let dt = reference_state.simulation_time_seconds - previous.simulation_time_seconds;
+        //             if !dt.is_finite() || dt <= 0.0 {
+        //                 return None;
+        //             }
+        //             let acceleration_start = planning_reference_acceleration(
+        //                 reference_jets,
+        //                 dynamics_tree,
+        //                 previous.simulation_time_seconds,
+        //                 world_position,
+        //             )?;
+        //             world_velocity += acceleration_start * (0.5 * dt);
+        //             world_position += world_velocity * dt;
+        //             let acceleration_end = planning_reference_acceleration(
+        //                 reference_jets,
+        //                 dynamics_tree,
+        //                 reference_state.simulation_time_seconds,
+        //                 world_position,
+        //             )?;
+        //             world_velocity += acceleration_end * (0.5 * dt);
+        //         }
+        //         let world_position_f32 = world_position.as_vec3();
+        //         let world_velocity_f32 = world_velocity.as_vec3();
+        //
+        let values = &trajectory[sample as usize * 6..];
+        let world_position_f32 = DVec3::from_slice(values).as_vec3();
+        let world_velocity_f32 = DVec3::from_slice(&values[3..]).as_vec3();
         let transverse_distance = world_position_f32.distance(reference_state.position);
         if !transverse_distance.is_finite() {
             return None;
@@ -735,46 +761,46 @@ fn candidate_initial_offset(
     Some(normal * (offset_radius * angle.cos()) + binormal * (offset_radius * angle.sin()))
 }
 
-fn planning_reference_acceleration(
-    jets: &[PlanningReferenceJet],
-    dynamics_tree: Option<&PlanningDynamicsTree>,
-    simulation_time_seconds: f64,
-    position: DVec3,
-) -> Option<DVec3> {
-    let first = jets[0];
-    let last = jets[jets.len() - 1];
-    let jet = if simulation_time_seconds <= first.simulation_time_seconds {
-        first
-    } else if simulation_time_seconds >= last.simulation_time_seconds {
-        last
-    } else {
-        let upper_index = jets
-            .partition_point(|jet| jet.simulation_time_seconds < simulation_time_seconds)
-            .clamp(1, jets.len() - 1);
-        let lower = jets[upper_index - 1];
-        let upper = jets[upper_index];
-        let interval =
-            (upper.simulation_time_seconds - lower.simulation_time_seconds).max(f64::MIN_POSITIVE);
-        let weight =
-            ((simulation_time_seconds - lower.simulation_time_seconds) / interval).clamp(0.0, 1.0);
-        PlanningReferenceJet {
-            simulation_time_seconds,
-            body_rotation: lower.body_rotation.slerp(upper.body_rotation, weight),
-            world_position: lower.world_position.lerp(upper.world_position, weight),
-            world_acceleration: lower
-                .world_acceleration
-                .lerp(upper.world_acceleration, weight),
-            world_jacobian: lower.world_jacobian * (1.0 - weight) + upper.world_jacobian * weight,
-        }
-    };
-    Some(if let Some(tree) = dynamics_tree {
-        let body_position = jet.body_rotation.inverse() * position;
-        jet.body_rotation * tree.acceleration(body_position)?
-    } else {
-        jet.world_acceleration + jet.world_jacobian * (position - jet.world_position)
-    })
-}
-
+// fn planning_reference_acceleration(
+//     jets: &[PlanningReferenceJet],
+//     dynamics_tree: Option<&PlanningDynamicsTree>,
+//     simulation_time_seconds: f64,
+//     position: DVec3,
+// ) -> Option<DVec3> {
+//     let first = jets[0];
+//     let last = jets[jets.len() - 1];
+//     let jet = if simulation_time_seconds <= first.simulation_time_seconds {
+//         first
+//     } else if simulation_time_seconds >= last.simulation_time_seconds {
+//         last
+//     } else {
+//         let upper_index = jets
+//             .partition_point(|jet| jet.simulation_time_seconds < simulation_time_seconds)
+//             .clamp(1, jets.len() - 1);
+//         let lower = jets[upper_index - 1];
+//         let upper = jets[upper_index];
+//         let interval =
+//             (upper.simulation_time_seconds - lower.simulation_time_seconds).max(f64::MIN_POSITIVE);
+//         let weight =
+//             ((simulation_time_seconds - lower.simulation_time_seconds) / interval).clamp(0.0, 1.0);
+//         PlanningReferenceJet {
+//             simulation_time_seconds,
+//             body_rotation: lower.body_rotation.slerp(upper.body_rotation, weight),
+//             world_position: lower.world_position.lerp(upper.world_position, weight),
+//             world_acceleration: lower
+//                 .world_acceleration
+//                 .lerp(upper.world_acceleration, weight),
+//             world_jacobian: lower.world_jacobian * (1.0 - weight) + upper.world_jacobian * weight,
+//         }
+//     };
+//     Some(if let Some(tree) = dynamics_tree {
+//         let body_position = jet.body_rotation.inverse() * position;
+//         jet.body_rotation * tree.acceleration(body_position)?
+//     } else {
+//         jet.world_acceleration + jet.world_jacobian * (position - jet.world_position)
+//     })
+// }
+//
 fn build_planning_reference_jets(
     reference: &[TrajectoryInversionKnot],
 ) -> Vec<PlanningReferenceJet> {
@@ -834,29 +860,57 @@ pub(crate) fn accumulate_planning_reference_chunk(
     if densities.len() != 56 || !target.is_finite() {
         return None;
     }
-    for source in basis_records {
-        let density = f64::from(*densities.get(source.voxel_index as usize)?);
-        let position = DVec3::new(
-            f64::from(source.position_volume[0]),
-            f64::from(source.position_volume[1]),
-            f64::from(source.position_volume[2]),
-        );
-        let displacement = position - target;
-        let radius_squared = displacement.length_squared().max(1.0e-16);
-        let inverse_radius = radius_squared.sqrt().recip();
-        let inverse_radius_cubed = inverse_radius / radius_squared;
-        let mass = f64::from(source.position_volume[3]) * density;
-        *acceleration += f64::from(G) * mass * displacement * inverse_radius_cubed;
-        let outer = DMat3::from_cols(
-            displacement * displacement.x,
-            displacement * displacement.y,
-            displacement * displacement.z,
-        );
-        *gradient += f64::from(G)
-            * mass
-            * (-DMat3::IDENTITY * inverse_radius_cubed
-                + outer * (3.0 * inverse_radius_cubed / radius_squared));
+    //     for source in basis_records {
+    //         let density = f64::from(*densities.get(source.voxel_index as usize)?);
+    //         let position = DVec3::new(
+    //             f64::from(source.position_volume[0]),
+    //             f64::from(source.position_volume[1]),
+    //             f64::from(source.position_volume[2]),
+    //         );
+    //         let displacement = position - target;
+    //         let radius_squared = displacement.length_squared().max(1.0e-16);
+    //         let inverse_radius = radius_squared.sqrt().recip();
+    //         let inverse_radius_cubed = inverse_radius / radius_squared;
+    //         let mass = f64::from(source.position_volume[3]) * density;
+    //         *acceleration += f64::from(G) * mass * displacement * inverse_radius_cubed;
+    //         let outer = DMat3::from_cols(
+    //             displacement * displacement.x,
+    //             displacement * displacement.y,
+    //             displacement * displacement.z,
+    //         );
+    //         *gradient += f64::from(G)
+    //             * mass
+    //             * (-DMat3::IDENTITY * inverse_radius_cubed
+    //                 + outer * (3.0 * inverse_radius_cubed / radius_squared));
+    //     }
+    //
+    let sources = basis_records
+        .iter()
+        .map(|record| {
+            Some((
+                DVec3::new(
+                    record.position_volume[0] as f64,
+                    record.position_volume[1] as f64,
+                    record.position_volume[2] as f64,
+                ),
+                record.position_volume[3] as f64
+                    * f64::from(*densities.get(record.voxel_index as usize)?),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let h = 0.01;
+    let mut targets = vec![target];
+    for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+        targets.extend([target + h * axis, target - h * axis]);
     }
+    let values = crate::cpp_backend::evaluate_sources("direct", &sources, &targets).ok()?;
+    let field = |i: usize| DVec3::new(values[i][0], values[i][1], values[i][2]);
+    *acceleration += field(0);
+    *gradient += DMat3::from_cols(
+        (field(1) - field(2)) / (2.0 * h),
+        (field(3) - field(4)) / (2.0 * h),
+        (field(5) - field(6)) / (2.0 * h),
+    );
     (acceleration.is_finite() && gradient.is_finite()).then_some(())
 }
 

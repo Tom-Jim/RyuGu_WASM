@@ -116,11 +116,12 @@ pub fn start_density_inversion_system(
                 sensitivities.clone_from(&cache.values);
             } else {
                 let matrix_started = Instant::now();
-                sensitivities = if method == ActiveGravityMethod::MmfftCompressed {
-                    crate::gpu::mmfft::voxel_basis_sensitivities(&basis_sources, &samples)
-                } else {
-                    fmm_voxel_basis_sensitivities(&basis_sources, &samples)
-                };
+                // Legacy Rust FFT/FMM sensitivities are no longer dispatched.
+                let key = if method == ActiveGravityMethod::MmfftCompressed { "fft" } else { "fmm" };
+                match crate::cpp_backend::voxel_basis_sensitivities(key, &basis_sources, &samples) {
+                    Ok(values) => sensitivities = values,
+                    Err(message) => { inversion.error = Some(message); return; }
+                }
                 timing.matrix_build_ms = matrix_started.elapsed().as_secs_f64() * 1.0e3;
                 *cache = DensitySensitivityCache {
                     capture_id: Some(capture_id),

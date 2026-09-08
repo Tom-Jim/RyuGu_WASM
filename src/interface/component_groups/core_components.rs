@@ -20,7 +20,6 @@ pub const JACOBI_HISTORY_CAPACITY: usize = 256;
 /// accelerated stable step (9 samples at 8x). A smaller capacity silently
 /// evicts the authoritative sample before the integrator can consume it.
 pub const GRAVITY_SAMPLE_HISTORY_CAPACITY: usize = 2 * (MAX_SIMULATION_ACCELERATION as usize + 1);
-pub const PHYSICS_SUBSTEPS: usize = 100;
 pub const MIN_SIMULATION_ACCELERATION: u32 = 1;
 pub const MAX_SIMULATION_ACCELERATION: u32 = 8;
 pub const VISIBILITY_THRESHOLD: f32 = 250.0;
@@ -104,6 +103,50 @@ impl Default for GravityBenchmarkTrajectory {
             ),
             capture_id: None,
             complete: false,
+        }
+    }
+}
+
+/// Browser/native state message produced by the Basilisk compatibility layer.
+/// Positions and velocities are SI values; time is kept as seconds here for
+/// the UI and is also exported as integer nanoseconds in the wire header.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BasiliskSnapshot {
+    pub algorithm: u8,
+    pub sequence: u64,
+    pub protocol_version: u16,
+    pub simulation_time_ns: u64,
+    pub simulation_time_seconds: f64,
+    pub epoch: u64,
+    pub position_m: [f64; 3],
+    pub velocity_mps: [f64; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BasiliskComparisonSample {
+    pub sample_count: u64,
+    pub relative_acceleration_error: f64,
+    pub reference_acceleration_mps2: [f64; 3],
+    pub measured_acceleration_mps2: [f64; 3],
+}
+
+#[derive(Resource, Clone, Debug)]
+pub struct BasiliskBridgeState {
+    pub protocol: &'static str,
+    pub version: u16,
+    pub fixed_step_seconds: f64,
+    pub snapshot: Option<BasiliskSnapshot>,
+    pub comparisons: [BasiliskComparisonSample; 5],
+}
+
+impl Default for BasiliskBridgeState {
+    fn default() -> Self {
+        Self {
+            protocol: "ryugu-basilisk-v1",
+            version: 1,
+            fixed_step_seconds: f64::from(TIME_SCALE) / 60.0,
+            snapshot: None,
+            comparisons: [BasiliskComparisonSample::default(); 5],
         }
     }
 }
@@ -308,18 +351,34 @@ impl JacobiHistory {
     }
 }
 
-#[derive(Resource, Clone, Copy, Debug, Default)]
+#[derive(Resource, Clone, Copy, Debug)]
 pub struct SimulationClock {
     pub request_id: u64,
     pub epoch: u64,
     pub elapsed_seconds: f64,
+    /// The physical integration interval represented by one FixedUpdate.
+    /// Keeping this in the clock makes the WASM and native adapters consume
+    /// the same step instead of deriving it from render-frame timing.
+    pub fixed_step_seconds: f64,
+}
+
+impl Default for SimulationClock {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            epoch: 0,
+            elapsed_seconds: 0.0,
+            fixed_step_seconds: 1.0,
+        }
+    }
 }
 
 impl SimulationClock {
-    pub fn advance(&mut self, seconds: f64) {
-        self.elapsed_seconds += seconds;
-        self.request_id = self.request_id.wrapping_add(1);
-    }
+    // Legacy frontend time advancement. The backend now owns simulation time.
+    // pub fn advance(&mut self, seconds: f64) {
+    //     self.elapsed_seconds += seconds;
+    //     self.request_id = self.request_id.wrapping_add(1);
+    // }
 
     pub fn reset_state(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);

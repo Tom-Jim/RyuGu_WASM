@@ -1,13 +1,13 @@
 //! GPU backends and render-world compute adapters.
 
-pub(crate) mod fmm;
+// pub(crate) mod fmm;
 pub(crate) mod frequency_domain;
-pub(crate) mod mmfft;
+// pub(crate) mod mmfft;
 pub(crate) mod normals;
 pub(crate) mod planning;
 pub(crate) mod planning_reduction;
 pub(crate) mod planning_timestamps;
-pub(crate) mod radial;
-pub(crate) mod werner;
+// pub(crate) mod radial;
+// pub(crate) mod werner;
 
 pub(crate) mod equation106;

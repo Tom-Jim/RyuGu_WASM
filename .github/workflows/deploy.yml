@@ -30,6 +30,14 @@ jobs:
             - name: Install web dependencies
               run: bun install --frozen-lockfile
 
+            - name: Install Zig
+              uses: mlugg/setup-zig@v2
+              with:
+                  version: 0.16.0
+
+            - name: Build C++ numerical WASM
+              run: node src/tools/build_cpp_wasm.mjs --fetch
+
             - name: Install Rust Toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
@@ -39,18 +47,29 @@ jobs:
               run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
             - name: Check formatting
-              run: cargo fmt --all -- --check
+              run: |
+                  cargo fmt --all -- --check
+                  cargo fmt --manifest-path src/backend/rust/Cargo.toml -- --check
 
             - name: Check production Rust library
               run: |
                   cargo clippy --locked --target wasm32-unknown-unknown --lib -- -D warnings
                   cargo check --locked --target wasm32-unknown-unknown --lib
+                  cargo clippy --locked --target wasm32-unknown-unknown --manifest-path src/backend/rust/Cargo.toml -- -D warnings
+
+            - name: Build independent Rust backend WASM
+              run: node src/tools/build_rust_backend.mjs
 
             - name: Build WASM Release
-              run: wasm-pack build --locked --release --target web --out-dir pkg --out-name ryugu_wasm
+              run: >-
+                  wasm-pack build --locked --release --target web --out-dir pkg --out-name ryugu_wasm
+                  && node src/tools/normalize_frontend_wasm.mjs
 
             - name: Build Tailwind stylesheet
               run: bun run styles
+
+            - name: Verify WASM ABI and generated module paths
+              run: node src/tools/check_wasm_build.mjs
 
             - name: Bundle Vue telemetry UI
               run: >-
@@ -69,6 +88,8 @@ jobs:
                   node --check src/html/app.js
                   node --check src/html/background.js
                   node --check src/html/background-worker.js
+                  node --check src/backend/host/cpp_backend.mjs
+                  node --check src/tools/build_rust_backend.mjs
                   node --check build/app.js
                   ! grep -Fq 'Runtime compilation is not supported in this build of Vue' build/app.js
                   ! grep -Fq 'Feature flags __VUE_OPTIONS_API__' build/app.js
@@ -101,6 +122,10 @@ jobs:
                   test -f site/src/html/tailwind.generated.css
                   test -f site/pkg/ryugu_wasm.js
                   test -f site/pkg/ryugu_wasm_bg.wasm
+                  test -f site/pkg/ryugu_backend.wasm
+                  test -f site/pkg/backend.mjs
+                  test -f site/pkg/backend/ryugu_backend.js
+                  test -f site/pkg/backend/ryugu_backend_bg.wasm
                   test -f site/assets/models/ryugu.glb
                   test -f site/assets/models/cassini.gltf
                   test -f site/assets/models/cassini.bin

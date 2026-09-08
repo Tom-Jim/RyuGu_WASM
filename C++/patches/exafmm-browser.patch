@@ -1,0 +1,109 @@
+diff --git a/include/align.h b/include/align.h
+index 73abb9d..71a31c9 100644
+--- a/include/align.h
++++ b/include/align.h
+@@ -14,7 +14,13 @@ struct AlignedAllocator : public std::allocator<T> {
+     void *ptr = nullptr;
+     int rc = posix_memalign(&ptr, NALIGN, n * sizeof(T));
+     if (rc != 0) return nullptr;
+-    if (ptr == nullptr) throw std::bad_alloc();
++    if (ptr == nullptr) {
++#if defined(__wasm__)
++      std::abort();
++#else
++      throw std::bad_alloc();
++#endif
++    }
+     return reinterpret_cast<T*>(ptr);
+   }
+ 
+diff --git a/include/fmm_scale_invariant.h b/include/fmm_scale_invariant.h
+index 9a888b5..f3508ae 100644
+--- a/include/fmm_scale_invariant.h
++++ b/include/fmm_scale_invariant.h
+@@ -84,6 +84,7 @@ namespace exafmm_t {
+ 
+     //! Save precomputation matrices
+     void save_matrix() {
++#if !defined(__wasm__)
+       std::remove(this->filename.c_str());
+       std::ofstream file(this->filename, std::ofstream::binary);
+       // r0
+@@ -107,10 +108,12 @@ namespace exafmm_t {
+         file.write(reinterpret_cast<char*>(&vec[0]), size*sizeof(real_t));
+       }
+       file.close(); 
++#endif
+     }
+ 
+     //! Check and load precomputation matrices
+     void load_matrix() {
++#if !defined(__wasm__)
+       size_t size_M2L = this->nfreq * 2 * NCHILD * NCHILD;
+       size_t file_size = (2*REL_COORD[M2M_Type].size()+4) * this->nsurf * this->nsurf * sizeof(T) 
+                        + REL_COORD[M2L_Type].size() * size_M2L * sizeof(real_t)
+@@ -145,6 +148,7 @@ namespace exafmm_t {
+         }
+       }
+       file.close();
++#endif
+     }
+ 
+     //! Precompute
+diff --git a/include/laplace.h b/include/laplace.h
+index c750ee9..dc0ec28 100644
+--- a/include/laplace.h
++++ b/include/laplace.h
+@@ -30,6 +30,7 @@ namespace exafmm_t {
+      * @param trg_value Vector of potentials of targets.
+      */
+     void potential_P2P(RealVec& src_coord, RealVec& src_value, RealVec& trg_coord, RealVec& trg_value) {
++#if !defined(__wasm__)
+       simdvec zero(real_t(0));
+       real_t newton_coef = 16;   // comes from Newton's method in simd rsqrt function
+       simdvec coef(real_t(1.0/(4*PI*newton_coef)));
+@@ -62,6 +63,11 @@ namespace exafmm_t {
+           trg_value[t+m] += tv[m];
+         }
+       }
++#else
++      int t = 0;
++      int nsrcs = src_coord.size() / 3;
++      int ntrgs = trg_coord.size() / 3;
++#endif
+       for (; t<ntrgs; t++) {
+         real_t potential = 0;
+         for (int s=0; s<nsrcs; ++s) {
+@@ -89,6 +95,7 @@ namespace exafmm_t {
+      * @param trg_value Vector of potentials of targets.
+      */
+     void gradient_P2P(RealVec& src_coord, RealVec& src_value, RealVec& trg_coord, RealVec& trg_value) {
++#if !defined(__wasm__)
+       simdvec zero(real_t(0));
+       real_t newton_coef = 16;   // comes from Newton's method in simd rsqrt function
+       simdvec coefp(real_t(1.0/(4*PI*newton_coef)));
+@@ -136,6 +143,11 @@ namespace exafmm_t {
+           trg_value[3+4*(t+m)] += tv3[m];
+         }
+       }
++#else
++      int t = 0;
++      int nsrcs = src_coord.size() / 3;
++      int ntrgs = trg_coord.size() / 3;
++#endif
+       for (; t<ntrgs; t++) {
+         real_t potential = 0;
+         vec3 gradient = 0;
+diff --git a/include/vec.h b/include/vec.h
+index 5631fb5..56d3f00 100644
+--- a/include/vec.h
++++ b/include/vec.h
+@@ -8,6 +8,8 @@ const int SIMD_BYTES = 64;
+ const int SIMD_BYTES = 32;
+ #elif __SSE__
+ const int SIMD_BYTES = 16;
++#elif defined(__wasm__)
++const int SIMD_BYTES = 8;
+ #else
+ #error no SIMD
+ #endif

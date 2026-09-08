@@ -69,12 +69,11 @@ pub(crate) fn build_planning_frequency_domain_payload(
         item_count: u32::try_from(ranges.iter().map(|range| u64::from(range[1])).sum::<u64>())
             .ok()?,
         secondary_count: 56,
-        total_mass: total_mass as f32,
+        // Legacy shared potential-grid metadata: total_mass: total_mass as f32,
         geometry_basis_preparation_ms,
         density_payload_preparation_ms: (started.elapsed().as_secs_f64() * 1.0e3
             - geometry_basis_preparation_ms)
             .max(0.0),
-        ..default()
     })
 }
 

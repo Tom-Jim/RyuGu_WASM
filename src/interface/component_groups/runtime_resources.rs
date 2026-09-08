@@ -36,17 +36,17 @@ pub struct DensitySensitivityCache {
 #[derive(Resource, Default)]
 pub struct DensitySensitivityCaches(pub [DensitySensitivityCache; 5]);
 
-#[derive(Resource)]
-pub struct FmmSource {
-    pub bytes: Vec<u8>,
-    /// Leaf particles packed as `(x, y, z, mass)` for the exact P2P near field.
-    pub particle_bytes: Vec<u8>,
-    pub node_count: u32,
-    pub particle_count: u32,
-    pub maximum_level: u32,
-    pub density_mode: DensityMode,
-}
-
+// #[derive(Resource)]
+// pub struct FmmSource {
+//     pub bytes: Vec<u8>,
+//     /// Leaf particles packed as `(x, y, z, mass)` for the exact P2P near field.
+//     pub particle_bytes: Vec<u8>,
+//     pub node_count: u32,
+//     pub particle_count: u32,
+//     pub maximum_level: u32,
+//     pub density_mode: DensityMode,
+// }
+//
 #[derive(Resource, Clone)]
 pub struct FmmReadbackChannel {
     pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
@@ -119,21 +119,21 @@ pub struct FrequencyDomainPerformanceMetrics {
 #[derive(Resource, Default)]
 pub struct MmfftCompressedHistory(pub GravitySampleHistory);
 
-#[derive(Resource)]
-pub struct MmfftCompressedSource {
-    pub bytes: Vec<u8>,
-    /// Number of Cartesian samples on each side of one physical grid.
-    pub grid_sizes: [u32; 2],
-    /// Number of nested grids, ordered finest to coarsest.
-    pub level_count: u32,
-    /// Half-widths of the nested physical grids (metres).
-    pub half_extents: [f32; 2],
-    /// Per-level scale used by the packed binary16 potential samples.
-    pub grid_scales: [f32; 2],
-    pub total_mass: f32,
-    pub density_mode: DensityMode,
-}
-
+// #[derive(Resource)]
+// pub struct MmfftCompressedSource {
+//     pub bytes: Vec<u8>,
+//     /// Number of Cartesian samples on each side of one physical grid.
+//     pub grid_sizes: [u32; 2],
+//     /// Number of nested grids, ordered finest to coarsest.
+//     pub level_count: u32,
+//     /// Half-widths of the nested physical grids (metres).
+//     pub half_extents: [f32; 2],
+//     /// Per-level scale used by the packed binary16 potential samples.
+//     pub grid_scales: [f32; 2],
+//     pub total_mass: f32,
+//     pub density_mode: DensityMode,
+// }
+//
 #[derive(Resource, Clone)]
 pub struct MmfftReadbackChannel {
     pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
@@ -211,17 +211,16 @@ impl GravityReadbackChannel {
     }
 }
 
-#[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(Resource, PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub enum ActiveGravityMethod {
     #[default]
     RadialAnalytic,
     HomogeneousWerner,
     /// Known-trajectory reciprocal-space gravity evaluation.
     FrequencyDomain,
-    /// Fourth method: CPU-preprocessed FFT grids with scale-normalized packed
-    /// binary16 GPU potential samples and a snapshot-tagged readback channel.
+    /// FLUPS free-space Poisson solver in the C++ WASM module.
     MmfftCompressed,
-    /// Fifth method: order-two source/target-cell FMM with exact P2P near field.
+    /// ExaFMM-t Laplace solver in the C++ WASM module.
     Fmm,
 }
 
@@ -371,19 +370,19 @@ impl ActiveGravityMethod {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::RadialAnalytic => "GPU Radial Analytic",
-            Self::HomogeneousWerner => "GPU Werner Polyhedron",
+            Self::RadialAnalytic => "Boost Adaptive Radial",
+            Self::HomogeneousWerner => "Basilisk Werner Polyhedron",
             Self::FrequencyDomain => "GPU Frequency-domain Algorithm",
-            Self::MmfftCompressed => "Packed MMFFT + GPU Interpolation",
-            Self::Fmm => "GPU Order-2 Target-Cell FMM",
+            Self::MmfftCompressed => "FLUPS Free-Space FFT",
+            Self::Fmm => "ExaFMM-t Laplace FMM",
         }
     }
 
     pub fn planning_label(self) -> &'static str {
         match self {
             Self::FrequencyDomain => "GPU Frequency-domain Algorithm reciprocal evaluation",
-            Self::MmfftCompressed => "GPU FFT 56-basis convolution + quintic interpolation",
-            Self::Fmm => "GPU order-2 FMM + 56 density bases",
+            Self::MmfftCompressed => "FLUPS C++ WASM Poisson evaluation",
+            Self::Fmm => "ExaFMM-t C++ WASM Laplace evaluation",
             _ => self.as_str(),
         }
     }

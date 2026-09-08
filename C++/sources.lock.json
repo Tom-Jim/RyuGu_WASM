@@ -1,0 +1,11 @@
+{
+  "basilisk": {"url": "https://github.com/AVSLab/basilisk.git", "commit": "0b4a8764735cee45fd3baf3b2b8a52941410dc8f", "sparse": ["src"]},
+  "exafmm-t": {"url": "https://github.com/exafmm/exafmm-t.git", "commit": "ed6d0ecc3f72b43d4945bfa2c1f3cdd1b5a5dbaa"},
+  "flups": {"url": "https://github.com/vortexlab-uclouvain/flups.git", "commit": "0c180ba56ec19df7efaaaeaf7761d086fcb225c6"},
+  "boost": {"url": "https://github.com/boostorg/boost.git", "commit": "dcc8af7b92877f324365d7392359243e688ff781", "submodules": ["libs/math", "libs/config", "libs/assert", "libs/core", "libs/static_assert", "libs/throw_exception", "libs/type_traits", "libs/predef"]},
+  "eigen": {"url": "https://gitlab.com/libeigen/eigen.git", "commit": "92d232856e512283c859f97c414ded3e63eddc17"},
+  "fftw3": {"url": "https://github.com/FFTW/fftw3.git", "commit": "93ed4c786934aec9946f8dda4b4e3eb08f8be41c"},
+  "fftw3-release": {"url": "https://salsa.debian.org/science-team/fftw3.git", "commit": "b51ba91278d120ad204b1609a93dd2c1ce937102", "branch": "upstream"},
+  "h3lpr": {"url": "https://github.com/vanreeslab/h3lpr.git", "commit": "7c4c0d4ec0254bc77e89accf95526836688f2111"},
+  "mpi-serial": {"url": "https://github.com/ESMCI/mpi-serial.git", "commit": "3092629c7d9ee6b10e58e1aa0aa1d263bde168df"}
+}

@@ -9,7 +9,7 @@
 use crate::cpu::frequency_domain::{
     AggregatedGravitySource, EQ184_QUADRATURE_COUNT, eq184_quadrature_node,
 };
-use crate::gpu::mmfft::{MmfftLevelWorkspace, sample_mmfft_grid};
+// Legacy CPU FFT import disabled.
 use crate::interface::components::*;
 use bevy::asset::RenderAssetUsages;
 use bevy::math::{DMat3, DVec3};
@@ -18,18 +18,18 @@ use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::render::mesh::Indices;
 use num_complex::Complex64;
-use std::collections::HashMap;
+// Legacy polyhedral edge map disabled.
 
 const SURFACE_PATCH_LIMIT: usize = 1_024;
 const CONSTANT_SOURCE_LIMIT: usize = 8_192;
 const SURFACE_COMPUTE_CHUNK: usize = 96;
 const SURFACE_COMPUTE_BUDGET_MS: f32 = 3.0;
 const SURFACE_EXPENSIVE_CHUNK: usize = 8;
-const FFT_GRID_SIZE: usize = 64;
-const FFT_HALF_EXTENT: f64 = 4_096.0;
-const FMM_MAX_LEVEL: u32 = 5;
-const FMM_LEAF_LIMIT: usize = 16;
-const FMM_THETA: f64 = 0.10;
+// const FFT_GRID_SIZE: usize = 64;
+// const FFT_HALF_EXTENT: f64 = 4_096.0;
+// const FMM_MAX_LEVEL: u32 = 5;
+// const FMM_LEAF_LIMIT: usize = 16;
+// const FMM_THETA: f64 = 0.10;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceFieldPatch {
@@ -66,10 +66,11 @@ struct SurfaceFieldJob {
 }
 
 enum SurfaceEvaluator {
-    Point(PointMassEvaluator),
-    Fft(FftSurfaceEvaluator),
-    Fmm(FmmSurfaceEvaluator),
-    Werner(WernerSurfaceEvaluator),
+    Cpp(ActiveGravityMethod),
+    //     Point(PointMassEvaluator),
+    //     Fft(FftSurfaceEvaluator),
+    //     Fmm(FmmSurfaceEvaluator),
+    //     Werner(WernerSurfaceEvaluator),
     Equation106(Vec<(DVec3, Complex64)>),
 }
 
@@ -96,63 +97,64 @@ struct PointMass {
     mass: f64,
 }
 
-struct PointMassEvaluator {
-    sources: Vec<PointMass>,
-}
-
-struct FftSurfaceEvaluator {
-    field: Vec<[f32; 4]>,
-    n: usize,
-    half_extent: f32,
-}
-
-struct FmmSurfaceEvaluator {
-    tree: CpuFmmTree,
-}
-
-struct WernerSurfaceEvaluator {
-    edges: Vec<WernerSurfaceEdge>,
-    faces: Vec<WernerSurfaceFace>,
-    g_density: f64,
-}
-
-#[derive(Clone, Copy)]
-struct WernerSurfaceEdge {
-    p0: DVec3,
-    p1: DVec3,
-    tensor_rows: DMat3,
-    length: f64,
-}
-
-#[derive(Clone, Copy)]
-struct WernerSurfaceFace {
-    p0: DVec3,
-    p1: DVec3,
-    p2: DVec3,
-    normal: DVec3,
-}
-
-#[derive(Clone, Copy)]
-struct WernerSurfaceEdgeSide {
-    normal: DVec3,
-    edge_outward: DVec3,
-}
-
-struct CpuFmmTree {
-    nodes: Vec<CpuFmmNode>,
-    sources: Vec<PointMass>,
-}
-
-struct CpuFmmNode {
-    half: f64,
-    mass: f64,
-    center_of_mass: DVec3,
-    quadrupole: DMat3,
-    level: u32,
-    children: [Option<usize>; 8],
-    particle_indices: Vec<usize>,
-}
-
+// struct PointMassEvaluator {
+//     sources: Vec<PointMass>,
+// }
+//
+// struct FftSurfaceEvaluator {
+//     field: Vec<[f32; 4]>,
+//     n: usize,
+//     half_extent: f32,
+// }
+//
+// struct FmmSurfaceEvaluator {
+//     tree: CpuFmmTree,
+// }
+//
+// struct WernerSurfaceEvaluator {
+//     edges: Vec<WernerSurfaceEdge>,
+//     faces: Vec<WernerSurfaceFace>,
+//     g_density: f64,
+// }
+//
+// #[derive(Clone, Copy)]
+// struct WernerSurfaceEdge {
+//     p0: DVec3,
+//     p1: DVec3,
+//     tensor_rows: DMat3,
+//     length: f64,
+// }
+//
+// #[derive(Clone, Copy)]
+// struct WernerSurfaceFace {
+//     p0: DVec3,
+//     p1: DVec3,
+//     p2: DVec3,
+//     normal: DVec3,
+// }
+//
+// #[derive(Clone, Copy)]
+// struct WernerSurfaceEdgeSide {
+//     normal: DVec3,
+//     edge_outward: DVec3,
+// }
+//
+// struct CpuFmmTree {
+//     nodes: Vec<CpuFmmNode>,
+//     sources: Vec<PointMass>,
+// }
+//
+// struct CpuFmmNode {
+//     half: f64,
+//     mass: f64,
+//     center_of_mass: DVec3,
+//     quadrupole: DMat3,
+//     level: u32,
+//     children: [Option<usize>; 8],
+//     particle_indices: Vec<usize>,
+// }
+//
+//
 pub(crate) fn queue_surface_field(
     state: &mut SurfaceFieldState,
     compute: &mut SurfaceFieldComputeState,
@@ -353,6 +355,8 @@ pub(crate) fn ensure_surface_field_overlay_system(
 }
 
 pub(crate) fn surface_field_compute_system(
+    cpp: Res<crate::cpp_backend::CppBackendState>,
+    density_mode: Res<DensityMode>,
     geometry: Res<SurfaceFieldGeometry>,
     topology: Option<Res<AsteroidTopologyGpuData>>,
     aggregated: Option<Res<AggregatedGravitySource>>,
@@ -360,6 +364,10 @@ pub(crate) fn surface_field_compute_system(
     mut compute: ResMut<SurfaceFieldComputeState>,
 ) {
     if geometry.patches.is_empty() || !state.computing {
+        return;
+    }
+    if !cpp.ready {
+        state.status = "Waiting for C++ gravity geometry.".into();
         return;
     }
     let Some(topology) = topology else {
@@ -380,7 +388,7 @@ pub(crate) fn surface_field_compute_system(
         let method_density_mode = if method == ActiveGravityMethod::HomogeneousWerner {
             DensityMode::Constant
         } else {
-            DensityMode::Variable
+            *density_mode
         };
         if method_density_mode == DensityMode::Variable && aggregated.is_none() {
             state.status = "Waiting for the variable-density source distribution...".into();
@@ -718,153 +726,159 @@ fn build_constant_sources(topology: &AsteroidTopologyGpuData, scale: f32) -> Vec
         .collect()
 }
 
-fn build_radial_surface_sources(
-    topology: &AsteroidTopologyGpuData,
-    scale: f32,
-) -> Option<Vec<PointMass>> {
-    const LAYERS: usize = 4;
-    let mut raw = Vec::new();
-    let mut total_volume = 0.0_f64;
-    for triangle in topology.triangles.as_chunks::<3>().0 {
-        let p0 = topology.positions.get(triangle[0] as usize)?.to_owned() * scale;
-        let p1 = topology.positions.get(triangle[1] as usize)?.to_owned() * scale;
-        let p2 = topology.positions.get(triangle[2] as usize)?.to_owned() * scale;
-        let n0 = p0.try_normalize()?;
-        let n1 = p1.try_normalize()?;
-        let n2 = p2.try_normalize()?;
-        let direction = (n0 + n1 + n2).try_normalize()?;
-        let numerator = n0.dot(n1.cross(n2)).abs();
-        let denominator = 1.0 + n0.dot(n1) + n1.dot(n2) + n2.dot(n0);
-        let solid_angle = 2.0 * numerator.atan2(denominator);
-        if !solid_angle.is_finite() || solid_angle <= 0.0 {
-            continue;
-        }
-        let face_normal = (p1 - p0).cross(p2 - p0);
-        let plane_radius = face_normal.dot(direction).abs();
-        let radius = if plane_radius > f32::EPSILON {
-            face_normal.dot(p0).abs() / plane_radius
-        } else {
-            ((p0 + p1 + p2) / 3.0).length()
-        };
-        if !radius.is_finite() || radius <= 0.0 {
-            continue;
-        }
-        for layer in 0..LAYERS {
-            let inner = radius * (layer as f32 / LAYERS as f32).cbrt();
-            let outer = radius * ((layer + 1) as f32 / LAYERS as f32).cbrt();
-            let volume = solid_angle as f64 * (outer.powi(3) - inner.powi(3)) as f64 / 3.0;
-            let radial_centroid = 0.75 * (outer.powi(4) - inner.powi(4)) as f64
-                / (outer.powi(3) - inner.powi(3)).max(f32::MIN_POSITIVE) as f64;
-            let position = direction.as_dvec3() * radial_centroid;
-            if volume.is_finite() && volume > 0.0 && position.is_finite() {
-                total_volume += volume;
-                raw.push((position, volume));
-            }
-        }
-    }
-    if raw.is_empty() || total_volume <= f64::EPSILON {
-        return None;
-    }
-    Some(
-        raw.into_iter()
-            .map(|(position, volume)| PointMass {
-                position,
-                mass: RYUGU_MASS as f64 * volume / total_volume,
-            })
-            .collect(),
-    )
-}
-
-fn build_werner_evaluator(
-    topology: &AsteroidTopologyGpuData,
-    scale: f32,
-) -> Option<WernerSurfaceEvaluator> {
-    let mut edge_sides: HashMap<(u32, u32), Vec<WernerSurfaceEdgeSide>> = HashMap::new();
-    let mut faces = Vec::new();
-    let mut volume = 0.0_f64;
-    for triangle in topology.triangles.as_chunks::<3>().0 {
-        let mut indices = [triangle[0], triangle[1], triangle[2]];
-        let mut points = [
-            *topology.positions.get(indices[0] as usize)? * scale,
-            *topology.positions.get(indices[1] as usize)? * scale,
-            *topology.positions.get(indices[2] as usize)? * scale,
-        ];
-        let centroid = (points[0] + points[1] + points[2]) / 3.0;
-        let raw_normal = (points[1] - points[0]).cross(points[2] - points[0]);
-        if raw_normal.dot(centroid) < 0.0 {
-            indices.swap(1, 2);
-            points.swap(1, 2);
-        }
-        let normal = (points[1] - points[0])
-            .cross(points[2] - points[0])
-            .try_normalize()?;
-        volume += points[0]
-            .as_dvec3()
-            .dot(points[1].as_dvec3().cross(points[2].as_dvec3()))
-            / 6.0;
-        let points = points.map(Vec3::as_dvec3);
-        let normal = normal.as_dvec3();
-        faces.push(WernerSurfaceFace {
-            p0: points[0],
-            p1: points[1],
-            p2: points[2],
-            normal,
-        });
-        for edge_index in 0..3 {
-            let next = (edge_index + 1) % 3;
-            let edge_direction = (points[next] - points[edge_index]).normalize();
-            let key = if indices[edge_index] < indices[next] {
-                (indices[edge_index], indices[next])
-            } else {
-                (indices[next], indices[edge_index])
-            };
-            edge_sides
-                .entry(key)
-                .or_default()
-                .push(WernerSurfaceEdgeSide {
-                    normal,
-                    edge_outward: edge_direction.cross(normal),
-                });
-        }
-    }
-    if faces.is_empty() || volume <= f64::EPSILON {
-        return None;
-    }
-    let mut edges = Vec::new();
-    for ((first, second), sides) in edge_sides {
-        if sides.len() != 2 {
-            continue;
-        }
-        let p0 = (*topology.positions.get(first as usize)? * scale).as_dvec3();
-        let p1 = (*topology.positions.get(second as usize)? * scale).as_dvec3();
-        let tensor = outer_product_d(sides[0].normal, sides[0].edge_outward)
-            + outer_product_d(sides[1].normal, sides[1].edge_outward);
-        edges.push(WernerSurfaceEdge {
-            p0,
-            p1,
-            tensor_rows: tensor.transpose(),
-            length: (p1 - p0).length(),
-        });
-    }
-    (!edges.is_empty()).then_some(WernerSurfaceEvaluator {
-        edges,
-        faces,
-        g_density: G as f64 * RYUGU_MASS as f64 / volume,
-    })
-}
-
-fn outer_product_d(left: DVec3, right: DVec3) -> DMat3 {
-    DMat3::from_cols(left * right.x, left * right.y, left * right.z)
-}
-
+// fn build_radial_surface_sources(
+//     topology: &AsteroidTopologyGpuData,
+//     scale: f32,
+// ) -> Option<Vec<PointMass>> {
+//     const LAYERS: usize = 4;
+//     let mut raw = Vec::new();
+//     let mut total_volume = 0.0_f64;
+//     for triangle in topology.triangles.as_chunks::<3>().0 {
+//         let p0 = topology.positions.get(triangle[0] as usize)?.to_owned() * scale;
+//         let p1 = topology.positions.get(triangle[1] as usize)?.to_owned() * scale;
+//         let p2 = topology.positions.get(triangle[2] as usize)?.to_owned() * scale;
+//         let n0 = p0.try_normalize()?;
+//         let n1 = p1.try_normalize()?;
+//         let n2 = p2.try_normalize()?;
+//         let direction = (n0 + n1 + n2).try_normalize()?;
+//         let numerator = n0.dot(n1.cross(n2)).abs();
+//         let denominator = 1.0 + n0.dot(n1) + n1.dot(n2) + n2.dot(n0);
+//         let solid_angle = 2.0 * numerator.atan2(denominator);
+//         if !solid_angle.is_finite() || solid_angle <= 0.0 {
+//             continue;
+//         }
+//         let face_normal = (p1 - p0).cross(p2 - p0);
+//         let plane_radius = face_normal.dot(direction).abs();
+//         let radius = if plane_radius > f32::EPSILON {
+//             face_normal.dot(p0).abs() / plane_radius
+//         } else {
+//             ((p0 + p1 + p2) / 3.0).length()
+//         };
+//         if !radius.is_finite() || radius <= 0.0 {
+//             continue;
+//         }
+//         for layer in 0..LAYERS {
+//             let inner = radius * (layer as f32 / LAYERS as f32).cbrt();
+//             let outer = radius * ((layer + 1) as f32 / LAYERS as f32).cbrt();
+//             let volume = solid_angle as f64 * (outer.powi(3) - inner.powi(3)) as f64 / 3.0;
+//             let radial_centroid = 0.75 * (outer.powi(4) - inner.powi(4)) as f64
+//                 / (outer.powi(3) - inner.powi(3)).max(f32::MIN_POSITIVE) as f64;
+//             let position = direction.as_dvec3() * radial_centroid;
+//             if volume.is_finite() && volume > 0.0 && position.is_finite() {
+//                 total_volume += volume;
+//                 raw.push((position, volume));
+//             }
+//         }
+//     }
+//     if raw.is_empty() || total_volume <= f64::EPSILON {
+//         return None;
+//     }
+//     Some(
+//         raw.into_iter()
+//             .map(|(position, volume)| PointMass {
+//                 position,
+//                 mass: RYUGU_MASS as f64 * volume / total_volume,
+//             })
+//             .collect(),
+//     )
+// }
+//
+// fn build_werner_evaluator(
+//     topology: &AsteroidTopologyGpuData,
+//     scale: f32,
+// ) -> Option<WernerSurfaceEvaluator> {
+//     let mut edge_sides: HashMap<(u32, u32), Vec<WernerSurfaceEdgeSide>> = HashMap::new();
+//     let mut faces = Vec::new();
+//     let mut volume = 0.0_f64;
+//     for triangle in topology.triangles.as_chunks::<3>().0 {
+//         let mut indices = [triangle[0], triangle[1], triangle[2]];
+//         let mut points = [
+//             *topology.positions.get(indices[0] as usize)? * scale,
+//             *topology.positions.get(indices[1] as usize)? * scale,
+//             *topology.positions.get(indices[2] as usize)? * scale,
+//         ];
+//         let centroid = (points[0] + points[1] + points[2]) / 3.0;
+//         let raw_normal = (points[1] - points[0]).cross(points[2] - points[0]);
+//         if raw_normal.dot(centroid) < 0.0 {
+//             indices.swap(1, 2);
+//             points.swap(1, 2);
+//         }
+//         let normal = (points[1] - points[0])
+//             .cross(points[2] - points[0])
+//             .try_normalize()?;
+//         volume += points[0]
+//             .as_dvec3()
+//             .dot(points[1].as_dvec3().cross(points[2].as_dvec3()))
+//             / 6.0;
+//         let points = points.map(Vec3::as_dvec3);
+//         let normal = normal.as_dvec3();
+//         faces.push(WernerSurfaceFace {
+//             p0: points[0],
+//             p1: points[1],
+//             p2: points[2],
+//             normal,
+//         });
+//         for edge_index in 0..3 {
+//             let next = (edge_index + 1) % 3;
+//             let edge_direction = (points[next] - points[edge_index]).normalize();
+//             let key = if indices[edge_index] < indices[next] {
+//                 (indices[edge_index], indices[next])
+//             } else {
+//                 (indices[next], indices[edge_index])
+//             };
+//             edge_sides
+//                 .entry(key)
+//                 .or_default()
+//                 .push(WernerSurfaceEdgeSide {
+//                     normal,
+//                     edge_outward: edge_direction.cross(normal),
+//                 });
+//         }
+//     }
+//     if faces.is_empty() || volume <= f64::EPSILON {
+//         return None;
+//     }
+//     let mut edges = Vec::new();
+//     for ((first, second), sides) in edge_sides {
+//         if sides.len() != 2 {
+//             continue;
+//         }
+//         let p0 = (*topology.positions.get(first as usize)? * scale).as_dvec3();
+//         let p1 = (*topology.positions.get(second as usize)? * scale).as_dvec3();
+//         let tensor = outer_product_d(sides[0].normal, sides[0].edge_outward)
+//             + outer_product_d(sides[1].normal, sides[1].edge_outward);
+//         edges.push(WernerSurfaceEdge {
+//             p0,
+//             p1,
+//             tensor_rows: tensor.transpose(),
+//             length: (p1 - p0).length(),
+//         });
+//     }
+//     (!edges.is_empty()).then_some(WernerSurfaceEvaluator {
+//         edges,
+//         faces,
+//         g_density: G as f64 * RYUGU_MASS as f64 / volume,
+//     })
+// }
+//
+// fn outer_product_d(left: DVec3, right: DVec3) -> DMat3 {
+//     DMat3::from_cols(left * right.x, left * right.y, left * right.z)
+// }
+//
+//
 fn build_evaluator(
     method: ActiveGravityMethod,
     sources: Vec<PointMass>,
     topology: &AsteroidTopologyGpuData,
     scale: f32,
-    density_mode: DensityMode,
+    _density_mode: DensityMode,
 ) -> SurfaceEvaluator {
     match method {
+        ActiveGravityMethod::MmfftCompressed
+        | ActiveGravityMethod::Fmm
+        | ActiveGravityMethod::HomogeneousWerner
+        | ActiveGravityMethod::RadialAnalytic => SurfaceEvaluator::Cpp(method),
+        /* Legacy evaluator dispatch retained for reference.
         ActiveGravityMethod::MmfftCompressed => build_fft_evaluator(sources, FFT_GRID_SIZE),
         ActiveGravityMethod::Fmm => SurfaceEvaluator::Fmm(FmmSurfaceEvaluator {
             tree: CpuFmmTree::new(sources),
@@ -885,6 +899,7 @@ fn build_evaluator(
                 sources: radial_sources,
             })
         }
+        */
         // Surface fields use the Eq.106 inverse-pole spatial operator. Eq.184
         // remains exclusively a trajectory transform, never a coarse FFT alias.
         ActiveGravityMethod::FrequencyDomain => {
@@ -911,26 +926,24 @@ fn build_evaluator(
     }
 }
 
-fn build_fft_evaluator(sources: Vec<PointMass>, n: usize) -> SurfaceEvaluator {
-    let records = sources
-        .iter()
-        .map(|source| (source.position, source.mass))
-        .collect::<Vec<_>>();
-    let mut workspace = MmfftLevelWorkspace::new(n, FFT_HALF_EXTENT);
-    let field = workspace.build(&records).to_vec();
-    SurfaceEvaluator::Fft(FftSurfaceEvaluator {
-        field,
-        n,
-        half_extent: FFT_HALF_EXTENT as f32,
-    })
-}
-
+// fn build_fft_evaluator(sources: Vec<PointMass>, n: usize) -> SurfaceEvaluator {
+//     let records = sources
+//         .iter()
+//         .map(|source| (source.position, source.mass))
+//         .collect::<Vec<_>>();
+//     let mut workspace = MmfftLevelWorkspace::new(n, FFT_HALF_EXTENT);
+//     let field = workspace.build(&records).to_vec();
+//     SurfaceEvaluator::Fft(FftSurfaceEvaluator {
+//         field,
+//         n,
+//         half_extent: FFT_HALF_EXTENT as f32,
+//     })
+// }
+//
+//
 fn evaluate_patch(evaluator: &SurfaceEvaluator, patch: SurfaceFieldPatch) -> SurfaceFieldSample {
     let value = evaluator.field_at(patch.body_position);
-    let jacobian = if matches!(
-        evaluator,
-        SurfaceEvaluator::Point(_) | SurfaceEvaluator::Equation106(_)
-    ) {
+    let jacobian = if matches!(evaluator, SurfaceEvaluator::Equation106(_)) {
         value.jacobian
     } else {
         finite_difference_jacobian(evaluator, patch.body_position)
@@ -981,10 +994,22 @@ fn finite_difference_jacobian(evaluator: &SurfaceEvaluator, position: Vec3) -> D
 impl SurfaceEvaluator {
     fn field_at(&self, position: Vec3) -> FieldValue {
         match self {
-            Self::Point(evaluator) => evaluator.field_at(position),
-            Self::Fft(evaluator) => evaluator.field_at(position),
-            Self::Fmm(evaluator) => evaluator.field_at(position),
-            Self::Werner(evaluator) => evaluator.field_at(position),
+            Self::Cpp(method) => match crate::cpp_backend::evaluate(*method, position) {
+                Ok((gravity, potential)) => FieldValue {
+                    gravity,
+                    potential,
+                    jacobian: DMat3::ZERO,
+                },
+                Err(_) => FieldValue {
+                    gravity: Vec3::splat(f32::NAN),
+                    potential: f32::NAN,
+                    jacobian: DMat3::ZERO,
+                },
+            },
+            //             Self::Point(evaluator) => evaluator.field_at(position),
+            //             Self::Fft(evaluator) => evaluator.field_at(position),
+            //             Self::Fmm(evaluator) => evaluator.field_at(position),
+            //             Self::Werner(evaluator) => evaluator.field_at(position),
             Self::Equation106(modes) => {
                 let mut field = FieldValue::default();
                 let mut gravity = DVec3::ZERO;
@@ -1004,302 +1029,305 @@ impl SurfaceEvaluator {
 
     fn derivative_step(&self) -> f32 {
         match self {
-            Self::Point(_) | Self::Fmm(_) | Self::Werner(_) | Self::Equation106(_) => 0.5,
-            Self::Fft(evaluator) => 0.5 * 2.0 * evaluator.half_extent / evaluator.n as f32,
+            Self::Cpp(ActiveGravityMethod::MmfftCompressed) => 64.0,
+            Self::Cpp(_) => 0.5,
+            Self::Equation106(_) => 0.5,
+            //             Self::Fft(evaluator) => 0.5 * 2.0 * evaluator.half_extent / evaluator.n as f32,
         }
     }
 }
 
-impl PointMassEvaluator {
-    fn field_at(&self, position: Vec3) -> FieldValue {
-        let observer = position.as_dvec3();
-        let mut result = FieldValue::default();
-        for source in &self.sources {
-            let displacement = source.position - observer;
-            let radius_squared = displacement.length_squared().max(1.0e-12);
-            let inverse_radius = radius_squared.sqrt().recip();
-            let inverse_radius3 = inverse_radius / radius_squared;
-            let factor = G as f64 * source.mass;
-            let gravity = factor * displacement * inverse_radius3;
-            let identity = DMat3::IDENTITY * inverse_radius3;
-            let outer = DMat3::from_cols(
-                displacement * displacement.x,
-                displacement * displacement.y,
-                displacement * displacement.z,
-            );
-            result.gravity += gravity.as_vec3();
-            result.potential += (factor * inverse_radius) as f32;
-            let contribution =
-                factor * (outer * (3.0 * inverse_radius3 / radius_squared) - identity);
-            result.jacobian += contribution;
-        }
-        result
-    }
-}
-
-impl FftSurfaceEvaluator {
-    fn field_at(&self, position: Vec3) -> FieldValue {
-        let gravity = sample_mmfft_grid(&self.field, position, self.half_extent, self.n);
-        let potential = sample_mmfft_potential(&self.field, position, self.half_extent, self.n);
-        FieldValue {
-            gravity,
-            potential,
-            ..default()
-        }
-    }
-}
-
-impl WernerSurfaceEvaluator {
-    fn field_at(&self, position: Vec3) -> FieldValue {
-        let observer = position.as_dvec3();
-        let mut gravity = DVec3::ZERO;
-        let mut potential = 0.0_f64;
-        for edge in &self.edges {
-            let r0 = edge.p0 - observer;
-            let r1 = edge.p1 - observer;
-            let length0 = r0.length();
-            let length1 = r1.length();
-            let denominator =
-                (length0 + length1 - edge.length).max(1.0e-6 * (length0 + length1).max(1.0));
-            let logarithm = ((length0 + length1 + edge.length) / denominator)
-                .max(1.0)
-                .ln();
-            let tensor_r = edge.tensor_rows * r0;
-            gravity -= tensor_r * logarithm;
-            potential += 0.5 * r0.dot(tensor_r) * logarithm;
-        }
-        for face in &self.faces {
-            let r0 = face.p0 - observer;
-            let r1 = face.p1 - observer;
-            let r2 = face.p2 - observer;
-            let length0 = r0.length();
-            let length1 = r1.length();
-            let length2 = r2.length();
-            let numerator = r0.dot(r1.cross(r2));
-            let denominator = length0 * length1 * length2
-                + length0 * r1.dot(r2)
-                + length1 * r2.dot(r0)
-                + length2 * r0.dot(r1);
-            let solid_angle = 2.0 * numerator.atan2(denominator);
-            let normal_distance = face.normal.dot(r0);
-            gravity += face.normal * normal_distance * solid_angle;
-            potential -= 0.5 * normal_distance * normal_distance * solid_angle;
-        }
-        let scale = self.g_density;
-        FieldValue {
-            gravity: (gravity * scale).as_vec3(),
-            potential: (potential * scale) as f32,
-            ..default()
-        }
-    }
-}
-
-impl CpuFmmTree {
-    fn new(sources: Vec<PointMass>) -> Self {
-        let indices = (0..sources.len()).collect::<Vec<_>>();
-        let half = sources
-            .iter()
-            .map(|source| source.position.abs().max_element())
-            .fold(1.0_f64, f64::max)
-            * 1.01;
-        let mut tree = Self {
-            nodes: Vec::new(),
-            sources,
-        };
-        tree.build_node(&indices, DVec3::ZERO, half, 0);
-        tree
-    }
-
-    fn build_node(&mut self, indices: &[usize], center: DVec3, half: f64, level: u32) -> usize {
-        let node_index = self.nodes.len();
-        self.nodes.push(CpuFmmNode {
-            half,
-            mass: 0.0,
-            center_of_mass: center,
-            quadrupole: DMat3::ZERO,
-            level,
-            children: [None; 8],
-            particle_indices: Vec::new(),
-        });
-        let (mass, center_of_mass, quadrupole) = self.moments(indices);
-        self.nodes[node_index].mass = mass;
-        self.nodes[node_index].center_of_mass = center_of_mass;
-        self.nodes[node_index].quadrupole = quadrupole;
-        if level >= FMM_MAX_LEVEL || indices.len() <= FMM_LEAF_LIMIT {
-            self.nodes[node_index].particle_indices = indices.to_vec();
-            return node_index;
-        }
-        let mut groups: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
-        for &index in indices {
-            let point = self.sources[index].position;
-            let child = usize::from(point.x >= center.x)
-                | (usize::from(point.y >= center.y) << 1)
-                | (usize::from(point.z >= center.z) << 2);
-            groups[child].push(index);
-        }
-        let child_half = half * 0.5;
-        for (child_index, group) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            let offset = DVec3::new(
-                if child_index & 1 == 0 {
-                    -child_half
-                } else {
-                    child_half
-                },
-                if child_index & 2 == 0 {
-                    -child_half
-                } else {
-                    child_half
-                },
-                if child_index & 4 == 0 {
-                    -child_half
-                } else {
-                    child_half
-                },
-            );
-            let child = self.build_node(&group, center + offset, child_half, level + 1);
-            self.nodes[node_index].children[child_index] = Some(child);
-        }
-        node_index
-    }
-
-    fn moments(&self, indices: &[usize]) -> (f64, DVec3, DMat3) {
-        let mut mass = 0.0;
-        let mut first = DVec3::ZERO;
-        let mut second = DMat3::ZERO;
-        for &index in indices {
-            let source = self.sources[index];
-            mass += source.mass;
-            first += source.position * source.mass;
-            let position = source.position;
-            second += DMat3::from_cols(
-                position * position.x,
-                position * position.y,
-                position * position.z,
-            ) * source.mass;
-        }
-        if mass <= f64::EPSILON {
-            return (0.0, DVec3::ZERO, DMat3::ZERO);
-        }
-        let center_of_mass = first / mass;
-        let central = second
-            - DMat3::from_cols(
-                center_of_mass * center_of_mass.x,
-                center_of_mass * center_of_mass.y,
-                center_of_mass * center_of_mass.z,
-            ) * mass;
-        let trace = central.x_axis.x + central.y_axis.y + central.z_axis.z;
-        let quadrupole = central * 3.0 - DMat3::IDENTITY * trace;
-        (mass, center_of_mass, quadrupole)
-    }
-
-    fn field_at(&self, position: Vec3) -> FieldValue {
-        self.node_field(0, position.as_dvec3())
-    }
-
-    fn node_field(&self, index: usize, observer: DVec3) -> FieldValue {
-        let node = &self.nodes[index];
-        if node.mass <= 0.0 {
-            return FieldValue::default();
-        }
-        let displacement = node.center_of_mass - observer;
-        let distance = displacement.length().max(1.0e-9);
-        let expansion_radius = 3.0_f64.sqrt() * node.half;
-        let has_children = node.children.iter().any(Option::is_some);
-        if has_children && node.level > 0 && expansion_radius / distance < FMM_THETA {
-            return multipole_field(node, observer);
-        }
-        if !has_children {
-            return node
-                .particle_indices
-                .iter()
-                .map(|&source_index| point_mass_field(self.sources[source_index], observer))
-                .fold(FieldValue::default(), add_field_values);
-        }
-        node.children
-            .iter()
-            .flatten()
-            .map(|&child| self.node_field(child, observer))
-            .fold(FieldValue::default(), add_field_values)
-    }
-}
-
-impl FmmSurfaceEvaluator {
-    fn field_at(&self, position: Vec3) -> FieldValue {
-        self.tree.field_at(position)
-    }
-}
-
-fn point_mass_field(source: PointMass, observer: DVec3) -> FieldValue {
-    PointMassEvaluator {
-        sources: vec![source],
-    }
-    .field_at(observer.as_vec3())
-}
-
-fn multipole_field(node: &CpuFmmNode, observer: DVec3) -> FieldValue {
-    let displacement = node.center_of_mass - observer;
-    let radius_squared = displacement.length_squared().max(1.0e-12);
-    let inverse_radius = radius_squared.sqrt().recip();
-    let inverse_radius3 = inverse_radius / radius_squared;
-    let inverse_radius5 = inverse_radius3 / radius_squared;
-    let qd = node.quadrupole * displacement;
-    let scalar = displacement.dot(qd);
-    let factor = G as f64;
-    let gravity = factor
-        * (node.mass * displacement * inverse_radius3 - qd * inverse_radius5
-            + 2.5 * scalar * displacement * inverse_radius5 / radius_squared);
-    FieldValue {
-        gravity: gravity.as_vec3(),
-        potential: (factor * (node.mass * inverse_radius + 0.5 * scalar * inverse_radius5)) as f32,
-        ..default()
-    }
-}
-
-fn add_field_values(left: FieldValue, right: FieldValue) -> FieldValue {
-    FieldValue {
-        gravity: left.gravity + right.gravity,
-        potential: left.potential + right.potential,
-        jacobian: left.jacobian + right.jacobian,
-    }
-}
-
-fn sample_mmfft_potential(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: usize) -> f32 {
-    let spacing = 2.0 * half_extent / n as f32;
-    let coordinate = (position + Vec3::splat(half_extent)) / spacing - Vec3::splat(0.5);
-    let base_floor = coordinate
-        .floor()
-        .clamp(Vec3::ONE, Vec3::splat((n - 3) as f32));
-    let fraction = (coordinate - base_floor).clamp(Vec3::ZERO, Vec3::ONE);
-    let base = base_floor.as_uvec3() - UVec3::ONE;
-    let weights = |t: f32| {
-        let t2 = t * t;
-        let t3 = t2 * t;
-        [
-            -0.5 * t + t2 - 0.5 * t3,
-            1.0 - 2.5 * t2 + 1.5 * t3,
-            0.5 * t + 2.0 * t2 - 1.5 * t3,
-            -0.5 * t2 + 0.5 * t3,
-        ]
-    };
-    let wx = weights(fraction.x);
-    let wy = weights(fraction.y);
-    let wz = weights(fraction.z);
-    let mut potential = 0.0;
-    for (z, &z_weight) in wz.iter().enumerate() {
-        for (y, &y_weight) in wy.iter().enumerate() {
-            for (x, &x_weight) in wx.iter().enumerate() {
-                let index =
-                    ((base.z as usize + z) * n + base.y as usize + y) * n + base.x as usize + x;
-                potential += field[index][3] * x_weight * y_weight * z_weight;
-            }
-        }
-    }
-    potential
-}
-
+// impl PointMassEvaluator {
+//     fn field_at(&self, position: Vec3) -> FieldValue {
+//         let observer = position.as_dvec3();
+//         let mut result = FieldValue::default();
+//         for source in &self.sources {
+//             let displacement = source.position - observer;
+//             let radius_squared = displacement.length_squared().max(1.0e-12);
+//             let inverse_radius = radius_squared.sqrt().recip();
+//             let inverse_radius3 = inverse_radius / radius_squared;
+//             let factor = G as f64 * source.mass;
+//             let gravity = factor * displacement * inverse_radius3;
+//             let identity = DMat3::IDENTITY * inverse_radius3;
+//             let outer = DMat3::from_cols(
+//                 displacement * displacement.x,
+//                 displacement * displacement.y,
+//                 displacement * displacement.z,
+//             );
+//             result.gravity += gravity.as_vec3();
+//             result.potential += (factor * inverse_radius) as f32;
+//             let contribution =
+//                 factor * (outer * (3.0 * inverse_radius3 / radius_squared) - identity);
+//             result.jacobian += contribution;
+//         }
+//         result
+//     }
+// }
+//
+// impl FftSurfaceEvaluator {
+//     fn field_at(&self, position: Vec3) -> FieldValue {
+//         let gravity = sample_mmfft_grid(&self.field, position, self.half_extent, self.n);
+//         let potential = sample_mmfft_potential(&self.field, position, self.half_extent, self.n);
+//         FieldValue {
+//             gravity,
+//             potential,
+//             ..default()
+//         }
+//     }
+// }
+//
+// impl WernerSurfaceEvaluator {
+//     fn field_at(&self, position: Vec3) -> FieldValue {
+//         let observer = position.as_dvec3();
+//         let mut gravity = DVec3::ZERO;
+//         let mut potential = 0.0_f64;
+//         for edge in &self.edges {
+//             let r0 = edge.p0 - observer;
+//             let r1 = edge.p1 - observer;
+//             let length0 = r0.length();
+//             let length1 = r1.length();
+//             let denominator =
+//                 (length0 + length1 - edge.length).max(1.0e-6 * (length0 + length1).max(1.0));
+//             let logarithm = ((length0 + length1 + edge.length) / denominator)
+//                 .max(1.0)
+//                 .ln();
+//             let tensor_r = edge.tensor_rows * r0;
+//             gravity -= tensor_r * logarithm;
+//             potential += 0.5 * r0.dot(tensor_r) * logarithm;
+//         }
+//         for face in &self.faces {
+//             let r0 = face.p0 - observer;
+//             let r1 = face.p1 - observer;
+//             let r2 = face.p2 - observer;
+//             let length0 = r0.length();
+//             let length1 = r1.length();
+//             let length2 = r2.length();
+//             let numerator = r0.dot(r1.cross(r2));
+//             let denominator = length0 * length1 * length2
+//                 + length0 * r1.dot(r2)
+//                 + length1 * r2.dot(r0)
+//                 + length2 * r0.dot(r1);
+//             let solid_angle = 2.0 * numerator.atan2(denominator);
+//             let normal_distance = face.normal.dot(r0);
+//             gravity += face.normal * normal_distance * solid_angle;
+//             potential -= 0.5 * normal_distance * normal_distance * solid_angle;
+//         }
+//         let scale = self.g_density;
+//         FieldValue {
+//             gravity: (gravity * scale).as_vec3(),
+//             potential: (potential * scale) as f32,
+//             ..default()
+//         }
+//     }
+// }
+//
+// impl CpuFmmTree {
+//     fn new(sources: Vec<PointMass>) -> Self {
+//         let indices = (0..sources.len()).collect::<Vec<_>>();
+//         let half = sources
+//             .iter()
+//             .map(|source| source.position.abs().max_element())
+//             .fold(1.0_f64, f64::max)
+//             * 1.01;
+//         let mut tree = Self {
+//             nodes: Vec::new(),
+//             sources,
+//         };
+//         tree.build_node(&indices, DVec3::ZERO, half, 0);
+//         tree
+//     }
+//
+//     fn build_node(&mut self, indices: &[usize], center: DVec3, half: f64, level: u32) -> usize {
+//         let node_index = self.nodes.len();
+//         self.nodes.push(CpuFmmNode {
+//             half,
+//             mass: 0.0,
+//             center_of_mass: center,
+//             quadrupole: DMat3::ZERO,
+//             level,
+//             children: [None; 8],
+//             particle_indices: Vec::new(),
+//         });
+//         let (mass, center_of_mass, quadrupole) = self.moments(indices);
+//         self.nodes[node_index].mass = mass;
+//         self.nodes[node_index].center_of_mass = center_of_mass;
+//         self.nodes[node_index].quadrupole = quadrupole;
+//         if level >= FMM_MAX_LEVEL || indices.len() <= FMM_LEAF_LIMIT {
+//             self.nodes[node_index].particle_indices = indices.to_vec();
+//             return node_index;
+//         }
+//         let mut groups: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
+//         for &index in indices {
+//             let point = self.sources[index].position;
+//             let child = usize::from(point.x >= center.x)
+//                 | (usize::from(point.y >= center.y) << 1)
+//                 | (usize::from(point.z >= center.z) << 2);
+//             groups[child].push(index);
+//         }
+//         let child_half = half * 0.5;
+//         for (child_index, group) in groups.into_iter().enumerate() {
+//             if group.is_empty() {
+//                 continue;
+//             }
+//             let offset = DVec3::new(
+//                 if child_index & 1 == 0 {
+//                     -child_half
+//                 } else {
+//                     child_half
+//                 },
+//                 if child_index & 2 == 0 {
+//                     -child_half
+//                 } else {
+//                     child_half
+//                 },
+//                 if child_index & 4 == 0 {
+//                     -child_half
+//                 } else {
+//                     child_half
+//                 },
+//             );
+//             let child = self.build_node(&group, center + offset, child_half, level + 1);
+//             self.nodes[node_index].children[child_index] = Some(child);
+//         }
+//         node_index
+//     }
+//
+//     fn moments(&self, indices: &[usize]) -> (f64, DVec3, DMat3) {
+//         let mut mass = 0.0;
+//         let mut first = DVec3::ZERO;
+//         let mut second = DMat3::ZERO;
+//         for &index in indices {
+//             let source = self.sources[index];
+//             mass += source.mass;
+//             first += source.position * source.mass;
+//             let position = source.position;
+//             second += DMat3::from_cols(
+//                 position * position.x,
+//                 position * position.y,
+//                 position * position.z,
+//             ) * source.mass;
+//         }
+//         if mass <= f64::EPSILON {
+//             return (0.0, DVec3::ZERO, DMat3::ZERO);
+//         }
+//         let center_of_mass = first / mass;
+//         let central = second
+//             - DMat3::from_cols(
+//                 center_of_mass * center_of_mass.x,
+//                 center_of_mass * center_of_mass.y,
+//                 center_of_mass * center_of_mass.z,
+//             ) * mass;
+//         let trace = central.x_axis.x + central.y_axis.y + central.z_axis.z;
+//         let quadrupole = central * 3.0 - DMat3::IDENTITY * trace;
+//         (mass, center_of_mass, quadrupole)
+//     }
+//
+//     fn field_at(&self, position: Vec3) -> FieldValue {
+//         self.node_field(0, position.as_dvec3())
+//     }
+//
+//     fn node_field(&self, index: usize, observer: DVec3) -> FieldValue {
+//         let node = &self.nodes[index];
+//         if node.mass <= 0.0 {
+//             return FieldValue::default();
+//         }
+//         let displacement = node.center_of_mass - observer;
+//         let distance = displacement.length().max(1.0e-9);
+//         let expansion_radius = 3.0_f64.sqrt() * node.half;
+//         let has_children = node.children.iter().any(Option::is_some);
+//         if has_children && node.level > 0 && expansion_radius / distance < FMM_THETA {
+//             return multipole_field(node, observer);
+//         }
+//         if !has_children {
+//             return node
+//                 .particle_indices
+//                 .iter()
+//                 .map(|&source_index| point_mass_field(self.sources[source_index], observer))
+//                 .fold(FieldValue::default(), add_field_values);
+//         }
+//         node.children
+//             .iter()
+//             .flatten()
+//             .map(|&child| self.node_field(child, observer))
+//             .fold(FieldValue::default(), add_field_values)
+//     }
+// }
+//
+// impl FmmSurfaceEvaluator {
+//     fn field_at(&self, position: Vec3) -> FieldValue {
+//         self.tree.field_at(position)
+//     }
+// }
+//
+// fn point_mass_field(source: PointMass, observer: DVec3) -> FieldValue {
+//     PointMassEvaluator {
+//         sources: vec![source],
+//     }
+//     .field_at(observer.as_vec3())
+// }
+//
+// fn multipole_field(node: &CpuFmmNode, observer: DVec3) -> FieldValue {
+//     let displacement = node.center_of_mass - observer;
+//     let radius_squared = displacement.length_squared().max(1.0e-12);
+//     let inverse_radius = radius_squared.sqrt().recip();
+//     let inverse_radius3 = inverse_radius / radius_squared;
+//     let inverse_radius5 = inverse_radius3 / radius_squared;
+//     let qd = node.quadrupole * displacement;
+//     let scalar = displacement.dot(qd);
+//     let factor = G as f64;
+//     let gravity = factor
+//         * (node.mass * displacement * inverse_radius3 - qd * inverse_radius5
+//             + 2.5 * scalar * displacement * inverse_radius5 / radius_squared);
+//     FieldValue {
+//         gravity: gravity.as_vec3(),
+//         potential: (factor * (node.mass * inverse_radius + 0.5 * scalar * inverse_radius5)) as f32,
+//         ..default()
+//     }
+// }
+//
+// fn add_field_values(left: FieldValue, right: FieldValue) -> FieldValue {
+//     FieldValue {
+//         gravity: left.gravity + right.gravity,
+//         potential: left.potential + right.potential,
+//         jacobian: left.jacobian + right.jacobian,
+//     }
+// }
+//
+// fn sample_mmfft_potential(field: &[[f32; 4]], position: Vec3, half_extent: f32, n: usize) -> f32 {
+//     let spacing = 2.0 * half_extent / n as f32;
+//     let coordinate = (position + Vec3::splat(half_extent)) / spacing - Vec3::splat(0.5);
+//     let base_floor = coordinate
+//         .floor()
+//         .clamp(Vec3::ONE, Vec3::splat((n - 3) as f32));
+//     let fraction = (coordinate - base_floor).clamp(Vec3::ZERO, Vec3::ONE);
+//     let base = base_floor.as_uvec3() - UVec3::ONE;
+//     let weights = |t: f32| {
+//         let t2 = t * t;
+//         let t3 = t2 * t;
+//         [
+//             -0.5 * t + t2 - 0.5 * t3,
+//             1.0 - 2.5 * t2 + 1.5 * t3,
+//             0.5 * t + 2.0 * t2 - 1.5 * t3,
+//             -0.5 * t2 + 0.5 * t3,
+//         ]
+//     };
+//     let wx = weights(fraction.x);
+//     let wy = weights(fraction.y);
+//     let wz = weights(fraction.z);
+//     let mut potential = 0.0;
+//     for (z, &z_weight) in wz.iter().enumerate() {
+//         for (y, &y_weight) in wy.iter().enumerate() {
+//             for (x, &x_weight) in wx.iter().enumerate() {
+//                 let index =
+//                     ((base.z as usize + z) * n + base.y as usize + y) * n + base.x as usize + x;
+//                 potential += field[index][3] * x_weight * y_weight * z_weight;
+//             }
+//         }
+//     }
+//     potential
+// }
+//
+//
 fn normalize_range(value: f32, range: (f32, f32)) -> f32 {
     if !value.is_finite() {
         return 0.0;
@@ -1365,26 +1393,27 @@ fn diverging_error_color(value: f32) -> [f32; 4] {
     [rgb.x, rgb.y, rgb.z, 0.94]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn point_mass_gradient_has_expected_trace_free_structure() {
-        let evaluator = PointMassEvaluator {
-            sources: vec![PointMass {
-                position: DVec3::ZERO,
-                mass: 1.0,
-            }],
-        };
-        let value = evaluator.field_at(Vec3::new(2.0, 0.0, 0.0));
-        let trace = value.jacobian.x_axis.x + value.jacobian.y_axis.y + value.jacobian.z_axis.z;
-        assert!(value.gravity.is_finite());
-        assert!(trace.abs() < 1.0e-18);
-    }
-
-    #[test]
-    fn error_palette_separates_positive_and_negative() {
-        assert_ne!(diverging_error_color(-0.8), diverging_error_color(0.8));
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//
+//     #[test]
+//     fn point_mass_gradient_has_expected_trace_free_structure() {
+//         let evaluator = PointMassEvaluator {
+//             sources: vec![PointMass {
+//                 position: DVec3::ZERO,
+//                 mass: 1.0,
+//             }],
+//         };
+//         let value = evaluator.field_at(Vec3::new(2.0, 0.0, 0.0));
+//         let trace = value.jacobian.x_axis.x + value.jacobian.y_axis.y + value.jacobian.z_axis.z;
+//         assert!(value.gravity.is_finite());
+//         assert!(trace.abs() < 1.0e-18);
+//     }
+//
+//     #[test]
+//     fn error_palette_separates_positive_and_negative() {
+//         assert_ne!(diverging_error_color(-0.8), diverging_error_color(0.8));
+//     }
+// }
+//

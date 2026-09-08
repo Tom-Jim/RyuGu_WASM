@@ -1,0 +1,46 @@
+diff --git a/src/expint.hpp b/src/expint.hpp
+index 7c522f6..cc66018 100644
+--- a/src/expint.hpp
++++ b/src/expint.hpp
+@@ -198,7 +198,11 @@ static double expint(const int n, const double x) {
+     int    i, ii, nm1 = n - 1;
+     double a, b, c, d, del, fact, h, psi, ans;
+     if (n < 0 || x < 0.0 || (x == 0.0 && (n == 0 || n == 1))) {
++#if defined(__wasm__)
++        std::abort();
++#else
+         throw std::runtime_error("bad arguments in expint");
++#endif
+     }
+     if (n == 0) {
+         ans = exp(-x) / x;  // Special case
+@@ -221,7 +225,11 @@ static double expint(const int n, const double x) {
+                 return ans;
+             }
+         }
++#if defined(__wasm__)
++        std::abort();
++#else
+         throw std::runtime_error("continued fraction failed in expint");
++#endif
+     } else {                                              // Evaluate series.
+         ans  = (nm1 != 0) ? (1.0 / nm1) : (-log(x) - c_gamma);  // Set first term.
+         fact = 1.0;
+@@ -241,11 +249,15 @@ static double expint(const int n, const double x) {
+                 return ans;
+             }
+         }
++#if defined(__wasm__)
++        std::abort();
++#else
+         throw std::runtime_error("series failed in expint");
++#endif
+     }
+     // ------------------------------------------------------------------------
+     return ans;
+ }
+ 
+ 
+-#endif
+\ No newline at end of file
++#endif

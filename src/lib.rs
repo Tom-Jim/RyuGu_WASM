@@ -1,13 +1,18 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+#[path = "protocol/basilisk.rs"]
+mod basilisk;
 #[path = "bevy/mod.rs"]
 mod bevy_app;
+mod cpp_backend;
+mod cpp_planning;
 mod cpu;
 mod gpu;
 #[cfg(target_arch = "wasm32")]
 mod html;
 mod interface;
 mod wgsl;
+use basilisk::BasiliskPlugin;
 use bevy::asset::AssetMetaCheck;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::log::{Level, LogPlugin};
@@ -45,6 +50,7 @@ use bevy_app::{
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use bevy_panorbit_camera::PanOrbitCameraPlugin;
+use cpp_backend::WernerReadbackChannel;
 use cpu::{
     density::build_density_quadrature_system,
     frequency_domain::build_aggregated_gravity_source_system,
@@ -52,13 +58,8 @@ use cpu::{
     physics::{physics_system, ryugu_rotation_system},
 };
 use gpu::{
-    fmm::FmmComputePlugin,
-    frequency_domain::FrequencyDomainGpuComputePlugin,
-    mmfft::MmfftCompressedComputePlugin,
-    normals::NormalsComputePlugin,
+    frequency_domain::FrequencyDomainGpuComputePlugin, normals::NormalsComputePlugin,
     planning::PlanningGpuComputePlugin,
-    radial::GravityComputePlugin,
-    werner::{WernerComputePlugin, WernerReadbackChannel},
 };
 use interface::components::{
     ActiveGravityMethod, CameraMode, DensityC, DensityMode, DensitySensitivityCaches,
@@ -482,9 +483,6 @@ pub fn main() {
         .add_plugins(
             DefaultPlugins
                 .build()
-                // The application has no audio. Disabling the plugin avoids
-                // creating a browser AudioContext before a user gesture.
-                .disable::<bevy::audio::AudioPlugin>()
                 .set(LogPlugin {
                     // Browser consoles should contain actionable failures,
                     // not Bevy startup/debug telemetry. Numerical diagnostics
@@ -523,6 +521,8 @@ pub fn main() {
         )
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(WgslPlugin)
+        .add_plugins(BasiliskPlugin)
+        .add_plugins(cpp_backend::CppBackendPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .init_gizmo_group::<ScientificGizmos>();
 
@@ -544,15 +544,16 @@ pub fn main() {
     if has_webgpu {
         app.add_plugins(PlanningGpuComputePlugin);
         app.add_plugins(NormalsComputePlugin);
-        app.add_plugins(GravityComputePlugin);
-        app.add_plugins(WernerComputePlugin);
+        // Legacy gravity plugins are retained in source, but are not registered.
+        // app.add_plugins(GravityComputePlugin);
+        // app.add_plugins(WernerComputePlugin);
         app.add_plugins(FrequencyDomainGpuComputePlugin);
         app.add_plugins(gpu::equation106::Equation106Plugin);
         // MMFFT+compression is the fourth GPU integration slot. Its packed
         // source buffer and tiled reduction are built once and evaluated in
         // the render-world compute pass.
-        app.add_plugins(MmfftCompressedComputePlugin);
-        app.add_plugins(FmmComputePlugin);
+        // app.add_plugins(MmfftCompressedComputePlugin);
+        // app.add_plugins(FmmComputePlugin);
     }
 
     app.add_systems(Startup, (configure_scientific_gizmos, setup_scene).chain());

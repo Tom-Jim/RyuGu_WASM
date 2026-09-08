@@ -10,7 +10,7 @@
 
 Ryugu Dynamics Laboratory combines a rotating Ryugu shape model, heterogeneous gravity models, live probe propagation, surface diagnostics, and constrained density inversion. Its central research direction is a **frequency-domain compression algorithm** that separates the asteroid's density representation from the spacecraft's trajectory representation, allowing repeated forward calculations and inverse problems to reuse numerical work.
 
-Rust and Bevy manage physical state and visualization; WebGPU/WGSL performs parallel numerical evaluation; an HTML interface with Vue/ECharts exposes the experiments. The **Frequency-domain** control selects the frequency-domain compression algorithm. The **Radial** and **FFT** controls select separate solvers.
+An independent Rust WASM backend owns probe dynamics and constrained optimization, Basilisk schedules physics tasks, and Bevy manages visualization; WebGPU/WGSL retains the frequency-domain operators; an HTML interface with Vue/ECharts exposes the experiments. The **Frequency-domain** control selects the frequency-domain compression algorithm. The **Radial** and **FFT** controls select separate solvers.
 
 The public mathematical companion is [mathpub.md](mathpub.md). It is the sole linked mathematical reference in this README. The formulas below are self-contained and use descriptive names rather than document-specific equation numbers.
 
@@ -246,7 +246,7 @@ The implemented data flow is:
 **Mass-normalized volume cells → independent WGSL propagation field → numerical orbit integration → captured body-frame arc → frequency-domain compression algorithm observations and sensitivities → constrained density fit.**
 
 - **Propagation:** the dedicated WGSL field kernel evaluates the spatial Newton field equivalent to the inverse-transformed reference-line response. It uses four-point radial Gauss quadrature within angular-shell cells. It does not numerically invert a stored Laplace response at every frame, and it does not use the truncated observation spectrum as the orbit force. Its acceleration history is separate from Radial, FFT, FMM, and Werner.
-- **Time integration:** the shared leapfrog-style substeps consume the selected evaluator's timestamped acceleration history, with bounded interpolation/extrapolation and pauses when usable readbacks are unavailable. Force latency remains a numerical error source; substepping alone does not guarantee the accuracy of freshly evaluated forces at every substep.
+- **Time integration:** Basilisk's serial process/task scheduler drives the independent Rust backend on integer nanosecond timestamps. Each physics tick uses method-specific double-precision leapfrog substeps. Non-frequency methods reevaluate gravity at each integration stage through C++ WASM. Frequency-domain propagation uses timestamped WGSL acceleration samples with bounded interpolation/extrapolation; substepping does not remove its force-latency error.
 - **Observation:** the captured trajectory supplies positions, physical times, and attitudes. The current transform uses 64 reciprocal wave-number nodes, positive real Laplace samples, and composite-trapezoid time weights. Source spectra and time contributions are reduced in GPU workgroups.
 - **Inversion:** the current finite model uses 56 occupied density voxels. Forward observations and unit-density sensitivity columns are evaluated in the same discrete observation space. The runtime volume-cell spectrum and the planning/inversion basis representations have distinct layouts; agreement still requires discretization checks.
 - **Reuse:** density, trajectory-capture, and basis identifiers govern caches and asynchronous results. Changed inputs must invalidate the corresponding products.
@@ -279,12 +279,14 @@ A unique regularized finite-dimensional solution requires suitable positive curv
 | UI selection | Representation and role | Main accuracy questions |
 | --- | --- | --- |
 | **Frequency-domain** | Independent volume-field propagation followed by the frequency-domain compression algorithm for whole-arc observations and sensitivities | Volume quadrature, spectral bandwidth, temporal sampling, and forward/basis consistency |
-| **Radial** | Angular cells with analytic radial endpoint contributions and local numerical stabilization | Angular resolution, shell approximation, and near-alignment conditioning |
-| **Werner** | Homogeneous closed-polyhedron edge and face evaluation | Mesh closure, orientation, near-surface conditioning, and the uniform-density assumption |
-| **FFT** | Cartesian source deposition, spectral convolution, and field interpolation | Grid resolution, domain extent, kernel discretization, and interpolation |
-| **FMM** | Hierarchical source aggregation with near/far evaluation | Multipole truncation, opening criteria, tree resolution, and near-field treatment |
+| **Radial** | Boost adaptive radial quadrature within angular cells and radial shells | Angular resolution, shell approximation, quadrature tolerance, and near-surface conditioning |
+| **Werner** | Basilisk homogeneous closed-polyhedron edge and face evaluation | Mesh closure, orientation, near-surface conditioning, and the uniform-density assumption |
+| **FFT** | FLUPS/FFTW free-space solve with source deposition and field interpolation | Grid resolution, domain extent, kernel discretization, and interpolation |
+| **FMM** | ExaFMM-t hierarchical Laplace evaluation | Expansion order, tree resolution, source quadrature, and near-field treatment |
 
-Select a method and press **Calculate field** for effective gravity, gradient magnitude, or effective slope. Surface products are computed in bounded CPU batches and uploaded to a display overlay; they are separate from the live GPU orbit evaluator. In particular, the frequency-domain surface product uses a finite spectral field approximation, so its convergence must be checked separately from the propagation field.
+Select a method and press **Calculate field** for effective gravity, gradient magnitude, or effective slope. Surface products are computed in bounded batches and uploaded to a display overlay; non-frequency products use the C++ backend. In particular, the frequency-domain surface product uses a finite spectral field approximation, so its convergence must be checked separately from the propagation field.
+
+The **Orbit & transform diagnostics** chart reports the live rotating-frame Jacobi constant from the active Radial, Werner, FFT, or FMM backend. Frequency-domain mode keeps its spectral transform diagnostic.
 
 **Section** shows the selected method's default density distribution without changing the density model or launching a surface calculation. **Normals** shows one outward normal per triangle. The orbit trail retains up to 100,000 integrated history positions; it displays the path already travelled.
 
@@ -296,13 +298,31 @@ The stack is chosen to keep a scientific experiment interactive while making its
 
 | Layer | Why it fits this project | Tradeoff |
 | --- | --- | --- |
-| **Rust** | Typed physical state, ownership of buffers and caches, reusable CPU reference operators, and explicit handling of asynchronous GPU results | Memory safety does not prove numerical correctness; generations, frames, units, and GPU layouts still need validation |
+| **Rust** | Independent backend state, trajectory integration and optimization; frontend ownership of display buffers and asynchronous GPU results | Memory safety does not prove numerical correctness; module boundaries, frames, units, and GPU layouts still need validation |
 | **WebAssembly** | Distributes the compiled Rust model through a web page, reducing setup for teaching, collaboration, and exploratory experiments | Browser memory limits, suspension, startup cost, and readback latency differ from a native scientific application |
 | **WebGPU / WGSL** | Exposes parallel source, wave-number, time, target, face, and density-basis work; shared-memory reductions and reusable buffers suit repeated linear operators | GPU f32 arithmetic, adapter limits, synchronization, and transfer costs constrain accuracy and workload size |
-| **Bevy** | Keeps body attitude, probe state, scene geometry, camera, and diagnostics in one scheduled application | Rendering competes with computation for frame time and GPU resources |
+| **Bevy** | Displays backend state, scene geometry, camera, and diagnostics while retaining the frequency-domain GPU operators | Rendering competes with GPU computation; the backend remains the authority for probe dynamics |
 | **HTML / Vue / ECharts** | Provides accessible controls, resizable panels, scientific charts, and mobile interaction around the simulation | UI scheduling and scientific timing must remain separate |
 
 GPU acceleration is concentrated where contributions can be evaluated independently and reduced. The CPU retains orchestration, constrained optimization, reference calculations, and current surface-product evaluation. The goal is to minimize repeated work and transfers, not to move every small operation onto the GPU. Matching Rust buffer layouts and WGSL storage layouts is part of correctness, as is rejecting stale readbacks.
+
+### Browser backend separation
+
+The page starts the Bevy frontend WASM (`pkg/ryugu_wasm_bg.wasm`) first, then loads the Zig-built C++ module (`pkg/ryugu_backend.wasm`) and independent Rust backend WASM (`pkg/backend/ryugu_backend_bg.wasm`) without blocking the first scene render. The JavaScript host bridges their independent linear memories with typed arrays; no native numerical service, WebSocket backend, or shared-memory support is required.
+
+| Method | Active numerical implementation |
+| --- | --- |
+| Radial | Boost.Math adaptive Gauss-Kronrod radial integration |
+| Werner | Basilisk `PolyhedralGravityModel`, homogeneous closed polyhedron |
+| FMM | ExaFMM-t Laplace solver, with the same eight-point Gauss-Legendre source nodes as the C++ double-precision direct reference |
+| FFT | FLUPS free-space Poisson solver with FFTW, density deposition, finite-difference acceleration, and trilinear sampling |
+| Frequency-domain | Existing Rust/WGSL spectral and dedicated propagation operators |
+
+Legacy non-frequency Rust/WGSL entry points and embedded evaluators are commented out in place, not moved to `old/`. Probe forces, surface fields, planning forces, and inversion sensitivities use the new backend paths. Rust backend WASM also performs candidate trajectory propagation and Clarabel optimization. Geometry preparation, experiment orchestration, and the retained frequency-domain GPU path remain frontend responsibilities.
+
+Basilisk's actual `SimModel`, `SysProcess`, `SysModelTask`, and messaging sources are compiled with a browser-serial patch. A scheduled Rust dynamics task publishes translational `SCStatesMsgPayload` messages. This ports the application's serial scheduling path, not native multithreading, Python scenario bindings, arbitrary spacecraft effectors, six-degree-of-freedom attitude dynamics, or the complete Vizard client. The external version-1 Ryugu ABI is not Vizard Protobuf.
+
+FLUPS's negative potential is converted to the positive potential convention above without reversing acceleration. The current live grid is 32 cubed with a 4096 metre half-width; out-of-domain targets fail explicitly. ExaFMM structures are rebuilt per batch and Basilisk polyhedral preprocessing is cached per configured mesh. These costs and grid errors need runtime evaluation; compilation is not evidence of performance parity.
 
 ## Using the workbench
 
@@ -332,7 +352,7 @@ The static-hosted page has no access to the local server's sleep-prevention proc
 
 This figure is retained from the original performance record. It was not remeasured for the current implementation or this README revision and is not evidence that all proposed compression techniques are implemented or faster.
 
-The workbench retains randomized method order, repeated measurements, medians and ranges, selectable source sizes, density-model counts, target counts, and accuracy thresholds. GPU timing uses GPU timestamps when available; missing timestamp measurements remain missing. CPU preparation, command encoding, transfers, and readback waits belong in end-to-end timing, not in GPU kernel time.
+The workbench retains randomized method order, repeated measurements, medians and ranges, selectable source sizes, density-model counts, target counts, and accuracy thresholds. GPU timing uses GPU timestamps when available; missing timestamp measurements remain missing. CPU preparation, command encoding, transfers, and readback waits belong in end-to-end timing, not in GPU kernel time. Compare C++ solvers against frequency-domain using full-pipeline wall time; C++ execution time is not substituted for unavailable GPU timestamps.
 
 A scientifically useful comparison must distinguish:
 
@@ -342,6 +362,14 @@ A scientifically useful comparison must distinguish:
 - **Workload:** cold preparation versus cached reuse, memory consumption, forward and sensitivity costs, and total completion time.
 
 Agreement with an f64 reference using the same finite quadrature checks implementation consistency. It does not establish convergence to the continuous field. Likewise, a low transformed residual can coexist with unresolved high-frequency field structure. Comparisons against independently refined spatial references are needed before making proximity-navigation claims.
+
+Independent validation tools are provided separately from the default build. `src/tools/validate_continuous_volume.py` refines radial integration of exported angular cells; `src/tools/validate_mesh_volume.py` uses SciPy Gauss-Legendre product quadrature over origin-facet tetrahedra to refine the full three-dimensional constant or logarithmic density integral. The latter accepts JSON `vertices` in metres, zero-based outward `facets`, `mass`, and `epsilon` (10 metres for the project profile), and requires a closed mesh star-shaped about the origin.
+
+```sh
+uv run src/tools/validate_mesh_volume.py mesh.json --position 1000 0 0 --orders 4 8 16 32
+```
+
+Refinement differences are convergence diagnostics, not rigorous error bounds. Same-node direct/FMM comparisons isolate solver error; independently refined volume integration checks their shared discretization error. These numerical validators are separate from the production build.
 
 ## Expected improvements
 
@@ -366,13 +394,18 @@ These are development directions, not delivered capability claims. Compression s
 | --- | --- |
 | `src/lib.rs` | Application resources, plugins, scheduling, and runtime setup |
 | `src/cpu/density.rs` | Shared density geometry and mass-preserving source representation |
-| `src/cpu/physics.rs` | Orbit integration, timestamped force use, and observation-arc capture |
+| `src/cpu/physics.rs` | Backend state client, display history, and observation-arc capture |
+| `src/backend/rust/` | Independent Rust WASM: authoritative probe integration, candidate propagation, and Clarabel solver |
+| `src/cpp_backend.rs` / `src/cpp_planning.rs` | Bevy-to-backend dispatch and planning packets |
+| `src/backend/zig/` / `C++/` | Browser C API, Basilisk scheduling, pinned upstream sources and patches |
+| `src/backend/host/cpp_backend.mjs` | Browser WASI host and C++ numerical ABI |
+| `src/tools/` | Build, source-fetch, validation, and WASM ABI checks |
 | `src/cpu/frequency_domain.rs` | Frequency-domain source preparation and discrete transform definitions |
 | `src/gpu/frequency_domain_pipeline/` | Whole-trajectory transforms, spectra, sensitivities, planning, and readback |
-| `src/gpu/fmm_pipeline/` | Hierarchical gravity preparation and evaluation |
-| `src/gpu/mmfft_pipeline/` | Grid, spectrum, and interpolated field evaluation |
-| `src/gpu/radial.rs` | Independent radial analytic field dispatch and reductions |
-| `src/cpu/inversion_components/` | Density basis, reference operators, caches, and constrained optimization |
+| `src/gpu/fmm_pipeline/` | Legacy FMM source, disabled at module registration |
+| `src/gpu/mmfft_pipeline/` | Legacy FFT source, disabled at module registration |
+| `src/gpu/radial.rs` | Legacy radial quadrature dispatch, disabled at module registration |
+| `src/cpu/inversion_components/` | Density basis, backend reference clients, caches, and optimization requests |
 | `src/bevy/surface_field.rs` | Chunked surface-field evaluation and display |
 | `src/wgsl/` | Unified numerical and rendering shaders |
 | `src/html/navigation.js` | Camera/whole-UI gestures, panel transforms, and mobile interaction |
@@ -380,29 +413,36 @@ These are development directions, not delivered capability claims. Compression s
 | `src/html/ui.js` / `src/html/app.js` | Controls, snapshots, and charts |
 | `mathpub.md` | Public mathematical companion |
 
+All project-owned source, bridge, protocol, and build-tool code is organized under `src/`. The top-level `C++/` directory is the intentional exception: it contains the pinned third-party Git checkouts required to build the browser numerical module reproducibly.
+
 ## Build and checks
 
-A local build needs Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, and Bun. The interactive numerical application requires an available WebGPU adapter in a supporting browser; local serving uses `localhost`, and deployment uses HTTPS.
+A local build needs Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, Bun, Node.js, Git, CMake, and Zig 0.16.0. The interactive numerical application requires an available WebGPU adapter in a supporting browser; local serving uses `localhost`, and deployment uses HTTPS.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-bun install
+bun install --frozen-lockfile
 bun run build
 bun run serve
 ```
 
-The local server runs at `http://localhost:3000`. `bun run dev` builds the development WASM package and starts the server; `bun run preview` performs a release build before serving. Keep the supplied model and operator assets with the project.
+The local server runs at `http://localhost:3000`. `bun run dev` builds the development WASM package and starts the server; `bun run preview` performs a release build before serving. Keep the supplied model and operator assets with the project. Set `PORT=3001` to use another local port. The server serves `.mjs` as JavaScript and `.wasm` as WebAssembly.
+
+Missing C++ checkouts are fetched automatically from revisions pinned in `C++/sources.lock.json`; existing checkouts are not overwritten. `bun run fetch:cpp` explicitly verifies pins and applies versioned browser patches. The official FFTW development repository is retained in `C++/fftw3`; compilation uses the pinned release-source mirror in `C++/fftw3-release` for generated codelets. First builds require network access. `bun run build` compiles all three modules without launching a browser, server, or numerical tests.
 
 The Rust checks used by CI include:
 
 ```sh
 cargo fmt --all -- --check
+cargo fmt --manifest-path src/backend/rust/Cargo.toml -- --check
+RUSTC_WRAPPER= cargo clippy --locked --target wasm32-unknown-unknown --manifest-path src/backend/rust/Cargo.toml -- -D warnings
+bun run check:wasm
 RUSTC_WRAPPER= cargo clippy --locked --target wasm32-unknown-unknown --lib -- -D warnings
 RUSTC_WRAPPER= cargo check --locked --target wasm32-unknown-unknown --lib
 ```
 
-The GitHub Pages workflow builds the release WASM package and Tailwind stylesheet, bundles the Vue telemetry interface, checks JavaScript syntax and deployment asset paths, and assembles the static site. Passing those checks establishes build and packaging consistency; scientific convergence and device-specific GPU behavior require separate validation.
+The GitHub Pages workflow installs Zig, fetches pinned C++ sources, builds all three release WASM packages and the Tailwind stylesheet, bundles the Vue telemetry interface, checks JavaScript syntax and deployment asset paths, and assembles the static site. The WASM checker compiles and inspects exports/import paths without instantiating modules. All module URLs are relative for repository-subpath hosting; choose GitHub Actions as the Pages source. Passing those checks establishes build and packaging consistency; scientific convergence and device-specific GPU behavior require separate validation.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+Project-owned source: MIT; see [LICENSE](LICENSE). Linked upstream dependencies retain their own licenses; the numerical WASM distribution is not MIT-only. The build copies upstream notices into `pkg/licenses/`.

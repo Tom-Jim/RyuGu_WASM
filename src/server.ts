@@ -2,7 +2,9 @@ import { join } from "path";
 import { mkdir, rename, rm } from "node:fs/promises";
 
 const PORT = Number.parseInt(Bun.env.PORT ?? "3000", 10);
-const ROOT = import.meta.dir;
+// This entry point lives in `src/`, while static assets and generated WASM
+// packages remain rooted at the workspace level.
+const ROOT = join(import.meta.dir, "..");
 
 // A real page connection owns idle-sleep prevention on this local Mac. Screen
 // sleep is deliberately allowed (-i/-s, not -d; -s applies on AC power). No browser security flags or
@@ -115,6 +117,7 @@ async function saveBenchmarkExport(req: Request, url: URL) {
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js":   "application/javascript",
+  ".mjs":  "application/javascript",
   ".wasm": "application/wasm",
   ".obj":  "text/plain",
   ".mtl":  "text/plain",

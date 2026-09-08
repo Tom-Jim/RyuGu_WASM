@@ -38,7 +38,7 @@ pub fn planning_batch_evaluator_system(
     mut frequency_domain_workspace: Local<
         crate::gpu::frequency_domain::PlanningFrequencyDomainWorkspace,
     >,
-    mut mmfft_workspace: Local<crate::gpu::mmfft::PlanningMmfftWorkspace>,
+    // Legacy CPU FFT workspace disabled.
     mut reference_cache: Local<PlanningReferenceCache>,
 ) {
     let Some(mut job) = planning.batch_job.take() else {
@@ -385,19 +385,10 @@ pub fn planning_batch_evaluator_system(
                     &mut frequency_domain_workspace,
                 )
             }
-            ActiveGravityMethod::MmfftCompressed => {
-                crate::gpu::mmfft::build_planning_mmfft_payload(
-                    &batch,
-                    job.density_model,
-                    payload_key,
-                    &mut mmfft_workspace,
-                )
-            }
-            ActiveGravityMethod::Fmm => crate::gpu::fmm::build_planning_fmm_gpu_payload(
-                &batch,
-                job.density_model,
-                payload_key,
-            ),
+            ActiveGravityMethod::MmfftCompressed | ActiveGravityMethod::Fmm => Some(PlanningMethodPayload {
+                request_id: payload_key, method: Some(job.method), density_model: job.density_model,
+                ..Default::default()
+            }),
             _ => None,
         };
         let Some(prepared) = prepared else {
@@ -1342,8 +1333,8 @@ fn finish_planning_method(
                 PlanningExecutionBackend::GpuFrequencyDomain
             ) | (
                 ActiveGravityMethod::MmfftCompressed,
-                PlanningExecutionBackend::GpuMmfft
-            ) | (ActiveGravityMethod::Fmm, PlanningExecutionBackend::GpuFmm)
+                PlanningExecutionBackend::CppFlups
+            ) | (ActiveGravityMethod::Fmm, PlanningExecutionBackend::CppExafmm)
         );
     planning.results[job.method.performance_index()] = Some(PlanningMethodMetrics {
         method: job.method,
