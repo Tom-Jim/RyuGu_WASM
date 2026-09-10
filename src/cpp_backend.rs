@@ -658,6 +658,20 @@ pub fn voxel_basis_sensitivities(
     Ok(result)
 }
 
+/// Validates the four-value `[gravity, potential]` field response.
+///
+/// Both the synchronous adapter and the asynchronous Worker delivery path must
+/// accept exactly the same payload, so the contract lives in one place.
+pub fn decode_field_response(values: Vec<f64>) -> Result<(Vec3, f32), String> {
+    if values.len() != 4 || !values.iter().all(|value| value.is_finite()) {
+        return Err("Invalid C++ gravity response".into());
+    }
+    Ok((
+        Vec3::new(values[0] as f32, values[1] as f32, values[2] as f32),
+        values[3] as f32,
+    ))
+}
+
 pub fn evaluate(method: ActiveGravityMethod, position: Vec3) -> Result<(Vec3, f32), String> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -672,13 +686,7 @@ pub fn evaluate(method: ActiveGravityMethod, position: Vec3) -> Result<(Vec3, f3
         };
         let value = cpp_evaluate(key, position.x as f64, position.y as f64, position.z as f64)
             .map_err(|error| format!("C++ {key}: {error:?}"))?;
-        if value.len() != 4 || !value.iter().all(|v| v.is_finite()) {
-            return Err("Invalid C++ gravity response".into());
-        }
-        Ok((
-            Vec3::new(value[0] as f32, value[1] as f32, value[2] as f32),
-            value[3] as f32,
-        ))
+        decode_field_response(value)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
