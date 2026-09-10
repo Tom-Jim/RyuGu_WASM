@@ -3,6 +3,7 @@ pub fn update_planning_results_from_inversion_system(
     inversion: Res<TrajectoryInversionState>,
     radial: Option<Res<DensityQuadratureSource>>,
     aggregated: Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>,
+    candidates_channel: Res<crate::cpp_backend::BackendCandidatesChannel>,
     mut planning: ResMut<PlanningComparisonState>,
     mut batch_builder: Local<Option<crate::cpu::planning::PlanningBatchBuilder>>,
 ) {
@@ -10,6 +11,7 @@ pub fn update_planning_results_from_inversion_system(
         // A UI cancellation must release the CPU-side candidate builder too;
         // otherwise a hidden quadrature page would retain a large work queue.
         *batch_builder = None;
+        candidates_channel.reset();
         return;
     }
     if planning.batch_job.is_some() {
@@ -39,6 +41,7 @@ pub fn update_planning_results_from_inversion_system(
         )
     });
     if !builder_matches {
+        candidates_channel.reset();
         let Some(radial) = radial else {
             planning.status =
                 "Planning queued: the common radial volume source is not ready.".into();
@@ -98,10 +101,11 @@ pub fn update_planning_results_from_inversion_system(
             .saturating_mul(2)
             .min(u32::MAX as usize) as u32
     };
-    if !builder.advance(propagation_budget) {
+    if !builder.advance(propagation_budget, &candidates_channel) {
         planning.status = "Planning candidate propagation failed.".into();
         planning.run_requested = false;
         *batch_builder = None;
+        candidates_channel.reset();
         return;
     }
     planning.preparation_progress = builder.preparation_progress();
@@ -113,6 +117,7 @@ pub fn update_planning_results_from_inversion_system(
         );
         return;
     }
+    candidates_channel.reset();
     let Some((batch, common_preparation_ms)) =
         batch_builder.take().and_then(|builder| builder.finish())
     else {

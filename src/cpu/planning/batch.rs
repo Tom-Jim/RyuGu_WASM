@@ -44,6 +44,10 @@ pub(crate) struct PlanningBatchBuilder {
     wasm_velocities: Vec<DVec3>,
     #[cfg(target_arch = "wasm32")]
     wasm_sources: Vec<(DVec3, f64)>,
+    #[cfg(target_arch = "wasm32")]
+    pending_slice: Option<PendingCandidateSlice>,
+    #[cfg(target_arch = "wasm32")]
+    worker_request_id: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +57,14 @@ struct PlanningReferenceJet {
     world_position: DVec3,
     world_acceleration: DVec3,
     world_jacobian: DMat3,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct PendingCandidateSlice {
+    snapshot: crate::cpp_backend::BackendCandidatesSnapshot,
+    start_sample: usize,
+    end_sample: usize,
+    started: bevy::platform::time::Instant,
 }
 
 impl PlanningBatchBuilder {
@@ -235,6 +247,10 @@ impl PlanningBatchBuilder {
             wasm_velocities,
             #[cfg(target_arch = "wasm32")]
             wasm_sources,
+            #[cfg(target_arch = "wasm32")]
+            pending_slice: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_request_id: 0,
         })
     }
 
@@ -259,10 +275,15 @@ impl PlanningBatchBuilder {
             ) == dimensions
     }
 
-    pub(crate) fn advance(&mut self, propagation_budget: u32) -> bool {
-        let started = bevy::platform::time::Instant::now();
+    pub(crate) fn advance(
+        &mut self,
+        propagation_budget: u32,
+        channel: &crate::cpp_backend::BackendCandidatesChannel,
+    ) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let started = bevy::platform::time::Instant::now();
+            let _ = channel;
             let end = (self.next_candidate + propagation_budget.max(1)).min(self.candidate_count);
             let generated = generate_candidate_range_parallel(
                 self.next_candidate,
@@ -281,111 +302,176 @@ impl PlanningBatchBuilder {
                 self.gpu_position_bytes.extend(bytes);
             }
             self.next_candidate = end;
+            self.preparation_ms += started.elapsed().as_secs_f64() * 1.0e3;
+            true
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let sample_count = self.reference_samples.len();
-            if sample_count < 2 {
-                return false;
-            }
-            let start_sample = self.next_sample.min(sample_count - 1);
-            let end_sample =
-                (start_sample + propagation_budget.max(1) as usize).min(sample_count - 1);
-            if start_sample == end_sample {
-                self.next_candidate = self.candidate_count;
-                self.next_sample = end_sample;
+            self.advance_wasm(propagation_budget, channel)
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn advance_wasm(
+        &mut self,
+        propagation_budget: u32,
+        channel: &crate::cpp_backend::BackendCandidatesChannel,
+    ) -> bool {
+        if let Some(pending) = self.pending_slice.take() {
+            let packet = channel
+                .data
+                .lock()
+                .expect("backend candidate result channel poisoned")
+                .take();
+            let Some(packet) = packet else {
+                self.pending_slice = Some(pending);
                 return true;
-            }
-            let candidate_positions: Vec<_> = self
-                .wasm_positions
-                .iter()
-                .map(|position| position.to_array())
-                .collect();
-            let candidate_velocities: Vec<_> = self
-                .wasm_velocities
-                .iter()
-                .map(|velocity| velocity.to_array())
-                .collect();
-            let Some(reference_jets) = self.reference_jets.get(start_sample..=end_sample) else {
-                return false;
             };
-            let jets: Vec<_> = reference_jets
-                .iter()
-                .map(|jet| {
-                    serde_json::json!({
-                        "time": jet.simulation_time_seconds,
-                        "rotation": jet.body_rotation.to_array(),
-                        "position": jet.world_position.to_array(),
-                        "acceleration": jet.world_acceleration.to_array(),
-                        "jacobian": jet.world_jacobian.to_cols_array(),
-                    })
-                })
-                .collect();
-            let sources: Vec<_> = self
-                .wasm_sources
-                .iter()
-                .map(|(position, mass)| (position.to_array(), *mass))
-                .collect();
-            // Serialize numeric slices directly instead of constructing a
-            // serde_json::Value array for every coordinate and source mass.
-            #[derive(serde::Serialize)]
-            struct CandidateRequest<'a> {
-                positions: &'a [[f64; 3]],
-                velocities: &'a [[f64; 3]],
-                jets: &'a [serde_json::Value],
-                sources: &'a [([f64; 3], f64)],
+            if packet.snapshot != pending.snapshot
+                || packet.snapshot.epoch != self.capture_epoch
+                || packet.snapshot.request_id != pending.snapshot.request_id
+            {
+                return false;
             }
-            let Ok(request) = serde_json::to_string(&CandidateRequest {
-                positions: &candidate_positions,
-                velocities: &candidate_velocities,
-                jets: &jets,
-                sources: &sources,
+            let Some(trajectory) = packet.result.ok().filter(|values| {
+                values.len()
+                    == self.candidate_count as usize
+                        * (pending.end_sample - pending.start_sample + 1)
+                        * 6
+                    && values.iter().all(|value| value.is_finite())
             }) else {
                 return false;
             };
-            let Some(trajectory) = crate::cpp_backend::propagate_candidates(&request)
-                .ok()
-                .filter(|values| {
-                    values.len()
-                        == self.candidate_count as usize * (end_sample - start_sample + 1) * 6
-                        && values.iter().all(|value| value.is_finite())
-                })
-            else {
+            if !self.apply_candidate_slice(
+                pending.start_sample,
+                pending.end_sample,
+                &trajectory,
+            ) {
                 return false;
-            };
-            let local_sample_count = end_sample - start_sample + 1;
-            for candidate in 0..self.candidate_count as usize {
-                let candidate_start = candidate * local_sample_count * 6;
-                for local_sample in 0..local_sample_count {
-                    if start_sample != 0 && local_sample == 0 {
-                        continue;
-                    }
-                    let values_start = candidate_start + local_sample * 6;
-                    if write_dynamical_candidate_sample(
-                        candidate as u32,
-                        start_sample + local_sample,
-                        &self.reference_samples,
-                        &trajectory[values_start..values_start + 6],
-                        &mut self.states,
-                        &mut self.gpu_position_bytes,
-                    )
-                    .is_none()
-                    {
-                        return false;
-                    }
-                }
-                let final_start = candidate_start + (local_sample_count - 1) * 6;
-                self.wasm_positions[candidate] =
-                    DVec3::from_slice(&trajectory[final_start..final_start + 3]);
-                self.wasm_velocities[candidate] =
-                    DVec3::from_slice(&trajectory[final_start + 3..final_start + 6]);
             }
-            self.next_sample = end_sample;
-            if self.is_complete() {
-                self.next_candidate = self.candidate_count;
-            }
+            self.preparation_ms += pending.started.elapsed().as_secs_f64() * 1.0e3;
+            return true;
         }
-        self.preparation_ms += started.elapsed().as_secs_f64() * 1.0e3;
+
+        let sample_count = self.reference_samples.len();
+        if sample_count < 2 {
+            return false;
+        }
+        let start_sample = self.next_sample.min(sample_count - 1);
+        let end_sample =
+            (start_sample + propagation_budget.max(1) as usize).min(sample_count - 1);
+        if start_sample == end_sample {
+            self.next_candidate = self.candidate_count;
+            self.next_sample = end_sample;
+            return true;
+        }
+        let Some(request) = self.serialize_candidate_slice(start_sample, end_sample) else {
+            return false;
+        };
+        self.worker_request_id = self.worker_request_id.wrapping_add(1).max(1);
+        let snapshot = crate::cpp_backend::BackendCandidatesSnapshot {
+            request_id: self.run_id.rotate_left(23) ^ self.worker_request_id,
+            epoch: self.capture_epoch,
+        };
+        match crate::cpp_backend::request_candidates(channel, snapshot, &request) {
+            Ok(true) => {
+                self.pending_slice = Some(PendingCandidateSlice {
+                    snapshot,
+                    start_sample,
+                    end_sample,
+                    started: bevy::platform::time::Instant::now(),
+                });
+                true
+            }
+            Ok(false) => true,
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn serialize_candidate_slice(&self, start_sample: usize, end_sample: usize) -> Option<String> {
+        let candidate_positions: Vec<_> = self
+            .wasm_positions
+            .iter()
+            .map(|position| position.to_array())
+            .collect();
+        let candidate_velocities: Vec<_> = self
+            .wasm_velocities
+            .iter()
+            .map(|velocity| velocity.to_array())
+            .collect();
+        let reference_jets = self.reference_jets.get(start_sample..=end_sample)?;
+        let jets: Vec<_> = reference_jets
+            .iter()
+            .map(|jet| {
+                serde_json::json!({
+                    "time": jet.simulation_time_seconds,
+                    "rotation": jet.body_rotation.to_array(),
+                    "position": jet.world_position.to_array(),
+                    "acceleration": jet.world_acceleration.to_array(),
+                    "jacobian": jet.world_jacobian.to_cols_array(),
+                })
+            })
+            .collect();
+        let sources: Vec<_> = self
+            .wasm_sources
+            .iter()
+            .map(|(position, mass)| (position.to_array(), *mass))
+            .collect();
+        #[derive(serde::Serialize)]
+        struct CandidateRequest<'a> {
+            positions: &'a [[f64; 3]],
+            velocities: &'a [[f64; 3]],
+            jets: &'a [serde_json::Value],
+            sources: &'a [([f64; 3], f64)],
+        }
+        serde_json::to_string(&CandidateRequest {
+            positions: &candidate_positions,
+            velocities: &candidate_velocities,
+            jets: &jets,
+            sources: &sources,
+        })
+        .ok()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn apply_candidate_slice(
+        &mut self,
+        start_sample: usize,
+        end_sample: usize,
+        trajectory: &[f64],
+    ) -> bool {
+        let local_sample_count = end_sample - start_sample + 1;
+        for candidate in 0..self.candidate_count as usize {
+            let candidate_start = candidate * local_sample_count * 6;
+            for local_sample in 0..local_sample_count {
+                if start_sample != 0 && local_sample == 0 {
+                    continue;
+                }
+                let values_start = candidate_start + local_sample * 6;
+                if write_dynamical_candidate_sample(
+                    candidate as u32,
+                    start_sample + local_sample,
+                    &self.reference_samples,
+                    &trajectory[values_start..values_start + 6],
+                    &mut self.states,
+                    &mut self.gpu_position_bytes,
+                )
+                .is_none()
+                {
+                    return false;
+                }
+            }
+            let final_start = candidate_start + (local_sample_count - 1) * 6;
+            self.wasm_positions[candidate] =
+                DVec3::from_slice(&trajectory[final_start..final_start + 3]);
+            self.wasm_velocities[candidate] =
+                DVec3::from_slice(&trajectory[final_start + 3..final_start + 6]);
+        }
+        self.next_sample = end_sample;
+        if self.is_complete() {
+            self.next_candidate = self.candidate_count;
+        }
         true
     }
 
@@ -477,9 +563,8 @@ impl PlanningBatchBuilder {
 /// Native planning uses a bounded work queue so trajectory propagation does
 /// not serialize behind GPU submission or UI rendering. Results are sorted by
 /// candidate index before they are appended, preserving the deterministic GPU
-/// buffer layout used by the WASM build. Browser WASM intentionally keeps the
-/// same algorithm cooperative: a web worker/atomics build is an opt-in deploy
-/// target, while the default page must remain responsive without it.
+/// buffer layout used by the WASM build. Browser WASM submits the same bounded
+/// slices to the dedicated numerical Worker and polls their result channel.
 #[cfg(not(target_arch = "wasm32"))]
 fn generate_candidate_range_parallel(
     start: u32,
