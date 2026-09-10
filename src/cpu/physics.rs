@@ -78,11 +78,7 @@ pub fn physics_system(
             }
         }
     } else {
-        if advance_channel
-            .in_flight
-            .load(std::sync::atomic::Ordering::Acquire)
-            || !crate::cpp_backend::should_advance_backend(&mut frame_pacer, *active)
-        {
+        if !crate::cpp_backend::should_advance_backend(&mut frame_pacer, &advance_channel) {
             return;
         }
         let mut steps = acceleration.stable_steps();

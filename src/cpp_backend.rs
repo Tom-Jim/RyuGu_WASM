@@ -9,7 +9,10 @@ use std::time::Duration;
 // Live propagation prioritizes browser responsiveness. Batch validation and
 // surface products retain their requested source resolution.
 const MAX_LIVE_ANGULAR_CELLS: usize = 32;
-const MIN_BACKEND_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+// The numerical Worker is the rate limit for live propagation: a new advance
+// request goes out as soon as the previous answer has been consumed. This floor
+// only stops a very fast worker from turning the submit path into a busy poll.
+const MIN_BACKEND_SUBMIT_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Resource, Default)]
 pub struct WernerAcceleration(pub Vec3);
@@ -704,14 +707,15 @@ pub struct CppBackendState {
     worker_configuration_request_id: u64,
 }
 
+/// Lower bound on how often the live advance path may submit a request.
 pub struct BackendFramePacer {
-    last_update: Instant,
+    last_submit: Instant,
 }
 
 impl Default for BackendFramePacer {
     fn default() -> Self {
         Self {
-            last_update: Instant::now() - MIN_BACKEND_FRAME_INTERVAL,
+            last_submit: Instant::now() - MIN_BACKEND_SUBMIT_INTERVAL,
         }
     }
 }
@@ -899,20 +903,25 @@ fn reduce_live_cells(cells: &[f64]) -> Vec<f64> {
     result
 }
 
-pub fn should_advance_backend(pacer: &mut BackendFramePacer, method: ActiveGravityMethod) -> bool {
-    let interval = match method {
-        ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::FrequencyDomain => {
-            MIN_BACKEND_FRAME_INTERVAL
-        }
-        ActiveGravityMethod::MmfftCompressed => Duration::from_millis(750),
-        ActiveGravityMethod::HomogeneousWerner => Duration::from_secs(1),
-        ActiveGravityMethod::Fmm => Duration::from_millis(1500),
-    };
-    let now = Instant::now();
-    if now.duration_since(pacer.last_update) < interval {
+/// Decides whether the live simulation may submit its next advance request.
+///
+/// The per-method wall-clock intervals (250 ms to 1.5 s) only existed because
+/// the advance call blocked the main thread. Requests are asynchronous now, so
+/// the outstanding request itself is the rate limit and the simulation advances
+/// as fast as the numerical Worker can answer. Nothing here changes how many
+/// integration steps a request carries.
+pub fn should_advance_backend(
+    pacer: &mut BackendFramePacer,
+    channel: &BackendAdvanceChannel,
+) -> bool {
+    if channel.in_flight.load(Ordering::Acquire) {
         return false;
     }
-    pacer.last_update = now;
+    let now = Instant::now();
+    if now.duration_since(pacer.last_submit) < MIN_BACKEND_SUBMIT_INTERVAL {
+        return false;
+    }
+    pacer.last_submit = now;
     true
 }
 
@@ -950,6 +959,27 @@ mod backend_channel_tests {
         let packet = channel.data.lock().unwrap().take().unwrap();
         assert_eq!(packet.snapshot, current);
         assert_eq!(packet.result.unwrap(), vec![2.0]);
+    }
+
+    #[test]
+    fn advance_pacing_follows_the_outstanding_request() {
+        let channel = BackendAdvanceChannel::default();
+        let mut pacer = BackendFramePacer {
+            last_submit: Instant::now() - MIN_BACKEND_SUBMIT_INTERVAL,
+        };
+        assert!(should_advance_backend(&mut pacer, &channel));
+        // The floor still holds back an immediate resubmission.
+        assert!(!should_advance_backend(&mut pacer, &channel));
+
+        pacer.last_submit = Instant::now() - MIN_BACKEND_SUBMIT_INTERVAL;
+        assert!(channel.begin(BackendAdvanceSnapshot {
+            request_id: 1,
+            epoch: 0,
+        }));
+        assert!(!should_advance_backend(&mut pacer, &channel));
+
+        channel.reset();
+        assert!(should_advance_backend(&mut pacer, &channel));
     }
 
     #[test]
