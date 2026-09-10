@@ -77,6 +77,11 @@ pub fn evaluate_sources(
     field_sources(method, xyz, masses, targets)
 }
 
+#[wasm_bindgen]
+pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, JsValue> {
+    planning::propagate_candidates(data)
+}
+
 #[derive(Clone, Default)]
 struct State {
     epoch: Option<u64>,

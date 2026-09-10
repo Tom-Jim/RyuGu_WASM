@@ -544,7 +544,6 @@ pub fn main() {
     if has_webgpu {
         app.add_plugins(PlanningGpuComputePlugin);
         app.add_plugins(NormalsComputePlugin);
-        // Legacy gravity plugins are retained in source, but are not registered.
         // app.add_plugins(GravityComputePlugin);
         // app.add_plugins(WernerComputePlugin);
         app.add_plugins(FrequencyDomainGpuComputePlugin);

@@ -4335,6 +4335,7 @@ dependencies = [
  "num-complex",
  "rand",
  "rand_distr",
+ "serde",
  "serde_json",
  "wasm-bindgen",
  "wgpu",

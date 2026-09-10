@@ -17,8 +17,11 @@ window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats 
         && Number.isFinite(sample.times?.[index]) && sample.times[index] > 0);
       const rejected = rows.length - valid.length;
       const qualified = complete && rejected === 0;
-      const measured = valid.map((sample) => sample[timingKey]?.[index]);
-      const timingAvailable = qualified && measured.every((time) => Number.isFinite(time) && time >= 0);
+      // Keep completed timings visible even when the independent accuracy
+      // gate fails. A failed result must be marked as failed, not rendered as
+      // an empty chart that suggests that no measurement was produced.
+      const measured = rows.map((sample) => sample[timingKey]?.[index]);
+      const timingAvailable = complete && measured.every((time) => Number.isFinite(time) && time >= 0);
       const sorted = timingAvailable ? measured.sort((a, b) => a - b) : [];
       const median = sorted.length ? (sorted[Math.floor(sorted.length / 2)] + sorted[Math.ceil(sorted.length / 2) - 1]) / 2 : null;
       const maximumError = (key) => rows.every((sample) => Number.isFinite(sample[key]?.[index]))
@@ -49,13 +52,18 @@ window.ryuguCurvePlotData = (groups, sourceCounts) => {
   return Array.from({ length: 6 }, (_, methodIndex) => ({
     points: sourceCounts.map((source) => {
       const method = bySource.get(source)?.methods[methodIndex];
-      return [source, method?.status === 'PASS' ? method.value : null, method];
+      return [source, method && ['PASS', 'FAIL'].includes(method.status) ? method.value : null, method];
     }),
     ranges: sourceCounts.flatMap((source) => {
       const method = bySource.get(source)?.methods[methodIndex];
-      return method?.status === 'PASS' && method.low > 0 && Number.isFinite(method.high)
+      return method && ['PASS', 'FAIL'].includes(method.status) && method.low > 0 && Number.isFinite(method.high)
         ? [[source, method.low, method.high]] : [];
     }),
+    failed: sourceCounts.map((source) => {
+      const method = bySource.get(source)?.methods[methodIndex];
+      return method && method.status === 'FAIL' && Number.isFinite(method.value)
+        ? [source, method.value, method] : null;
+    }).filter(Boolean),
   }));
 };
 
@@ -312,6 +320,20 @@ window.ryuguPlanningProgress = (planning) => ({
           svg.append(marker);
         });
       }
+      for (const point of item.failed ?? []) {
+        const marker = svgNode('circle', {
+          cx: pixelX(point[0]).toFixed(2),
+          cy: pixelY(point[1]).toFixed(2),
+          r: 4,
+          fill: '#ff7d89',
+          stroke: '#061013',
+          'stroke-width': 1,
+          class: 'chart-point chart-point-failed',
+        });
+        const sourceLabel = categoryIndex ? `${point[0] / 1000}K` : formatAxis(point[0]);
+        marker.append(svgNode('title', {}, `${item.label} at ${sourceLabel}: ${formatAxis(point[1])} ms; accuracy gate failed`));
+        svg.append(marker);
+      }
     });
   }
 
@@ -426,7 +448,7 @@ window.ryuguPlanningProgress = (planning) => ({
     const progress = pending
       ? ` · ${pending.sources / 1000}K accumulating ${pending.methods[0].count}/${required} repetitions`
       : '';
-    status.textContent = `${complete.length}/${quadratureSourceCounts.length} source sizes complete · ${plotted} qualified method points plotted${failed ? ` · ${failed} failed method cells excluded` : ''}${unavailable ? ` · ${unavailable} timestamp cells unavailable/below resolution` : ''}${progress}. Each completed source size adds its points immediately.`;
+    status.textContent = `${complete.length}/${quadratureSourceCounts.length} source sizes complete · ${plotted} qualified method points plotted${failed ? ` · ${failed} failed method cells shown as warning markers` : ''}${unavailable ? ` · ${unavailable} timestamp cells unavailable/below resolution` : ''}${progress}. Each completed source size adds its points immediately.`;
     const errorText = (value) => Number.isFinite(value) ? value.toExponential(2) : 'unavailable';
     $('#quadrature-accuracy').textContent = groups.length ? groups.map((group) =>
       `${group.sources / 1000}K: ` + group.methods.map((method, index) =>
@@ -445,7 +467,7 @@ window.ryuguPlanningProgress = (planning) => ({
         xLabel: 'source points',
         yLabel: `${timingTitle} median / min–max (ms)`,
         empty: unavailable ? 'GPU timestamps unavailable or below timer resolution; pipeline totals remain available.'
-          : failed ? 'Completed repetitions failed accuracy; see details below.'
+          : failed ? 'Completed repetitions failed accuracy; warning markers show their measured timings.'
           : 'Waiting for the first source size to complete 7 passing repetitions…',
       });
       makeLegend($('#curve-legend'), series);

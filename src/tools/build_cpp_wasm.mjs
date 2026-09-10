@@ -14,7 +14,9 @@ if (process.argv.includes("--fetch") || Object.keys(sources).some(name => !exist
 }
 const toolchain = `-DCMAKE_TOOLCHAIN_FILE=${join(root, "src/backend/zig/wasm-toolchain.cmake")}`;
 run("cmake", ["-S", "C++/fftw3-release", "-B", "src/backend/zig/deps/fftw", toolchain,
-  "-DCMAKE_POLICY_VERSION_MINIMUM=3.5", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTS=OFF", "-DDISABLE_FORTRAN=ON"]);
+  // FFTW's pinned CMake project declares CMake 3.0.  Set the policy floor here
+  // so current CMake versions do not enable deprecated pre-3.10 compatibility.
+  "-DCMAKE_POLICY_VERSION_MINIMUM=3.10", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTS=OFF", "-DDISABLE_FORTRAN=ON"]);
 run("cmake", ["--build", "src/backend/zig/deps/fftw", "-j", "4"]);
 run("cmake", ["-S", "src/backend/zig/flups", "-B", "src/backend/zig/deps/flups", toolchain]);
 run("cmake", ["--build", "src/backend/zig/deps/flups", "-j", "4"]);

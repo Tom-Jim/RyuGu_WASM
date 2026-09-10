@@ -36,17 +36,6 @@ pub struct DensitySensitivityCache {
 #[derive(Resource, Default)]
 pub struct DensitySensitivityCaches(pub [DensitySensitivityCache; 5]);
 
-// #[derive(Resource)]
-// pub struct FmmSource {
-//     pub bytes: Vec<u8>,
-//     /// Leaf particles packed as `(x, y, z, mass)` for the exact P2P near field.
-//     pub particle_bytes: Vec<u8>,
-//     pub node_count: u32,
-//     pub particle_count: u32,
-//     pub maximum_level: u32,
-//     pub density_mode: DensityMode,
-// }
-//
 #[derive(Resource, Clone)]
 pub struct FmmReadbackChannel {
     pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,
@@ -119,21 +108,6 @@ pub struct FrequencyDomainPerformanceMetrics {
 #[derive(Resource, Default)]
 pub struct MmfftCompressedHistory(pub GravitySampleHistory);
 
-// #[derive(Resource)]
-// pub struct MmfftCompressedSource {
-//     pub bytes: Vec<u8>,
-//     /// Number of Cartesian samples on each side of one physical grid.
-//     pub grid_sizes: [u32; 2],
-//     /// Number of nested grids, ordered finest to coarsest.
-//     pub level_count: u32,
-//     /// Half-widths of the nested physical grids (metres).
-//     pub half_extents: [f32; 2],
-//     /// Per-level scale used by the packed binary16 potential samples.
-//     pub grid_scales: [f32; 2],
-//     pub total_mass: f32,
-//     pub density_mode: DensityMode,
-// }
-//
 #[derive(Resource, Clone)]
 pub struct MmfftReadbackChannel {
     pub data: Arc<Mutex<Option<GravityReadbackPacket>>>,

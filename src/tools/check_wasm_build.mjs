@@ -8,7 +8,7 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
 const host = readFileSync(join(root, "src/backend/host/cpp_backend.mjs"), "utf8");
 for (const [file, required] of [
   ["pkg/ryugu_backend.wasm", ["memory", "__wasm_call_ctors", "ryugu_scheduler_reset", "ryugu_scheduler_advance", "ryugu_scheduler_time", "ryugu_direct_sum_eval", "ryugu_radial_boost_eval", "ryugu_werner_eval", "ryugu_werner_reset_cache", "ryugu_exafmm_eval", "ryugu_flups_free_space_eval"]],
-  ["pkg/backend/ryugu_backend_bg.wasm", ["memory", "configure", "evaluate", "evaluate_sources", "advance_frame", "tick", "solve_density", "propagate_candidate", "protocol_version"]],
+  ["pkg/backend/ryugu_backend_bg.wasm", ["memory", "configure", "evaluate", "evaluate_sources", "advance_frame", "tick", "solve_density", "propagate_candidate", "propagate_candidates", "protocol_version"]],
   ["pkg/ryugu_wasm_bg.wasm", ["memory"]],
 ]) {
   const module = await WebAssembly.compile(readFileSync(join(root, file)));

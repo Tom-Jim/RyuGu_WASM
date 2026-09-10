@@ -374,11 +374,6 @@ impl Default for SimulationClock {
 }
 
 impl SimulationClock {
-    // Legacy frontend time advancement. The backend now owns simulation time.
-    // pub fn advance(&mut self, seconds: f64) {
-    //     self.elapsed_seconds += seconds;
-    //     self.request_id = self.request_id.wrapping_add(1);
-    // }
 
     pub fn reset_state(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);

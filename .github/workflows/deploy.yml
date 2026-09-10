@@ -150,3 +150,30 @@ jobs:
             - name: Deploy to GitHub Pages
               id: deployment
               uses: actions/deploy-pages@v4
+
+    macos-arm64-optimization:
+        if: github.event_name != 'pull_request'
+        runs-on: macos-14
+        continue-on-error: true
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Build native ARM64 numerical code
+              env:
+                  RUSTFLAGS: "-C target-cpu=native"
+                  CARGO_PROFILE_RELEASE_LTO: "true"
+                  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+              run: |
+                  cargo build --locked --release --lib
+                  cargo build --locked --release --manifest-path src/backend/rust/Cargo.toml
+
+            - name: Inspect Apple acceleration capabilities
+              run: |
+                  sysctl -n hw.optional.arm64
+                  system_profiler SPHardwareDataType
+                  xcrun --find metal
+                  xcrun --find coremlc || true

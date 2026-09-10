@@ -284,10 +284,6 @@ fn dispatch_frequency_domain(
             });
             pass.set_pipeline(evaluate);
             pass.set_bind_group(0, &bind_group, &[]);
-            // Each y workgroup evaluates one Laplace-frequency observation
-            // for each trajectory block. Every observation integrates the
-            // complete T_gamma over all uploaded samples; there is no spatial
-            // target specialization.
             pass.dispatch_workgroups(1, inner.target_count, trajectory_block_count);
         }
         encoder.copy_buffer_to_buffer(&inner.output, 0, &inner.staging, 0, inner.output_size);

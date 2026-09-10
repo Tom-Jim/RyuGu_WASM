@@ -115,19 +115,6 @@ pub fn update_gpu_memory_estimate_system(
     mut estimate: ResMut<GpuMemoryEstimate>,
 ) {
     let mut bytes = [0_u64; 5];
-    //     if let Some(source) = quadrature.as_ref() {
-    //         let count = (source.bytes.len() / 32) as u32;
-    //         bytes[ActiveGravityMethod::RadialAnalytic.performance_index()] =
-    //             source.bytes.len() as u64 + 32 + 2 * reduction_buffer_bytes(count);
-    //     }
-    //     if let Some(topology) = topology {
-    //         let face_count = (topology.triangles.len() / 3) as u64;
-    //         let edge_count = face_count * 3 / 2;
-    //         let item_count = edge_count.max(face_count) as u32;
-    //         bytes[ActiveGravityMethod::HomogeneousWerner.performance_index()] =
-    //             edge_count * 80 + face_count * 64 + 32 + 2 * reduction_buffer_bytes(item_count);
-    //     }
-    //
     if let Some(source) = quadrature.as_ref() {
         let timing = frequency_domain_performance.latest.unwrap_or_default();
         let target_count = u64::from(timing.target_count.max(1));
@@ -145,25 +132,9 @@ pub fn update_gpu_memory_estimate_system(
             + quadrature_count * 24
             + 64;
     }
-    //     if let Some(source) = mmfft {
-    //         bytes[ActiveGravityMethod::MmfftCompressed.performance_index()] =
-    //             source.bytes.len() as u64 + 64 + 32;
-    //     }
-    //     if let Some(source) = fmm {
-    //         bytes[ActiveGravityMethod::Fmm.performance_index()] = source.bytes.len() as u64
-    //             + source.particle_bytes.len() as u64
-    //             + 32
-    //             + 2 * reduction_buffer_bytes(source.node_count);
-    //     }
-    //
     estimate.bytes = bytes;
 }
 
-// fn reduction_buffer_bytes(item_count: u32) -> u64 {
-//     item_count.div_ceil(64) as u64 * 16
-// }
-//
-//
 pub fn performance_comparison_system(
     time: Res<Time>,
     clock: Res<SimulationClock>,

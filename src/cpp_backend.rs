@@ -36,8 +36,8 @@ export function backend_advance(epoch, method, initial, step, steps, history) {
 export function backend_solve_density(data) {
     return globalThis.ryuguRustBackend.solve_density(data);
 }
-export function backend_candidate(data) {
-    return globalThis.ryuguRustBackend.propagate_candidate(data);
+export function backend_candidates(data) {
+    return globalThis.ryuguRustBackend.propagate_candidates(data);
 }
 export function backend_ready() {
     return Boolean(globalThis.ryuguRustBackend && globalThis.ryuguCpp && globalThis.ryuguScheduler);
@@ -47,7 +47,7 @@ extern "C" {
     #[wasm_bindgen]
     fn backend_ready() -> bool;
     #[wasm_bindgen(catch)]
-    fn backend_candidate(data: &str) -> Result<Vec<f64>, JsValue>;
+    fn backend_candidates(data: &str) -> Result<Vec<f64>, JsValue>;
     #[wasm_bindgen(catch)]
     fn backend_solve_density(data: &str) -> Result<Vec<f32>, JsValue>;
     #[wasm_bindgen(catch)]
@@ -77,10 +77,10 @@ extern "C" {
     ) -> Result<Vec<f64>, JsValue>;
 }
 
-pub fn propagate_candidate(data: &str) -> Result<Vec<f64>, String> {
+pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, String> {
     #[cfg(target_arch = "wasm32")]
     {
-        backend_candidate(data).map_err(|e| format!("Candidate backend: {e:?}"))
+        backend_candidates(data).map_err(|e| format!("Candidate batch backend: {e:?}"))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

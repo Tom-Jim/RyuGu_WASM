@@ -10,10 +10,11 @@ pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
 pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
-/// Candidate propagation is CPU work in the browser's WASM thread.  Keep it
-/// deliberately small so JS input, painting, and Rust simulation can all get
-/// a turn between propagation slices.
-pub const PLANNING_BUILD_CANDIDATES_PER_FRAME: u32 = 1;
+/// Candidate propagation is performed by batched C++ FMM time slices in the
+/// browser's WASM thread. Keep each slice bounded so input and WebGPU can get
+/// a turn while all candidates still share the same FMM target traversal.
+pub const PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME: u32 = 8;
+pub const PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME: u32 = 2;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
 pub const PLANNING_MAX_REQUEST_MS: f64 = 34.0;
@@ -23,8 +24,6 @@ pub const PLANNING_GPU_TARGET_SUBMISSION_MS: f64 = 8.0;
 pub const PLANNING_GPU_MAX_SUBMISSION_MS: f64 = 20.0;
 pub const PLANNING_GPU_MIN_STAGE_BUDGET: usize = 1;
 pub const PLANNING_GPU_MAX_STAGE_BUDGET: usize = 2;
-// pub const PLANNING_GPU_MIN_BATCH: u32 = 1;
-// pub const PLANNING_GPU_MAX_BATCH: u32 = 4;
 pub const PLANNING_MAX_RECENT_FRAME_MS: f64 = 18.5;
 pub const PLANNING_GPU_UPLOAD_BYTES_PER_FRAME: usize = 1024 * 1024;
 pub const PLANNING_REFERENCE_STRIDE: u32 = 32;
@@ -286,11 +285,6 @@ pub struct PlanningMethodPayload {
     pub secondary: Arc<[u8]>,
     pub item_count: u32,
     pub secondary_count: u32,
-//     pub maximum_level: u32,
-//     pub grid_sizes: [u32; 2],
-//     pub half_extents: [f32; 2],
-//     pub grid_scales: [f32; 2],
-//     pub total_mass: f32,
     /// Method-specific immutable geometry/basis work performed once per source
     /// point. Program-lifetime setup such as FFT plans is excluded.
     pub geometry_basis_preparation_ms: f64,

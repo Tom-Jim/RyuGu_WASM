@@ -86,28 +86,30 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     let builder = batch_builder.as_mut().expect("matched planning builder");
-    let candidate_budget = if cfg!(target_arch = "wasm32") {
-        PLANNING_BUILD_CANDIDATES_PER_FRAME
+    let propagation_budget = if cfg!(target_arch = "wasm32") {
+        match planning.workload_profile {
+            PlanningWorkloadProfile::First => PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME,
+            PlanningWorkloadProfile::InteractiveStress => PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME,
+            PlanningWorkloadProfile::SourceCrossover => 1,
+        }
     } else {
         std::thread::available_parallelism()
             .map_or(1, usize::from)
             .saturating_mul(2)
             .min(u32::MAX as usize) as u32
     };
-    if !builder.advance(candidate_budget) {
+    if !builder.advance(propagation_budget) {
         planning.status = "Planning candidate propagation failed.".into();
         planning.run_requested = false;
         *batch_builder = None;
         return;
     }
-    planning.preparation_progress =
-        f64::from(builder.completed_candidates()) / f64::from(dimensions.0.max(1));
+    planning.preparation_progress = builder.preparation_progress();
     if !builder.is_complete() {
         planning.status = format!(
-            "{} candidate preparation: {} / {} trajectories.",
+            "{} candidate preparation: {:.1}% of batched FMM trajectory.",
             planning.workload_profile.label(),
-            builder.completed_candidates(),
-            dimensions.0
+            planning.preparation_progress * 100.0,
         );
         return;
     }

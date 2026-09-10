@@ -318,7 +318,9 @@ The page starts the Bevy frontend WASM (`pkg/ryugu_wasm_bg.wasm`) first, then lo
 | FFT | FLUPS free-space Poisson solver with FFTW, density deposition, finite-difference acceleration, and trilinear sampling |
 | Frequency-domain | Existing Rust/WGSL spectral and dedicated propagation operators |
 
-Legacy non-frequency Rust/WGSL entry points and embedded evaluators are commented out in place, not moved to `old/`. Probe forces, surface fields, planning forces, and inversion sensitivities use the new backend paths. Rust backend WASM also performs candidate trajectory propagation and Clarabel optimization. Geometry preparation, experiment orchestration, and the retained frequency-domain GPU path remain frontend responsibilities.
+Unused legacy non-frequency Rust/WGSL implementations have been removed. Probe forces, surface fields, planning forces, and inversion sensitivities use the C++ backend paths. Rust backend WASM also performs candidate trajectory propagation and Clarabel optimization. Geometry preparation, experiment orchestration, and the frequency-domain GPU path remain frontend responsibilities.
+
+First/Stress preparation batches candidate targets through C++ ExaFMM at each integration time. Within a time slice, the endpoint acceleration is reused for the next initial kick at the identical position and time; no linearized field replaces FMM. A slice of k integration steps requires k+1 FMM evaluations instead of 2k (for k >= 1). Slice boundaries still recompute the initial field. Target buffers are reused, numeric request arrays serialize without a JSON Value tree, and the host copies C++ output directly into a typed result array. The browser OpenMP shim is single-threaded: target batching is not CPU multithreading or GPU execution. C++ tree construction/precomputation and synchronous calls remain potential latency bottlenecks; build success alone does not establish interactive responsiveness.
 
 Basilisk's actual `SimModel`, `SysProcess`, `SysModelTask`, and messaging sources are compiled with a browser-serial patch. A scheduled Rust dynamics task publishes translational `SCStatesMsgPayload` messages. This ports the application's serial scheduling path, not native multithreading, Python scenario bindings, arbitrary spacecraft effectors, six-degree-of-freedom attitude dynamics, or the complete Vizard client. The external version-1 Ryugu ABI is not Vizard Protobuf.
 
@@ -402,11 +404,11 @@ These are development directions, not delivered capability claims. Compression s
 | `src/tools/` | Build, source-fetch, validation, and WASM ABI checks |
 | `src/cpu/frequency_domain.rs` | Frequency-domain source preparation and discrete transform definitions |
 | `src/gpu/frequency_domain_pipeline/` | Whole-trajectory transforms, spectra, sensitivities, planning, and readback |
-| `src/gpu/fmm_pipeline/` | Legacy FMM source, disabled at module registration |
-| `src/gpu/mmfft_pipeline/` | Legacy FFT source, disabled at module registration |
-| `src/gpu/radial.rs` | Legacy radial quadrature dispatch, disabled at module registration |
+| `src/cpu/planning/` | Candidate batches, source geometry, trajectory records, references, and density models |
+| `src/bevy/planning/` | Planning dispatch, reduction, reference caching, and result assembly |
 | `src/cpu/inversion_components/` | Density basis, backend reference clients, caches, and optimization requests |
-| `src/bevy/surface_field.rs` | Chunked surface-field evaluation and display |
+| `src/bevy/surface/` | Surface state, geometry, chunked computation, rendering, and field evaluation |
+| `src/html/rust/` | Browser actions and published snapshots |
 | `src/wgsl/` | Unified numerical and rendering shaders |
 | `src/html/navigation.js` | Camera/whole-UI gestures, panel transforms, and mobile interaction |
 | `src/html/background*.js` | Background scheduling and keep-alive coordination |

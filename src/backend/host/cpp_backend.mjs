@@ -270,8 +270,18 @@ export function createFieldBackend(backend) {
         const field = alloc(new Float64Array(count * 3));
         checked(api.ryugu_exafmm_eval(source, mass, BigInt(masses.length),
           alloc(new Float64Array(targets)), BigInt(count), 4, 64, potential, field), method);
-        const a = backend.doubles(field, count * 3), u = backend.doubles(potential, count);
-        return new Float64Array(u.flatMap((v, i) => [...a.slice(i * 3, i * 3 + 3), v]));
+        // Create views only after the C++ call: memory.grow can detach earlier
+        // views. Copy into JS-owned storage before temporary allocations free.
+        const a = new Float64Array(api.memory.buffer, field, count * 3);
+        const u = new Float64Array(api.memory.buffer, potential, count);
+        const result = new Float64Array(count * 4);
+        for (let i = 0; i < count; i++) {
+          result[4 * i] = a[3 * i];
+          result[4 * i + 1] = a[3 * i + 1];
+          result[4 * i + 2] = a[3 * i + 2];
+          result[4 * i + 3] = u[i];
+        }
+        return result;
       }
       const previousGeometry = geometry, previousFft = fft;
       try {
