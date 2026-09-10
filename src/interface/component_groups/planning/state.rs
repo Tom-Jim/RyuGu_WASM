@@ -159,6 +159,7 @@ impl PlanningComparisonState {
     /// Estimated arithmetic work with source traversal, basis construction,
     /// FFT butterflies, density combinations, targets and reference validation.
     /// This is not a GPU FLOP counter or an ETA. Only completion can yield 100%.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn operation_work(&self) -> (f64, f64) {
         let source_curve = self.workload_profile == PlanningWorkloadProfile::SourceCrossover;
         let (b, k, nt) = self.dimensions();
@@ -256,6 +257,7 @@ impl PlanningComparisonState {
         )
     }
 
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn progress_fraction(&self) -> f64 {
         if self.computation_complete {
             return 1.0;

@@ -4,8 +4,8 @@ pub const PROBE_ORBIT_NORMAL: Vec3 = Vec3::new(0.037_806, -0.933_691, -0.356_079
 
 pub const NEAR_SYNC_SEGMENT_MAX_SECONDS: f32 = 300.0;
 
-pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 2.0e-2;
-pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 2.5e-1;
+pub const PLANNING_GRAVITY_ERROR_LIMIT: f32 = 1.0e-3;
+pub const PLANNING_GRADIENT_ERROR_LIMIT: f32 = 1.0e-2;
 pub const PLANNING_PERICENTER_ERROR_LIMIT_METERS: f32 = 1.0;
 
 /// Reporting policy only: changing it never changes numerical outputs or

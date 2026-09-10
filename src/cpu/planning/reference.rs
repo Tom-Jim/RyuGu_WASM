@@ -1,25 +1,3 @@
-/// Direct source sum retained as the independent certified reference.  It is
-/// retained for method-independent accuracy checks: certification needs an
-/// exact, method-independent field/gradient, while candidate dynamics use the
-/// source-count-independent FMM tree and reevaluate every updated position.
-#[cfg(test)]
-pub(crate) fn evaluate_planning_reference_field(
-    target: DVec3,
-    basis_records: &[PlanningBasisRecord],
-    densities: &[f32],
-) -> Option<(DVec3, DMat3)> {
-    let mut acceleration = DVec3::ZERO;
-    let mut gradient = DMat3::ZERO;
-    accumulate_planning_reference_chunk(
-        target,
-        basis_records,
-        densities,
-        &mut acceleration,
-        &mut gradient,
-    )?;
-    Some((acceleration, gradient))
-}
-
 /// Independent f64 oracle. WebGPU has no portable shader-f64, so keep this
 /// verification on CPU but bound each caller's work and retain sum order.
 pub(crate) fn accumulate_planning_reference_chunk(

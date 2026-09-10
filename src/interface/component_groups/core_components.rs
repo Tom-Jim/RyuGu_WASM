@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 pub const G: f32 = 6.6743e-11;
 pub const RYUGU_MASS: f32 = 4.5e11;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub const TIME_SCALE: f32 = 60.0;
 pub const BENCHMARK_DURATION_SECONDS: f64 = 901.66;
 pub const BENCHMARK_SAMPLE_INTERVAL_SECONDS: f64 = 0.01;
@@ -173,6 +174,7 @@ impl Default for GravityBenchmarkTrajectory {
 /// Browser/native state message produced by the Basilisk compatibility layer.
 /// Positions and velocities are SI values; time is kept as seconds here for
 /// the UI and is also exported as integer nanoseconds in the wire header.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BasiliskSnapshot {
     pub algorithm: u8,
@@ -193,6 +195,7 @@ pub struct BasiliskComparisonSample {
     pub measured_acceleration_mps2: [f64; 3],
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Resource, Clone, Debug)]
 pub struct BasiliskBridgeState {
     pub protocol: &'static str,
@@ -501,6 +504,7 @@ pub enum DensityMode {
     Constant,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl DensityMode {
     pub fn key(self) -> &'static str {
         match self {
@@ -511,6 +515,7 @@ impl DensityMode {
 }
 
 /// Quantity used to color the latest surface-field overlay.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SurfaceFieldMetric {
     #[default]
@@ -520,6 +525,7 @@ pub enum SurfaceFieldMetric {
     Error,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl SurfaceFieldMetric {
     pub fn key(self) -> &'static str {
         match self {
@@ -540,6 +546,7 @@ impl SurfaceFieldMetric {
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SurfaceFieldSample {
     pub position: Vec3,
@@ -552,6 +559,7 @@ pub struct SurfaceFieldSample {
     pub slope_degrees: f32,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct SurfaceFieldDataset {
     pub method: ActiveGravityMethod,
@@ -563,6 +571,7 @@ pub struct SurfaceFieldDataset {
     pub slope_range: (f32, f32),
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct SurfaceFieldComparison {
     pub baseline: SurfaceFieldDataset,

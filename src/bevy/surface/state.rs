@@ -79,6 +79,7 @@ struct PointMass {
     mass: f64,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn queue_surface_field(
     state: &mut SurfaceFieldState,
     compute: &mut SurfaceFieldComputeState,
@@ -103,6 +104,7 @@ pub(crate) fn queue_surface_field(
     });
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn cancel_surface_field(
     state: &mut SurfaceFieldState,
     compute: &mut SurfaceFieldComputeState,
@@ -117,6 +119,7 @@ pub(crate) fn cancel_surface_field(
     state.status = status.into();
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn queue_surface_comparison(
     state: &mut SurfaceFieldState,
     compute: &mut SurfaceFieldComputeState,

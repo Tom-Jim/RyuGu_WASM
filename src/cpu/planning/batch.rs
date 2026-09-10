@@ -192,13 +192,14 @@ impl PlanningBatchBuilder {
             )
         };
         let state_count = candidate_count as usize * samples_per_candidate as usize;
-        let mut states = Vec::with_capacity(state_count);
-        let mut gpu_position_bytes = Vec::with_capacity(state_count * 16);
         #[cfg(target_arch = "wasm32")]
-        {
-            states.resize(state_count, PlanningCandidateState::default());
-            gpu_position_bytes.resize(state_count * 16, 0);
-        }
+        let states = vec![PlanningCandidateState::default(); state_count];
+        #[cfg(not(target_arch = "wasm32"))]
+        let states = Vec::with_capacity(state_count);
+        #[cfg(target_arch = "wasm32")]
+        let gpu_position_bytes = vec![0; state_count * 16];
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_position_bytes = Vec::with_capacity(state_count * 16);
         Some(Self {
             profile,
             run_id,

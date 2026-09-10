@@ -201,6 +201,7 @@ pub struct PlanningBatchJob {
 }
 
 impl PlanningMethodMetrics {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn accuracy_eligible(self) -> bool {
         self.accuracy_failure_mask(PlanningAccuracyProfile::Strict, false) == 0
     }
