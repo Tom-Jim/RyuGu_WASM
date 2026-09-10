@@ -68,7 +68,7 @@ pub fn record_probe_jacobi_system(
     // Keep the frequency-domain history path below because it represents the
     // spectral transform diagnostic rather than an instantaneous potential.
     if *active_method != ActiveGravityMethod::FrequencyDomain {
-        if !cpp_backend.ready {
+        if !cpp_backend.ready || !cpp_backend.worker_ready {
             // Keep the invariant "no pending request implies nothing in
             // flight" so a re-configured backend can always start again.
             if live_worker.pending.take().is_some() {

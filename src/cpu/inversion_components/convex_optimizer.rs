@@ -14,6 +14,7 @@ pub fn convex_optimization_system(
     mut performance: ResMut<FrequencyDomainPerformanceMetrics>,
     frequency_domain_sensitivity: Res<FrequencyDomainSensitivityMatrix>,
     density_channel: Res<crate::cpp_backend::BackendDensityChannel>,
+    cpp: Res<crate::cpp_backend::CppBackendState>,
     mut worker: Local<DensityWorkerState>,
 ) {
     let Some(mut job) = inversion.optimizer.take() else {
@@ -149,6 +150,12 @@ pub fn convex_optimization_system(
     }
 
     if worker.realization < OBSERVATION_NOISE_REALIZATIONS {
+        // Queue the job instead of serializing the same problem every frame
+        // while the numerical backend is still being configured.
+        if !cpp.worker_ready {
+            inversion.optimizer = Some(job);
+            return;
+        }
         let seed = job.capture_id
             ^ job.source_hash.rotate_left(19)
             ^ (worker.realization as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);

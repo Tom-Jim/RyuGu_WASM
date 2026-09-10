@@ -28,8 +28,9 @@ macro_rules! backend_channel {
             pub epoch: u64,
         }
 
-        // C2 installs every semantic channel before C3 migrates its consumer.
-        // Keep intermediate commits warning-free while preserving that order.
+        // Host builds compile the channel plumbing but never call it: only the
+        // wasm delivery path runs `begin`/`complete` and reads packets. Keep the
+        // whole family warning-free on both targets.
         #[allow(dead_code)]
         #[derive(Clone, Debug)]
         pub struct $packet {
@@ -405,7 +406,6 @@ extern "C" {
     ) -> Result<(), JsValue>;
 }
 
-#[allow(dead_code)]
 pub fn request_advance(
     channel: &BackendAdvanceChannel,
     snapshot: BackendAdvanceSnapshot,
@@ -441,7 +441,6 @@ pub fn request_advance(
     }
 }
 
-#[allow(dead_code)]
 pub fn request_evaluate_sources(
     channel: &BackendEvaluateSourcesChannel,
     snapshot: BackendEvaluateSourcesSnapshot,
@@ -504,7 +503,6 @@ pub fn request_candidates(
     }
 }
 
-#[allow(dead_code)]
 pub fn request_density(
     channel: &BackendDensityChannel,
     snapshot: BackendDensitySnapshot,
@@ -528,7 +526,6 @@ pub fn request_density(
     }
 }
 
-#[allow(dead_code)]
 pub fn request_evaluate(
     channel: &BackendEvaluateChannel,
     snapshot: BackendEvaluateSnapshot,
@@ -569,7 +566,6 @@ pub fn request_evaluate(
     }
 }
 
-#[allow(dead_code)]
 pub fn request_configure(
     channel: &BackendConfigureChannel,
     snapshot: BackendConfigureSnapshot,
@@ -603,6 +599,8 @@ pub fn request_configure(
     }
 }
 
+// Only the native candidate builder calls this, and only the wasm worker path
+// can answer it, so one target always sees it as unused.
 #[allow(dead_code)]
 pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, String> {
     #[cfg(target_arch = "wasm32")]
