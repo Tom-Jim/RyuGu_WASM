@@ -113,6 +113,14 @@ pub fn convex_optimization_system(
             .expect("backend density result channel poisoned")
             .take();
         let Some(packet) = packet else {
+            if !density_channel.is_idle() {
+                inversion.optimizer = Some(job);
+                return;
+            }
+            // Cancelling an experiment clears the channel, so a free channel
+            // with nothing delivered means this realization was discarded.
+            // Drop it and re-issue below instead of waiting forever.
+            worker.pending_snapshot = None;
             inversion.optimizer = Some(job);
             return;
         };

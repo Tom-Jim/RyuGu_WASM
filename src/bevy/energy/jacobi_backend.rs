@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 const LIVE_JACOBI_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
@@ -138,7 +136,7 @@ pub fn record_probe_jacobi_system(
         if live_worker.pending.is_some() {
             // A cancelled request never delivers a packet, so `in_flight`
             // falling back to false means the answer was discarded.
-            if evaluate_channel.in_flight.load(Ordering::Acquire) {
+            if !evaluate_channel.is_idle() {
                 return;
             }
             live_worker.pending = None;

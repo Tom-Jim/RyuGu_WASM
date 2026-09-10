@@ -91,6 +91,21 @@ macro_rules! backend_channel {
                     .expect("backend snapshot channel poisoned") = None;
                 self.in_flight.store(false, Ordering::Release);
             }
+
+            /// No request is running and no answer is waiting.
+            ///
+            /// A consumer that recorded an outstanding request and then still
+            /// sees an idle channel knows the request was cancelled by an
+            /// experiment reset: a delivered answer always stores `data`
+            /// before `in_flight` drops.
+            pub fn is_idle(&self) -> bool {
+                !self.in_flight.load(Ordering::Acquire)
+                    && self
+                        .data
+                        .lock()
+                        .expect("backend result channel poisoned")
+                        .is_none()
+            }
         }
     };
 }
@@ -957,6 +972,28 @@ mod backend_channel_tests {
         let packet = channel.data.lock().unwrap().take().unwrap();
         assert_eq!(packet.snapshot, current);
         assert_eq!(packet.result.unwrap(), vec![2.0]);
+    }
+
+    #[test]
+    fn a_cancelled_request_leaves_the_channel_idle() {
+        let channel = BackendAdvanceChannel::default();
+        let snapshot = BackendAdvanceSnapshot {
+            request_id: 3,
+            epoch: 1,
+        };
+        assert!(channel.is_idle());
+
+        assert!(channel.begin(snapshot));
+        assert!(!channel.is_idle());
+        channel.reset();
+        assert!(channel.is_idle());
+
+        assert!(channel.begin(snapshot));
+        assert!(channel.complete(BackendAdvancePacket {
+            snapshot,
+            result: Ok(vec![1.0]),
+        }));
+        assert!(!channel.is_idle());
     }
 
     #[test]

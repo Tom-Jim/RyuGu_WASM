@@ -323,34 +323,43 @@ impl PlanningBatchBuilder {
                 .lock()
                 .expect("backend candidate result channel poisoned")
                 .take();
-            let Some(packet) = packet else {
-                self.pending_slice = Some(pending);
-                return true;
-            };
-            if packet.snapshot != pending.snapshot
-                || packet.snapshot.epoch != self.capture_epoch
-                || packet.snapshot.request_id != pending.snapshot.request_id
-            {
-                return false;
+            match packet {
+                None if !channel.is_idle() => {
+                    // The slice is still being propagated.
+                    self.pending_slice = Some(pending);
+                    return true;
+                }
+                // Cancelling an experiment clears the channel, so a free
+                // channel with nothing delivered means this slice was
+                // discarded. Fall through and re-issue it below.
+                None => {}
+                Some(packet) => {
+                    if packet.snapshot != pending.snapshot
+                        || packet.snapshot.epoch != self.capture_epoch
+                        || packet.snapshot.request_id != pending.snapshot.request_id
+                    {
+                        return false;
+                    }
+                    let Some(trajectory) = packet.result.ok().filter(|values| {
+                        values.len()
+                            == self.candidate_count as usize
+                                * (pending.end_sample - pending.start_sample + 1)
+                                * 6
+                            && values.iter().all(|value| value.is_finite())
+                    }) else {
+                        return false;
+                    };
+                    if !self.apply_candidate_slice(
+                        pending.start_sample,
+                        pending.end_sample,
+                        &trajectory,
+                    ) {
+                        return false;
+                    }
+                    self.preparation_ms += pending.started.elapsed().as_secs_f64() * 1.0e3;
+                    return true;
+                }
             }
-            let Some(trajectory) = packet.result.ok().filter(|values| {
-                values.len()
-                    == self.candidate_count as usize
-                        * (pending.end_sample - pending.start_sample + 1)
-                        * 6
-                    && values.iter().all(|value| value.is_finite())
-            }) else {
-                return false;
-            };
-            if !self.apply_candidate_slice(
-                pending.start_sample,
-                pending.end_sample,
-                &trajectory,
-            ) {
-                return false;
-            }
-            self.preparation_ms += pending.started.elapsed().as_secs_f64() * 1.0e3;
-            return true;
         }
 
         let sample_count = self.reference_samples.len();

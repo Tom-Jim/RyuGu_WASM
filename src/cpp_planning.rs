@@ -85,6 +85,13 @@ pub(crate) fn dispatch(
         }
         return;
     }
+    if cache.pending.is_some() && backend_channel.is_idle() {
+        // Cancelling an experiment clears the channel, so a free channel with
+        // nothing delivered means this request was discarded. Re-issue it
+        // instead of waiting for an answer that will never arrive.
+        cache.pending = None;
+        cache.last_request = 0;
+    }
     if cache.last_request == request.request_id || backend_channel.in_flight.load(Ordering::Acquire)
     {
         return;
