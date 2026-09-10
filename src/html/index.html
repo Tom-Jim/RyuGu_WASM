@@ -237,6 +237,56 @@
             const suffix = cacheVersion ? `?v=${encodeURIComponent(cacheVersion)}` : '';
             const wasm = await import(`./pkg/ryugu_wasm.js${suffix}`);
             await wasm.default({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` });
+            const { createNumericalBackendClient } = await import(`./src/html/backend-client.js${suffix}`);
+            globalThis.ryuguNumericalWorkerReady = false;
+            globalThis.ryuguBackendClient = createNumericalBackendClient({
+                cacheSuffix: suffix,
+                deliverResult(result) {
+                    const requestId = result.requestId;
+                    const epoch = result.epoch;
+                    const error = result.ok ? undefined : result.error;
+                    switch (result.kind) {
+                        case 'advance':
+                            wasm.deliver_backend_advance_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'evaluate_sources':
+                            wasm.deliver_backend_evaluate_sources_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'propagate_candidates':
+                            wasm.deliver_backend_candidates_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'solve_density':
+                            wasm.deliver_backend_density_result(
+                                requestId, epoch, result.value ?? new Float32Array(), error,
+                            );
+                            break;
+                        case 'evaluate':
+                            wasm.deliver_backend_evaluate_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'configure':
+                            wasm.deliver_backend_configure_result(requestId, epoch, error);
+                            break;
+                        default:
+                            console.error(`Unknown numerical Worker result: ${result.kind}`);
+                    }
+                },
+                onReady() {
+                    globalThis.ryuguNumericalWorkerReady = true;
+                    window.dispatchEvent(new Event('ryugu-numerical-worker-ready'));
+                },
+                onFailed(message) {
+                    globalThis.ryuguNumericalWorkerReady = false;
+                    console.error(`Numerical Worker failed: ${message}`);
+                },
+            });
             // Do not block first paint on the large numerical module. Bevy
             // waits for this flag before configuring C++ geometry or advancing
             // physics, while the controls and WebGPU scene stay responsive.
