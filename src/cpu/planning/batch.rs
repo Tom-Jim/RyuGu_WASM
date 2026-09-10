@@ -392,7 +392,7 @@ impl PlanningBatchBuilder {
     pub(crate) fn preparation_progress(&self) -> f64 {
         #[cfg(target_arch = "wasm32")]
         {
-            return (self.next_sample + 1) as f64 / self.reference_samples.len() as f64;
+            (self.next_sample + 1) as f64 / self.reference_samples.len() as f64
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
