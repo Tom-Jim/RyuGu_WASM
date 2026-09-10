@@ -404,8 +404,16 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
     } else {
         "cold batch"
     };
+    let pacing_note = matches!(
+        job.method,
+        ActiveGravityMethod::Fmm | ActiveGravityMethod::MmfftCompressed
+    )
+    .then_some(
+        " C++ FMM/FFT dispatches include fixed backend preparation and are paced from measured request time to protect rendering; total completion time may increase.",
+    )
+    .unwrap_or_default();
     format!(
-        "{} {}: {} / {} density combinations, {} model {}, tile {}, GPU requests {}, dispatches {}; random seed {}, mass rel. error {:.2e}.",
+        "{} {}: {} / {} density combinations, {} model {}, tile {}, GPU requests {}, dispatches {}; random seed {}, mass rel. error {:.2e}.{}",
         job.profile.label(),
         job.method.planning_label(),
         completed.min(job.total_evaluations),
@@ -417,5 +425,6 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
         job.dispatch_count,
         job.density_seed,
         job.maximum_density_mass_relative_error,
+        pacing_note,
     )
 }
