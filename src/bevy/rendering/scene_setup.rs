@@ -21,6 +21,8 @@ pub fn setup_scene(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     probe_initial: Res<ProbeInitialConditions>,
+    clock: Res<SimulationClock>,
+    mut probe_visual: ResMut<ProbeVisualState>,
 ) {
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.8, 0.8, 1.0),
@@ -66,16 +68,35 @@ pub fn setup_scene(
         RyuguMarker,
     ));
 
-    commands.spawn((
-        WorldAssetRoot(
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/cassini.gltf")),
-        ),
-        TargetSize(6.7),
-        Transform::from_translation(probe_initial.position),
-        Velocity(probe_initial.velocity()),
-        OrbitHistory(std::collections::VecDeque::from([probe_initial.position])),
-        CassiniMarker,
-    ));
+    let initial_position = probe_initial.position;
+    let initial_velocity = probe_initial.velocity();
+    probe_visual.reset(
+        initial_position,
+        initial_velocity,
+        clock.epoch,
+        bevy::platform::time::Instant::now(),
+    );
+    let probe = commands
+        .spawn((
+            Transform::from_translation(initial_position),
+            Velocity(initial_velocity),
+            OrbitHistory(std::collections::VecDeque::from([initial_position])),
+            CassiniMarker,
+        ))
+        .id();
+    let probe_visual_entity = commands
+        .spawn((
+            WorldAssetRoot(
+                asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/cassini.gltf")),
+            ),
+            TargetSize(6.7),
+            Transform::default(),
+            ProbeVisualTransform {
+                world_translation: initial_position,
+            },
+        ))
+        .id();
+    commands.entity(probe).add_child(probe_visual_entity);
 }
 
 /// Builds one deterministic finite-length equation-(185) fixed-point arc and
@@ -211,7 +232,7 @@ pub(crate) fn hash_trajectory_capture(knots: &[TrajectoryInversionKnot]) -> u64 
 
 pub fn camera_follow_system(
     mode: Res<CameraMode>,
-    cassini_query: Query<&Transform, (With<CassiniMarker>, Without<Camera3d>)>,
+    probe_visual: Res<ProbeVisualState>,
     mut cam_query: Query<&mut PanOrbitCamera, With<Camera3d>>,
 ) {
     let Some(mut pan_orbit) = cam_query.iter_mut().next() else {
@@ -219,12 +240,82 @@ pub fn camera_follow_system(
     };
     pan_orbit.target_focus = match *mode {
         CameraMode::Overview => Vec3::ZERO,
-        CameraMode::FollowCassini => cassini_query
-            .iter()
-            .next()
-            .map(|t| t.translation)
-            .unwrap_or(Vec3::ZERO),
+        CameraMode::FollowCassini => probe_visual.rendered_position,
     };
+}
+
+const PROBE_VISUAL_BLEND_SECONDS: f32 = 0.12;
+
+fn probe_visual_extrapolation_limit(method: ActiveGravityMethod) -> f32 {
+    // Keep this presentation-only horizon at twice the current backend pacing
+    // interval. Stage D will remove the long pacing intervals after requests
+    // become asynchronous; this guard remains useful if a worker stalls.
+    match method {
+        ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::FrequencyDomain => 0.5,
+        ActiveGravityMethod::MmfftCompressed => 1.5,
+        ActiveGravityMethod::HomogeneousWerner => 2.0,
+        ActiveGravityMethod::Fmm => 3.0,
+    }
+}
+
+fn extrapolated_probe_position(
+    visual: &ProbeVisualState,
+    method: ActiveGravityMethod,
+    now: bevy::platform::time::Instant,
+) -> Vec3 {
+    let Some(sampled_at) = visual.authoritative_wall_time else {
+        return visual.authoritative_position;
+    };
+    let elapsed = now
+        .saturating_duration_since(sampled_at)
+        .as_secs_f32()
+        .min(probe_visual_extrapolation_limit(method));
+    let extrapolated = visual.authoritative_position + visual.authoritative_velocity * elapsed;
+    let Some(blend_started) = visual.blend_started else {
+        return extrapolated;
+    };
+    let blend = (now
+        .saturating_duration_since(blend_started)
+        .as_secs_f32()
+        / PROBE_VISUAL_BLEND_SECONDS)
+        .clamp(0.0, 1.0);
+    visual.blend_from.lerp(extrapolated, blend)
+}
+
+/// Updates only the Cassini model child. The authoritative parent transform is
+/// intentionally read-only so no extrapolated value can reach physics data.
+pub fn probe_visual_extrapolation_system(
+    active_method: Res<ActiveGravityMethod>,
+    clock: Res<SimulationClock>,
+    authoritative_probe: Query<(&Transform, &Velocity), With<CassiniMarker>>,
+    mut visual_probe: Query<(&mut Transform, &mut ProbeVisualTransform), Without<CassiniMarker>>,
+    mut visual: ResMut<ProbeVisualState>,
+) {
+    let (Ok((authoritative_transform, velocity)), Ok((mut transform, mut visual_transform))) =
+        (authoritative_probe.single(), visual_probe.single_mut())
+    else {
+        return;
+    };
+    let now = bevy::platform::time::Instant::now();
+    if visual.authoritative_epoch != clock.epoch || visual.authoritative_wall_time.is_none() {
+        visual.reset(
+            authoritative_transform.translation,
+            velocity.0,
+            clock.epoch,
+            now,
+        );
+    }
+    let world_translation = extrapolated_probe_position(&visual, *active_method, now);
+    visual.rendered_position = world_translation;
+    visual_transform.world_translation = world_translation;
+
+    // The visual entity is a child of the authoritative entity. Preserve the
+    // child scale established by normalize_model_scale_system and express only
+    // the presentation offset in the parent's local frame.
+    transform.translation = authoritative_transform
+        .to_matrix()
+        .inverse()
+        .transform_point3(world_translation);
 }
 
 /// Zoom only the Bevy camera. The HTML overlay is intentionally not involved
@@ -247,18 +338,19 @@ pub fn camera_keyboard_zoom_system(
 pub fn render_gizmos_system(
     mut gizmos: Gizmos<ScientificGizmos>,
     camera_query: Query<&Transform, With<Camera3d>>,
-    cassini_query: Query<(&Transform, &OrbitHistory), With<CassiniMarker>>,
+    cassini_query: Query<&OrbitHistory, With<CassiniMarker>>,
     global_transforms: Query<&GlobalTransform>,
     show_normals: Res<ShowNormals>,
     topo: Option<Res<AsteroidTopologyGpuData>>,
     active_method: Res<ActiveGravityMethod>,
     time: Res<Time>,
     inversion: Res<TrajectoryInversionState>,
+    probe_visual: Res<ProbeVisualState>,
 ) {
     let Some(cam) = camera_query.iter().next() else {
         return;
     };
-    for (ct, history) in cassini_query.iter() {
+    for history in cassini_query.iter() {
         let orbit_color = match *active_method {
             ActiveGravityMethod::RadialAnalytic => Color::srgba(0.0, 1.0, 1.0, 0.8),
             ActiveGravityMethod::HomogeneousWerner => Color::srgba(1.0, 0.2, 0.2, 0.8),
@@ -288,8 +380,8 @@ pub fn render_gizmos_system(
 
         }
 
-        if cam.translation.distance(ct.translation) > VISIBILITY_THRESHOLD {
-            let pos = ct.translation;
+        if cam.translation.distance(probe_visual.rendered_position) > VISIBILITY_THRESHOLD {
+            let pos = probe_visual.rendered_position;
             gizmos
                 .sphere(pos, 12.0, Color::srgb(1.0, 0.9, 0.1))
                 .resolution(8);
@@ -404,5 +496,60 @@ pub fn render_gizmos_system(
                 Color::srgb(0.2, 1.0, 0.8),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_visual_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    #[test]
+    fn visual_extrapolation_preserves_authoritative_state_and_orbit_history() {
+        let authoritative_position = Vec3::new(10.0, 20.0, 30.0);
+        let authoritative_velocity = Vec3::new(2.0, -1.0, 0.5);
+        let orbit = VecDeque::from([Vec3::ZERO, authoritative_position]);
+        let now = bevy::platform::time::Instant::now();
+        let mut visual = ProbeVisualState::default();
+        visual.reset(authoritative_position, authoritative_velocity, 7, now);
+        visual.authoritative_wall_time = Some(now - Duration::from_millis(100));
+
+        let mut app = App::new();
+        app.insert_resource(ActiveGravityMethod::RadialAnalytic);
+        app.insert_resource(SimulationClock {
+            epoch: 7,
+            ..Default::default()
+        });
+        app.insert_resource(visual);
+        let authoritative = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(authoritative_position),
+                Velocity(authoritative_velocity),
+                OrbitHistory(orbit.clone()),
+                CassiniMarker,
+            ))
+            .id();
+        let rendered = app
+            .world_mut()
+            .spawn((Transform::default(), ProbeVisualTransform::default()))
+            .id();
+        app.add_systems(Update, probe_visual_extrapolation_system);
+
+        app.update();
+
+        let authority = app.world().entity(authoritative);
+        assert_eq!(authority.get::<Transform>().unwrap().translation, authoritative_position);
+        assert_eq!(authority.get::<Velocity>().unwrap().0, authoritative_velocity);
+        assert_eq!(authority.get::<OrbitHistory>().unwrap().0, orbit);
+        assert_ne!(
+            app.world()
+                .entity(rendered)
+                .get::<ProbeVisualTransform>()
+                .unwrap()
+                .world_translation,
+            authoritative_position
+        );
     }
 }

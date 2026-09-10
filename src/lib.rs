@@ -37,8 +37,9 @@ use bevy_app::{
     energy::record_probe_jacobi_system,
     render::{
         ScientificGizmos, camera_follow_system, camera_keyboard_zoom_system,
-        capture_trajectory_inversion_system, configure_scientific_gizmos, render_gizmos_system,
-        render_section_system, section_alpha_system, setup_scene,
+        capture_trajectory_inversion_system, configure_scientific_gizmos,
+        probe_visual_extrapolation_system, render_gizmos_system, render_section_system,
+        section_alpha_system, setup_scene,
     },
     scale::{build_topology_system, normalize_model_scale_system},
     surface_field::{
@@ -68,8 +69,9 @@ use interface::components::{
     GravityReadbackChannel, GravityRuntimeError, JacobiHistory, MmfftReadbackChannel,
     NormalsReadbackChannel, PerformanceComparisonState, PlanningComparisonState,
     PlanningGpuReadbackChannel, PlanningGpuRequest, PlanningGpuResult, PlanningMethodPayload,
-    ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions, ShowNormals, ShowSection,
-    SimulationAcceleration, SimulationClock, SurfaceFieldState, TrajectoryInversionState,
+    ProbeCrashResetRequest, ProbeCrashState, ProbeInitialConditions, ProbeVisualState, ShowNormals,
+    ShowSection, SimulationAcceleration, SimulationClock, SurfaceFieldState,
+    TrajectoryInversionState,
 };
 use std::time::Duration;
 use wgsl::WgslPlugin;
@@ -457,6 +459,7 @@ pub fn main() {
         .init_resource::<GravityBenchmarkTrajectory>()
         .init_resource::<SimulationAcceleration>()
         .init_resource::<ProbeInitialConditions>()
+        .init_resource::<ProbeVisualState>()
         .init_resource::<PlanningComparisonState>()
         .init_resource::<ProbeCrashState>()
         .init_resource::<ProbeCrashResetRequest>()
@@ -653,6 +656,7 @@ pub fn main() {
         Update,
         (
             performance_comparison_system,
+            probe_visual_extrapolation_system,
             camera_follow_system,
             camera_keyboard_zoom_system.after(camera_follow_system),
             update_gpu_memory_estimate_system,

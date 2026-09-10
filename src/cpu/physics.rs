@@ -46,6 +46,7 @@ pub fn physics_system(
     mut blend: ResMut<GravityBlendFactor>,
     mut error: ResMut<GravityRuntimeError>,
     mut clock: ResMut<SimulationClock>,
+    mut visual: ResMut<ProbeVisualState>,
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
@@ -204,6 +205,12 @@ pub fn physics_system(
     velocity.0 = speed(last);
     clock.elapsed_seconds = (last[0] * 1e9).round() * 1e-9;
     clock.request_id = clock.request_id.wrapping_add(1);
+    visual.accept_authoritative_sample(
+        transform.translation,
+        velocity.0,
+        clock.epoch,
+        bevy::platform::time::Instant::now(),
+    );
     blend.0 = 1.0;
 }
 

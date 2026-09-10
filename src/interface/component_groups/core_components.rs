@@ -56,10 +56,73 @@ pub struct TopologyBuilt;
 pub struct RyuguMarker;
 #[derive(Component)]
 pub struct CassiniMarker;
+/// Presentation-only transform carried by the Cassini model child.
+///
+/// The parent entity with [`CassiniMarker`] remains the authoritative
+/// simulation state used by physics, collision detection, Jacobi sampling,
+/// and protocol publication. This component must never be queried by those
+/// systems.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ProbeVisualTransform {
+    pub world_translation: Vec3,
+}
 #[derive(Component)]
 pub struct Velocity(pub Vec3);
 #[derive(Component)]
 pub struct OrbitHistory(pub VecDeque<Vec3>);
+
+/// Dead-reckoned presentation state between authoritative backend samples.
+#[derive(Resource, Clone, Debug)]
+pub struct ProbeVisualState {
+    pub authoritative_position: Vec3,
+    pub authoritative_velocity: Vec3,
+    pub authoritative_wall_time: Option<Instant>,
+    pub authoritative_epoch: u64,
+    pub blend_from: Vec3,
+    pub blend_started: Option<Instant>,
+    pub rendered_position: Vec3,
+}
+
+impl Default for ProbeVisualState {
+    fn default() -> Self {
+        Self {
+            authoritative_position: Vec3::ZERO,
+            authoritative_velocity: Vec3::ZERO,
+            authoritative_wall_time: None,
+            authoritative_epoch: u64::MAX,
+            blend_from: Vec3::ZERO,
+            blend_started: None,
+            rendered_position: Vec3::ZERO,
+        }
+    }
+}
+
+impl ProbeVisualState {
+    pub fn reset(&mut self, position: Vec3, velocity: Vec3, epoch: u64, now: Instant) {
+        self.authoritative_position = position;
+        self.authoritative_velocity = velocity;
+        self.authoritative_wall_time = Some(now);
+        self.authoritative_epoch = epoch;
+        self.blend_from = position;
+        self.blend_started = None;
+        self.rendered_position = position;
+    }
+
+    pub fn accept_authoritative_sample(
+        &mut self,
+        position: Vec3,
+        velocity: Vec3,
+        epoch: u64,
+        now: Instant,
+    ) {
+        self.blend_from = self.rendered_position;
+        self.authoritative_position = position;
+        self.authoritative_velocity = velocity;
+        self.authoritative_wall_time = Some(now);
+        self.authoritative_epoch = epoch;
+        self.blend_started = Some(now);
+    }
+}
 
 /// Number of uniformly resampled detector states exposed by the trajectory
 /// inversion controls.  The capture is presentation-only and never feeds the
