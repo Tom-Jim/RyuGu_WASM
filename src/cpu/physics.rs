@@ -30,10 +30,10 @@ fn hash_benchmark_trajectory(samples: &[GravityBenchmarkSample]) -> u64 {
         })
 }
 
-
 pub fn physics_system(
     mut frame_pacer: Local<crate::cpp_backend::BackendFramePacer>,
     ready: Res<crate::cpp_backend::CppBackendState>,
+    advance_channel: Res<crate::cpp_backend::BackendAdvanceChannel>,
     body: Query<&Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
     mut probe: Query<
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
@@ -50,10 +50,7 @@ pub fn physics_system(
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    if !crate::cpp_backend::should_advance_backend(&mut frame_pacer, *active) {
-        return;
-    }
-    if !ready.ready || error.is_active() || planning.blocks_realtime_gpu() {
+    if !ready.ready || !ready.worker_ready || error.is_active() || planning.blocks_realtime_gpu() {
         return;
     }
     let (Ok(body), Ok((mut transform, mut velocity, mut orbit))) =
@@ -61,57 +58,84 @@ pub fn physics_system(
     else {
         return;
     };
-    let mut steps = acceleration.stable_steps();
-    let mut history = Vec::new();
-    if *active == ActiveGravityMethod::FrequencyDomain {
-        let Some(frequency) = frequency else { return };
-        for sample in &frequency.0.samples {
-            if sample.snapshot.epoch != clock.epoch {
-                continue;
-            }
-            history.push(sample.snapshot.simulation_time_seconds);
-            history.extend(sample.body_acceleration.to_array().map(f64::from));
-        }
-        let samples = history.as_chunks::<4>().0;
-        let Some(last) = samples.last() else { return };
-        let horizon = if samples.len() > 1 {
-            2.0 * (last[0] - samples[samples.len() - 2][0])
-        } else {
-            clock.fixed_step_seconds
-        };
-        let available = ((last[0] + horizon - clock.elapsed_seconds) / clock.fixed_step_seconds
-            + 1e-6)
-            .floor()
-            .max(0.0) as u32;
-        steps = steps.min(available);
-        if steps == 0 {
+    let packet = advance_channel
+        .data
+        .lock()
+        .expect("backend advance result channel poisoned")
+        .take();
+    let trace = if let Some(packet) = packet {
+        if packet.snapshot.epoch != clock.epoch || packet.snapshot.request_id != clock.request_id {
             return;
         }
-    }
-    let initial: Vec<f64> = transform
-        .translation
-        .to_array()
-        .into_iter()
-        .chain(velocity.0.to_array())
-        .chain(body.rotation.to_array())
-        .map(f64::from)
-        .collect();
-    let trace = match crate::cpp_backend::advance(
-        clock.epoch,
-        *active,
-        &initial,
-        clock.fixed_step_seconds,
-        steps,
-        &history,
-    ) {
-        Ok(trace) => trace,
-        Err(message) => {
-            if message.contains("Waiting for frequency-domain samples") {
+        match packet.result {
+            Ok(trace) => trace,
+            Err(message) => {
+                if message.contains("Waiting for frequency-domain samples") {
+                    return;
+                }
+                error.raise(message);
                 return;
             }
-            error.raise(message);
+        }
+    } else {
+        if advance_channel
+            .in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !crate::cpp_backend::should_advance_backend(&mut frame_pacer, *active)
+        {
             return;
         }
+        let mut steps = acceleration.stable_steps();
+        let mut history = Vec::new();
+        if *active == ActiveGravityMethod::FrequencyDomain {
+            let Some(frequency) = frequency else { return };
+            for sample in &frequency.0.samples {
+                if sample.snapshot.epoch != clock.epoch {
+                    continue;
+                }
+                history.push(sample.snapshot.simulation_time_seconds);
+                history.extend(sample.body_acceleration.to_array().map(f64::from));
+            }
+            let samples = history.as_chunks::<4>().0;
+            let Some(last) = samples.last() else { return };
+            let horizon = if samples.len() > 1 {
+                2.0 * (last[0] - samples[samples.len() - 2][0])
+            } else {
+                clock.fixed_step_seconds
+            };
+            let available = ((last[0] + horizon - clock.elapsed_seconds) / clock.fixed_step_seconds
+                + 1e-6)
+                .floor()
+                .max(0.0) as u32;
+            steps = steps.min(available);
+            if steps == 0 {
+                return;
+            }
+        }
+        let initial: Vec<f64> = transform
+            .translation
+            .to_array()
+            .into_iter()
+            .chain(velocity.0.to_array())
+            .chain(body.rotation.to_array())
+            .map(f64::from)
+            .collect();
+        let snapshot = crate::cpp_backend::BackendAdvanceSnapshot {
+            request_id: clock.request_id,
+            epoch: clock.epoch,
+        };
+        if let Err(message) = crate::cpp_backend::request_advance(
+            &advance_channel,
+            snapshot,
+            *active,
+            &initial,
+            clock.fixed_step_seconds,
+            steps,
+            &history,
+        ) {
+            error.raise(message);
+        }
+        return;
     };
     if trace.len() < 28 || !trace.len().is_multiple_of(14) || !trace.iter().all(|v| v.is_finite()) {
         error.raise("Invalid simulation snapshot sequence");

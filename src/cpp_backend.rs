@@ -275,9 +275,6 @@ export function cpp_evaluate(method, x, y, z) {
 export function cpp_sources(method, xyz, masses, targets) {
     return globalThis.ryuguRustBackend.evaluate_sources(method, xyz, masses, targets);
 }
-export function backend_advance(epoch, method, initial, step, steps, history) {
-    return globalThis.ryuguRustBackend.advance_frame(epoch, method, initial, step, steps, history);
-}
 export function backend_solve_density(data) {
     return globalThis.ryuguRustBackend.solve_density(data);
 }
@@ -340,15 +337,6 @@ extern "C" {
         xyz: &[f64],
         masses: &[f64],
         targets: &[f64],
-    ) -> Result<Vec<f64>, JsValue>;
-    #[wasm_bindgen(catch)]
-    fn backend_advance(
-        epoch: u64,
-        method: &str,
-        initial: &[f64],
-        step: f64,
-        steps: u32,
-        history: &[f64],
     ) -> Result<Vec<f64>, JsValue>;
     #[wasm_bindgen(catch)]
     fn request_backend_advance(
@@ -608,33 +596,6 @@ pub fn solve_density(data: &str) -> Result<Vec<f32>, String> {
     backend_solve_density(data).map_err(|e| format!("Rust density backend: {e:?}"))
 }
 
-pub fn advance(
-    epoch: u64,
-    method: ActiveGravityMethod,
-    initial: &[f64],
-    step: f64,
-    steps: u32,
-    history: &[f64],
-) -> Result<Vec<f64>, String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        backend_advance(
-            epoch,
-            crate::basilisk::BasiliskAlgorithm::from_active(method).key(),
-            initial,
-            step,
-            steps,
-            history,
-        )
-        .map_err(|e| format!("Simulation backend: {e:?}"))
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (epoch, method, initial, step, steps, history);
-        Err("The numerical backend requires WASM".into())
-    }
-}
-
 pub fn evaluate_sources(
     method: &str,
     sources: &[(bevy::math::DVec3, f64)],
@@ -712,7 +673,10 @@ pub fn evaluate(method: ActiveGravityMethod, position: Vec3) -> Result<(Vec3, f3
 #[derive(Resource, Default)]
 pub struct CppBackendState {
     pub ready: bool,
+    pub worker_ready: bool,
     source_key: Option<(u64, DensityMode)>,
+    worker_source_key: Option<(u64, DensityMode)>,
+    worker_configuration_request_id: u64,
 }
 
 pub struct BackendFramePacer {
@@ -779,6 +743,7 @@ fn configure_backend(
     topology: Option<Res<AsteroidTopologyGpuData>>,
     mode: Res<DensityMode>,
     ryugu: Query<&Transform, With<RyuguMarker>>,
+    worker_channel: Res<BackendConfigureChannel>,
     mut state: ResMut<CppBackendState>,
     mut error: ResMut<GravityRuntimeError>,
 ) {
@@ -790,10 +755,43 @@ fn configure_backend(
         return;
     };
     let key = (source.source_hash, *mode);
-    if state.source_key == Some(key) {
+    if state.source_key != Some(key) {
+        state.ready = false;
+    }
+    if state.worker_source_key != Some(key) {
+        state.worker_ready = false;
+    }
+    let completed_configuration = worker_channel
+        .data
+        .lock()
+        .expect("backend configure result channel poisoned")
+        .take()
+        .filter(|packet| {
+            packet.snapshot.epoch == source.source_hash
+                && packet.snapshot.request_id == state.worker_configuration_request_id
+        });
+    if let Some(packet) = completed_configuration {
+        match packet.result {
+            Ok(()) => {
+                state.worker_source_key = Some(key);
+                state.worker_ready = true;
+            }
+            Err(message) => error.raise(format!("Worker geometry configuration failed: {message}")),
+        }
+    }
+    if error.is_active() || (state.source_key == Some(key) && state.worker_source_key == Some(key))
+    {
         return;
     }
-    state.ready = false;
+    #[cfg(target_arch = "wasm32")]
+    let worker_can_accept = backend_worker_ready()
+        && !worker_channel.in_flight.load(Ordering::Acquire)
+        && state.worker_source_key != Some(key);
+    #[cfg(not(target_arch = "wasm32"))]
+    let worker_can_accept = false;
+    if state.source_key == Some(key) && !worker_can_accept {
+        return;
+    }
     let bytes = if *mode == DensityMode::Constant {
         &source.constant_bytes
     } else {
@@ -811,25 +809,47 @@ fn configure_backend(
         .iter()
         .flat_map(|p| (*p * transform.scale.x).to_array().map(f64::from))
         .collect();
-    #[cfg(target_arch = "wasm32")]
-    let result = cpp_configure(
-        &live_cells,
-        &vertices,
-        &topology.triangles,
-        RYUGU_MASS as f64,
-    )
-    .map_err(|e| format!("C++ geometry configuration failed: {e:?}"));
-    #[cfg(not(target_arch = "wasm32"))]
-    let result: Result<(), String> = {
-        let _ = (live_cells, vertices);
-        Err("C++ browser host is unavailable".into())
-    };
-    match result {
-        Ok(()) => {
-            state.source_key = Some(key);
-            state.ready = true;
+    if state.source_key != Some(key) {
+        #[cfg(target_arch = "wasm32")]
+        let result = cpp_configure(
+            &live_cells,
+            &vertices,
+            &topology.triangles,
+            RYUGU_MASS as f64,
+        )
+        .map_err(|e| format!("C++ geometry configuration failed: {e:?}"));
+        #[cfg(not(target_arch = "wasm32"))]
+        let result: Result<(), String> = Err("C++ browser host is unavailable".into());
+        match result {
+            Ok(()) => {
+                state.source_key = Some(key);
+                state.ready = true;
+            }
+            Err(message) => {
+                error.raise(message);
+                return;
+            }
         }
-        Err(message) => error.raise(message),
+    }
+    if worker_can_accept {
+        state.worker_configuration_request_id =
+            state.worker_configuration_request_id.wrapping_add(1);
+        let snapshot = BackendConfigureSnapshot {
+            request_id: state.worker_configuration_request_id,
+            epoch: source.source_hash,
+        };
+        match request_configure(
+            &worker_channel,
+            snapshot,
+            &live_cells,
+            &vertices,
+            &topology.triangles,
+            RYUGU_MASS as f64,
+        ) {
+            Ok(true) => {}
+            Ok(false) => state.worker_ready = false,
+            Err(message) => error.raise(message),
+        }
     }
 }
 
