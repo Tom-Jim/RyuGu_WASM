@@ -3,74 +3,15 @@ use crate::interface::components::*;
 use bevy::math::DVec3;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
-use std::collections::VecDeque;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
 
-const PLANNING_DISPATCH_TIMING_WINDOW: usize = 9;
-const PLANNING_DISPATCH_FRAME_MARGIN: Duration = Duration::from_nanos(33_333_334);
-
-#[derive(Default)]
-struct MethodDispatchTiming {
-    last_dispatch: Option<Instant>,
-    request_durations: VecDeque<Duration>,
-}
-
-impl MethodDispatchTiming {
-    fn measured_interval(&self) -> Duration {
-        if self.request_durations.is_empty() {
-            return Duration::ZERO;
-        }
-        let mut samples = self.request_durations.iter().copied().collect::<Vec<_>>();
-        samples.sort_unstable();
-        samples[samples.len() / 2] + PLANNING_DISPATCH_FRAME_MARGIN
-    }
-
-    fn record(&mut self, started: Instant, duration: Duration) {
-        self.last_dispatch = Some(started);
-        if self.request_durations.len() >= PLANNING_DISPATCH_TIMING_WINDOW {
-            self.request_durations.pop_front();
-        }
-        self.request_durations.push_back(duration);
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct PlanningDispatchPacer {
-    fmm: MethodDispatchTiming,
-    mmfft: MethodDispatchTiming,
-}
-
-impl PlanningDispatchPacer {
-    fn timing(&self, method: ActiveGravityMethod) -> Option<&MethodDispatchTiming> {
-        match method {
-            ActiveGravityMethod::Fmm => Some(&self.fmm),
-            ActiveGravityMethod::MmfftCompressed => Some(&self.mmfft),
-            _ => None,
-        }
-    }
-
-    fn timing_mut(&mut self, method: ActiveGravityMethod) -> Option<&mut MethodDispatchTiming> {
-        match method {
-            ActiveGravityMethod::Fmm => Some(&mut self.fmm),
-            ActiveGravityMethod::MmfftCompressed => Some(&mut self.mmfft),
-            _ => None,
-        }
-    }
-
-    fn should_dispatch(&self, method: ActiveGravityMethod, now: Instant) -> bool {
-        let Some(timing) = self.timing(method) else {
-            return true;
-        };
-        timing.last_dispatch.is_none_or(|last_dispatch| {
-            now.saturating_duration_since(last_dispatch) >= timing.measured_interval()
-        })
-    }
-
-    fn record(&mut self, method: ActiveGravityMethod, started: Instant, duration: Duration) {
-        if let Some(timing) = self.timing_mut(method) {
-            timing.record(started, duration);
-        }
-    }
+struct PendingPlanningEvaluation {
+    snapshot: crate::cpp_backend::BackendEvaluateSourcesSnapshot,
+    request: PlanningGpuRequest,
+    method: ActiveGravityMethod,
+    started: Instant,
+    preprocess_ms: f64,
+    target_count: usize,
 }
 
 #[derive(Default)]
@@ -78,6 +19,7 @@ pub(crate) struct PlanningCache {
     identity: Option<(u64, ActiveGravityMethod)>,
     last_request: u64,
     baseline: Vec<Option<[f32; 4]>>,
+    pending: Option<PendingPlanningEvaluation>,
 }
 
 pub(crate) fn dispatch(
@@ -85,10 +27,16 @@ pub(crate) fn dispatch(
     request: Res<PlanningGpuRequest>,
     mut result: ResMut<PlanningGpuResult>,
     channel: Res<PlanningGpuReadbackChannel>,
+    backend_channel: Res<crate::cpp_backend::BackendEvaluateSourcesChannel>,
     mut cache: Local<PlanningCache>,
-    mut pacer: Local<PlanningDispatchPacer>,
 ) {
-    let Some(method) = request.method else { return };
+    let Some(method) = request.method else {
+        if backend_channel.in_flight.load(Ordering::Acquire) {
+            backend_channel.reset();
+        }
+        cache.pending = None;
+        return;
+    };
     if !matches!(
         method,
         ActiveGravityMethod::Fmm | ActiveGravityMethod::MmfftCompressed
@@ -99,22 +47,71 @@ pub(crate) fn dispatch(
     }
     let identity = Some((batch.batch_id, method));
     if cache.identity != identity {
+        backend_channel.reset();
         cache.identity = identity;
         cache.last_request = 0;
         cache.baseline = vec![None; batch.states.len()];
+        cache.pending = None;
     }
-    if cache.last_request == request.request_id {
+
+    let completed = backend_channel
+        .data
+        .lock()
+        .expect("backend source result channel poisoned")
+        .take();
+    if let Some(packet) = completed {
+        let Some(pending) = cache.pending.take() else {
+            cache.last_request = 0;
+            return;
+        };
+        if pending.snapshot != packet.snapshot
+            || pending.snapshot.epoch != batch.capture_epoch
+            || pending.request.request_id != request.request_id
+            || pending.request.batch_id != batch.batch_id
+        {
+            cache.last_request = 0;
+            return;
+        }
+        let evaluated = packet
+            .result
+            .and_then(|values| finish_evaluation(&batch, pending, values, &mut cache));
+        match evaluated {
+            Ok(packet) => result.0 = Some(packet),
+            Err(message) => {
+                if let Ok(mut error) = channel.error.lock() {
+                    *error = Some((request.request_id, message));
+                }
+            }
+        }
         return;
     }
-    let started = Instant::now();
-    if !pacer.should_dispatch(method, started) {
+    if cache.last_request == request.request_id || backend_channel.in_flight.load(Ordering::Acquire)
+    {
         return;
     }
-    cache.last_request = request.request_id;
-    let evaluated = evaluate(&batch, &request, method, &mut cache);
-    pacer.record(method, started, started.elapsed());
-    match evaluated {
-        Ok(packet) => result.0 = Some(packet),
+
+    let prepared =
+        prepare_evaluation(&batch, &request, method).and_then(|(pending, sources, targets)| {
+            let key = if method == ActiveGravityMethod::Fmm {
+                "fmm"
+            } else {
+                "fft"
+            };
+            crate::cpp_backend::request_evaluate_sources(
+                &backend_channel,
+                pending.snapshot,
+                key,
+                &sources,
+                &targets,
+            )
+            .map(|submitted| (submitted, pending))
+        });
+    match prepared {
+        Ok((true, pending)) => {
+            cache.last_request = request.request_id;
+            cache.pending = Some(pending);
+        }
+        Ok((false, _)) => {}
         Err(message) => {
             if let Ok(mut error) = channel.error.lock() {
                 *error = Some((request.request_id, message));
@@ -123,44 +120,11 @@ pub(crate) fn dispatch(
     }
 }
 
-#[cfg(test)]
-mod planning_dispatch_pacer_tests {
-    use super::*;
-
-    #[test]
-    fn measured_request_time_adds_two_render_frames_of_headroom() {
-        let mut pacer = PlanningDispatchPacer::default();
-        let started = Instant::now();
-        let request_time = Duration::from_millis(80);
-
-        assert!(pacer.should_dispatch(ActiveGravityMethod::Fmm, started));
-        pacer.record(ActiveGravityMethod::Fmm, started, request_time);
-        assert!(!pacer.should_dispatch(
-            ActiveGravityMethod::Fmm,
-            started + request_time + Duration::from_millis(32)
-        ));
-        assert!(pacer.should_dispatch(
-            ActiveGravityMethod::Fmm,
-            started + request_time + Duration::from_millis(34)
-        ));
-    }
-
-    #[test]
-    fn non_cpp_planning_methods_are_not_throttled() {
-        let pacer = PlanningDispatchPacer::default();
-        let now = Instant::now();
-        assert!(pacer.should_dispatch(ActiveGravityMethod::FrequencyDomain, now));
-        assert!(pacer.should_dispatch(ActiveGravityMethod::RadialAnalytic, now));
-        assert!(pacer.should_dispatch(ActiveGravityMethod::HomogeneousWerner, now));
-    }
-}
-
-fn evaluate(
+fn prepare_evaluation(
     batch: &PlanningCandidateBatch,
     request: &PlanningGpuRequest,
     method: ActiveGravityMethod,
-    cache: &mut PlanningCache,
-) -> Result<PlanningGpuPacket, String> {
+) -> Result<(PendingPlanningEvaluation, Vec<(DVec3, f64)>, Vec<DVec3>), String> {
     let started = Instant::now();
     let densities = batch
         .density_models
@@ -193,22 +157,58 @@ fn evaluate(
     };
     let mut targets = Vec::with_capacity(count * 7);
     for state in states {
-        let p = state.body_position().as_dvec3();
-        targets.push(p);
+        let position = state.body_position().as_dvec3();
+        targets.push(position);
         for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
-            targets.extend([p + axis * h, p - axis * h]);
+            targets.extend([position + axis * h, position - axis * h]);
         }
     }
-    let preprocess = started.elapsed().as_secs_f64() * 1e3;
-    let key = if method == ActiveGravityMethod::Fmm {
-        "fmm"
-    } else {
-        "fft"
+    let snapshot = crate::cpp_backend::BackendEvaluateSourcesSnapshot {
+        request_id: batch.batch_id.rotate_left(29) ^ request.request_id,
+        epoch: batch.capture_epoch,
     };
-    let values = crate::cpp_backend::evaluate_sources(key, &sources, &targets)?;
+    Ok((
+        PendingPlanningEvaluation {
+            snapshot,
+            request: request.clone(),
+            method,
+            started,
+            preprocess_ms: started.elapsed().as_secs_f64() * 1e3,
+            target_count: targets.len(),
+        },
+        sources,
+        targets,
+    ))
+}
+
+fn finish_evaluation(
+    batch: &PlanningCandidateBatch,
+    pending: PendingPlanningEvaluation,
+    flat_values: Vec<f64>,
+    cache: &mut PlanningCache,
+) -> Result<PlanningGpuPacket, String> {
+    if flat_values.len() != pending.target_count * 4
+        || !flat_values.iter().all(|value| value.is_finite())
+    {
+        return Err("Invalid C++ planning Worker response".into());
+    }
+    let request = &pending.request;
+    let method = pending.method;
+    let values = flat_values.as_chunks::<4>().0;
+    let start = request.candidate_start as usize * batch.samples_per_candidate as usize;
+    let count = request.candidate_count as usize * batch.samples_per_candidate as usize;
+    let states = batch
+        .states
+        .get(start..start + count)
+        .ok_or("Invalid candidate range")?;
+    let h = if method == ActiveGravityMethod::MmfftCompressed {
+        64.0
+    } else {
+        0.5
+    };
     let mut rows = Vec::with_capacity(count * 4);
     for values in values.as_chunks::<7>().0 {
-        rows.push(values[0].map(|v| v as f32));
+        rows.push(values[0].map(|value| value as f32));
         for axis in 0..3 {
             let mut column = [0.0; 4];
             for component in 0..3 {
@@ -240,18 +240,22 @@ fn evaluate(
     let indices = crate::gpu::planning_reduction::planning_verification_targets(request, batch);
     let compact: Vec<_> = indices
         .iter()
-        .flat_map(|i| rows[*i as usize * 4..*i as usize * 4 + 4].iter().copied())
+        .flat_map(|index| {
+            rows[*index as usize * 4..*index as usize * 4 + 4]
+                .iter()
+                .copied()
+        })
         .collect();
     if !rows
         .iter()
         .flatten()
         .chain(metrics.iter().flatten())
-        .all(|v| v.is_finite())
+        .all(|value| value.is_finite())
     {
         return Err("C++ planning returned non-finite values".into());
     }
     Ok(PlanningGpuPacket {
-        request: request.clone(),
+        request: pending.request,
         state_indices: indices,
         rows: compact.clone(),
         raw_rows: compact,
@@ -259,11 +263,13 @@ fn evaluate(
         candidate_metrics: metrics,
         readback_valid: true,
         timing: PlanningGpuTiming {
-            method_preprocess_ms: preprocess,
-            command_submission_ms: (started.elapsed().as_secs_f64() * 1e3 - preprocess).max(0.0),
-            // C++ wall-clock work must never be presented as GPU timestamps.
+            method_preprocess_ms: pending.preprocess_ms,
+            command_submission_ms: (pending.started.elapsed().as_secs_f64() * 1e3
+                - pending.preprocess_ms)
+                .max(0.0),
+            // Worker wall time must never be presented as GPU timestamps.
             dispatch_count: 1,
-            forward_kernel_evaluations: targets.len() as u64,
+            forward_kernel_evaluations: pending.target_count as u64,
             ..Default::default()
         },
         backend: if method == ActiveGravityMethod::Fmm {

@@ -404,12 +404,12 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
     } else {
         "cold batch"
     };
-    let pacing_note = matches!(
+    let worker_note = matches!(
         job.method,
         ActiveGravityMethod::Fmm | ActiveGravityMethod::MmfftCompressed
     )
     .then_some(
-        " C++ FMM/FFT dispatches include fixed backend preparation and are paced from measured request time to protect rendering; total completion time may increase.",
+        " C++ FMM/FFT evaluation runs in the numerical Worker; per-request tree/grid preparation may extend total completion time without blocking rendering.",
     )
     .unwrap_or_default();
     format!(
@@ -425,6 +425,6 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
         job.dispatch_count,
         job.density_seed,
         job.maximum_density_mass_relative_error,
-        pacing_note,
+        worker_note,
     )
 }
