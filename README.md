@@ -320,11 +320,11 @@ The page starts the Bevy frontend WASM (`pkg/ryugu_wasm_bg.wasm`) first, then lo
 
 Unused legacy non-frequency Rust/WGSL implementations have been removed. Probe forces, surface fields, planning forces, and inversion sensitivities use the C++ backend paths. Rust backend WASM also performs candidate trajectory propagation and Clarabel optimization. Geometry preparation, experiment orchestration, and the frequency-domain GPU path remain frontend responsibilities.
 
-First/Stress preparation batches candidate targets through C++ ExaFMM at each integration time. Within a time slice, the endpoint acceleration is reused for the next initial kick at the identical position and time; no linearized field replaces FMM. A slice of k integration steps requires k+1 FMM evaluations instead of 2k (for k >= 1). Slice boundaries still recompute the initial field. Target buffers are reused, numeric request arrays serialize without a JSON Value tree, and the host copies C++ output directly into a typed result array. The browser OpenMP shim is single-threaded: target batching is not CPU multithreading or GPU execution. C++ tree construction/precomputation and synchronous calls remain potential latency bottlenecks; build success alone does not establish interactive responsiveness.
+First/Stress preparation batches candidate targets through C++ ExaFMM at each integration time. A dedicated browser worker owns its Rust and C++ WASM instances, so a long FMM slice cannot block Bevy rendering or the control panel. Within a time slice, the endpoint acceleration is reused for the next initial kick at the identical position and time; no linearized field replaces FMM. A slice of k integration steps requires k+1 FMM evaluations instead of 2k (for k >= 1). Source geometry is uploaded once per planning run and retained for later slices; target, output, and result buffers are reused, and scale-matched FMM translation matrices are cached. The browser OpenMP shim is single-threaded, so target batching does not enable native CPU threads or GPU execution.
 
 Basilisk's actual `SimModel`, `SysProcess`, `SysModelTask`, and messaging sources are compiled with a browser-serial patch. A scheduled Rust dynamics task publishes translational `SCStatesMsgPayload` messages. This ports the application's serial scheduling path, not native multithreading, Python scenario bindings, arbitrary spacecraft effectors, six-degree-of-freedom attitude dynamics, or the complete Vizard client. The external version-1 Ryugu ABI is not Vizard Protobuf.
 
-FLUPS's negative potential is converted to the positive potential convention above without reversing acceleration. The current live grid is 32 cubed with a 4096 metre half-width; out-of-domain targets fail explicitly. ExaFMM structures are rebuilt per batch and Basilisk polyhedral preprocessing is cached per configured mesh. These costs and grid errors need runtime evaluation; compilation is not evidence of performance parity.
+FLUPS's negative potential is converted to the positive potential convention above without reversing acceleration. The current live grid is 32 cubed with a 4096 metre half-width; out-of-domain targets fail explicitly. ExaFMM source uploads and scale-matched translation matrices persist across planning slices, while target-dependent tree topology is rebuilt for each slice. Basilisk polyhedral preprocessing is cached per configured mesh. These costs and grid errors still require runtime evaluation; compilation is not evidence of performance parity.
 
 ## Using the workbench
 
@@ -400,7 +400,7 @@ These are development directions, not delivered capability claims. Compression s
 | `src/backend/rust/` | Independent Rust WASM: authoritative probe integration, candidate propagation, and Clarabel solver |
 | `src/cpp_backend.rs` / `src/cpp_planning.rs` | Bevy-to-backend dispatch and planning packets |
 | `src/backend/zig/` / `C++/` | Browser C API, Basilisk scheduling, pinned upstream sources and patches |
-| `src/backend/host/cpp_backend.mjs` | Browser WASI host and C++ numerical ABI |
+| `src/backend/host/cpp_backend.mjs` | Browser WASI host and reusable C++ source/field buffers |
 | `src/tools/` | Build, source-fetch, validation, and WASM ABI checks |
 | `src/cpu/frequency_domain.rs` | Frequency-domain source preparation and discrete transform definitions |
 | `src/gpu/frequency_domain_pipeline/` | Whole-trajectory transforms, spectra, sensitivities, planning, and readback |

@@ -10,9 +10,10 @@ pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
 pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
-/// Candidate propagation is performed by batched C++ FMM time slices in the
-/// browser's WASM thread. Keep each slice bounded so input and WebGPU can get
-/// a turn while all candidates still share the same FMM target traversal.
+/// Candidate propagation is performed by batched C++ FMM time slices in a
+/// dedicated browser worker. Keep each slice bounded so cancellation and
+/// progress updates stay responsive while all candidates share the same FMM
+/// target traversal.
 pub const PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME: u32 = 8;
 pub const PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME: u32 = 2;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;

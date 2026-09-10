@@ -1,6 +1,6 @@
 //! Independent numerical WASM. No Bevy, renderer, window, or DOM dependencies.
 use glam::{DQuat, DVec3};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 mod density;
 mod planning;
@@ -15,6 +15,15 @@ export function field_evaluate(method, x, y, z) {
 export function field_sources(method, xyz, masses, targets) {
   return globalThis.ryuguCpp.evaluateSources(method, xyz, masses, targets);
 }
+export function field_prepare(xyz, masses) {
+  return globalThis.ryuguCpp.prepareSources(xyz, masses);
+}
+export function field_prepared(id, targets) {
+  return globalThis.ryuguCpp.evaluatePreparedSources(id, targets);
+}
+export function field_release(id) {
+  globalThis.ryuguCpp.releaseSources(id);
+}
 export function scheduler_reset(period) {
   const status = globalThis.ryuguScheduler.ryugu_scheduler_reset(period);
   if (status) throw new Error(`Basilisk reset failed: ${status}`);
@@ -25,6 +34,11 @@ export function scheduler_advance(stop) {
 }
 "#)]
 extern "C" {
+    #[wasm_bindgen(catch)]
+    fn field_prepare(xyz: &[f64], masses: &[f64]) -> Result<f64, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn field_prepared(id: f64, targets: &[f64]) -> Result<Vec<f64>, JsValue>;
+    fn field_release(id: f64);
     #[wasm_bindgen(catch)]
     fn field_configure(
         cells: &[f64],
@@ -45,6 +59,69 @@ extern "C" {
     fn scheduler_reset(period: u64) -> Result<(), JsValue>;
     #[wasm_bindgen(catch)]
     fn scheduler_advance(stop: u64) -> Result<(), JsValue>;
+}
+
+/// Owns a C++ source upload for a complete integration slice, including errors.
+struct PreparedSources(f64);
+
+impl PreparedSources {
+    fn new(xyz: &[f64], masses: &[f64]) -> Result<Self, JsValue> {
+        field_prepare(xyz, masses).map(Self)
+    }
+
+    fn evaluate(&self, targets: &[f64]) -> Result<Vec<f64>, JsValue> {
+        field_prepared(self.0, targets)
+    }
+}
+
+impl Drop for PreparedSources {
+    fn drop(&mut self) {
+        field_release(self.0);
+    }
+}
+
+thread_local! {
+    // The numerically expensive source geometry is reused across planning
+    // integration slices. Keep the thread-local payload copy-only so WASI
+    // does not need to register a nontrivial TLS destructor.
+    static CACHED_SOURCE: Cell<Option<f64>> = const { Cell::new(None) };
+}
+
+fn cached_source() -> Option<f64> {
+    CACHED_SOURCE.with(Cell::get)
+}
+
+/// Uploads source geometry once for a sequence of candidate trajectory slices.
+/// The caller must call `clear_candidate_sources` before the C++ module is
+/// dropped; the browser Worker owns the lifetime in normal operation.
+#[wasm_bindgen]
+pub fn prepare_candidate_sources(xyz: &[f64], masses: &[f64]) -> Result<(), JsValue> {
+    if masses.is_empty() || xyz.len() != masses.len() * 3 {
+        return Err("Invalid candidate source geometry".into());
+    }
+    let source = PreparedSources::new(xyz, masses)?;
+    let id = source.0;
+    std::mem::forget(source);
+    CACHED_SOURCE.with(|slot| {
+        if let Some(old) = slot.replace(Some(id)) {
+            field_release(old);
+        }
+    });
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn clear_candidate_sources() {
+    CACHED_SOURCE.with(|slot| {
+        if let Some(id) = slot.replace(None) {
+            field_release(id);
+        }
+    });
+}
+
+pub(crate) fn evaluate_cached_sources(targets: &[f64]) -> Result<Vec<f64>, JsValue> {
+    let id = cached_source().ok_or("Candidate source cache is empty")?;
+    field_prepared(id, targets)
 }
 
 #[wasm_bindgen]

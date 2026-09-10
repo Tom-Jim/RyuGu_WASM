@@ -32,6 +32,19 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 #if defined(RYUGU_BASILISK_NATIVE)
 std::unique_ptr<PolyhedralGravityModel> cached_polyhedron;
 #endif
+#if defined(RYUGU_EXAFMM_NATIVE)
+// Laplace translation matrices depend on order and root radius, not target
+// positions or charges. Keep one bounded cache; rebuild all tree-dependent data.
+#if defined(__wasm__)
+std::unique_ptr<exafmm_t::LaplaceFmm> cached_fmm;
+double cached_fmm_radius = -1.0;
+int cached_fmm_depth = -1;
+#else
+thread_local std::unique_ptr<exafmm_t::LaplaceFmm> cached_fmm;
+thread_local double cached_fmm_radius = -1.0;
+thread_local int cached_fmm_depth = -1;
+#endif
+#endif
 
 int direct_sum(const double *source_xyz, const double *source_mass,
               uint64_t source_count, const double position[3],
@@ -231,7 +244,13 @@ int32_t ryugu_exafmm_eval(const double *source_xyz,
             targets[index].X[component] = target_xyz[3 * index + component];
         }
     }
-    LaplaceFmm fmm(expansion_order, leaf_capacity);
+    if (!cached_fmm || cached_fmm->p != expansion_order) {
+        cached_fmm = std::make_unique<LaplaceFmm>(expansion_order, leaf_capacity);
+        cached_fmm_radius = -1.0;
+        cached_fmm_depth = -1;
+    }
+    auto &fmm = *cached_fmm;
+    fmm.ncrit = leaf_capacity;
     NodePtrs<real_t> leafs, nonleafs;
     Nodes<real_t> nodes;
     get_bounds(sources, targets, fmm.x0, fmm.r0);
@@ -239,7 +258,12 @@ int32_t ryugu_exafmm_eval(const double *source_xyz,
     init_rel_coord();
     build_list(nodes, fmm);
     fmm.M2L_setup(nonleafs);
-    fmm.precompute();
+    if (cached_fmm_radius != fmm.r0 || cached_fmm_depth != fmm.depth) {
+        fmm.is_precomputed = false;
+        fmm.precompute();
+        cached_fmm_radius = fmm.r0;
+        cached_fmm_depth = fmm.depth;
+    }
     fmm.upward_pass(nodes, leafs);
     fmm.downward_pass(nodes, leafs);
     for (Node<real_t> *leaf : leafs) {

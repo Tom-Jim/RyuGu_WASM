@@ -77,7 +77,7 @@ export async function instantiateBackend(bytes) {
       return pointer;
     },
     doubles(pointer, count) {
-      return Array.from(new Float64Array(api.memory.buffer, pointer, count));
+      return new Float64Array(api.memory.buffer, pointer, count).slice();
     },
     free(pointer) {
       if (allocations.delete(pointer)) api.ryugu_free(pointer);
@@ -97,6 +97,69 @@ export function createFieldBackend(backend) {
   let geometry;
   let fft;
   const own = [];
+  // Only pointers survive calls: memory.grow invalidates cached typed views.
+  const scratch = new Map();
+  const sourceSets = new Map();
+  let nextSourceId = 1;
+  function reserve(name, count) {
+    let slot = scratch.get(name);
+    if (!slot || slot.capacity < count) {
+      const capacity = Math.max(count, (slot?.capacity ?? 0) * 2, 4);
+      const pointer = backend.put(new Float64Array(capacity));
+      if (slot) backend.free(slot.pointer);
+      slot = { pointer, capacity };
+      scratch.set(name, slot);
+    }
+    return slot.pointer;
+  }
+  function upload(name, values) {
+    const pointer = reserve(name, values.length);
+    new Float64Array(api.memory.buffer, pointer, values.length).set(values);
+    return pointer;
+  }
+  function prepareSources(xyz, masses) {
+    if (!masses.length || xyz.length !== masses.length * 3
+        || !xyz.every(Number.isFinite) || !masses.every(Number.isFinite)) {
+      throw new Error("Invalid prepared source batch");
+    }
+    const source = backend.put(xyz instanceof Float64Array ? xyz : new Float64Array(xyz));
+    try {
+      const mass = backend.put(masses instanceof Float64Array ? masses : new Float64Array(masses));
+      const id = nextSourceId++;
+      sourceSets.set(id, { source, mass, count: BigInt(masses.length) });
+      return id;
+    } catch (error) { backend.free(source); throw error; }
+  }
+  function releaseSources(id) {
+    const entry = sourceSets.get(id);
+    if (!entry) return;
+    backend.free(entry.source);
+    backend.free(entry.mass);
+    sourceSets.delete(id);
+  }
+  function evaluatePreparedSources(id, targets) {
+    const entry = sourceSets.get(id);
+    if (!entry) throw new Error("Unknown prepared source batch");
+    if (targets.length % 3 || !targets.every(Number.isFinite)) throw new Error("Invalid target batch");
+    const count = targets.length / 3;
+    if (!count) return new Float64Array(0);
+    const target = upload("batch-target", targets);
+    const potential = reserve("batch-potential", count);
+    const field = reserve("batch-field", count * 3);
+    checked(api.ryugu_exafmm_eval(entry.source, entry.mass, entry.count,
+      target, BigInt(count), 4, 64, potential, field), "fmm");
+    const a = new Float64Array(api.memory.buffer, field, count * 3);
+    const u = new Float64Array(api.memory.buffer, potential, count);
+    const result = new Float64Array(count * 4);
+    for (let i = 0; i < count; i++) {
+      result[4 * i] = a[3 * i];
+      result[4 * i + 1] = a[3 * i + 1];
+      result[4 * i + 2] = a[3 * i + 2];
+      result[4 * i + 3] = u[i];
+    }
+    if (!result.every(Number.isFinite)) throw new Error("Non-finite FMM field");
+    return result;
+  }
   function put(array) {
     const pointer = backend.put(array);
     own.push(pointer);
@@ -236,10 +299,10 @@ export function createFieldBackend(backend) {
       }
       return value;
     }
-    return temporary((alloc) => {
-      const target = alloc(new Float64Array(position));
-      const acceleration = alloc(new Float64Array(3));
-      const potential = alloc(new Float64Array(1));
+    {
+      const target = upload("live-target", position);
+      const acceleration = reserve("live-field", 3);
+      const potential = reserve("live-potential", 1);
       let status;
       if (method === "radial") status = api.ryugu_radial_boost_eval(geometry.cells, geometry.cellCount,
         target, acceleration, potential, 1e-12, 1e-8);
@@ -254,35 +317,22 @@ export function createFieldBackend(backend) {
       const result = [...backend.doubles(acceleration, 3), ...backend.doubles(potential, 1)];
       if (!result.every(Number.isFinite)) throw new Error(`${method} returned a non-finite field`);
       return result;
-    });
+    }
   }
   function evaluateSources(method, xyz, masses, targets) {
     if (xyz.length !== masses.length * 3 || targets.length % 3
         || !xyz.every(Number.isFinite) || !masses.every(Number.isFinite)
         || !targets.every(Number.isFinite)) throw new Error("Invalid source batch");
     if (masses.length === 0) return new Float64Array(targets.length / 3 * 4);
+    if (method === "fmm") {
+      const id = prepareSources(xyz, masses);
+      try { return evaluatePreparedSources(id, targets); }
+      finally { releaseSources(id); }
+    }
     return temporary((alloc) => {
       const source = alloc(new Float64Array(xyz));
       const mass = alloc(new Float64Array(masses));
       const count = targets.length / 3;
-      if (method === "fmm") {
-        const potential = alloc(new Float64Array(count));
-        const field = alloc(new Float64Array(count * 3));
-        checked(api.ryugu_exafmm_eval(source, mass, BigInt(masses.length),
-          alloc(new Float64Array(targets)), BigInt(count), 4, 64, potential, field), method);
-        // Create views only after the C++ call: memory.grow can detach earlier
-        // views. Copy into JS-owned storage before temporary allocations free.
-        const a = new Float64Array(api.memory.buffer, field, count * 3);
-        const u = new Float64Array(api.memory.buffer, potential, count);
-        const result = new Float64Array(count * 4);
-        for (let i = 0; i < count; i++) {
-          result[4 * i] = a[3 * i];
-          result[4 * i + 1] = a[3 * i + 1];
-          result[4 * i + 2] = a[3 * i + 2];
-          result[4 * i + 3] = u[i];
-        }
-        return result;
-      }
       const previousGeometry = geometry, previousFft = fft;
       try {
         geometry = { xyz: source, masses: mass, sourceCount: BigInt(masses.length),
@@ -294,5 +344,5 @@ export function createFieldBackend(backend) {
       } finally { geometry = previousGeometry; fft = previousFft; }
     });
   }
-  return { configure, evaluate, evaluateSources };
+  return { configure, evaluate, evaluateSources, prepareSources, evaluatePreparedSources, releaseSources };
 }

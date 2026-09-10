@@ -535,7 +535,14 @@ window.ryuguPlanningProgress = (planning) => ({
     $('#quadrature-accuracy-policy').textContent = `${accuracyLabel}. ${thresholdText}. Each source size is plotted after 7 passing repetitions.`;
     $('#quadrature-accuracy-summary').textContent = `Accuracy details — ${planning.accuracyProfile ?? 'strict'} profile (worst repetition RMS)`;
     pressed('[data-action="planning-metric"]', (button) => button.dataset.value === planning.metric);
-    pressed('[data-action="planning-workload"]', (button) => button.dataset.value === planning.workload);
+    pressed('[data-action="planning-workload"]', (button) => (
+      planning.workloadSelected === true && button.dataset.value === planning.workload
+    ));
+    $$('[data-action="planning-workload"]').forEach((button) => {
+      button.setAttribute('aria-busy', String(
+        planning.running === true && button.dataset.value === planning.workload
+      ));
+    });
     const inversionRows = (lastSnapshot?.inversion?.results ?? []).filter(Boolean);
     const rows = planning.metric === 'density' || planning.metric === 'inversion-time'
       ? inversionRows
@@ -850,7 +857,12 @@ window.ryuguPlanningProgress = (planning) => ({
       $('#modal-status').textContent = snapshot.planning.workload === 'quadrature'
         ? snapshot.planning.status : 'Choose parameters, then press Run to start the quadrature task.';
       $('#quadrature-state').textContent = snapshot.planning.running ? Math.round(snapshot.planning.sourceCount / 1000) + 'K · R' + snapshot.planning.repeat : 'IDLE';
-      $$('[data-action="quadrature-start"]').forEach((button) => { button.disabled = snapshot.planning.running; });
+      // First/Stress and the selected-scope sweep share one planning slot.
+      // The action handler replaces the current job, so only an active
+      // quadrature sweep should disable a repeat click.
+      $$('[data-action="quadrature-start"]').forEach((button) => {
+        button.disabled = snapshot.planning.running && snapshot.planning.workload === 'quadrature';
+      });
       const plan = snapshot.planning;
       const cells = plan.scope === 'all' ? 'all 35 Kρ × Nt combinations' : `Kρ=${plan.densityModels}, Nt=${plan.targets}`;
       $('#quadrature-run-scope').textContent = plan.workload === 'quadrature'

@@ -3,6 +3,7 @@ pub fn update_planning_results_from_inversion_system(
     inversion: Res<TrajectoryInversionState>,
     radial: Option<Res<DensityQuadratureSource>>,
     aggregated: Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>,
+    cpp: Res<crate::cpp_backend::CppBackendState>,
     candidates_channel: Res<crate::cpp_backend::BackendCandidatesChannel>,
     mut planning: ResMut<PlanningComparisonState>,
     mut batch_builder: Local<Option<crate::cpu::planning::PlanningBatchBuilder>>,
@@ -15,6 +16,13 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     if planning.batch_job.is_some() {
+        return;
+    }
+    if !cpp.ready {
+        planning.status = format!(
+            "{} queued: waiting for the C++ numerical backend.",
+            planning.workload_profile.label()
+        );
         return;
     }
     let Some(capture_id) = inversion.capture_id else {

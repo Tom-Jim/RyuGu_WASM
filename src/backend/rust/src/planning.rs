@@ -57,12 +57,20 @@ pub fn propagate_candidate(data: &str) -> Result<Vec<f64>, JsValue> {
         .flat_map(|(p, _)| p.to_array())
         .collect();
     let masses: Vec<_> = request.sources.iter().map(|(_, m)| *m).collect();
+    let prepared = if masses.is_empty() || request.jets.len() < 2 {
+        None
+    } else {
+        Some(super::PreparedSources::new(&xyz, &masses)?)
+    };
     let acceleration = |jet: &Jet, position: DVec3| -> Result<DVec3, JsValue> {
         let value = if masses.is_empty() {
             jet.acceleration + jet.jacobian * (position - jet.position)
         } else {
             let target = jet.rotation.inverse() * position;
-            let field = super::field_sources("fmm", &xyz, &masses, &target.to_array())?;
+            let field = prepared
+                .as_ref()
+                .ok_or("Missing FMM sources")?
+                .evaluate(&target.to_array())?;
             if field.len() != 4 {
                 return Err("Invalid candidate field response".into());
             }
@@ -101,7 +109,6 @@ pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, JsValue> {
         serde_json::from_str(data).map_err(|e| JsValue::from_str(&e.to_string()))?;
     if request.positions.is_empty()
         || request.positions.len() > 2_048
-        || request.sources.is_empty()
         || request.positions.len() != request.velocities.len()
         || request.velocities.iter().any(|v| !v.is_finite())
         || request.positions.iter().any(|p| !p.is_finite())
@@ -123,6 +130,10 @@ pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, JsValue> {
         return Err("Invalid candidate batch request".into());
     }
 
+    let cached_source = super::cached_source().is_some();
+    if request.sources.is_empty() && !cached_source {
+        return Err("Invalid candidate batch request".into());
+    }
     let source_xyz: Vec<f64> = request
         .sources
         .iter()
@@ -131,6 +142,11 @@ pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, JsValue> {
     let source_masses: Vec<f64> = request.sources.iter().map(|(_, m)| *m).collect();
     let candidate_count = request.positions.len();
     let sample_count = request.jets.len();
+    let prepared = if sample_count > 1 && !cached_source && !source_masses.is_empty() {
+        Some(super::PreparedSources::new(&source_xyz, &source_masses)?)
+    } else {
+        None
+    };
     let mut positions = request.positions;
     let mut velocities = request.velocities;
     let mut output = vec![0.0; candidate_count * sample_count * 6];
@@ -155,16 +171,18 @@ pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, JsValue> {
         // A one-sample request only copies the initial state.
         if sample_count > 1 {
             let inverse_rotation = jet.rotation.inverse();
-            for (target, position) in targets.chunks_exact_mut(3).zip(&positions) {
+            for (target, position) in targets.as_chunks_mut::<3>().0.iter_mut().zip(&positions) {
                 target.copy_from_slice(&(inverse_rotation * *position).to_array());
             }
-            let fields = super::field_sources("fmm", &source_xyz, &source_masses, &targets)?;
-            if fields.len() != candidate_count * 4
-                || fields.iter().any(|value| !value.is_finite())
+            let fields = match prepared.as_ref() {
+                Some(prepared) => prepared.evaluate(&targets)?,
+                None => super::evaluate_cached_sources(&targets)?,
+            };
+            if fields.len() != candidate_count * 4 || fields.iter().any(|value| !value.is_finite())
             {
                 return Err("Invalid batched FMM field response".into());
             }
-            for (acceleration, field) in accelerations.iter_mut().zip(fields.chunks_exact(4)) {
+            for (acceleration, field) in accelerations.iter_mut().zip(fields.as_chunks::<4>().0) {
                 *acceleration = jet.rotation * DVec3::from_slice(&field[..3]);
             }
         }

@@ -13,7 +13,43 @@ use crate::interface::components::{
     GravitySampleHistory, RyuguMarker, SimulationClock, Velocity,
 };
 use bevy::math::Vec3;
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
+use std::time::Duration;
+
+/// `point_source_acceleration` still calls the synchronous, main-thread
+/// `cpp_backend::evaluate_sources` adapter (it has not been migrated to the
+/// numerical Worker request/response channel used by `physics_system`,
+/// `cpp_planning::dispatch`, and `record_probe_jacobi_system`). Advance
+/// requests are no longer wall-clock throttled (see
+/// `cpp_backend::should_advance_backend`), so without this pacer this
+/// diagnostic-only comparison would now run far more often than it used to
+/// and reintroduce a main-thread stall into the very path that was just
+/// fixed. This interval matches the previous Radial/FrequencyDomain advance
+/// pacing and is a deliberate stop-gap, not the final fix: the correct fix is
+/// giving this call its own `backend_channel!` (for example
+/// `BackendComparisonChannel`) and a matching Worker request/delivery pair,
+/// exactly like the other four call sites.
+const BASILISK_COMPARISON_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct BasiliskComparisonPacer {
+    last_call: Option<Instant>,
+}
+
+impl BasiliskComparisonPacer {
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_call
+            .is_some_and(|last| now.duration_since(last) < BASILISK_COMPARISON_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_call = Some(now);
+        true
+    }
+}
 
 pub const PROTOCOL_NAME: &str = "ryugu-basilisk-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -150,6 +186,7 @@ fn publish_basilisk_snapshot_system(
     mut state: ResMut<BasiliskBridgeState>,
     cassini: Query<(&Transform, &Velocity), With<CassiniMarker>>,
     ryugu: Query<&Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
+    mut comparison_pacer: Local<BasiliskComparisonPacer>,
 ) {
     let Ok((transform, velocity)) = cassini.single() else {
         return;
@@ -193,6 +230,12 @@ fn publish_basilisk_snapshot_system(
     let Some(source) = source.as_deref() else {
         return;
     };
+    // Stop-gap rate limit: see `BasiliskComparisonPacer` above. This call is
+    // still a synchronous, main-thread WASM call and must not run on every
+    // accepted physics tick now that advance requests are unthrottled.
+    if !comparison_pacer.allow() {
+        return;
+    }
     let body_position = ryugu_transform.rotation.inverse() * transform.translation;
     let Some(reference) = point_source_acceleration(source, *density_mode, body_position) else {
         return;
@@ -280,5 +323,14 @@ mod tests {
     fn relative_error_is_zero_for_matching_vectors() {
         let acceleration = Vec3::new(1.0, -2.0, 3.0);
         assert_eq!(relative_vector_error(acceleration, acceleration), 0.0);
+    }
+
+    #[test]
+    fn comparison_pacer_rejects_immediate_resubmission_and_allows_after_interval() {
+        let mut pacer = BasiliskComparisonPacer::default();
+        assert!(pacer.allow());
+        assert!(!pacer.allow());
+        pacer.last_call = Some(Instant::now() - BASILISK_COMPARISON_MIN_INTERVAL);
+        assert!(pacer.allow());
     }
 }

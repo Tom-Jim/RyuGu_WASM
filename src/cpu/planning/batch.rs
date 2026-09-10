@@ -410,16 +410,22 @@ impl PlanningBatchBuilder {
             .map(|velocity| velocity.to_array())
             .collect();
         let reference_jets = self.reference_jets.get(start_sample..=end_sample)?;
+        #[derive(serde::Serialize)]
+        struct CandidateJet {
+            time: f64,
+            rotation: [f64; 4],
+            position: [f64; 3],
+            acceleration: [f64; 3],
+            jacobian: [f64; 9],
+        }
         let jets: Vec<_> = reference_jets
             .iter()
-            .map(|jet| {
-                serde_json::json!({
-                    "time": jet.simulation_time_seconds,
-                    "rotation": jet.body_rotation.to_array(),
-                    "position": jet.world_position.to_array(),
-                    "acceleration": jet.world_acceleration.to_array(),
-                    "jacobian": jet.world_jacobian.to_cols_array(),
-                })
+            .map(|jet| CandidateJet {
+                time: jet.simulation_time_seconds,
+                rotation: jet.body_rotation.to_array(),
+                position: jet.world_position.to_array(),
+                acceleration: jet.world_acceleration.to_array(),
+                jacobian: jet.world_jacobian.to_cols_array(),
             })
             .collect();
         let sources: Vec<_> = self
@@ -431,7 +437,7 @@ impl PlanningBatchBuilder {
         struct CandidateRequest<'a> {
             positions: &'a [[f64; 3]],
             velocities: &'a [[f64; 3]],
-            jets: &'a [serde_json::Value],
+            jets: &'a [CandidateJet],
             sources: &'a [([f64; 3], f64)],
         }
         serde_json::to_string(&CandidateRequest {

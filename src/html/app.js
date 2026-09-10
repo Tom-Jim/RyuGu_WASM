@@ -34,7 +34,7 @@ const app = createApp({
         <div class="mt-1 h-1.5 overflow-hidden rounded bg-cyan-950/80" role="progressbar" :aria-label="labels[kind] + ' calculation progress'" :aria-valuenow="tracked[kind].progress" aria-valuemin="0" aria-valuemax="100">
           <div class="h-full rounded bg-cyan-300" :style="{ width: tracked[kind].progress + '%' }"></div>
         </div>
-        <div class="mt-1 font-mono text-[9px] text-slate-500">{{ tracked[kind].running ? tracked[kind].progress + '% complete' : tracked[kind].completed ? 'Complete' : tracked[kind].progress > 0 ? 'Stopped' : 'Ready' }}</div>
+        <div class="mt-1 font-mono text-[9px] text-slate-500">{{ tracked[kind].running ? 'Running · ' + tracked[kind].progress + '%' : tracked[kind].completed ? 'Complete' : tracked[kind].progress > 0 ? 'Stopped · ' + tracked[kind].progress + '%' : 'Ready' }}</div>
       </div>
     </section>
   `,

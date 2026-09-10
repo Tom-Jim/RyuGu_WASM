@@ -334,6 +334,7 @@ pub(crate) fn browser_ui_action_system(
                 };
                 if let Some(profile) = profile {
                     planning.workload_profile = profile;
+                    planning.workload_selected = true;
                     if planning.selected_metric.is_inversion() {
                         planning.selected_metric = ComparisonMetric::SpeedupVsGpuFmm;
                     }
@@ -450,6 +451,7 @@ pub(crate) fn browser_ui_action_system(
                 planning.computation_complete = false;
                 planning.stopped_operation_work = 0.0;
                 planning.workload_profile = PlanningWorkloadProfile::SourceCrossover;
+                planning.workload_selected = false;
                 planning.selected_metric = ComparisonMetric::SpeedupVsGpuFmm;
                 planning.requested_source_count = PLANNING_SOURCE_COUNTS[0];
                 planning.source_curve_active = true;

@@ -4,6 +4,10 @@ pub struct PlanningComparisonState {
     pub selected_metric: ComparisonMetric,
     pub accuracy_profile: PlanningAccuracyProfile,
     pub workload_profile: PlanningWorkloadProfile,
+    /// False until the user explicitly starts First or Stress. The profile
+    /// remains useful as an internal default but must not paint a button as
+    /// selected before the user requests a calculation.
+    pub workload_selected: bool,
     pub results: [Option<PlanningMethodMetrics>; 5],
     pub run_requested: bool,
     pub run_id: u64,
@@ -87,6 +91,7 @@ impl Default for PlanningComparisonState {
             selected_metric: ComparisonMetric::DensityFit,
             accuracy_profile: PlanningAccuracyProfile::default(),
             workload_profile: PlanningWorkloadProfile::First,
+            workload_selected: false,
             results: std::array::from_fn(|_| None),
             run_requested: false,
             run_id: 0,
@@ -95,7 +100,7 @@ impl Default for PlanningComparisonState {
             source_curve_run_id: 0,
             stopped_operation_work: 0.0,
             reference_duration_seconds: 0.0,
-            status: "Choose a planning metric to run First, or use inversion metrics with the inversion button.".into(),
+            status: "Select First or Stress to start a planning calculation.".into(),
             batch_job: None,
             preparation_progress: 0.0,
             requested_source_count: PLANNING_SOURCE_COUNTS[0],

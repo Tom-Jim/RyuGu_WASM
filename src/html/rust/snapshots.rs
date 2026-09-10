@@ -281,6 +281,7 @@ pub(crate) fn browser_ui_publish_system(
             "targets": state.planning.dimensions().2,
             "metric": metric_key(state.planning.selected_metric),
             "workload": workload_key(state.planning.workload_profile),
+            "workloadSelected": state.planning.workload_selected,
             "results": planning_results,
             "curve": curve,
             "progress": progress,
