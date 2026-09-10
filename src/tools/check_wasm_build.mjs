@@ -29,4 +29,7 @@ for (const file of ["pkg/ryugu_wasm.js", "pkg/backend/ryugu_backend.js"]) {
   }
 }
 assert(existsSync(join(root, "pkg/backend.mjs")), "Missing C++ host");
+for (const file of ["src/html/backend-client.js", "src/html/backend-worker.js"]) {
+  assert(existsSync(join(root, file)), `Missing numerical Worker source ${file}`);
+}
 console.log("Static module checks passed; no WASM instantiated or executed.");
