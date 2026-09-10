@@ -128,6 +128,32 @@ backend_channel!(
     ()
 );
 
+/// Every numerical-worker channel in one system parameter.
+///
+/// Cancelling an experiment (method switch, probe edit, crash reset) must never
+/// leave a channel stuck with `in_flight` set, otherwise no later request can
+/// ever be submitted on it.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct BackendChannels<'w> {
+    pub advance: Res<'w, BackendAdvanceChannel>,
+    pub evaluate_sources: Res<'w, BackendEvaluateSourcesChannel>,
+    pub candidates: Res<'w, BackendCandidatesChannel>,
+    pub density: Res<'w, BackendDensityChannel>,
+    pub evaluate: Res<'w, BackendEvaluateChannel>,
+    pub configure: Res<'w, BackendConfigureChannel>,
+}
+
+impl BackendChannels<'_> {
+    pub fn reset_all(&self) {
+        self.advance.reset();
+        self.evaluate_sources.reset();
+        self.candidates.reset();
+        self.density.reset();
+        self.evaluate.reset();
+        self.configure.reset();
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
 struct BackendDeliveryChannels {
@@ -275,9 +301,6 @@ export function cpp_evaluate(method, x, y, z) {
 export function cpp_sources(method, xyz, masses, targets) {
     return globalThis.ryuguRustBackend.evaluate_sources(method, xyz, masses, targets);
 }
-export function backend_solve_density(data) {
-    return globalThis.ryuguRustBackend.solve_density(data);
-}
 export function backend_candidates(data) {
     return globalThis.ryuguRustBackend.propagate_candidates(data);
 }
@@ -320,8 +343,6 @@ extern "C" {
     fn backend_worker_ready() -> bool;
     #[wasm_bindgen(catch)]
     fn backend_candidates(data: &str) -> Result<Vec<f64>, JsValue>;
-    #[wasm_bindgen(catch)]
-    fn backend_solve_density(data: &str) -> Result<Vec<f32>, JsValue>;
     #[wasm_bindgen(catch)]
     fn cpp_configure(
         cells: &[f64],
@@ -579,6 +600,7 @@ pub fn request_configure(
     }
 }
 
+#[allow(dead_code)]
 pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, String> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -589,11 +611,6 @@ pub fn propagate_candidates(data: &str) -> Result<Vec<f64>, String> {
         let _ = data;
         Err("Candidate backend requires WASM".into())
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn solve_density(data: &str) -> Result<Vec<f32>, String> {
-    backend_solve_density(data).map_err(|e| format!("Rust density backend: {e:?}"))
 }
 
 pub fn evaluate_sources(
@@ -925,5 +942,80 @@ mod backend_channel_tests {
         let packet = channel.data.lock().unwrap().take().unwrap();
         assert_eq!(packet.snapshot, current);
         assert_eq!(packet.result.unwrap(), vec![2.0]);
+    }
+
+    #[test]
+    fn cancelling_an_experiment_clears_every_worker_channel() {
+        let mut app = App::new();
+        app.init_resource::<BackendAdvanceChannel>()
+            .init_resource::<BackendEvaluateSourcesChannel>()
+            .init_resource::<BackendCandidatesChannel>()
+            .init_resource::<BackendDensityChannel>()
+            .init_resource::<BackendEvaluateChannel>()
+            .init_resource::<BackendConfigureChannel>()
+            .add_systems(Update, |channels: BackendChannels| channels.reset_all());
+
+        {
+            let world = app.world_mut();
+            for in_flight in [
+                world.resource::<BackendAdvanceChannel>().in_flight.clone(),
+                world
+                    .resource::<BackendEvaluateSourcesChannel>()
+                    .in_flight
+                    .clone(),
+                world
+                    .resource::<BackendCandidatesChannel>()
+                    .in_flight
+                    .clone(),
+                world.resource::<BackendDensityChannel>().in_flight.clone(),
+                world.resource::<BackendEvaluateChannel>().in_flight.clone(),
+                world
+                    .resource::<BackendConfigureChannel>()
+                    .in_flight
+                    .clone(),
+            ] {
+                in_flight.store(true, Ordering::Release);
+            }
+        }
+
+        app.update();
+
+        let world = app.world();
+        for in_flight in [
+            world
+                .resource::<BackendAdvanceChannel>()
+                .in_flight
+                .load(Ordering::Acquire),
+            world
+                .resource::<BackendEvaluateSourcesChannel>()
+                .in_flight
+                .load(Ordering::Acquire),
+            world
+                .resource::<BackendCandidatesChannel>()
+                .in_flight
+                .load(Ordering::Acquire),
+            world
+                .resource::<BackendDensityChannel>()
+                .in_flight
+                .load(Ordering::Acquire),
+            world
+                .resource::<BackendEvaluateChannel>()
+                .in_flight
+                .load(Ordering::Acquire),
+            world
+                .resource::<BackendConfigureChannel>()
+                .in_flight
+                .load(Ordering::Acquire),
+        ] {
+            assert!(!in_flight);
+        }
+        assert!(
+            world
+                .resource::<BackendAdvanceChannel>()
+                .snapshot
+                .lock()
+                .unwrap()
+                .is_none()
+        );
     }
 }

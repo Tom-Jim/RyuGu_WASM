@@ -1,6 +1,6 @@
 pub fn apply_probe_input_system(
     probe: Res<ProbeInitialConditions>,
-    advance_channel: Res<crate::cpp_backend::BackendAdvanceChannel>,
+    channels: crate::cpp_backend::BackendChannels,
     mut gravity_acceleration: ResMut<GravityAcceleration>,
     mut werner_acceleration: Option<ResMut<WernerAcceleration>>,
     mut gravity_blend: ResMut<GravityBlendFactor>,
@@ -22,7 +22,7 @@ pub fn apply_probe_input_system(
     if !probe.is_changed() {
         return;
     }
-    advance_channel.reset();
+    channels.reset_all();
     gravity_acceleration.0 = Vec3::ZERO;
     if let Some(acceleration) = werner_acceleration.as_deref_mut() {
         acceleration.0 = Vec3::ZERO;
@@ -125,7 +125,7 @@ pub fn reset_after_probe_crash_state_system(
     mut performance: ResMut<PerformanceComparisonState>,
     mut inversion: ResMut<TrajectoryInversionState>,
     mut clock: ResMut<SimulationClock>,
-    advance_channel: Res<crate::cpp_backend::BackendAdvanceChannel>,
+    channels: crate::cpp_backend::BackendChannels,
     mut blend: ResMut<GravityBlendFactor>,
     mut acceleration: ResMut<GravityAcceleration>,
     mut potential: ResMut<GravityPotential>,
@@ -145,7 +145,7 @@ pub fn reset_after_probe_crash_state_system(
         return;
     }
     *reset_request = ProbeCrashResetRequest(false);
-    advance_channel.reset();
+    channels.reset_all();
     *active_method = ActiveGravityMethod::RadialAnalytic;
     *performance = PerformanceComparisonState::default();
     *inversion = TrajectoryInversionState::default();

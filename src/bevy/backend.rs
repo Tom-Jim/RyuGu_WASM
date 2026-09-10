@@ -71,7 +71,7 @@ pub fn method_selection_system(
 
 pub fn clear_gpu_histories_on_method_change(
     active: Res<ActiveGravityMethod>,
-    advance_channel: Res<crate::cpp_backend::BackendAdvanceChannel>,
+    channels: crate::cpp_backend::BackendChannels,
     mut werner: Option<ResMut<WernerGravityHistory>>,
     mut mmfft: Option<ResMut<MmfftCompressedHistory>>,
     mut fmm: Option<ResMut<FmmGravityHistory>>,
@@ -79,7 +79,7 @@ pub fn clear_gpu_histories_on_method_change(
     if !active.is_changed() {
         return;
     }
-    advance_channel.reset();
+    channels.reset_all();
     // Radial history belongs only to its pointwise evaluator. Epoch checks
     // prevent any old sample from participating in a new experiment.
     if let Some(value) = werner.as_deref_mut() {
