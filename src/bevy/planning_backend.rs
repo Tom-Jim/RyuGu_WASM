@@ -1,6 +1,7 @@
 pub fn update_planning_results_from_inversion_system(
     mut commands: Commands,
     inversion: Res<TrajectoryInversionState>,
+    active_method: Res<ActiveGravityMethod>,
     radial: Option<Res<DensityQuadratureSource>>,
     aggregated: Option<Res<crate::cpu::frequency_domain::AggregatedGravitySource>>,
     cpp: Res<crate::cpp_backend::CppBackendState>,
@@ -27,9 +28,16 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     let Some(capture_id) = inversion.capture_id else {
+        let note = inversion
+            .capture_note
+            .as_deref()
+            .unwrap_or("keep the live orbit moving");
         planning.status = format!(
-            "{} planning queued: freeze a reference trajectory first.",
-            planning.workload_profile.label()
+            "{} capturing a live reference arc: {:.1}/0.8 s, {} samples, on {}. {note}.",
+            planning.workload_profile.label(),
+            inversion.wall_elapsed_seconds,
+            inversion.capture_trace.len(),
+            active_method.as_str(),
         );
         return;
     };
@@ -99,9 +107,10 @@ pub fn update_planning_results_from_inversion_system(
     }
     let builder = batch_builder.as_mut().expect("matched planning builder");
     let propagation_budget = match planning.workload_profile {
-        PlanningWorkloadProfile::First => PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME,
+        PlanningWorkloadProfile::First | PlanningWorkloadProfile::SourceCrossover => {
+            PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME
+        }
         PlanningWorkloadProfile::InteractiveStress => PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME,
-        PlanningWorkloadProfile::SourceCrossover => 1,
     };
     if !builder.advance(propagation_budget, &candidates_channel) {
         planning.status = builder

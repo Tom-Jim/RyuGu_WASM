@@ -57,14 +57,13 @@ pub fn method_selection_system(
         transform.rotation = Quat::IDENTITY;
         transform.translation = Vec3::ZERO;
     }
-    let queued_inversion = inversion.start_requested;
     inversion.preserve_truth_track = false;
     inversion.optimizer = None;
     inversion.reset_live_capture();
     inversion.truth_knots.clear();
     inversion.truth_capture_id = None;
     inversion.capture_id = None;
-    inversion.start_requested = queued_inversion;
+    inversion.start_requested = false;
     frequency_domain_result.capture_id = None;
     frequency_domain_result.observations.clear();
 }
@@ -105,12 +104,13 @@ pub fn reset_inversion_on_method_change(
     if !active.is_changed() || performance.active {
         return;
     }
-    let queued_inversion = inversion.start_requested;
     inversion.capture_id = None;
     inversion.capture_source_hash = 0;
     inversion.reset_live_capture();
     inversion.optimizer = None;
-    inversion.start_requested = queued_inversion;
+    inversion.preserve_best_results_on_next_epoch = true;
+    // Recapture on the new method; do not auto-start Invert from a queued click.
+    inversion.start_requested = false;
     inversion.error = None;
 }
 

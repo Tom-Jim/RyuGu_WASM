@@ -5,18 +5,23 @@
   "main": "src/tools/run.mjs",
   "module": "src/tools/run.mjs",
   "scripts": {
-    "start": "node src/tools/run.mjs",
-    "preview": "node src/tools/run.mjs",
-    "dev": "node src/tools/run.mjs --dev",
+    "start": "bun src/tools/run.mjs",
+    "preview": "bun src/tools/run.mjs",
+    "dev": "bun src/tools/run.mjs --dev",
     "serve": "bun src/server.ts",
-    "fetch:cpp": "node src/tools/fetch_cpp.mjs",
-    "build:cpp": "node src/tools/build_cpp_wasm.mjs",
-    "build:backend": "bun run build:cpp && node src/tools/build_rust_backend.mjs",
-    "check:wasm": "node src/tools/check_wasm_build.mjs",
-    "build:wasm": "node src/tools/build_wasm.mjs --dev",
-    "build": "node src/tools/build_wasm.mjs --release",
-    "styles": "bunx @tailwindcss/cli -i src/html/tailwind.css -o src/html/tailwind.generated.css --minify"
+    "fetch:cpp": "bun src/tools/fetch_cpp.mjs",
+    "build:cpp": "bun src/tools/build_cpp_wasm.mjs",
+    "build:backend": "bun run build:cpp && bun src/tools/build_rust_backend.mjs",
+    "check:js": "bun src/tools/check_js.mjs",
+    "check:wasm": "bun src/tools/check_wasm_build.mjs",
+    "build:wasm": "bun src/tools/build_wasm.mjs --dev",
+    "build": "bun src/tools/build_wasm.mjs --release",
+    "styles": "bun x @tailwindcss/cli -i src/html/tailwind.css -o src/html/tailwind.generated.css --minify"
   },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "packageManager": "bun@1.3.14",
   "dependencies": {
     "echarts": "^6.1.0",
     "vue": "^3.5.0",

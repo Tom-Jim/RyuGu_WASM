@@ -1,3 +1,16 @@
+window.ryuguRawTimingKey = (timingKey = 'times') => ({
+  times: 'rawTimes',
+  kernelTimes: 'rawKernelTimes',
+  evaluationKernelTimes: 'rawEvaluationKernelTimes',
+}[timingKey] ?? timingKey);
+
+window.ryuguMeasuredTime = (sample, index, timingKey = 'times') => {
+  const published = sample?.[timingKey]?.[index];
+  if (Number.isFinite(published) && published >= 0) return published;
+  const raw = sample?.[window.ryuguRawTimingKey(timingKey)]?.[index];
+  return Number.isFinite(raw) && raw >= 0 ? raw : published;
+};
+
 // Shared by both chart renderers. A timing cell is published only after all
 // seven distinct repetitions pass; never take a median of just the survivors.
 window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats = 7, timingKey = 'times') => {
@@ -17,14 +30,12 @@ window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats 
         && Number.isFinite(sample.times?.[index]) && sample.times[index] > 0);
       const rejected = rows.length - valid.length;
       const qualified = complete && rejected === 0;
-      // `value`/`low`/`high` are the published timing: null unless every
-      // repetition passed the accuracy gate. A failed cell must never be
-      // plotted as a point or range. `observed` is a diagnostic-only median of
-      // the completed repetitions so a FAIL cell can be marked with a warning
-      // marker instead of an empty chart that suggests no measurement was made.
-      const measured = rows.map((sample) => sample[timingKey]?.[index]);
+      // `value`/`low`/`high` stay fail-closed: null unless every repetition
+      // passed the accuracy gate. `observed` reads rawTimes when the snapshot
+      // stripped `times`, so a computed-but-ineligible cell still has a median.
+      const measured = rows.map((sample) => window.ryuguMeasuredTime(sample, index, timingKey));
       const timingAvailable = complete && measured.every((time) => Number.isFinite(time) && time >= 0);
-      const sorted = timingAvailable ? measured.sort((a, b) => a - b) : [];
+      const sorted = timingAvailable ? [...measured].sort((a, b) => a - b) : [];
       const median = sorted.length ? (sorted[Math.floor(sorted.length / 2)] + sorted[Math.ceil(sorted.length / 2) - 1]) / 2 : null;
       const published = qualified && timingAvailable;
       const maximumError = (key) => rows.every((sample) => Number.isFinite(sample[key]?.[index]))
@@ -49,9 +60,9 @@ window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats 
   });
 };
 
-// A full source axis is shared by every series. Missing/failed cells remain
-// explicit gaps (line breaks); completed cells do not wait for the rest of the
-// sweep. Failed cells are exposed only as separate warning markers.
+// Qualified cells are the solid/dashed series. Completed FAIL cells with
+// measured rawTimes become an ineligible series plus warning markers so a
+// strict miss is not mistaken for a skipped method.
 window.ryuguCurvePlotData = (groups, sourceCounts) => {
   const bySource = new Map(groups.map((group) => [group.sources, group]));
   return Array.from({ length: 6 }, (_, methodIndex) => ({
@@ -83,6 +94,7 @@ window.ryuguPlanningProgress = (planning) => ({
   completed: planning.completed === true,
   workCompleted: Number(planning.workCompleted) || 0,
   workTotal: Number(planning.workTotal) || 0,
+  phase: planning.progressPhase || '',
 });
 
 (() => {
@@ -212,9 +224,11 @@ window.ryuguPlanningProgress = (planning) => ({
     const height = fitViewport ? Math.max(svg.clientHeight, 240) : 430;
     const margin = { l: 104, r: 28, t: 22, b: 70 };
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    const isChartPoint = (point) => Number.isFinite(point?.[0]) && Number.isFinite(point?.[1])
+      && (!yLog || point[1] > 0);
     const points = series
-      .flatMap((item) => item.points)
-      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!yLog || point[1] > 0));
+      .flatMap((item) => [...(item.points ?? []), ...(item.failed ?? [])])
+      .filter(isChartPoint);
     const categoryIndex = xCategories ? new Map(xCategories.map((value, index) => [value, index])) : null;
     const transformX = (value) => categoryIndex ? categoryIndex.get(value) : value;
     const transformY = (value) => yLog ? Math.log10(value) : value;
@@ -287,12 +301,11 @@ window.ryuguPlanningProgress = (planning) => ({
       return;
     }
     series.forEach((item) => {
-      const isValid = (point) => Number.isFinite(point[0]) && Number.isFinite(point[1]) && (!yLog || point[1] > 0);
-      const valid = item.points.filter(isValid);
+      const valid = (item.points ?? []).filter(isChartPoint);
       if (valid.length) {
         let connected = false;
         const path = item.points.map((point) => {
-          if (!isValid(point)) { connected = false; return ''; }
+          if (!isChartPoint(point)) { connected = false; return ''; }
           const command = connected ? 'L' : 'M';
           connected = true;
           return `${command}${pixelX(point[0]).toFixed(2)},${pixelY(point[1]).toFixed(2)}`;
@@ -325,18 +338,36 @@ window.ryuguPlanningProgress = (planning) => ({
           svg.append(marker);
         });
       }
-      for (const point of item.failed ?? []) {
+      const failed = (item.failed ?? []).filter(isChartPoint);
+      if (failed.length) {
+        let connected = false;
+        const path = failed.map((point) => {
+          const command = connected ? 'L' : 'M';
+          connected = true;
+          return `${command}${pixelX(point[0]).toFixed(2)},${pixelY(point[1]).toFixed(2)}`;
+        }).join(' ');
+        svg.append(svgNode('path', {
+          d: path,
+          stroke: item.color,
+          class: 'chart-line chart-line-ineligible',
+          'stroke-dasharray': '3 4',
+          'stroke-opacity': '0.9',
+        }));
+      }
+      for (const point of failed) {
         const marker = svgNode('circle', {
           cx: pixelX(point[0]).toFixed(2),
           cy: pixelY(point[1]).toFixed(2),
-          r: 4,
-          fill: '#ff7d89',
-          stroke: '#061013',
-          'stroke-width': 1,
+          r: 4.5,
+          fill: item.color,
+          stroke: '#ff7d89',
+          'stroke-width': 2,
           class: 'chart-point chart-point-failed',
         });
         const sourceLabel = categoryIndex ? `${point[0] / 1000}K` : formatAxis(point[0]);
-        marker.append(svgNode('title', {}, `${item.label} at ${sourceLabel}: ${formatAxis(point[1])} ms; accuracy gate failed`));
+        const stats = point[2];
+        const reasons = stats?.reasons?.length ? stats.reasons.join(', ') : 'accuracy';
+        marker.append(svgNode('title', {}, `${item.label} at ${sourceLabel}: ${formatAxis(point[1])} ms; computed but ineligible (${reasons})`));
         svg.append(marker);
       }
     });
@@ -352,12 +383,9 @@ window.ryuguPlanningProgress = (planning) => ({
     }));
   }
 
-  function exportQuadrature(planning, selection, source) {
-    // Build a detached, self-contained SVG at fixed resolution. Do not depend
-    // on layout, the visible dropdowns, screenshots of the desktop, or RAF.
-    const timingKey = selection.timingKey;
-    const strict = selection.accuracyProfile === 'strict';
-    const rows = (planning.curve ?? []).filter((row) => row.sources <= source).map((row) => {
+  function curveDisplayRows(curve, accuracyProfile) {
+    const strict = accuracyProfile === 'strict';
+    return (curve ?? []).map((row) => {
       const masks = strict ? row.strictFailures : row.screeningFailures;
       return {
         ...row,
@@ -369,6 +397,22 @@ window.ryuguPlanningProgress = (planning) => ({
           : row.screeningFailureReasons ?? row.failureReasons,
       };
     });
+  }
+
+  function seriesLegendLabel(item) {
+    const hasPass = (item.points ?? []).some((point) => Number.isFinite(point[1]));
+    const hasFail = (item.failed ?? []).length > 0;
+    if (hasFail && !hasPass) return `${item.label} (measured, ineligible)`;
+    if (hasFail) return `${item.label} (includes ineligible)`;
+    return item.label;
+  }
+
+  function exportQuadrature(planning, selection, source) {
+    // Build a detached, self-contained SVG at fixed resolution. Do not depend
+    // on layout, the visible dropdowns, screenshots of the desktop, or RAF.
+    const timingKey = selection.timingKey;
+    const rows = curveDisplayRows(planning.curve, selection.accuracyProfile)
+      .filter((row) => row.sources <= source);
     const groups = window.ryuguCurveStatistics(rows, selection.densityModels,
       selection.targets, planning.requiredRepeats, timingKey);
     const series = curveSeries(groups, timingKey);
@@ -389,20 +433,24 @@ window.ryuguPlanningProgress = (planning) => ({
     text(32, 88, `Kρ=${selection.densityModels} · Nt=${selection.targets} · ${selection.accuracyProfile} · ${timingKey} · 7 repetitions / median / min–max`);
     const completed = groups.filter((group) => group.methods.every((method) => method.count >= (planning.requiredRepeats ?? 7))).length;
     text(32, 122, `Milestone ${source / 1000}K · ${completed}/9 source sizes complete · ${new Date().toISOString()}`);
-    text(32, 155, 'Finished FAIL cells remain gaps. Screenshots keep the parameters selected at task launch.', { fill: '#98b4bc' });
+    text(32, 155, 'Ineligible cells keep measured rawTimes as a dotted series. Screenshots keep the parameters selected at task launch.', { fill: '#98b4bc' });
     const chart = svgNode('svg', { x: 20, y: 174, width: 1760, height: 840 });
     drawChart(chart, series, {
       yLog: true, xCategories: quadratureSourceCounts, xLabel: 'source points',
       yLabel: `${timingKey === 'times' ? 'pipeline total' : 'GPU kernels'} median / min–max (ms)`,
-      empty: 'Completed cells have no qualified positive timings; see the accuracy results below.',
+      empty: 'Completed cells have no measured timings; see the accuracy results below.',
     });
     root.append(chart);
     series.forEach((item, index) => {
       const x = 32 + (index % 3) * 580;
       const y = 1040 + Math.floor(index / 3) * 38;
+      const ineligibleOnly = (item.failed ?? []).length > 0
+        && !(item.points ?? []).some((point) => Number.isFinite(point[1]));
       root.append(svgNode('line', { x1: x, x2: x + 42, y1: y - 7, y2: y - 7,
-        stroke: item.color, 'stroke-width': 3, ...(item.dashed ? { 'stroke-dasharray': '8 5' } : {}) }));
-      text(x + 52, y, item.label);
+        stroke: item.color, 'stroke-width': 3,
+        ...(ineligibleOnly ? { 'stroke-dasharray': '3 4' }
+          : item.dashed ? { 'stroke-dasharray': '8 5' } : {}) }));
+      text(x + 52, y, seriesLegendLabel(item));
     });
     text(32, 1130, `${source / 1000}K accuracy / timings (ms)`, { style: 'font-weight:bold' });
     text(680, 1130, 'Status / median');
@@ -412,7 +460,10 @@ window.ryuguPlanningProgress = (planning) => ({
     cell?.methods.forEach((method, index) => {
       const y = 1172 + index * 42;
       text(32, y, series[index].label);
-      text(680, y, `${method.status} ${method.count}/7 · ${formatAxis(method.value)}`);
+      const timing = Number.isFinite(method.value) ? method.value : method.observed;
+      const gate = method.status === 'FAIL' && Number.isFinite(method.observed)
+        ? 'measured, ineligible' : method.status;
+      text(680, y, `${gate} ${method.count}/7 · ${formatAxis(timing)}`);
       text(1030, y, `${formatAxis(method.low)}–${formatAxis(method.high)}`);
       text(1370, y, `${formatAxis(method.gravityError)} / ${formatAxis(method.gradientError)}`);
     });
@@ -430,7 +481,8 @@ window.ryuguPlanningProgress = (planning) => ({
     const dataKey = JSON.stringify([planning.runId, planning.accuracyProfile,
       selection.densityModels, selection.targets, planning.requiredRepeats, timingKey, planning.curve?.length ?? 0]);
     if (dataKey !== lastCurveDataKey) {
-      lastCurveGroups = window.ryuguCurveStatistics(planning.curve,
+      lastCurveGroups = window.ryuguCurveStatistics(
+        curveDisplayRows(planning.curve, planning.accuracyProfile),
         selection.densityModels, selection.targets, planning.requiredRepeats, timingKey);
       lastCurveDataKey = dataKey;
       lastCurveRenderKey = null;
@@ -445,6 +497,9 @@ window.ryuguPlanningProgress = (planning) => ({
       + group.methods.filter((method) => method.status === 'PASS' && Number.isFinite(method.value)).length, 0);
     const failed = groups.reduce((total, group) => total
       + group.methods.filter((method) => method.status === 'FAIL').length, 0);
+    const failedMeasured = groups.reduce((total, group) => total
+      + group.methods.filter((method) => method.status === 'FAIL' && Number.isFinite(method.observed)).length, 0);
+    const failedPending = failed - failedMeasured;
     const unavailable = groups.reduce((total, group) => total
       + group.methods.filter((method) => method.status === 'PASS' && !Number.isFinite(method.value)).length, 0);
     const pending = groups.find((group) => group.methods.some((method) => method.count < required));
@@ -453,12 +508,32 @@ window.ryuguPlanningProgress = (planning) => ({
     const progress = pending
       ? ` · ${pending.sources / 1000}K accumulating ${pending.methods[0].count}/${required} repetitions`
       : '';
-    status.textContent = `${complete.length}/${quadratureSourceCounts.length} source sizes complete · ${plotted} qualified method points plotted${failed ? ` · ${failed} failed method cells shown as warning markers` : ''}${unavailable ? ` · ${unavailable} timestamp cells unavailable/below resolution` : ''}${progress}. Each completed source size adds its points immediately.`;
+    const ineligibleText = failedMeasured
+      ? ` · ${failedMeasured} computed but ineligible method cells (measured times shown dashed with warning markers)`
+      : '';
+    const pendingFailText = failedPending
+      ? ` · ${failedPending} ineligible cells still accumulating or without usable timings`
+      : '';
+    status.textContent = `${complete.length}/${quadratureSourceCounts.length} source sizes complete · ${plotted} qualified method points plotted${ineligibleText}${pendingFailText}${unavailable ? ` · ${unavailable} timestamp cells unavailable/below resolution` : ''}${progress}. Each completed source size adds its points immediately.`;
     const errorText = (value) => Number.isFinite(value) ? value.toExponential(2) : 'unavailable';
-    $('#quadrature-accuracy').textContent = groups.length ? groups.map((group) =>
-      `${group.sources / 1000}K: ` + group.methods.map((method, index) =>
-        `${curveLabels[index]} ${planning.accuracyProfile} ${method.status} (${method.count}/${required}${method.rejected ? `; ${method.rejected} failed` : ''}; strict ${method.strictPassed}/${method.count}; εg=${errorText(method.gravityError)}, ε∇g=${errorText(method.gradientError)}${method.reasons.length ? '; reasons: ' + method.reasons.join(', ') : ''}${method.status === 'PASS' && !Number.isFinite(method.value) ? '; timestamp unavailable/below resolution' : ''})`
-      ).join(' · ')).join('\n') : 'No completed repetitions for this Kρ × Nt cell.';
+    const accuracyLines = groups.flatMap((group) => [
+      `${group.sources / 1000}K`,
+      ...group.methods.map((method, index) => {
+        const measured = Number.isFinite(method.observed)
+          ? `; measured ${formatAxis(method.observed)} ms${method.status === 'FAIL' ? ', ineligible' : ''}` : '';
+        const reasons = method.reasons.length ? `; reasons: ${method.reasons.join(', ')}` : '';
+        const timestamp = method.status === 'PASS' && !Number.isFinite(method.value)
+          ? '; timestamp unavailable/below resolution' : '';
+        return `  ${curveLabels[index]} — ${planning.accuracyProfile} ${method.status} (${method.count}/${required}${method.rejected ? `; ${method.rejected} failed` : ''}; strict ${method.strictPassed}/${method.count}; εg=${errorText(method.gravityError)}, ε∇g=${errorText(method.gradientError)}${reasons}${measured}${timestamp})`;
+      }),
+    ]);
+    $('#quadrature-accuracy').textContent = accuracyLines.length
+      ? accuracyLines.join('\n') : 'No completed repetitions for this Kρ × Nt cell.';
+    const accuracyDetails = $('#quadrature-accuracy')?.closest('details');
+    if (accuracyDetails && failedMeasured) accuracyDetails.open = true;
+    $('#quadrature-accuracy-summary').textContent = failedMeasured
+      ? `Accuracy details — ${planning.accuracyProfile ?? 'strict'} profile (worst repetition RMS) · ${failedMeasured} computed but ineligible`
+      : `Accuracy details — ${planning.accuracyProfile ?? 'strict'} profile (worst repetition RMS)`;
     // Preserve existing point nodes between new results (and their tooltips).
     // A seventh repetition updates immediately; task completion is not a gate.
     const key = JSON.stringify([planning.runId, planning.accuracyProfile,
@@ -472,7 +547,8 @@ window.ryuguPlanningProgress = (planning) => ({
         xLabel: 'source points',
         yLabel: `${timingTitle} median / min–max (ms)`,
         empty: unavailable ? 'GPU timestamps unavailable or below timer resolution; pipeline totals remain available.'
-          : failed ? 'Completed repetitions failed accuracy; warning markers show their measured timings.'
+          : failedMeasured ? 'Completed methods missed the accuracy gate; dotted series show measured but ineligible timings.'
+          : failed ? 'Completed repetitions failed accuracy and have no usable timings yet.'
           : 'Waiting for the first source size to complete 7 passing repetitions…',
       });
       makeLegend($('#curve-legend'), series);
@@ -488,8 +564,10 @@ window.ryuguPlanningProgress = (planning) => ({
     const entries = series.map((item) => {
       const span = document.createElement('span');
       span.style.setProperty('--series', item.color);
-      span.dataset.lineStyle = item.dashed ? 'certified' : 'raw';
-      span.textContent = item.label;
+      const hasPass = (item.points ?? []).some((point) => Number.isFinite(point[1]));
+      const hasFail = (item.failed ?? []).length > 0;
+      span.dataset.lineStyle = hasFail && !hasPass ? 'ineligible' : item.dashed ? 'certified' : 'raw';
+      span.textContent = seriesLegendLabel(item);
       return span;
     });
     container.replaceChildren(...entries);
@@ -537,8 +615,7 @@ window.ryuguPlanningProgress = (planning) => ({
     $('#planning-accuracy-note').dataset.profile = planning.accuracyProfile;
     $('#quadrature-accuracy-policy').dataset.profile = planning.accuracyProfile;
     $('#planning-accuracy-note').textContent = `${accuracyLabel}. ${thresholdText}. ${planning.implementation ?? ''}`;
-    $('#quadrature-accuracy-policy').textContent = `${accuracyLabel}. ${thresholdText}. Each source size is plotted after 7 passing repetitions.`;
-    $('#quadrature-accuracy-summary').textContent = `Accuracy details — ${planning.accuracyProfile ?? 'strict'} profile (worst repetition RMS)`;
+    $('#quadrature-accuracy-policy').textContent = `${accuracyLabel}. ${thresholdText}. Qualified points require 7 passing repetitions. Computed but ineligible timings stay on the chart as a dotted series with warning markers.`;
     pressed('[data-action="planning-metric"]', (button) => button.dataset.value === planning.metric);
     pressed('[data-action="planning-workload"]', (button) => (
       planning.workloadSelected === true && button.dataset.value === planning.workload
@@ -548,18 +625,19 @@ window.ryuguPlanningProgress = (planning) => ({
         planning.running === true && button.dataset.value === planning.workload
       ));
     });
-    const inversionRows = (lastSnapshot?.inversion?.results ?? []).filter(Boolean);
+    const inversionRows = (() => {
+      const best = (lastSnapshot?.inversion?.bestResults ?? []).filter(Boolean);
+      if (best.length) return best;
+      return (lastSnapshot?.inversion?.results ?? []).filter(Boolean);
+    })();
     const rows = planning.metric === 'density' || planning.metric === 'inversion-time'
       ? inversionRows
       : (planning.results ?? []).filter(Boolean);
     const [field, unit] = metricFields[planning.metric] ?? ['totalMs', 'ms'];
     if (planning.metric === 'density') {
-      const displayed = lastSnapshot?.inversion?.displayed;
       $('#planning-result').textContent = rows.length
         ? rows.map((row) => `${row.method}: ${densityText(row)}`).join(' · ')
-        : displayed
-          ? `${displayed.method}: ${densityText(displayed)}`
-          : 'Waiting for density inversion result.';
+        : 'Waiting for density inversion result.';
       return;
     }
     if (planning.metric === 'inversion-time') {
@@ -569,11 +647,19 @@ window.ryuguPlanningProgress = (planning) => ({
       return;
     }
     $('#planning-result').dataset.accuracyState = planning.metric !== 'speedup' || !rows.length
-      ? 'pending' : rows.some((row) => row.eligible !== true) ? 'fail' : 'pass';
+      ? 'pending' : rows.every((row) => row.eligible === true) ? 'pass'
+        : rows.some((row) => row.eligible === true) ? 'pending' : 'fail';
     $('#planning-result').textContent = rows.length
-      ? rows.map((row) => planning.metric === 'speedup' && row.eligible !== true
-        ? `${row.method}: FAIL (${row.failureReasons?.join(', ') || 'accuracy'})`
-        : `${row.method}: ${finiteText(row[field], unit)}${planning.metric === 'speedup' ? ` [${planning.accuracyProfile}; strict ${row.strictEligible ? 'PASS' : 'FAIL'}]` : ''}`).join(' · ')
+      ? rows.map((row) => {
+        const value = finiteText(row[field], unit);
+        if (planning.metric !== 'speedup') {
+          return `${row.method}: ${value}`;
+        }
+        const gate = row.eligible === true
+          ? `strict PASS`
+          : `strict ineligible (${row.failureReasons?.join(', ') || 'accuracy'})`;
+        return `${row.method}: ${value} [${planning.accuracyProfile}; ${gate}]`;
+      }).join(' · ')
       : 'No comparison result yet.';
   }
   function renderInversion(inversion, method) {
@@ -652,10 +738,12 @@ window.ryuguPlanningProgress = (planning) => ({
   // occasionally lose the deferred module request after the page and WASM have
   // already loaded. The fallback consumes the same snapshot and keeps the
   // coordinate system adaptive until the module becomes available again.
-  const telemetryWindow = (samples, mapper, positiveOnly = false) => (samples ?? [])
-    .map(mapper)
-    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value) && (!positiveOnly || value > 0))
-    .slice(-96);
+  const telemetryWindow = (samples, mapper, positiveOnly = false, keepAll = false) => {
+    const points = (samples ?? [])
+      .map(mapper)
+      .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value) && (!positiveOnly || value > 0));
+    return keepAll ? points : points.slice(-96);
+  };
   const telemetryDomain = (points) => {
     if (!points.length) return null;
     const values = points.map(([time]) => time);
@@ -675,7 +763,7 @@ window.ryuguPlanningProgress = (planning) => ({
   function renderTelemetryFallback(snapshot) {
     if (window.ryuguTelemetryReady) return;
     const transform = snapshot.method === 'frequency_domain';
-    const points = telemetryWindow(transform ? snapshot.frequencyDomain : snapshot.jacobi, (sample) => [Number(sample[0]), Number(sample[1])]);
+    const points = telemetryWindow(transform ? snapshot.frequencyDomain : snapshot.jacobi, (sample) => [Number(sample[0]), Number(sample[1])], false, transform);
     drawChart(fallbackTelemetrySvg($('#jacobi-chart'), 'diagnostic'), [{ label: transform ? 'Frequency-domain algorithm norm' : 'Jacobi constant', color: transform ? '#36e7f2' : '#43df81', points }], {
       xLabel: transform ? 'σ (s⁻¹)' : 't (s)',
       yLabel: transform ? '‖g̃γ(σ)‖' : 'Cⱼ',
@@ -849,13 +937,15 @@ window.ryuguPlanningProgress = (planning) => ({
       $('#health-dot').style.background = snapshot.runtimeError ? '#ff6262' : '#43e58a';
       $('#method-label').textContent = snapshot.methodLabel;
       $('#operator-chain').textContent = snapshot.method === 'frequency_domain'
-        ? 'Eq.121 force → computed orbit → Eq.184 → density inversion'
+        ? 'Eq.(106) line → Eq.(121) FLUPS force → orbit → Eq.(184) inversion'
         : `${snapshot.methodLabel} → orbit → physical diagnostics`;
       const activeMemoryIndex = methodKeys.indexOf(snapshot.method);
       const activeMemory = Number.isFinite(snapshot.activeVramBytes)
         ? snapshot.activeVramBytes
         : activeMemoryIndex >= 0 ? snapshot.memoryBytes[activeMemoryIndex] : 0;
-      $('#vram').textContent = bytes([activeMemory]);
+      $('#vram').textContent = snapshot.method === 'frequency_domain' || activeMemory > 0
+        ? bytes([activeMemory])
+        : 'n/a (WASM)';
       $('#acceleration').value = snapshot.acceleration;
       $('#acceleration-out').textContent = snapshot.acceleration + '×';
       pressed('[data-action="method"]', (button) => button.dataset.value === snapshot.method);

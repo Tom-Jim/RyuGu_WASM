@@ -1,5 +1,5 @@
+import { mkdir, rename, rm } from "fs/promises";
 import { join } from "path";
-import { mkdir, rename, rm } from "node:fs/promises";
 
 const PORT = Number.parseInt(Bun.env.PORT ?? "3000", 10);
 // This entry point lives in `src/`, while static assets and generated WASM

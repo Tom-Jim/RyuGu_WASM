@@ -10,9 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-// Live propagation prioritizes browser responsiveness. Batch validation and
-// surface products retain their requested source resolution.
-const MAX_LIVE_ANGULAR_CELLS: usize = 32;
 // The numerical Worker is the rate limit for live propagation: a new advance
 // request goes out as soon as the previous answer has been consumed. This floor
 // only stops a very fast worker from turning the submit path into a busy poll.
@@ -1098,7 +1095,7 @@ fn configure_backend(
         .iter()
         .map(|b| f32::from_le_bytes(*b) as f64)
         .collect();
-    let live_cells = reduce_live_cells(&cells);
+    let live_cells = crate::cpu::density::reduce_live_cells(&cells);
     let vertices: Vec<f64> = topology
         .positions
         .iter()
@@ -1123,8 +1120,8 @@ fn configure_backend(
     }
 }
 
-/// Builds and uploads the discrete Eq.121 operator once per density geometry.
-/// The Worker evaluates it at every integration substep for frequency-domain.
+/// Builds and uploads packed spherical Eq.(121) modes once per density.
+/// Live Eq.(106)+Taylor uses FLUPS for ∫d³κ; these modes are the off-grid fallback.
 fn upload_frequency_domain_modes(
     source: Option<Res<DensityQuadratureSource>>,
     mode: Res<DensityMode>,
@@ -1180,27 +1177,6 @@ fn upload_frequency_domain_modes(
         Ok(false) => {}
         Err(message) => error.raise(message),
     }
-}
-
-fn reduce_live_cells(cells: &[f64]) -> Vec<f64> {
-    let shells = cells.as_chunks::<8>().0;
-    if shells.len() <= MAX_LIVE_ANGULAR_CELLS * 4 {
-        return cells.to_vec();
-    }
-    let layers = 4;
-    let angular = shells.len() / layers;
-    let target = MAX_LIVE_ANGULAR_CELLS.min(angular);
-    let stride = angular.div_ceil(target);
-    let mut result = Vec::with_capacity(target * layers * 8);
-    for angular_index in (0..angular).step_by(stride) {
-        for layer in 0..layers {
-            let mut shell = shells[angular_index * layers + layer];
-            let represented = (angular - angular_index).min(stride);
-            shell[3] *= represented as f64;
-            result.extend(shell);
-        }
-    }
-    result
 }
 
 /// Decides whether the live simulation may submit its next advance request.

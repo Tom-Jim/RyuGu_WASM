@@ -105,6 +105,7 @@ pub fn setup_scene(
 pub fn capture_trajectory_inversion_system(
     clock: Res<SimulationClock>,
     active_method: Res<ActiveGravityMethod>,
+    planning: Res<PlanningComparisonState>,
     frequency_domain_source: Option<Res<AggregatedGravitySource>>,
     density_mode: Res<DensityMode>,
     mut inversion: ResMut<TrajectoryInversionState>,
@@ -135,7 +136,11 @@ pub fn capture_trajectory_inversion_system(
         inversion.batch_capture_id = None;
         inversion.displayed_density = None;
         inversion.results = std::array::from_fn(|_| None);
-        inversion.best_results = std::array::from_fn(|_| None);
+        if inversion.preserve_best_results_on_next_epoch {
+            inversion.preserve_best_results_on_next_epoch = false;
+        } else {
+            inversion.best_results = std::array::from_fn(|_| None);
+        }
         inversion.reference_cache_capture_id = None;
         inversion.reference_training_observations.clear();
         inversion.reference_training_sensitivities.clear();
@@ -162,14 +167,21 @@ pub fn capture_trajectory_inversion_system(
     if inversion.ready {
         return;
     }
-    if !supports_live_inversion_capture(*active_method) {
+    if !needs_live_observation_arc(*active_method, planning.run_requested) {
         return;
     }
     // Wait for ~5 real seconds of live integration, then uniform-sample the
     // full path accumulated in that wall-clock window. Higher acceleration
     // advances more simulation time in the same real interval → longer arc.
+    // First/Stress/quadrature may be queued before that window closes; freeze
+    // as soon as the path is non-degenerate so those jobs are not stuck at 0%.
+    let capture_seconds = if planning.run_requested {
+        0.75
+    } else {
+        TRAJECTORY_INVERSION_CAPTURE_SECONDS
+    };
     if inversion.capture_started_at.is_none()
-        || inversion.wall_elapsed_seconds + 1e-9 < TRAJECTORY_INVERSION_CAPTURE_SECONDS
+        || inversion.wall_elapsed_seconds + 1e-9 < capture_seconds
     {
         return;
     }
@@ -368,8 +380,8 @@ fn probe_visual_extrapolation_limit(method: ActiveGravityMethod) -> f32 {
     // stalled Worker freezes the model instead of flying it off the orbit.
     match method {
         ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::FrequencyDomain => 0.5,
-        ActiveGravityMethod::MmfftCompressed | ActiveGravityMethod::Fmm => 0.8,
-        ActiveGravityMethod::HomogeneousWerner => 2.0,
+        ActiveGravityMethod::MmfftCompressed => 0.8,
+        ActiveGravityMethod::Fmm | ActiveGravityMethod::HomogeneousWerner => 2.0,
     }
 }
 

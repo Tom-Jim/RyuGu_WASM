@@ -267,10 +267,74 @@ impl PlanningComparisonState {
         if self.computation_complete {
             return 1.0;
         }
-        let (completed, total) = self.operation_work();
+        let cell = self.staged_cell_progress();
+        let fraction = if self.workload_profile == PlanningWorkloadProfile::SourceCrossover {
+            let total = self.source_curve_cell_total().max(1) as f64;
+            (self.source_curve_samples.len() as f64 + cell) / total
+        } else {
+            cell
+        };
         // The UI also floors the displayed percentage; only an explicit final
         // completion flag can produce 100%, including when a run is cancelled.
-        (completed / total.max(1.0)).clamp(0.0, 0.999_999)
+        fraction.clamp(0.0, 0.999_999)
+    }
+
+    fn staged_cell_progress(&self) -> f64 {
+        match self.batch_job.as_ref() {
+            None => 0.15 * self.preparation_progress.clamp(0.0, 1.0),
+            Some(job) => {
+                let method_index = job.method_order_index.min(2) as f64;
+                0.15 + 0.85 * (method_index + Self::in_method_frac(job)) / 3.0
+            }
+        }
+    }
+
+    fn in_method_frac(job: &PlanningBatchJob) -> f64 {
+        let models = f64::from(job.density_model_count.max(1));
+        let candidates = f64::from(job.candidate_count.max(1));
+        let tile = (f64::from(job.density_model) * candidates + f64::from(job.candidate_start))
+            / (models * candidates).max(1.0);
+        let pass = if job.certified_repetition {
+            0.5 + 0.5 * tile
+        } else if job.warm_repetition {
+            0.5
+        } else {
+            0.5 * tile
+        };
+        pass.clamp(0.0, 1.0)
+    }
+
+    fn source_curve_cell_total(&self) -> usize {
+        let repeats = PLANNING_SOURCE_COUNTS.len() * PLANNING_SOURCE_REPEATS as usize;
+        if self.source_curve_all_parameters {
+            repeats * PLANNING_DENSITY_MODEL_COUNTS.len() * PLANNING_TARGET_COUNTS.len()
+        } else {
+            repeats
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn progress_phase(&self) -> String {
+        if self.computation_complete {
+            return "Complete".into();
+        }
+        if let Some(job) = self.batch_job.as_ref() {
+            let pass = if job.certified_repetition {
+                "checked pass"
+            } else if job.warm_repetition {
+                "warm repeat"
+            } else {
+                "raw pass"
+            };
+            return format!("{} {pass}", job.method.planning_label());
+        }
+        if self.run_requested {
+            if self.preparation_progress <= 0.0 {
+                return "Capturing reference trajectory".into();
+            }
+            return "Preparing candidates".into();
+        }
+        "Idle".into()
     }
 
     pub fn blocks_realtime_gpu(&self) -> bool {
@@ -279,6 +343,14 @@ impl PlanningComparisonState {
         // plotting: the Worker Eq.121 integrator and GPU Eq.121 diagnostic stamps
         // keep running while those benchmarks use their own queues.
         self.run_requested && self.workload_profile == PlanningWorkloadProfile::SourceCrossover
+    }
+
+    /// Live Verlet must keep integrating until a reference capture exists.
+    /// Opening quadrature used to call `blocks_realtime_gpu` immediately, which
+    /// froze physics before `capture_id` was sealed and left Invert / First /
+    /// Stress / the crossover modal at 0%.
+    pub fn blocks_live_verlet(&self, inversion_ready: bool) -> bool {
+        self.blocks_realtime_gpu() && inversion_ready
     }
 
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {
@@ -327,7 +399,7 @@ impl PlanningComparisonState {
             let mask = result.accuracy_failure_mask(self.accuracy_profile, false)
                 | if common_samples { 0 } else { 1 << 8 };
             if mask == 0 {
-                eligible.push((name, result.total_ms));
+                eligible.push((name, result));
             } else {
                 disqualified.push(format!(
                     "{name}: {}",
@@ -335,13 +407,45 @@ impl PlanningComparisonState {
                 ));
             }
         }
-        eligible.sort_by(|left, right| left.1.total_cmp(&right.1));
-        let verdict = eligible.first().map_or_else(
-            || "No eligible winner".to_string(),
-            |(name, milliseconds)| {
-                format!("Fastest eligible method: {name} ({milliseconds:.2} ms)")
-            },
-        );
+        let backend_note = |result: &PlanningMethodMetrics| match result.backend {
+            PlanningExecutionBackend::GpuFrequencyDomain => "GPU",
+            PlanningExecutionBackend::CppFlups | PlanningExecutionBackend::CppExafmm => "Worker",
+        };
+        let mixed_devices = eligible.iter().any(|(_, result)| {
+            result.backend == PlanningExecutionBackend::GpuFrequencyDomain
+        }) && eligible.iter().any(|(_, result)| {
+            matches!(
+                result.backend,
+                PlanningExecutionBackend::CppFlups | PlanningExecutionBackend::CppExafmm
+            )
+        });
+        let notes = eligible
+            .iter()
+            .map(|(name, result)| {
+                format!(
+                    "{name} [{}]: {:.2} ms",
+                    backend_note(result),
+                    result.total_ms
+                )
+            })
+            .collect::<Vec<_>>();
+        let verdict = if mixed_devices {
+            format!(
+                "No cross-device winner (GPU Frequency-domain wall time is not comparable with Worker FFT/FMM). {}",
+                notes.join("; ")
+            )
+        } else {
+            eligible.sort_by(|left, right| left.1.total_ms.total_cmp(&right.1.total_ms));
+            eligible.first().map_or_else(
+                || "No eligible winner".to_string(),
+                |(name, result)| {
+                    format!(
+                        "Fastest eligible method: {name} ({:.2} ms)",
+                        result.total_ms
+                    )
+                },
+            )
+        };
         Some(format!(
             "{} profile — {verdict}{}",
             self.accuracy_profile.key(),
@@ -542,5 +646,71 @@ mod planning_sweep_tests {
                 * PLANNING_SOURCE_REPEATS as usize
         );
         assert_eq!(state.dimensions(), (1, 1024, 8192));
+    }
+
+    #[test]
+    fn quadrature_keeps_live_verlet_until_the_capture_exists() {
+        let mut state = PlanningComparisonState {
+            workload_profile: PlanningWorkloadProfile::SourceCrossover,
+            run_requested: true,
+            ..Default::default()
+        };
+        assert!(state.blocks_realtime_gpu());
+        assert!(
+            !state.blocks_live_verlet(false),
+            "opening quadrature must not freeze the Worker before capture_id exists"
+        );
+        assert!(state.blocks_live_verlet(true));
+        state.workload_profile = PlanningWorkloadProfile::First;
+        assert!(!state.blocks_live_verlet(true));
+        state.workload_profile = PlanningWorkloadProfile::InteractiveStress;
+        assert!(!state.blocks_live_verlet(true));
+    }
+
+    #[test]
+    fn planning_captures_a_geometric_arc_on_forward_only_methods() {
+        assert!(!supports_live_inversion_capture(
+            ActiveGravityMethod::RadialAnalytic
+        ));
+        assert!(!supports_live_inversion_capture(
+            ActiveGravityMethod::HomogeneousWerner
+        ));
+        assert!(needs_live_observation_arc(
+            ActiveGravityMethod::RadialAnalytic,
+            true
+        ));
+        assert!(needs_live_observation_arc(
+            ActiveGravityMethod::HomogeneousWerner,
+            true
+        ));
+        assert!(!needs_live_observation_arc(
+            ActiveGravityMethod::RadialAnalytic,
+            false
+        ));
+        assert!(needs_live_observation_arc(
+            ActiveGravityMethod::Fmm,
+            false
+        ));
+        let capturing = PlanningComparisonState {
+            run_requested: true,
+            preparation_progress: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(capturing.progress_phase(), "Capturing reference trajectory");
+    }
+
+    #[test]
+    fn progress_is_staged_not_flop_weighted() {
+        let mut state = PlanningComparisonState {
+            run_requested: true,
+            workload_profile: PlanningWorkloadProfile::First,
+            preparation_progress: 0.5,
+            ..Default::default()
+        };
+        assert!((state.progress_fraction() - 0.075).abs() < 1e-12);
+        assert_eq!(state.progress_phase(), "Preparing candidates");
+        state.computation_complete = true;
+        assert_eq!(state.progress_fraction(), 1.0);
+        assert_eq!(state.progress_phase(), "Complete");
     }
 }

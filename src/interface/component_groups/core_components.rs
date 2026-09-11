@@ -155,6 +155,16 @@ pub fn supports_live_inversion_capture(method: ActiveGravityMethod) -> bool {
     )
 }
 
+/// First / Stress / Quadrature only need a geometric reference arc. Radial and
+/// Werner still integrate a live orbit, so a queued planning job must capture
+/// that path even though those methods cannot invert it.
+pub fn needs_live_observation_arc(
+    method: ActiveGravityMethod,
+    planning_run_requested: bool,
+) -> bool {
+    supports_live_inversion_capture(method) || planning_run_requested
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrajectoryInversionKnot {
     pub position: Vec3,
@@ -370,6 +380,9 @@ pub struct TrajectoryInversionState {
     /// Best fit seen for each method across method switches. Historical only;
     /// current-trajectory comparisons continue to use `results`.
     pub best_results: [Option<DensityInversionResult>; 5],
+    /// Set on a user method switch so the next epoch wipe keeps `best_results`.
+    /// Probe/crash epochs leave this false and clear the historical fits.
+    pub preserve_best_results_on_next_epoch: bool,
     pub displayed_density: Option<DensityInversionResult>,
 }
 
@@ -408,6 +421,7 @@ impl Default for TrajectoryInversionState {
             reference_holdout_sensitivities: Vec::new(),
             results: std::array::from_fn(|_| None),
             best_results: std::array::from_fn(|_| None),
+            preserve_best_results_on_next_epoch: false,
             displayed_density: None,
         }
     }

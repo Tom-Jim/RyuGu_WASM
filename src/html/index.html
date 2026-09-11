@@ -160,7 +160,7 @@
                     <label>Next run <select id="quadrature-scope"><option value="selected" selected>Selected Kρ × Nt</option><option value="all">All 35 combinations</option></select></label>
                     <button onclick="window.ryuguUi?.activate?.(this)" data-action="quadrature-start">Run selected scope</button>
                     <span>Parameter dropdowns select the displayed curve and the next run; an active task keeps its original scope.</span>
-                    <span id="quadrature-accuracy-policy">Strict comparison thresholds; each source size is plotted after 7 passing repetitions.</span>
+                    <span id="quadrature-accuracy-policy">Strict comparison thresholds; qualified points require 7 passing repetitions. Computed but ineligible timings stay on the chart.</span>
                 </div>
                 <p id="quadrature-implementation" class="benchmark-note"></p>
                 <p id="quadrature-timing-policy" class="benchmark-note"></p>
@@ -229,15 +229,14 @@
             const requestedVersion = new URL(location.href).searchParams.get('v');
             const version = requestedVersion || '__RYUGU_VERSION__';
             // A local/unprocessed checkout still contains the CI placeholder.
-            // Do not let that literal query pin an old WASM module after a
-            // device-loss reload; production replaces it with a commit SHA.
-            const cacheVersion = version === '__RYUGU_VERSION__'
-                ? Date.now().toString(36)
-                : version;
+            // Pin a manual epoch so Chrome's Worker cache cannot keep the
+            // FMM/FFT invert-starving worker after a source change. Production
+            // replaces __RYUGU_VERSION__ with the commit SHA.
+            const cacheVersion = version === '__RYUGU_VERSION__' ? '20260911-eq184-fullsigma' : version;
             const suffix = cacheVersion ? `?v=${encodeURIComponent(cacheVersion)}` : '';
             const wasm = await import(`./pkg/ryugu_wasm.js${suffix}`);
             await wasm.default({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` });
-            const { createNumericalBackendClient } = await import(`./src/html/backend-client.js${suffix}`);
+            const { createNumericalBackendClient, asU64 } = await import(`./src/html/backend-client.js${suffix}`);
             globalThis.ryuguNumericalWorkerReady = false;
             // Per-kind delivery counters for diagnostics (DevTools:
             // `ryuguBackendStats`); the numerical results themselves never
@@ -247,11 +246,12 @@
             globalThis.ryuguBackendClient = createNumericalBackendClient({
                 cacheSuffix: suffix,
                 deliverResult(result) {
-                    const requestId = result.requestId;
-                    const epoch = result.epoch;
+                    const requestId = asU64(result.requestId);
+                    const epoch = asU64(result.epoch);
                     const error = result.ok ? undefined : result.error;
                     const tally = result.ok ? backendStats.delivered : backendStats.failed;
                     tally[result.kind] = (tally[result.kind] ?? 0) + 1;
+                    try {
                     switch (result.kind) {
                         case 'advance':
                             wasm.deliver_backend_advance_result(
@@ -318,6 +318,9 @@
                             break;
                         default:
                             console.error(`Unknown numerical Worker result: ${result.kind}`);
+                    }
+                    } catch (deliveryError) {
+                        console.error(`Numerical result delivery failed (${result.kind}):`, deliveryError);
                     }
                 },
                 onReady() {

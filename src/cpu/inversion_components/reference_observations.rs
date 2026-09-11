@@ -6,8 +6,20 @@ fn reference_source_sets(
     voxels: &[InvertedDensityVoxel],
     radial_source: &DensityQuadratureSource,
 ) -> Option<Vec<Vec<(DVec3, f64)>>> {
-    let tree = high_resolution_reference_tree(radial_source)?;
-    let basis_trees = high_resolution_reference_basis_trees(voxels, radial_source)?;
+    // Same 32-angular live mesh as Worker Verlet. The full face tessellation
+    // is tens of thousands of cells; 57 direct trees of that size never
+    // returned, so FMM/FFT invert sat on Preparing while FD (no Worker
+    // reference) finished.
+    let bytes = crate::cpu::density::reduce_live_quadrature_bytes(&radial_source.bytes);
+    let reduced = DensityQuadratureSource {
+        bytes,
+        constant_bytes: Vec::new(),
+        radius: radial_source.radius,
+        source_hash: radial_source.source_hash,
+        constant_hash: radial_source.constant_hash,
+    };
+    let tree = high_resolution_reference_tree(&reduced)?;
+    let basis_trees = high_resolution_reference_basis_trees(voxels, &reduced)?;
     let mut sets = Vec::with_capacity(1 + basis_trees.len());
     sets.push(tree.into_sources());
     sets.extend(basis_trees.into_iter().map(FmmNode::into_sources));

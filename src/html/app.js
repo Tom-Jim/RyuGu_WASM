@@ -34,7 +34,7 @@ const app = createApp({
         <div class="mt-1 h-1.5 overflow-hidden rounded bg-cyan-950/80" role="progressbar" :aria-label="labels[kind] + ' calculation progress'" :aria-valuenow="tracked[kind].progress" aria-valuemin="0" aria-valuemax="100">
           <div class="h-full rounded bg-cyan-300" :style="{ width: tracked[kind].progress + '%' }"></div>
         </div>
-        <div class="mt-1 font-mono text-[9px] text-slate-500">{{ tracked[kind].running ? 'Running · ' + tracked[kind].progress + '%' : tracked[kind].completed ? 'Complete' : tracked[kind].progress > 0 ? 'Stopped · ' + tracked[kind].progress + '%' : 'Ready' }}</div>
+        <div class="mt-1 font-mono text-[9px] text-slate-500">{{ tracked[kind].running ? (tracked[kind].phase ? tracked[kind].phase + ' · ' : 'Running · ') + tracked[kind].progress + '%' : tracked[kind].completed ? 'Complete' : tracked[kind].progress > 0 ? 'Stopped · ' + tracked[kind].progress + '%' : 'Ready' }}</div>
       </div>
     </section>
   `,
@@ -75,7 +75,9 @@ function recentTelemetryPoints(snapshot) {
   const points = (transform ? snapshot?.frequencyDomain ?? [] : snapshot?.jacobi ?? [])
     .map((sample) => [Number(sample[0]), Number(sample[1])])
     .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value));
-  return points.slice(-LIVE_SAMPLE_WINDOW);
+  // Jacobi is a rolling time series. Eq.(184) is the complete Laplace curve
+  // versus σ; slicing the tail drops the low-frequency decay the chart is for.
+  return transform ? points : points.slice(-LIVE_SAMPLE_WINDOW);
 }
 
 function paddedDomain(points, logarithmic) {

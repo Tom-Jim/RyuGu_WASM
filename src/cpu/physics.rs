@@ -71,7 +71,7 @@ pub fn physics_system(
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    if !ready.ready || error.is_active() || planning.blocks_realtime_gpu() {
+    if !ready.ready || error.is_active() || planning.blocks_live_verlet(inversion.ready) {
         return;
     }
     let (Ok(body), Ok((mut transform, mut velocity, mut orbit))) =
@@ -87,11 +87,14 @@ pub fn physics_system(
         match packet.result {
             Ok(trace) => trace,
             Err(message) => {
-                if message.contains("Waiting for frequency-domain") {
-                    // Soft status only — do not freeze the pipeline. Pause the
-                    // capture clock until Eq.121 modes land and advances resume.
-                    inversion.capture_note =
-                        Some("Waiting for Eq.121 frequency-domain modes…".into());
+                if recoverable_live_field_miss(&message) {
+                    // Soft status only — do not freeze Invert / First / Stress.
+                    // Pause the capture clock until the Worker can advance again.
+                    inversion.capture_note = Some(if message.contains("Waiting for frequency-domain") {
+                        "Waiting for Eq.121 frequency-domain modes…".into()
+                    } else {
+                        "Live field used the far-field fallback; continuing the orbit…".into()
+                    });
                     inversion.capture_last_advance_at = None;
                     return;
                 }
@@ -100,13 +103,27 @@ pub fn physics_system(
             }
         }
     } else {
+        if inversion.preparing {
+            // FMM/FFT invert's `source_sets` share this Worker. Queueing
+            // another 64× advance while Preparing is showing starves it.
+            return;
+        }
         if !crate::cpp_backend::should_advance_backend(&mut frame_pacer, &advance_channel) {
             return;
         }
-        let steps = acceleration.stable_steps();
-        // Live FD evaluates Eq.121 at the current body-frame position inside
-        // the Worker. GPU Eq.121 stamps are diagnostics only; packing them
-        // here can abort advance_frame on a non-monotonic diagnostic clock.
+        let first_or_stress = planning.run_requested
+            && planning.workload_profile != PlanningWorkloadProfile::SourceCrossover;
+        // First/Stress keep the orbit alive with 1-step ticks so the Worker
+        // can spend most of its time on the batch. Quadrature-only still uses
+        // the user acceleration, including 64×.
+        let steps = if first_or_stress {
+            1
+        } else {
+            acceleration.stable_steps()
+        };
+        // Live FD force is Worker FLUPS Eq.(121) at q_B (`mathtidy.md`).
+        // GPU Eq.184 stamps stay diagnostics; packing them here can abort
+        // advance_frame on a non-monotonic diagnostic clock.
         let history = Vec::new();
         let initial: Vec<f64> = transform
             .translation
@@ -156,7 +173,8 @@ pub fn physics_system(
             velocity: speed(&records[0]),
         });
     }
-    let capturing = supports_live_inversion_capture(*active) && !inversion.ready;
+    let capturing =
+        !inversion.ready && needs_live_observation_arc(*active, planning.run_requested);
     if capturing {
         let now = bevy::platform::time::Instant::now();
         // Accrue only while advances are actually delivering. Gaps above a
@@ -250,6 +268,12 @@ pub fn ryugu_rotation_system(
     }
 }
 
+fn recoverable_live_field_miss(message: &str) -> bool {
+    message.contains("Waiting for frequency-domain")
+        || message.contains("outside FLUPS grid")
+        || message.contains("Mass source outside FLUPS")
+}
+
 /// Accrue wall time for a delivered live advance. Slow FMM/FFT ticks (often
 /// >350 ms) still count; only an explicit pause (`capture_last_advance_at =
 /// None`, e.g. waiting for Eq.121 modes) skips the gap. Gaps longer than the
@@ -262,7 +286,7 @@ pub(crate) fn accrue_live_capture_gap(gap_secs: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod live_capture_gap_tests {
-    use super::accrue_live_capture_gap;
+    use super::{accrue_live_capture_gap, recoverable_live_field_miss};
 
     #[test]
     fn slow_fmm_ticks_still_accrue() {
@@ -272,5 +296,15 @@ mod live_capture_gap_tests {
         assert_eq!(accrue_live_capture_gap(8.0), Some(8.0));
         assert_eq!(accrue_live_capture_gap(30.0), None);
         assert_eq!(accrue_live_capture_gap(0.0), None);
+    }
+
+    #[test]
+    fn flups_grid_miss_is_recoverable() {
+        assert!(recoverable_live_field_miss("Gravity target outside FLUPS grid"));
+        assert!(recoverable_live_field_miss("Mass source outside FLUPS grid"));
+        assert!(recoverable_live_field_miss(
+            "Waiting for frequency-domain Eq.121 modes"
+        ));
+        assert!(!recoverable_live_field_miss("WebGPU device lost"));
     }
 }

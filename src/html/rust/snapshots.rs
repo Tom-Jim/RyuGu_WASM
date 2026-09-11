@@ -145,23 +145,28 @@ pub(crate) fn browser_ui_publish_system(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let inversion_result_row = |result: &DensityInversionResult| {
+        json!({
+            "method": method_key(result.method),
+            "density": result.density,
+            "densityScale": result.density_scale,
+            "fit": result.model_fit,
+            "timeMs": result.inversion_time_ms,
+            "trainingRmse": result.training_rmse,
+            "holdoutRmse": result.holdout_rmse,
+        })
+    };
     let inversion_results = state
         .inversion
         .results
         .iter()
-        .map(|result| {
-            result.as_ref().map(|result| {
-                json!({
-                    "method": method_key(result.method),
-                    "density": result.density,
-                    "densityScale": result.density_scale,
-                    "fit": result.model_fit,
-                    "timeMs": result.inversion_time_ms,
-                    "trainingRmse": result.training_rmse,
-                    "holdoutRmse": result.holdout_rmse,
-                })
-            })
-        })
+        .map(|result| result.as_ref().map(inversion_result_row))
+        .collect::<Vec<_>>();
+    let inversion_best_results = state
+        .inversion
+        .best_results
+        .iter()
+        .map(|result| result.as_ref().map(inversion_result_row))
         .collect::<Vec<_>>();
     let displayed_density = state.inversion.displayed_density.as_ref().map(|result| {
         json!({
@@ -196,9 +201,8 @@ pub(crate) fn browser_ui_publish_system(
                 json!({
                     "method": method_key(result.method),
                     "implementation": result.method.planning_label(),
-                    "totalMs": (failures == 0).then_some(result.total_ms),
-                    "checkedTotalMs": (result.accuracy_failure_mask(state.planning.accuracy_profile, true) == 0)
-                        .then_some(result.certified_estimated_total_ms),
+                    "totalMs": result.total_ms,
+                    "checkedTotalMs": result.certified_estimated_total_ms,
                     "kernelMs": result.raw_kernels.all_ms,
                     "checkedKernelMs": result.checked_kernels.all_ms,
                     "evaluationKernelMs": result.raw_kernels.evaluation_ms,
@@ -224,6 +228,7 @@ pub(crate) fn browser_ui_publish_system(
         })
         .collect::<Vec<_>>();
     let progress = 100.0 * state.planning.progress_fraction();
+    let progress_phase = state.planning.progress_phase();
     let accuracy = state.planning.batch_job.as_ref().map_or(0.0, |job| {
         let checks = [
             job.gravity_samples > 0,
@@ -260,7 +265,7 @@ pub(crate) fn browser_ui_publish_system(
             "workCompleted": state.planning.operation_work().0,
             "workTotal": state.planning.operation_work().1,
             "progressUnit": "estimated arithmetic operation units (source/basis/FFT/RHS/target/reference work); not measured FLOPs or an ETA",
-            "implementation": "Discrete frequency-domain trajectory transform: 64-node finite reciprocal-space point-residue quadrature; GPU FFT (compensated f32), 56 GPU density bases + quintic evaluation; GPU order-2 FMM (P2M/M2M/M2L/P2P and 56-basis density mix). Independent f64 frequency-domain reference uses the same reciprocal-space operator and bounded CPU slices.",
+            "implementation": "Discrete frequency-domain trajectory transform: 64-node finite reciprocal-space point-residue quadrature on GPU; Worker FFT (compensated C++/FLUPS) and Worker order-2 FMM (P2M/M2M/M2L/P2P). Independent f64 frequency-domain reference uses the same reciprocal-space operator and bounded CPU slices. GPU FMM/FFT plugins are not in this build.",
             "timingDefinition": "Raw total = shared CPU preparation + method CPU preparation + GPU preparation/evaluation submission wall times + result processing. Cooperative gaps between submissions are excluded. Checked total = raw total + the additional full checked pass; fixed-target bases charged once, streamed FMM target windows charged whenever rebuilt. Warm calibration and shared f64 references are excluded. GPU views use only pass timestamps; no CPU or readback substitution. All methods share source counts, density rows and trajectory samples; the frequency-domain algorithm reports whole-trajectory Laplace observations while FFT/FMM report pointwise fields, so eligibility is checked against each observable's independent f64 reference rather than pretending the raw outputs are identical.",
             "visible": state.planning.source_curve_visible,
             "status": state.planning.status,
@@ -285,6 +290,7 @@ pub(crate) fn browser_ui_publish_system(
             "results": planning_results,
             "curve": curve,
             "progress": progress,
+            "progressPhase": progress_phase,
             "accuracy": accuracy,
         },
         "performance": {
@@ -307,6 +313,7 @@ pub(crate) fn browser_ui_publish_system(
             "captureNote": state.inversion.capture_note,
             "wallElapsedSeconds": state.inversion.wall_elapsed_seconds,
             "results": inversion_results,
+            "bestResults": inversion_best_results,
             "displayed": displayed_density,
             "trajectory": trajectory,
         },

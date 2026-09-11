@@ -69,24 +69,10 @@ jobs:
                   --define=__VUE_PROD_HYDRATION_MISMATCH_DETAILS__=false
                   --outfile=build/app.js
 
-            - name: Verify browser sources
+            - name: Verify browser and Bun tooling sources
               run: |
-                  node --check src/html/navigation.js
-                  node --check src/html/ui.js
-                  node --check src/html/capture.js
-                  node --check src/html/visit.js
-                  node --check src/html/app.js
-                  node --check src/html/background.js
-                  node --check src/html/background-worker.js
-                  node --check src/html/backend-client.js
-                  node --check src/html/backend-worker.js
-                  node --check src/backend/host/cpp_backend.mjs
-                  node --check src/tools/build_helpers.mjs
-                  node --check src/tools/build_cpp_wasm.mjs
-                  node --check src/tools/build_rust_backend.mjs
-                  node --check src/tools/build_wasm.mjs
-                  node --check src/tools/run.mjs
-                  node --check build/app.js
+                  bun run check:js
+                  bun run check:js -- build/app.js
                   ! grep -Fq 'Runtime compilation is not supported in this build of Vue' build/app.js
                   ! grep -Fq 'Feature flags __VUE_OPTIONS_API__' build/app.js
 

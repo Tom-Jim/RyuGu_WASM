@@ -25,7 +25,10 @@ pub fn render_section_system(
     let inferred = if show_section.0 {
         None
     } else {
-        inversion.displayed_density.as_ref()
+        inversion
+            .displayed_density
+            .as_ref()
+            .filter(|result| result.method == *active_method)
     };
     if !show_section.0 && inferred.is_none() {
         *frame = 0;
@@ -204,6 +207,13 @@ pub fn render_section_system(
         }
     }
 
+    let skip_internal_isolines = inferred.is_some_and(|result| {
+        let (minimum, maximum) = result.voxels.iter().map(|voxel| voxel.density).fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(minimum, maximum), density| (minimum.min(density), maximum.max(density)),
+        );
+        maximum - minimum <= result.density.abs() * 0.05
+    });
     draw_section_contours(
         &mut gizmos,
         &section_values,
@@ -215,7 +225,7 @@ pub fn render_section_system(
         tangent_u,
         tangent_v,
         plane_normal,
-        !homogeneous_display,
+        !homogeneous_display && !skip_internal_isolines,
     );
 }
 
@@ -262,9 +272,9 @@ fn draw_section_contours(
             (f32::INFINITY, f32::NEG_INFINITY),
             |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
         );
-    // Interpolation of an exactly uniform voxel field still accumulates small
-    // floating-point differences. Use a relative threshold so marching
-    // squares does not magnify numerical dust into dozens of false loops.
+    // `values` are colormap t in [0, 1], not raw density. Interpolation of an
+    // exactly uniform voxel field still accumulates small floating-point
+    // differences. Keep the 1e-4 gate; do not lower it to mint fake isolines.
     let density_scale = minimum.abs().max(maximum.abs()).max(1.0);
     if !minimum.is_finite() || maximum - minimum <= density_scale * 1.0e-4 {
         return;
@@ -430,16 +440,21 @@ fn heterogeneous_density_color(t: f32, method: ActiveGravityMethod) -> Color {
 /// Toggles Ryugu's material alpha when ShowSection changes.
 pub fn section_alpha_system(
     show_section: Res<ShowSection>,
+    active_method: Res<ActiveGravityMethod>,
     inversion: Res<TrajectoryInversionState>,
     ryugu_query: Query<Entity, With<RyuguMarker>>,
     children_query: Query<&Children>,
     material_handles: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if !show_section.is_changed() && !inversion.is_changed() {
+    if !show_section.is_changed() && !inversion.is_changed() && !active_method.is_changed() {
         return;
     }
-    let section_visible = show_section.0 || inversion.displayed_density.is_some();
+    let overlay = inversion
+        .displayed_density
+        .as_ref()
+        .is_some_and(|result| result.method == *active_method);
+    let section_visible = show_section.0 || overlay;
 
     let Some(root) = ryugu_query.iter().next() else {
         return;

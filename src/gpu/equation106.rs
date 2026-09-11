@@ -1,7 +1,8 @@
-//! Independent Eq.121 inverse-pole diagnostic pipeline (GPU stamps).
-//! Live orbit propagation uses the Worker Eq.121 IR/UV evaluator; Eq.184 is
-//! the trajectory Laplace observation used by density inversion.
-//! Density construction is cached on the GPU; only a 16-byte field is read back.
+//! Independent Eq.106/121 GPU diagnostic stamps.
+//! Live Verlet force is Worker FLUPS Eq.(121) at `q_B` (inverse Laplace of
+//! Eq.(106)); do not feed these stamps into propagation. Eq.(184) is the
+//! known-curve Fourier–Laplace observation used by density inversion and the
+//! spectral chart, not the live Verlet force.
 use crate::cpu::frequency_domain::{
     EQ184_QUADRATURE_COUNT, EQ184_QUADRATURE_LAYOUT, eq184_quadrature_node,
 };
@@ -179,13 +180,14 @@ fn poll(
     mut history: ResMut<Equation106History>,
     clock: Res<SimulationClock>,
     active: Res<ActiveGravityMethod>,
-    mut error: ResMut<GravityRuntimeError>,
 ) {
     if let Ok(mut slot) = channel.error.try_lock()
         && let Some(message) = slot.take()
         && *active == ActiveGravityMethod::FrequencyDomain
     {
-        error.raise(message);
+        // GPU Eq.(106) is the independent diagnostic stamp. Live Verlet is
+        // Worker FLUPS Eq.(121); a failed diagnostic must not freeze the orbit.
+        bevy::log::warn!("Equation (106) GPU diagnostic: {message}");
     }
     let Ok(mut slot) = channel.data.try_lock() else {
         return;
@@ -201,7 +203,9 @@ fn poll(
     };
     let value = Vec4::from_array(*value);
     if !value.is_finite() {
-        error.raise("Equation (106) returned a non-finite field; propagation is paused.");
+        bevy::log::warn!(
+            "Equation (106) GPU diagnostic returned a non-finite field; live Verlet continues."
+        );
         return;
     }
     history.0.push(GravityFieldSample {

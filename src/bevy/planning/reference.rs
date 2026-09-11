@@ -268,7 +268,8 @@ fn direct_planning_reference_cached(
 /// Independent f64 reference for one discrete frequency-domain observation.
 /// This mirrors the shader's rho-hat(k) * T_gamma(s,k) reciprocal-space
 /// operator, including its quadrature, phase convention, Laplace attenuation,
-/// Newton multiplier, and Jacobian column layout.
+/// Newton multiplier, and Jacobian column layout. Callers time-slice the
+/// outer reduction (~8 ms) so one GPU callback cannot run unbounded here.
 fn frequency_domain_reference_integral(
     batch: &PlanningCandidateBatch,
     candidate_index: usize,

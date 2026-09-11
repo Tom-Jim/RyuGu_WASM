@@ -43,6 +43,9 @@ pub(crate) struct PlanningBatchBuilder {
     sources_prepared: bool,
     pending: Option<PendingCandidateRequest>,
     worker_request_id: u64,
+    /// Candidate window for the current sample span when the integration cap
+    /// cannot cover every candidate in one `propagate_candidates` call.
+    next_candidate: usize,
     /// Last Worker/slice failure detail for the planning status line.
     pub(crate) last_error: Option<String>,
 }
@@ -67,6 +70,8 @@ enum PendingCandidateRequest {
         snapshot: crate::cpp_backend::BackendCandidatesSnapshot,
         start_sample: usize,
         end_sample: usize,
+        start_candidate: usize,
+        end_candidate: usize,
         started: bevy::platform::time::Instant,
     },
 }
@@ -241,6 +246,7 @@ impl PlanningBatchBuilder {
             sources_prepared: false,
             pending: None,
             worker_request_id: 0,
+            next_candidate: 0,
             last_error: None,
         })
     }
@@ -308,13 +314,15 @@ impl PlanningBatchBuilder {
                         PendingCandidateRequest::Slice {
                             start_sample,
                             end_sample,
+                            start_candidate,
+                            end_candidate,
                             started,
                             ..
                         } => {
                             let trajectory = match packet.result {
                                 Ok(values)
                                     if values.len()
-                                        == self.candidate_count as usize
+                                        == (end_candidate - start_candidate)
                                             * (end_sample - start_sample + 1)
                                             * 6
                                         && values.iter().all(|value| value.is_finite()) =>
@@ -333,7 +341,13 @@ impl PlanningBatchBuilder {
                                     return false;
                                 }
                             };
-                            if !self.apply_candidate_slice(start_sample, end_sample, &trajectory) {
+                            if !self.apply_candidate_slice(
+                                start_sample,
+                                end_sample,
+                                start_candidate,
+                                end_candidate,
+                                &trajectory,
+                            ) {
                                 self.last_error = Some(
                                     "Planning candidate slice could not be applied to the batch."
                                         .into(),
@@ -377,7 +391,18 @@ impl PlanningBatchBuilder {
             self.next_sample = end_sample;
             return true;
         }
-        let Some(request) = self.serialize_candidate_slice(start_sample, end_sample) else {
+        let step_count = (end_sample - start_sample).max(1);
+        let candidate_limit = (PLANNING_MAX_PROPAGATION_INTEGRATIONS as usize / step_count).max(1);
+        let start_candidate = self.next_candidate.min(self.candidate_count as usize);
+        let end_candidate =
+            (start_candidate + candidate_limit).min(self.candidate_count as usize);
+        if start_candidate >= end_candidate {
+            self.next_candidate = 0;
+            return true;
+        }
+        let Some(request) =
+            self.serialize_candidate_slice(start_sample, end_sample, start_candidate, end_candidate)
+        else {
             self.last_error = Some("Planning candidate slice could not be serialized.".into());
             return false;
         };
@@ -388,6 +413,8 @@ impl PlanningBatchBuilder {
                     snapshot,
                     start_sample,
                     end_sample,
+                    start_candidate,
+                    end_candidate,
                     started: bevy::platform::time::Instant::now(),
                 });
                 true
@@ -408,14 +435,22 @@ impl PlanningBatchBuilder {
         }
     }
 
-    fn serialize_candidate_slice(&self, start_sample: usize, end_sample: usize) -> Option<String> {
+    fn serialize_candidate_slice(
+        &self,
+        start_sample: usize,
+        end_sample: usize,
+        start_candidate: usize,
+        end_candidate: usize,
+    ) -> Option<String> {
         let candidate_positions: Vec<_> = self
             .candidate_positions
+            .get(start_candidate..end_candidate)?
             .iter()
             .map(|position| position.to_array())
             .collect();
         let candidate_velocities: Vec<_> = self
             .candidate_velocities
+            .get(start_candidate..end_candidate)?
             .iter()
             .map(|velocity| velocity.to_array())
             .collect();
@@ -460,11 +495,15 @@ impl PlanningBatchBuilder {
         &mut self,
         start_sample: usize,
         end_sample: usize,
+        start_candidate: usize,
+        end_candidate: usize,
         trajectory: &[f64],
     ) -> bool {
         let local_sample_count = end_sample - start_sample + 1;
-        for candidate in 0..self.candidate_count as usize {
-            let candidate_start = candidate * local_sample_count * 6;
+        let local_candidate_count = end_candidate - start_candidate;
+        for local_candidate in 0..local_candidate_count {
+            let candidate = start_candidate + local_candidate;
+            let candidate_start = local_candidate * local_sample_count * 6;
             for local_sample in 0..local_sample_count {
                 if start_sample != 0 && local_sample == 0 {
                     continue;
@@ -489,16 +528,24 @@ impl PlanningBatchBuilder {
             self.candidate_velocities[candidate] =
                 DVec3::from_slice(&trajectory[final_start + 3..final_start + 6]);
         }
-        self.next_sample = end_sample;
+        if end_candidate >= self.candidate_count as usize {
+            self.next_candidate = 0;
+            self.next_sample = end_sample;
+        } else {
+            self.next_candidate = end_candidate;
+        }
         true
     }
 
     pub(crate) fn preparation_progress(&self) -> f64 {
-        (self.next_sample + 1) as f64 / self.reference_samples.len() as f64
+        let samples = self.reference_samples.len() as f64;
+        let candidates = f64::from(self.candidate_count.max(1));
+        ((self.next_sample as f64) * candidates + self.next_candidate as f64)
+            / (samples * candidates).max(1.0)
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        self.next_sample + 1 >= self.reference_samples.len()
+        self.next_candidate == 0 && self.next_sample + 1 >= self.reference_samples.len()
     }
 
     pub(crate) fn finish(self) -> Option<(PlanningCandidateBatch, f64)> {

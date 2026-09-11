@@ -28,6 +28,8 @@ pub const PLANNING_FFT_DISPATCH_MIN_INTERVAL_MS: u64 = 0;
 /// while cancellation still lands between slices.
 pub const PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME: u32 = 12;
 pub const PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME: u32 = 8;
+/// Cap `propagate_candidates` by candidate×sample integrations, not samples-only.
+pub const PLANNING_MAX_PROPAGATION_INTEGRATIONS: u32 = 512;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
 pub const PLANNING_MAX_REQUEST_MS: f64 = 34.0;

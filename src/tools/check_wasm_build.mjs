@@ -1,22 +1,32 @@
 // Compile and inspect modules without instantiating or executing application code.
-import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { join, dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "path";
 
-const root = fileURLToPath(new URL("../../", import.meta.url));
-const host = readFileSync(join(root, "src/backend/host/cpp_backend.mjs"), "utf8");
+const root = join(import.meta.dir, "../..");
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function readText(path) {
+  return await Bun.file(path).text();
+}
+
+async function exists(path) {
+  return await Bun.file(path).exists();
+}
+
+const host = await readText(join(root, "src/backend/host/cpp_backend.mjs"));
 
 // Source-level contract first: every request kind the frontend glue posts must
 // be executed by the Worker and routed back by the page, every delivery export
 // the page calls must exist in the frontend crate, and the Worker must be the
 // only place that instantiates the numerical modules.
 for (const file of ["src/html/backend-client.js", "src/html/backend-worker.js"]) {
-  assert(existsSync(join(root, file)), `Missing numerical Worker source ${file}`);
+  assert(await exists(join(root, file)), `Missing numerical Worker source ${file}`);
 }
-const glue = readFileSync(join(root, "src/cpp_backend.rs"), "utf8");
-const worker = readFileSync(join(root, "src/html/backend-worker.js"), "utf8");
-const page = readFileSync(join(root, "src/html/index.html"), "utf8");
+const glue = await readText(join(root, "src/cpp_backend.rs"));
+const worker = await readText(join(root, "src/html/backend-worker.js"));
+const page = await readText(join(root, "src/html/index.html"));
 const requestedKinds = new Set(
   [...glue.matchAll(/(?:post_backend_request|\.request)\(\s*'([a-z_]+)'/g)].map(match => match[1]),
 );
@@ -49,7 +59,7 @@ for (const [file, required] of [
   ["pkg/backend/ryugu_backend_bg.wasm", ["memory", "configure", "evaluate", "evaluate_sources", "prepare_candidate_sources", "clear_candidate_sources", "set_frequency_domain_modes", "advance_frame", "tick", "solve_density", "propagate_candidate", "propagate_candidates", "protocol_version"]],
   ["pkg/ryugu_wasm_bg.wasm", ["memory", ...deliveryExports]],
 ]) {
-  const module = await WebAssembly.compile(readFileSync(join(root, file)));
+  const module = await WebAssembly.compile(await Bun.file(join(root, file)).bytes());
   const exports = new Set(WebAssembly.Module.exports(module).map(entry => entry.name));
   for (const name of required) assert(exports.has(name), `${file}: missing export ${name} (rebuild with \`bun run build\`)`);
   if (file === "pkg/ryugu_backend.wasm") {
@@ -61,10 +71,10 @@ for (const [file, required] of [
   console.log(`${file}: valid WASM and required exports`);
 }
 for (const file of ["pkg/ryugu_wasm.js", "pkg/backend/ryugu_backend.js"]) {
-  const source = readFileSync(join(root, file), "utf8");
+  const source = await readText(join(root, file));
   for (const match of source.matchAll(/from\s+['"](\.\/[^'"]+)['"]/g)) {
-    assert(existsSync(resolve(root, dirname(file), match[1])), `Missing module ${match[1]}`);
+    assert(await exists(resolve(root, dirname(file), match[1])), `Missing module ${match[1]}`);
   }
 }
-assert(existsSync(join(root, "pkg/backend.mjs")), "Missing C++ host");
+assert(await exists(join(root, "pkg/backend.mjs")), "Missing C++ host");
 console.log("Static module checks passed; no WASM instantiated or executed.");

@@ -1,15 +1,19 @@
-import { readFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { existsSync } from "fs";
+import { join } from "path";
 
-const root = fileURLToPath(new URL("../../C++/", import.meta.url));
-const sources = JSON.parse(readFileSync(join(root, "sources.lock.json"), "utf8"));
+const root = join(import.meta.dir, "../../C++");
+const sources = await Bun.file(join(root, "sources.lock.json")).json();
+
 function git(args) {
-  const result = spawnSync("git", args, { encoding: "utf8" });
-  if (result.status !== 0) throw new Error(result.stderr || "git failed");
-  return result.stdout.trim();
+  const result = Bun.spawnSync({
+    cmd: ["git", ...args],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) throw new Error(result.stderr.toString() || "git failed");
+  return result.stdout.toString().trim();
 }
+
 for (const [name, source] of Object.entries(sources)) {
   const path = join(root, name);
   if (!existsSync(path)) {
@@ -29,8 +33,12 @@ for (const [name, source] of Object.entries(sources)) {
   if (source.submodules) git(["-C", path, "submodule", "update", "--init", "--depth", "1", ...source.submodules]);
   if (name === "exafmm-t" || name === "flups" || name === "basilisk") {
     const patch = join(root, "patches", name === "exafmm-t" ? "exafmm-browser.patch" : `${name}-browser.patch`);
-    const applied = spawnSync("git", ["-C", path, "apply", "--reverse", "--check", patch]);
-    if (applied.status !== 0) {
+    const applied = Bun.spawnSync({
+      cmd: ["git", "-C", path, "apply", "--reverse", "--check", patch],
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (applied.exitCode !== 0) {
       git(["-C", path, "apply", "--check", patch]);
       git(["-C", path, "apply", patch]);
     }

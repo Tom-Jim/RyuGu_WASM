@@ -1,5 +1,5 @@
-import { existsSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, unlinkSync } from "fs";
+import { join } from "path";
 import { isUpToDate, root, run } from "./build_helpers.mjs";
 
 const crate = join(root, "src/backend/rust");

@@ -11,10 +11,10 @@ const LIVE_KINDS = new Set(['advance', 'evaluate', 'frequency_domain_modes', 'co
 const liveQueue = [];
 const batchQueue = [];
 let pumping = false;
-// First/Stress `evaluate_sources` used to run as one 65k-source call that
-// occupied the only Worker until it finished, freezing live orbit + Jacobi.
-// Slice and yield so `advance` can run between chunks.
-const LIVE_YIELD_SOURCES = 512;
+let batchStreak = 0;
+const BATCH_WEIGHT = 4;
+const TARGET_SLICE = 512;
+const CONTINUE = { continue: true };
 
 function versionedUrl(path, cacheSuffix) {
     const url = new URL(path, import.meta.url);
@@ -54,39 +54,89 @@ function detachedResult(value) {
 
 async function yieldForLiveOrbit() {
     await new Promise((resolve) => setTimeout(resolve, 0));
-    while (liveQueue.length) {
-        const data = liveQueue.shift();
-        await handleRequest(data);
-        await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    // Nested yields must not run a 64-step advance inside a timed tile.
+    // Jacobi `evaluate` and Eq.121 modes may still drain; live `advance`
+    // returns to the weighted pump instead.
+    const index = liveQueue.findIndex((item) => (
+        item.kind === 'evaluate' || item.kind === 'frequency_domain_modes'
+    ));
+    if (index < 0) return;
+    const item = liveQueue.splice(index, 1)[0];
+    await handleRequest(item);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function addInto(accumulator, piece) {
-    for (let index = 0; index < accumulator.length; index += 1) {
-        accumulator[index] += piece[index];
-    }
+function evaluateSourcesFull(backend, method, xyz, masses, targets) {
+    return backend.evaluate_sources(method, xyz, masses, targets);
 }
 
-async function evaluateSourcesYielding(backend, method, xyz, masses, targets) {
-    const sourceCount = masses.length;
-    const accumulator = new Float64Array((targets.length / 3) * 4);
-    if (sourceCount === 0) return accumulator;
-    for (let start = 0; start < sourceCount; start += LIVE_YIELD_SOURCES) {
-        await yieldForLiveOrbit();
-        const end = Math.min(sourceCount, start + LIVE_YIELD_SOURCES);
-        const piece = backend.evaluate_sources(
-            method,
-            xyz.subarray(3 * start, 3 * end),
-            masses.subarray(start, end),
-            targets,
-        );
-        addInto(accumulator, piece);
+function continueEvaluateSources(backend, message) {
+    const payload = message.payload;
+    const targetCount = (payload.targets.length / 3) | 0;
+    if (targetCount === 0) return new Float64Array(0);
+    const start = message._targetStart || 0;
+    if (start === 0 && targetCount <= TARGET_SLICE) {
+        return detachedResult(evaluateSourcesFull(
+            backend,
+            payload.method,
+            payload.xyz,
+            payload.masses,
+            payload.targets,
+        ));
     }
-    return accumulator;
+    const end = Math.min(targetCount, start + TARGET_SLICE);
+    const piece = evaluateSourcesFull(
+        backend,
+        payload.method,
+        payload.xyz,
+        payload.masses,
+        payload.targets.subarray(3 * start, 3 * end),
+    );
+    if (!message._out) message._out = new Float64Array(targetCount * 4);
+    message._out.set(piece, start * 4);
+    if (end < targetCount) {
+        message._targetStart = end;
+        return CONTINUE;
+    }
+    const out = message._out;
+    message._out = null;
+    message._targetStart = 0;
+    return out;
 }
 
-async function runRequest(kind, payload) {
+function continueReferenceSources(backend, message) {
+    const payload = message.payload;
+    const chunk = Math.max(1, payload.chunk | 0);
+    const sourceCount = payload.masses.length;
+    const chunkCount = Math.ceil(sourceCount / chunk) || 0;
+    const targetValues = (payload.targets.length / 3) * 4;
+    if (chunkCount === 0) return new Float64Array(0);
+    const index = message._chunkIndex || 0;
+    if (!message._out) message._out = new Float64Array(chunkCount * targetValues);
+    const start = index * chunk;
+    const end = Math.min(sourceCount, start + chunk);
+    // Full source chunk, one tree/grid. Do not 512-slice sources.
+    const block = evaluateSourcesFull(
+        backend,
+        payload.method || 'direct',
+        payload.xyz.subarray(3 * start, 3 * end),
+        payload.masses.subarray(start, end),
+        payload.targets,
+    );
+    message._out.set(block, index * targetValues);
+    if (index + 1 < chunkCount) {
+        message._chunkIndex = index + 1;
+        return CONTINUE;
+    }
+    const out = message._out;
+    message._out = null;
+    message._chunkIndex = 0;
+    return out;
+}
+
+async function runRequest(message) {
     const backend = globalThis.ryuguRustBackend;
+    const { kind, payload } = message;
     switch (kind) {
         case 'configure':
             backend.configure(payload.cells, payload.vertices, payload.facets, payload.mass);
@@ -109,39 +159,14 @@ async function runRequest(kind, payload) {
         }
         case 'evaluate_sources':
         case 'comparison_sources':
-            return await evaluateSourcesYielding(
-                backend,
-                payload.method,
-                payload.xyz,
-                payload.masses,
-                payload.targets,
-            );
-        case 'reference_sources': {
-            // One field block per consecutive source chunk, in chunk order, so
-            // the frontend can accumulate them exactly like its former loop.
-            // Internally the chunk is sliced so live `advance` is not blocked.
-            const chunk = Math.max(1, payload.chunk | 0);
-            const sourceCount = payload.masses.length;
-            const chunkCount = Math.ceil(sourceCount / chunk);
-            const targetValues = (payload.targets.length / 3) * 4;
-            const out = new Float64Array(chunkCount * targetValues);
-            for (let index = 0; index < chunkCount; index += 1) {
-                const start = index * chunk;
-                const end = Math.min(sourceCount, start + chunk);
-                const block = await evaluateSourcesYielding(
-                    backend,
-                    payload.method || 'direct',
-                    payload.xyz.subarray(3 * start, 3 * end),
-                    payload.masses.subarray(start, end),
-                    payload.targets,
-                );
-                out.set(block, index * targetValues);
-            }
-            return out;
-        }
+            return continueEvaluateSources(backend, message);
+        case 'reference_sources':
+            return continueReferenceSources(backend, message);
         case 'source_sets': {
-            // Independent source sets against one common target list; the
-            // answer is laid out [set][target][4].
+            // Invert reference + voxel columns. Do not yield to live advance
+            // between sets: that drain never finished under 64×, so FMM/FFT
+            // invert sat on "Preparing inversion observations…" forever.
+            // Frequency-domain invert skips this Worker path entirely.
             const offsets = payload.setOffsets;
             const setCount = offsets.length - 1;
             const targetValues = (payload.targets.length / 3) * 4;
@@ -149,8 +174,7 @@ async function runRequest(kind, payload) {
             for (let index = 0; index < setCount; index += 1) {
                 const start = offsets[index];
                 const end = offsets[index + 1];
-                const block = await evaluateSourcesYielding(
-                    backend,
+                const block = backend.evaluate_sources(
                     payload.method,
                     payload.xyz.subarray(3 * start, 3 * end),
                     payload.masses.subarray(start, end),
@@ -179,29 +203,37 @@ async function runRequest(kind, payload) {
                 payload.history,
             ));
         case 'solve_density':
-            // Clarabel can monopolize the Worker for seconds; drain live orbit first.
-            await yieldForLiveOrbit();
             return detachedResult(backend.solve_density(payload.data));
         case 'propagate_candidates':
-            // First/Stress slices are still synchronous WASM, but draining the
-            // live queue between slices keeps advance from starving entirely.
-            await yieldForLiveOrbit();
             return detachedResult(backend.propagate_candidates(payload.data));
         default:
             throw new Error(`Unknown numerical request: ${kind}`);
     }
 }
 
+function asU64(value) {
+    if (typeof value === 'bigint') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
+    if (typeof value === 'string' && value !== '') return BigInt(value);
+    return 0n;
+}
+
 async function handleRequest(message) {
+    const requestId = asU64(message.requestId);
+    const epoch = asU64(message.epoch);
     try {
         await backendReady;
-        const value = await runRequest(message.kind, message.payload);
+        const value = await runRequest(message);
+        if (value === CONTINUE) {
+            batchQueue.unshift(message);
+            return;
+        }
         const transfer = ArrayBuffer.isView(value) ? [value.buffer] : [];
         postMessage({
             type: 'result',
             kind: message.kind,
-            requestId: message.requestId,
-            epoch: message.epoch,
+            requestId,
+            epoch,
             ok: true,
             value,
         }, transfer);
@@ -209,8 +241,8 @@ async function handleRequest(message) {
         postMessage({
             type: 'result',
             kind: message.kind,
-            requestId: message.requestId,
-            epoch: message.epoch,
+            requestId,
+            epoch,
             ok: false,
             error: error instanceof Error ? error.message : String(error),
         });
@@ -232,19 +264,38 @@ self.onmessage = ({ data }) => {
         return;
     }
     if (data?.type !== 'request') return;
-    // Live orbit/Jacobi/configure stay ahead of First/Stress batches so a
-    // planning job cannot freeze the probe, trail, or bottom chart.
+    // Configure stays first. Weighted pump: K batch : 1 live while batch
+    // work is queued so First/Stress/Invert make progress without freezing orbit.
     if (LIVE_KINDS.has(data.kind)) liveQueue.push(data);
     else batchQueue.push(data);
     pump();
 };
+
+function takeQueuedRequest() {
+    const configure = liveQueue.findIndex((item) => item.kind === 'configure');
+    if (configure >= 0) {
+        batchStreak = 0;
+        return liveQueue.splice(configure, 1)[0];
+    }
+    if (liveQueue.length && batchQueue.length) {
+        if (batchStreak < BATCH_WEIGHT) {
+            batchStreak += 1;
+            return batchQueue.shift();
+        }
+        batchStreak = 0;
+        return liveQueue.shift();
+    }
+    batchStreak = 0;
+    return liveQueue.shift() || batchQueue.shift();
+}
 
 async function pump() {
     if (pumping) return;
     pumping = true;
     try {
         while (liveQueue.length || batchQueue.length) {
-            const data = liveQueue.shift() || batchQueue.shift();
+            const data = takeQueuedRequest();
+            if (!data) break;
             await handleRequest(data);
         }
     } finally {

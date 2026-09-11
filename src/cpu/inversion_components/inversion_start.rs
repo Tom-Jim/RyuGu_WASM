@@ -19,6 +19,7 @@ pub(crate) struct InversionStartJob {
     sensitivities: Option<Vec<Vec3>>,
     pending: Option<PendingInversionRequest>,
     common_started: Instant,
+    watchdog_reset: bool,
     truth_prepare_ms: Option<f64>,
     method_started: Instant,
     matrix_started: Option<Instant>,
@@ -46,7 +47,6 @@ pub(crate) struct InversionStartWorker {
 
 pub fn start_density_inversion_system(
     active_method: Res<ActiveGravityMethod>,
-    planning: Res<PlanningComparisonState>,
     radial_source: Option<Res<DensityQuadratureSource>>,
     aggregated_source: Option<Res<AggregatedGravitySource>>,
     channel: Res<crate::cpp_backend::BackendSensitivityChannel>,
@@ -61,12 +61,12 @@ pub fn start_density_inversion_system(
         job: job_slot,
         next_request_id,
     } = &mut *worker;
-    // A start whose capture, method, or metric went away is abandoned together
-    // with its Worker request. A repeated Invert click while a job is in flight
-    // is ignored instead of restarting from scratch.
+    // Invert is independent of the First/Stress metric. Switching Speedup
+    // used to abandon a running FMM/FFT invert and leave the 3D view blank.
+    // A repeated Invert click while a job is in flight is ignored instead of
+    // restarting from scratch. Capture/method changes still cancel it.
     let abandoned = job_slot.as_ref().is_some_and(|job| {
-        !planning.selected_metric.is_inversion()
-            || !inversion.ready
+        !inversion.ready
             || inversion.capture_id != Some(job.capture_id)
             || inversion.capture_epoch != job.capture_epoch
             || *active_method != job.method
@@ -78,10 +78,6 @@ pub fn start_density_inversion_system(
     }
     if job_slot.is_some() && inversion.start_requested {
         inversion.start_requested = false;
-    }
-    if !planning.selected_metric.is_inversion() {
-        inversion.preparing = job_slot.is_some();
-        return;
     }
     if job_slot.is_none() {
         if !validate_inversion_request(inversion.start_requested, *active_method, &mut inversion)
@@ -113,8 +109,23 @@ pub fn start_density_inversion_system(
     if let Some(pending) = job.pending.take() {
         match channel.take() {
             None if !channel.is_idle() => {
-                job.pending = Some(pending);
-                return;
+                let waited = job.common_started.elapsed().as_secs_f64();
+                if waited > 20.0 {
+                    inversion.error = Some(
+                        "Inversion observations did not return from the numerical Worker.".into(),
+                    );
+                    inversion.preparing = false;
+                    *job_slot = None;
+                    channel.reset();
+                    return;
+                }
+                if waited > 8.0 && !job.watchdog_reset {
+                    channel.reset();
+                    job.watchdog_reset = true;
+                } else {
+                    job.pending = Some(pending);
+                    return;
+                }
             }
             // An experiment reset discarded the request; it is re-issued below.
             None => {}
@@ -140,6 +151,25 @@ pub fn start_density_inversion_system(
             // A mismatching answer belongs to a superseded request.
             Some(_) => {}
         }
+    }
+
+    let waited = job.common_started.elapsed().as_secs_f64();
+    if waited > 20.0 {
+        inversion.error = Some(
+            "Inversion observations did not return from the numerical Worker.".into(),
+        );
+        inversion.preparing = false;
+        *job_slot = None;
+        channel.reset();
+        return;
+    }
+    if waited > 8.0 && !job.watchdog_reset {
+        // A mismatched u64 id or a leftover in_flight flag leaves this
+        // channel wedged: begin() returns false forever and Invert stays
+        // on Preparing. One reset re-issues the same source_sets job.
+        channel.reset();
+        job.pending = None;
+        job.watchdog_reset = true;
     }
 
     if let Some(sets) = job.reference_sets.as_ref() {
@@ -262,6 +292,7 @@ pub fn start_density_inversion_system(
         return;
     }
     inversion.inverted = true;
+    // Recovered voxels are the overlay, not forward D. Do not auto-enable Section.
     show_section.0 = false;
     inversion.displayed_density = Some(density_result_from_job(
         &optimizer,
@@ -278,7 +309,7 @@ fn next_inversion_snapshot(
 ) -> crate::cpp_backend::BackendSensitivitySnapshot {
     *next_request_id = next_request_id.wrapping_add(1).max(1);
     crate::cpp_backend::BackendSensitivitySnapshot {
-        request_id: job.capture_id.rotate_left(13) ^ *next_request_id,
+        request_id: *next_request_id,
         epoch: job.capture_epoch,
     }
 }
@@ -303,7 +334,24 @@ fn begin_inversion_start(
             voxels.len()
         ));
     }
-    let basis_sources = build_voxel_basis_sources(&voxels, aggregated, voxel_size)
+    let live_bytes = crate::cpu::density::reduce_live_quadrature_bytes(&source.bytes);
+    let live_aggregated = AggregatedGravitySource {
+        sources: crate::cpu::frequency_domain::point_sources_from_quadrature_bytes(&live_bytes),
+        constant_sources: Vec::new(),
+        total_mass: aggregated.total_mass,
+        constant_total_mass: aggregated.constant_total_mass,
+        radius: aggregated.radius,
+        source_hash: aggregated.source_hash,
+        constant_hash: aggregated.constant_hash,
+    };
+    // FMM/FFT invert must use the same 32-angular live mesh as Verlet. FD
+    // invert is the Eq.(184) operator on the full quadrature and stays that way.
+    let basis_geometry = if method == ActiveGravityMethod::FrequencyDomain {
+        aggregated
+    } else {
+        &live_aggregated
+    };
+    let basis_sources = build_voxel_basis_sources(&voxels, basis_geometry, voxel_size)
         .ok_or("The shared mass-preserving voxel basis is not ready.")?;
     let samples = sample_frozen_trajectory(&inversion.knots)
         .ok_or("The frozen trajectory cannot be sampled.")?;
@@ -361,6 +409,7 @@ fn begin_inversion_start(
         sensitivities: None,
         pending: None,
         common_started,
+        watchdog_reset: false,
         truth_prepare_ms: None,
         method_started: common_started,
         matrix_started: None,
@@ -373,17 +422,20 @@ fn apply_reference_answer(
     result: Result<Vec<f64>, String>,
     inversion: &mut TrajectoryInversionState,
 ) -> Result<(), String> {
-    let (training, training_basis, holdout, holdout_basis) = result
-        .ok()
-        .and_then(|values| {
-            decode_training_and_holdout_reference(
-                &values,
-                &job.samples,
-                &job.holdout_samples,
-                job.voxels.len(),
-            )
-        })
-        .ok_or("The frozen trajectory has no valid reference observations.")?;
+    let values = result?;
+    let expected = (1 + job.voxels.len()) * (job.samples.len() + job.holdout_samples.len()) * 4;
+    let (training, training_basis, holdout, holdout_basis) = decode_training_and_holdout_reference(
+        &values,
+        &job.samples,
+        &job.holdout_samples,
+        job.voxels.len(),
+    )
+    .ok_or_else(|| {
+        format!(
+            "The frozen trajectory has no valid reference observations (got {} values, expected {expected}).",
+            values.len()
+        )
+    })?;
     inversion.reference_cache_capture_id = Some(job.capture_id);
     inversion.reference_cache_source_hash = job.source_hash;
     inversion.reference_training_observations = training;
@@ -442,15 +494,17 @@ fn validate_inversion_request(
     };
     inversion.optimizer = None;
     let source_hash = inversion.capture_source_hash;
+    if inversion.batch_capture_id != Some(capture_id) {
+        inversion.results = std::array::from_fn(|_| None);
+        inversion.batch_capture_id = Some(capture_id);
+    }
     let source_changed = inversion
         .best_results
         .iter()
         .flatten()
         .any(|result| result.source_hash != source_hash);
-    if inversion.batch_capture_id != Some(capture_id) || source_changed {
-        inversion.results = std::array::from_fn(|_| None);
+    if source_changed {
         inversion.best_results = std::array::from_fn(|_| None);
-        inversion.batch_capture_id = Some(capture_id);
     }
     inversion.results[method.performance_index()] = None;
     inversion.displayed_density = None;

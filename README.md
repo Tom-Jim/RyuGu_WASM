@@ -4,6 +4,7 @@
 [![Live demo](https://img.shields.io/badge/Live_demo-WebGPU-success)](https://tom-jim.github.io/RyuGu_WASM/)
 [![Bevy](https://img.shields.io/badge/Bevy-0.19.1-purple)](https://bevy.org/)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange)](https://www.rust-lang.org/)
+[![Bun](https://img.shields.io/badge/runtime-Bun_1.3-f9f1e1?logo=bun&logoColor=000)](https://bun.sh/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **A browser-based planetary-science workbench for investigating how an irregular asteroid's shape and internal density affect spacecraft motion, surface gravity, and the information recoverable from an observation arc.**
@@ -421,7 +422,7 @@ All project-owned source, bridge, protocol, and build-tool code is organized und
 
 ## Build and checks
 
-A local build needs Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, Bun, Node.js, Git, CMake, and Zig 0.16.0. The interactive numerical application requires an available WebGPU adapter in a supporting browser; local serving uses `localhost`, and deployment uses HTTPS.
+A local build needs Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, Bun, Git, CMake, and Zig 0.16.0. JavaScript tooling, the local server, and CI syntax checks all run on Bun; Node.js is not used. The interactive numerical application requires an available WebGPU adapter in a supporting browser; local serving uses `localhost`, and deployment uses HTTPS.
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -439,12 +440,13 @@ The Rust checks used by CI include:
 cargo fmt --all -- --check
 cargo fmt --manifest-path src/backend/rust/Cargo.toml -- --check
 RUSTC_WRAPPER= cargo clippy --locked --target wasm32-unknown-unknown --manifest-path src/backend/rust/Cargo.toml -- -D warnings
+bun run check:js
 bun run check:wasm
 RUSTC_WRAPPER= cargo clippy --locked --target wasm32-unknown-unknown --lib -- -D warnings
 RUSTC_WRAPPER= cargo check --locked --target wasm32-unknown-unknown --lib
 ```
 
-The GitHub Pages workflow installs Zig, fetches pinned C++ sources, runs `bun run build` for the three release WASM packages and the Tailwind stylesheet, bundles the Vue telemetry interface, checks JavaScript syntax and deployment asset paths, and assembles the static site. The WASM checker compiles and inspects exports/import paths without instantiating modules. All module URLs are relative for repository-subpath hosting; choose GitHub Actions as the Pages source. Passing those checks establishes build and packaging consistency; scientific convergence and device-specific GPU behavior require separate validation.
+The GitHub Pages workflow installs Zig, fetches pinned C++ sources, runs `bun run build` for the three release WASM packages and the Tailwind stylesheet, bundles the Vue telemetry interface, checks JavaScript with Bun, verifies deployment asset paths, and assembles the static site. The WASM checker compiles and inspects exports/import paths without instantiating modules. All module URLs are relative for repository-subpath hosting; choose GitHub Actions as the Pages source. Passing those checks establishes build and packaging consistency; scientific convergence and device-specific GPU behavior require separate validation.
 
 ## License
 

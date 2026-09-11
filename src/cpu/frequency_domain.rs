@@ -1,7 +1,7 @@
 //! Density preparation shared by the frequency-domain runtime and planners.
 
 use crate::interface::components::*;
-use bevy::math::DVec3;
+use bevy::math::{DMat3, DVec3};
 use bevy::prelude::*;
 use num_complex::Complex64;
 use std::collections::hash_map::DefaultHasher;
@@ -11,14 +11,23 @@ pub(crate) const EQ184_RADIAL_SHELLS: usize = 4;
 pub(crate) const EQ184_DIRECTIONS_PER_SHELL: usize = 16;
 pub(crate) const EQ184_QUADRATURE_COUNT: usize = EQ184_RADIAL_SHELLS * EQ184_DIRECTIONS_PER_SHELL;
 /// Bumps GPU node/sensitivity caches when the shared 64-node κ layout changes.
-pub(crate) const EQ184_QUADRATURE_LAYOUT: u64 = 2;
+pub(crate) const EQ184_QUADRATURE_LAYOUT: u64 = 3;
 pub(crate) const EQ184_BASE_LAPLACE_SIGMA: f64 = 1.0e-3;
 
 /// Packed Eq.121 modes: `[kx, ky, kz, coeff_re, coeff_im]` per quadrature node.
 pub(crate) const EQUATION121_MODE_STRIDE: usize = 5;
-/// Trailer after the 64 Fourier records: `[cmx, cmy, cmz, GM, sentinel]`.
+/// Trailer after the Fourier records: `[cmx, cmy, cmz, GM, sentinel]`.
 /// The sentinel (`2`) marks the analytic k→0 monopole of the same integral.
 const EQUATION121_NEWTON_SENTINEL: f64 = 2.0;
+
+/// Packed spherical Eq.(121) fallback / tests. GPU Eq.(184) stays on the
+/// 64-node layout (`EQ184_QUADRATURE_COUNT`) because the WGSL time-lane
+/// product is 64×4. Live Verlet does **not** use this sum: the Worker
+/// evaluates the same ∫d³κ with FLUPS/FFTW (Zig-bound C++) at `q_B`.
+pub(crate) const EQ121_LIVE_RADIAL_SHELLS: usize = 8;
+pub(crate) const EQ121_LIVE_DIRECTIONS_PER_SHELL: usize = 32;
+pub(crate) const EQ121_LIVE_QUADRATURE_COUNT: usize =
+    EQ121_LIVE_RADIAL_SHELLS * EQ121_LIVE_DIRECTIONS_PER_SHELL;
 
 const GAUSS_NODES: [f64; 4] = [
     -0.861_136_311_6,
@@ -31,6 +40,27 @@ const GAUSS_WEIGHTS: [f64; 4] = [
     0.652_145_154_9,
     0.652_145_154_9,
     0.347_854_845_1,
+];
+/// 8-point Gauss–Legendre on [-1, 1], identical to the C++ cell quadrature.
+const GAUSS8_NODES: [f64; 8] = [
+    -0.960_289_856_497_536_3,
+    -0.796_666_477_413_626_7,
+    -0.525_532_409_916_329_0,
+    -0.183_434_642_495_649_8,
+    0.183_434_642_495_649_8,
+    0.525_532_409_916_329_0,
+    0.796_666_477_413_626_7,
+    0.960_289_856_497_536_3,
+];
+const GAUSS8_WEIGHTS: [f64; 8] = [
+    0.101_228_536_290_376_3,
+    0.222_381_034_453_374_5,
+    0.313_706_645_877_887_3,
+    0.362_683_783_378_362_0,
+    0.362_683_783_378_362_0,
+    0.313_706_645_877_887_3,
+    0.222_381_034_453_374_5,
+    0.101_228_536_290_376_3,
 ];
 
 /// Finite reciprocal-space realization of equation (121):
@@ -47,9 +77,9 @@ pub fn build_equation121_modes(bytes: &[u8], source_radius: f64) -> Option<Vec<f
         return None;
     }
     let (mass, center) = quadrature_mass_centroid(cells)?;
-    let mut packed = Vec::with_capacity((EQ184_QUADRATURE_COUNT + 1) * EQUATION121_MODE_STRIDE);
-    for index in 0..EQ184_QUADRATURE_COUNT {
-        let (k, weight) = eq184_quadrature_node(index, source_radius)?;
+    let mut packed = Vec::with_capacity((EQ121_LIVE_QUADRATURE_COUNT + 1) * EQUATION121_MODE_STRIDE);
+    for index in 0..EQ121_LIVE_QUADRATURE_COUNT {
+        let (k, weight) = eq121_live_quadrature_node(index, source_radius)?;
         let k_squared = k.length_squared();
         if !(k_squared > 0.0) {
             return None;
@@ -79,15 +109,38 @@ pub fn build_equation121_modes(bytes: &[u8], source_radius: f64) -> Option<Vec<f
     Some(packed)
 }
 
-/// Evaluate the packed Eq.121 operator at a body-frame position.
+/// Inverse Laplace of Eq.(106) on a point of the reference line equals the
+/// spatial Eq.(121) residue there (`mathtidy.md` §2). Jacobian is `D_q g`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn evaluate_equation121(modes: &[f64], position: DVec3) -> Option<(DVec3, f64)> {
+    evaluate_equation121_with_jacobian(modes, position).map(|(gravity, potential, _)| (gravity, potential))
+}
+
+/// First-order trajectory Taylor of `mathtidy.md` (15)/(119):
+/// `g(q_ref + y) = g_ref + (D_q g_ref) y`.
+/// Eq.(184) is the whole-trajectory observation, not this live force.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn evaluate_equation106_taylor(
+    modes: &[f64],
+    reference: DVec3,
+    transverse: DVec3,
+) -> Option<(DVec3, f64)> {
+    let (gravity, potential, jacobian) = evaluate_equation121_with_jacobian(modes, reference)?;
+    let field = gravity + jacobian * transverse;
+    (field.is_finite() && potential.is_finite()).then_some((field, potential))
+}
+
+fn evaluate_equation121_with_jacobian(
+    modes: &[f64],
+    position: DVec3,
+) -> Option<(DVec3, f64, DMat3)> {
     if modes.len() % EQUATION121_MODE_STRIDE != 0 || modes.is_empty() {
         return None;
     }
     let (fourier, newton) = split_equation121_modes(modes);
     let mut gravity = DVec3::ZERO;
     let mut potential = 0.0;
+    let mut jacobian = DMat3::ZERO;
     for mode in fourier.as_chunks::<EQUATION121_MODE_STRIDE>().0 {
         let k = DVec3::new(mode[0], mode[1], mode[2]);
         let phase = k.dot(position);
@@ -96,29 +149,47 @@ pub fn evaluate_equation121(modes: &[f64], position: DVec3) -> Option<(DVec3, f6
         let im = mode[3] * sin_phase + mode[4] * cos_phase;
         gravity -= im * k;
         potential += re;
+        jacobian -= DMat3::from_cols(k * k.x, k * k.y, k * k.z) * re;
     }
     if let Some((center, gravitational_parameter)) = newton {
         let offset = position - center;
         let distance_squared = offset.length_squared();
         if distance_squared > 0.0 {
             let inverse_distance = distance_squared.sqrt().recip();
-            // Formula-faithful IR/UV split of Eq.(121): uncapped residual of
-            // (ρ̂−M) plus the analytic k→0 monopole. Near-surface erf/erfc
-            // (derivation appendix) is a separate long/short split, not a
-            // residual magnitude clamp.
-            let monopole = -gravitational_parameter * offset * inverse_distance.powi(3);
-            gravity += monopole;
+            let inv3 = inverse_distance.powi(3);
+            let inv5 = inverse_distance.powi(5);
+            gravity += -gravitational_parameter * offset * inv3;
             potential += gravitational_parameter * inverse_distance;
+            jacobian += DMat3::from_cols(
+                DVec3::new(
+                    -gravitational_parameter * (inv3 - 3.0 * offset.x * offset.x * inv5),
+                    gravitational_parameter * 3.0 * offset.x * offset.y * inv5,
+                    gravitational_parameter * 3.0 * offset.x * offset.z * inv5,
+                ),
+                DVec3::new(
+                    gravitational_parameter * 3.0 * offset.y * offset.x * inv5,
+                    -gravitational_parameter * (inv3 - 3.0 * offset.y * offset.y * inv5),
+                    gravitational_parameter * 3.0 * offset.y * offset.z * inv5,
+                ),
+                DVec3::new(
+                    gravitational_parameter * 3.0 * offset.z * offset.x * inv5,
+                    gravitational_parameter * 3.0 * offset.z * offset.y * inv5,
+                    -gravitational_parameter * (inv3 - 3.0 * offset.z * offset.z * inv5),
+                ),
+            );
         }
     }
-    (gravity.is_finite() && potential.is_finite()).then_some((gravity, potential))
+    (gravity.is_finite() && potential.is_finite() && jacobian.is_finite())
+        .then_some((gravity, potential, jacobian))
 }
 
 fn split_equation121_modes(modes: &[f64]) -> (&[f64], Option<(DVec3, f64)>) {
-    let trailer_start = EQ184_QUADRATURE_COUNT * EQUATION121_MODE_STRIDE;
-    if modes.len() != trailer_start + EQUATION121_MODE_STRIDE {
+    if modes.len() < 2 * EQUATION121_MODE_STRIDE
+        || !modes.len().is_multiple_of(EQUATION121_MODE_STRIDE)
+    {
         return (modes, None);
     }
+    let trailer_start = modes.len() - EQUATION121_MODE_STRIDE;
     let trailer = &modes[trailer_start..];
     if trailer[4] != EQUATION121_NEWTON_SENTINEL || !(trailer[3] > 0.0) {
         return (modes, None);
@@ -212,14 +283,14 @@ pub(crate) fn eq184_quadrature_node(index: usize, source_radius: f64) -> Option<
     let radius_xy = (1.0 - z * z).max(0.0).sqrt();
     let phi = 2.399_963_229_728_653 * base as f64;
     let direction = sign * DVec3::new(radius_xy * phi.cos(), radius_xy * phi.sin(), z);
-    // Four Gauss–Legendre shells on ln κ keep the packed 64-node layout while
-    // covering quadrupole-small IR residual (κR ~ 1/2π) through body-scale UV
-    // (κR ~ 4π, λ = R/2). Linear [1/R, π/R] left the residual almost without
-    // near-field content, so live Eq.121 orbits collapsed toward a hook.
-    // Analytic IR monopole stays in the trailer; nodes never sample κ → 0.
+    // Four Gauss–Legendre shells on ln κ keep the packed 64-node layout.
+    // IR edge κR ~ 1/(2π) keeps ρ̂−M quadrupole-small; UV cutoff is the body
+    // Nyquist κR = π (λ = 2R). Extending to 4π/R put nodes in the oscillating
+    // 3j₁(κR)/(κR)−1 band, so the uncapped residual precessed a 1.07 v_circ
+    // ellipse into a flower. Analytic IR monopole stays in the trailer.
     let radius = source_radius.max(1.0);
     let k_min = 1.0 / (2.0 * std::f64::consts::PI * radius);
-    let k_max = 4.0 * std::f64::consts::PI / radius;
+    let k_max = std::f64::consts::PI / radius;
     let ln_min = k_min.ln();
     let ln_max = k_max.ln();
     let ln_mid = 0.5 * (ln_max + ln_min);
@@ -229,6 +300,36 @@ pub(crate) fn eq184_quadrature_node(index: usize, source_radius: f64) -> Option<
     let wave_number = ln_k.exp();
     let angular_weight = std::f64::consts::TAU * 2.0 / EQ184_DIRECTIONS_PER_SHELL as f64;
     let volume_weight = wave_number.powi(3) * ln_half * GAUSS_WEIGHTS[shell] * angular_weight;
+    Some((direction * wave_number, volume_weight))
+}
+
+/// Dense log-Gauss × Fibonacci node for the live inverse-Laplace of Eq.(106).
+/// Same IR/UV split as Eq.(184), more radial shells and angles so the residual
+/// of ρ̂−M is a correction instead of a 16-spike aliasing torque.
+pub(crate) fn eq121_live_quadrature_node(index: usize, source_radius: f64) -> Option<(DVec3, f64)> {
+    if index >= EQ121_LIVE_QUADRATURE_COUNT || !source_radius.is_finite() || source_radius <= 0.0 {
+        return None;
+    }
+    let angular = index % EQ121_LIVE_DIRECTIONS_PER_SHELL;
+    let bases = EQ121_LIVE_DIRECTIONS_PER_SHELL / 2;
+    let base = angular % bases;
+    let sign = if angular >= bases { -1.0 } else { 1.0 };
+    let z = 1.0 - 2.0 * (base as f64 + 0.5) / bases as f64;
+    let radius_xy = (1.0 - z * z).max(0.0).sqrt();
+    let phi = 2.399_963_229_728_653 * base as f64;
+    let direction = sign * DVec3::new(radius_xy * phi.cos(), radius_xy * phi.sin(), z);
+    let radius = source_radius.max(1.0);
+    let k_min = 1.0 / (2.0 * std::f64::consts::PI * radius);
+    let k_max = std::f64::consts::PI / radius;
+    let ln_min = k_min.ln();
+    let ln_max = k_max.ln();
+    let ln_mid = 0.5 * (ln_max + ln_min);
+    let ln_half = 0.5 * (ln_max - ln_min);
+    let shell = index / EQ121_LIVE_DIRECTIONS_PER_SHELL;
+    let ln_k = ln_mid + ln_half * GAUSS8_NODES[shell];
+    let wave_number = ln_k.exp();
+    let angular_weight = std::f64::consts::TAU * 2.0 / EQ121_LIVE_DIRECTIONS_PER_SHELL as f64;
+    let volume_weight = wave_number.powi(3) * ln_half * GAUSS8_WEIGHTS[shell] * angular_weight;
     Some((direction * wave_number, volume_weight))
 }
 
@@ -340,6 +441,133 @@ pub fn build_aggregated_gravity_source_system(
         source_hash: hash_source_bytes(&quadrature.bytes),
         constant_hash: hash_source_bytes(&quadrature.constant_bytes),
     });
+}
+
+/// Discrete equation-(184) observations for the live spectral chart: one
+/// `‖g̃_γ(σ)‖` sample per frozen knot at `eq184_laplace_sigma`. This is the
+/// same f64 operator invert uses, not the GPU f32 stamp and not Verlet force.
+pub(crate) fn eq184_chart_observations(
+    knots: &[TrajectoryInversionKnot],
+    sources: &[FrequencyDomainPointSource],
+    radius: f64,
+) -> Option<Vec<FrequencyDomainObservation>> {
+    if knots.len() < 2 || sources.is_empty() {
+        return None;
+    }
+    let quadrature = (0..EQ184_QUADRATURE_COUNT)
+        .map(|index| {
+            let (wave_vector, weight) = eq184_quadrature_node(index, radius)?;
+            let coefficient = f64::from(G) * 4.0 * std::f64::consts::PI
+                / std::f64::consts::TAU.powi(3)
+                * weight
+                / wave_vector.length_squared().max(1.0e-18);
+            Some((wave_vector, coefficient))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let density_spectrum = quadrature
+        .iter()
+        .map(|(wave_vector, _)| {
+            sources.iter().fold(Complex64::new(0.0, 0.0), |sum, source| {
+                sum + Complex64::from_polar(source.mass, -wave_vector.dot(source.position))
+            })
+        })
+        .collect::<Vec<_>>();
+    let count = knots.len();
+    let mut observations = Vec::with_capacity(count);
+    for observation_index in 0..count {
+        let sigma = eq184_laplace_sigma(observation_index, count);
+        let mut field = DVec3::ZERO;
+        let mut potential = 0.0;
+        for (node, (wave_vector, coefficient)) in quadrature.iter().enumerate() {
+            let trajectory = knots.iter().enumerate().try_fold(
+                Complex64::new(0.0, 0.0),
+                |sum, (sample_index, sample)| {
+                    let previous = knots.get(sample_index.wrapping_sub(1)).unwrap_or(sample);
+                    let next = knots.get(sample_index + 1).unwrap_or(sample);
+                    let body_position = sample
+                        .body_rotation
+                        .inverse()
+                        .mul_vec3(sample.position)
+                        .as_dvec3();
+                    Some(
+                        sum + eq184_trajectory_term(
+                            *wave_vector,
+                            body_position,
+                            previous.simulation_time_seconds,
+                            sample.simulation_time_seconds,
+                            next.simulation_time_seconds,
+                            sample_index,
+                            count,
+                            sigma,
+                        )?,
+                    )
+                },
+            )?;
+            let product = density_spectrum[node] * trajectory;
+            field += -*coefficient * product.im * *wave_vector;
+            potential += -*coefficient * product.re;
+        }
+        if !field.is_finite() || !potential.is_finite() || sigma <= 0.0 {
+            return None;
+        }
+        observations.push(FrequencyDomainObservation {
+            laplace_frequency: sigma as f32,
+            transformed_field: field.as_vec3(),
+            transformed_jacobian: Mat3::ZERO,
+            transformed_potential: potential as f32,
+        });
+    }
+    Some(observations)
+}
+
+/// Fills the FD telemetry chart from Eq.(184) once a capture exists.
+/// GPU f32 readback is invert sensitivity / planning only; a failed stamp
+/// must not leave the chart empty or overwrite this Laplace curve.
+pub fn publish_equation184_chart_system(
+    active: Res<ActiveGravityMethod>,
+    inversion: Res<TrajectoryInversionState>,
+    quadrature: Option<Res<DensityQuadratureSource>>,
+    aggregated: Option<Res<AggregatedGravitySource>>,
+    mut chart: ResMut<FrequencyDomainTrajectoryBatchResult>,
+) {
+    if *active != ActiveGravityMethod::FrequencyDomain || !inversion.ready {
+        return;
+    }
+    let Some(capture_id) = inversion.capture_id else {
+        return;
+    };
+    if chart.capture_id == Some(capture_id) && !chart.observations.is_empty() {
+        return;
+    }
+    let radius = aggregated
+        .as_ref()
+        .map(|source| source.radius)
+        .or_else(|| quadrature.as_ref().map(|source| source.radius as f64))
+        .unwrap_or(0.0);
+    let sources = if let Some(quadrature) = quadrature.as_ref() {
+        // Live 128-cell mesh: same ρ̂ the Verlet FLUPS force sees, cheap enough
+        // to publish once at capture without hitching the orbit.
+        point_sources_from_quadrature_bytes(&crate::cpu::density::reduce_live_quadrature_bytes(
+            &quadrature.bytes,
+        ))
+    } else {
+        let Some(aggregated) = aggregated else {
+            return;
+        };
+        aggregated.sources.clone()
+    };
+    let samples = crate::cpu::inversion::sample_frozen_trajectory(&inversion.knots)
+        .unwrap_or_else(|| inversion.knots.clone());
+    let Some(observations) = eq184_chart_observations(&samples, &sources, radius) else {
+        return;
+    };
+    chart.capture_id = Some(capture_id);
+    chart.observations = observations;
+    chart.revision = chart.revision.wrapping_add(1);
+}
+
+pub(crate) fn point_sources_from_quadrature_bytes(bytes: &[u8]) -> Vec<FrequencyDomainPointSource> {
+    parse_quadrature(bytes).0
 }
 
 fn parse_quadrature(bytes: &[u8]) -> (Vec<FrequencyDomainPointSource>, f64, f64) {
@@ -463,7 +691,7 @@ mod tests {
                 "sphere at -x must attract toward +x, got {gravity:?}"
             );
             assert!(
-                (0.85..=1.15).contains(&ratio),
+                (0.95..=1.05).contains(&ratio),
                 "Eq.121 |g| / (GM/r²) = {ratio:.3} at r={distance} (newton={newton:.3e}, |g|={:.3e})",
                 gravity.length()
             );
@@ -473,16 +701,26 @@ mod tests {
         let newton = gm / ic.length_squared();
         let ratio = gravity.length() as f64 / newton;
         assert!(
-            (0.85..=1.15).contains(&ratio),
+            (0.95..=1.05).contains(&ratio),
             "Eq.121 at the live IC must be near-Newtonian, got {ratio:.3}"
         );
-        let fourier_only = &modes[..EQ184_QUADRATURE_COUNT * EQUATION121_MODE_STRIDE];
+        let fourier_only = &modes[..modes.len() - EQUATION121_MODE_STRIDE];
         let (residual, _) = evaluate_equation121(fourier_only, ic).expect("residual");
         assert!(
-            residual.length() < 0.35 * newton,
-            "64-node residual should be a correction, not the monopole; |g_res|/Newton={:.3}",
+            residual.length() < 0.05 * newton,
+            "body-scale residual must stay a small correction; |g_res|/Newton={:.3}",
             residual.length() / newton
         );
+        for distance in [500.0, 620.0, 900.0] {
+            let position = DVec3::new(-distance, 0.0, 0.0);
+            let (gravity, _) = evaluate_equation121(&modes, position).expect("field");
+            let inward = -position.normalize();
+            let cosine = gravity.normalize().dot(inward);
+            assert!(
+                cosine > 15f64.to_radians().cos(),
+                "Eq.121 must stay attractive along -r̂ at r={distance}, cos={cosine:.3}"
+            );
+        }
     }
 
     #[test]
@@ -503,11 +741,100 @@ mod tests {
             k_min * radius
         );
         assert!(
-            k_max * radius > std::f64::consts::PI,
-            "UV edge should exceed the old π/R slab, got κR={}",
+            k_max * radius <= std::f64::consts::PI + 1.0e-9,
+            "UV edge must stay at or below the body Nyquist π/R, got κR={}",
+            k_max * radius
+        );
+        assert!(
+            k_max * radius > 2.0,
+            "UV edge should still reach body-scale multipoles, got κR={}",
             k_max * radius
         );
         wave_numbers.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
         assert_eq!(wave_numbers.len(), EQ184_RADIAL_SHELLS);
+    }
+
+    #[test]
+    fn equation106_taylor_recovers_on_axis_and_first_order_off_axis() {
+        let radius = 450.0_f32;
+        let volume = 4.0 / 3.0 * std::f64::consts::PI * (radius as f64).powi(3);
+        let density = (f64::from(RYUGU_MASS) / volume) as f32;
+        let bytes = fibonacci_sphere_bytes(radius, density, 64);
+        let modes = build_equation121_modes(&bytes, radius as f64).expect("modes");
+        let q_ref = DVec3::new(-620.0, 0.0, 0.0);
+        let (on_axis, _) = evaluate_equation106_taylor(&modes, q_ref, DVec3::ZERO).expect("axis");
+        let (direct, _) = evaluate_equation121(&modes, q_ref).expect("direct");
+        assert!((on_axis - direct).length() < 1.0e-12);
+        let y = DVec3::new(0.0, 8.0, 0.0);
+        let (taylor, _) = evaluate_equation106_taylor(&modes, q_ref, y).expect("taylor");
+        let (exact, _) = evaluate_equation121(&modes, q_ref + y).expect("exact");
+        let relative = (taylor - exact).length() / exact.length().max(1.0e-18);
+        assert!(
+            relative < 0.05,
+            "first-order Taylor of g_ref should track a 8 m offset, relative={relative:.3}"
+        );
+    }
+
+    #[test]
+    fn live_equation121_uses_dense_gauss8_fibonacci_quadrature() {
+        let radius = 450.0;
+        let mut wave_numbers = Vec::new();
+        for index in 0..EQ121_LIVE_QUADRATURE_COUNT {
+            let (k, weight) = eq121_live_quadrature_node(index, radius).expect("node");
+            assert!(weight > 0.0 && weight.is_finite());
+            wave_numbers.push(k.length());
+        }
+        wave_numbers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        wave_numbers.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+        assert_eq!(wave_numbers.len(), EQ121_LIVE_RADIAL_SHELLS);
+        assert_eq!(EQ121_LIVE_QUADRATURE_COUNT, 256);
+        assert!(EQ121_LIVE_QUADRATURE_COUNT > EQ184_QUADRATURE_COUNT);
+    }
+
+    #[test]
+    fn eq184_chart_is_smooth_laplace_decay_on_a_bound_arc() {
+        let radius = 450.0_f32;
+        let volume = 4.0 / 3.0 * std::f64::consts::PI * (radius as f64).powi(3);
+        let density = (f64::from(RYUGU_MASS) / volume) as f32;
+        let bytes = fibonacci_sphere_bytes(radius, density, 32);
+        let sources = point_sources_from_quadrature_bytes(&bytes);
+        let r0 = 620.0_f32;
+        let knots: Vec<TrajectoryInversionKnot> = (0..16)
+            .map(|index| {
+                let time = index as f64 * 20.0;
+                let angle = index as f32 * 0.12;
+                TrajectoryInversionKnot {
+                    position: Vec3::new(r0 * angle.cos(), r0 * angle.sin(), -65.0),
+                    velocity: Vec3::ZERO,
+                    simulation_time_seconds: time,
+                    baseline_acceleration: Vec3::ZERO,
+                    body_rotation: Quat::IDENTITY,
+                }
+            })
+            .collect();
+        let observations =
+            eq184_chart_observations(&knots, &sources, radius as f64).expect("eq184 chart");
+        assert_eq!(observations.len(), 16);
+        let sigmas: Vec<f32> = observations.iter().map(|row| row.laplace_frequency).collect();
+        let norms: Vec<f32> = observations
+            .iter()
+            .map(|row| row.transformed_field.length())
+            .collect();
+        assert!(sigmas.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(norms.iter().all(|value| value.is_finite() && *value > 0.0));
+        let first = norms[0];
+        let last = *norms.last().expect("last");
+        assert!(
+            last < first,
+            "Laplace |g̃(σ)| should decay: first={first} last={last}"
+        );
+        let peak_jump = norms
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs() / first.max(1.0e-18))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            peak_jump < 0.5,
+            "spectral chart should not oscillate like a flower, peak jump={peak_jump}"
+        );
     }
 }

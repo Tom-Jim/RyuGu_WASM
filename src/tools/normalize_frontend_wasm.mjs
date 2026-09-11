@@ -1,8 +1,7 @@
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { existsSync, renameSync, unlinkSync } from "fs";
+import { join } from "path";
 
-const root = fileURLToPath(new URL("../../", import.meta.url));
+const root = join(import.meta.dir, "../..");
 const packageDirectory = join(root, "pkg");
 
 function renameCaseInsensitive(actual, expected) {
@@ -25,11 +24,11 @@ for (const [actual, expected] of [
 
 const frontend = join(packageDirectory, "ryugu_wasm.js");
 if (!existsSync(frontend)) throw new Error("wasm-pack did not produce pkg/ryugu_wasm.js");
-const source = readFileSync(frontend, "utf8");
+const source = await Bun.file(frontend).text();
 const normalized = source
   .replaceAll("Ryugu_wasm_bg.wasm", "ryugu_wasm_bg.wasm")
   .replaceAll("Ryugu_wasm.d.ts", "ryugu_wasm.d.ts");
-if (normalized !== source) writeFileSync(frontend, normalized);
+if (normalized !== source) await Bun.write(frontend, normalized);
 
 // wasm-pack 0.13 re-parses an existing output package manifest on the next
 // invocation and rejects its own object-form repository field. The browser

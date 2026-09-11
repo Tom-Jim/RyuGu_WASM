@@ -2,14 +2,14 @@
 
 Zig 0.16 compiles Basilisk serial task scheduling, polyhedral gravity, Boost quadrature, ExaFMM-t,
 FLUPS and FFTW into a single `wasm32-wasi` module. The browser-compatible
-JavaScript host is `src/backend/host/cpp_backend.mjs`; it does not need a server-side
-runtime or Node's WASI implementation.
+JavaScript host is `src/backend/host/cpp_backend.mjs`; it does not need a
+server-side WASI runtime.
 
 Run from the project root:
 
 ```sh
-node src/tools/fetch_cpp.mjs
-node src/tools/build_cpp_wasm.mjs
+bun src/tools/fetch_cpp.mjs
+bun src/tools/build_cpp_wasm.mjs
 ```
 
 The build writes `pkg/ryugu_backend.wasm`, `pkg/backend.mjs`, and dependency

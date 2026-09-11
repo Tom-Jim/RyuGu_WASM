@@ -38,6 +38,12 @@ pub(crate) struct PlanningReferenceCache {
     frequency_domain_partial_density_spectrum: Vec<Complex64>,
     frequency_domain_source_cursor: usize,
     frequency_domain_observations: HashMap<(usize, usize), (DVec3, DMat3)>,
+    reduction_request_id: Option<u64>,
+    reduction_index: usize,
+    reduction_header_done: bool,
+    reduction_position_error: Vec<DVec3>,
+    reduction_velocity_error: Vec<DVec3>,
+    reduction_previous_time: Vec<Option<f64>>,
 }
 
 pub fn planning_batch_evaluator_system(
@@ -176,10 +182,23 @@ pub fn planning_batch_evaluator_system(
                     planning.batch_job = Some(job);
                     return;
                 }
-                job.certified_warm_evaluation_ms = repetition_ms;
-                job.certified_full_pass_ms += repetition_ms;
-                job.certified_kernels.record(packet.timing);
-                reduce_certified_packet(&mut job, &batch, &packet, &mut reference_cache);
+                if !reference_cache.reduction_header_done {
+                    job.certified_warm_evaluation_ms = repetition_ms;
+                    job.certified_full_pass_ms += repetition_ms;
+                }
+                if !reduce_certified_packet(&mut job, &batch, &packet, &mut reference_cache) {
+                    planning.status = format!(
+                        "{} reducing certified f64 verification {}/{}",
+                        job.method.planning_label(),
+                        reference_cache.reduction_index,
+                        packet.state_indices.len(),
+                    );
+                    job.awaiting_gpu_seconds = 0.0;
+                    job.awaiting_gpu_last_poll = None;
+                    gpu_result.0 = Some(packet);
+                    planning.batch_job = Some(job);
+                    return;
+                }
                 if !advance_certified_tile(&mut job, packet.request.candidate_count) {
                     job.awaiting_gpu = false;
                     job.awaiting_gpu_seconds = 0.0;
@@ -333,8 +352,24 @@ pub fn planning_batch_evaluator_system(
                     return;
                 }
                 advance_planning_method(&mut job);
+            } else if !reduce_planning_packet(
+                &mut job,
+                &batch,
+                &packet,
+                &mut reference_cache,
+            ) {
+                planning.status = format!(
+                    "{} reducing independent f64 verification {}/{}",
+                    job.method.planning_label(),
+                    reference_cache.reduction_index,
+                    packet.state_indices.len(),
+                );
+                job.awaiting_gpu_seconds = 0.0;
+                job.awaiting_gpu_last_poll = None;
+                gpu_result.0 = Some(packet);
+                planning.batch_job = Some(job);
+                return;
             } else {
-                reduce_planning_packet(&mut job, &batch, &packet, &mut reference_cache);
                 adapt_candidate_tile(&mut job, &packet);
                 advance_planning_tile(&mut job, packet.request.candidate_count);
             }

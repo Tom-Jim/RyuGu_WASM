@@ -252,18 +252,69 @@ export function createFieldBackend(backend) {
       xyz: put(xyz), masses: put(masses), sourceCount: BigInt(masses.length),
       xyzValues: xyz, massValues: masses, mu: G * mass };
   }
+  function monopoleField(position) {
+    // Far-field GM/r² at the mass centroid. Live FFT/FD probes and invert
+    // knots must stay finite outside the 32³ box; throwing paused the whole
+    // GPU/Worker pipeline and made Invert / First / Stress look dead.
+    const xyz = geometry?.xyzValues;
+    const masses = geometry?.massValues;
+    let mass = 0, cx = 0, cy = 0, cz = 0;
+    if (masses && masses.length && xyz) {
+      for (let i = 0; i < masses.length; i++) {
+        const m = masses[i];
+        if (!(m > 0)) continue;
+        mass += m;
+        cx += m * xyz[3 * i];
+        cy += m * xyz[3 * i + 1];
+        cz += m * xyz[3 * i + 2];
+      }
+    }
+    const mu = mass > 0 ? G * mass : (geometry?.mu ?? 0);
+    if (!(mu > 0)) return [0, 0, 0, 0];
+    if (mass > 0) {
+      cx /= mass;
+      cy /= mass;
+      cz /= mass;
+    }
+    const dx = position[0] - cx, dy = position[1] - cy, dz = position[2] - cz;
+    const r2 = dx * dx + dy * dy + dz * dz;
+    const r = Math.sqrt(r2);
+    if (!(r > 1e-9)) return [0, 0, 0, 0];
+    const scale = mu / (r2 * r);
+    return [-scale * dx, -scale * dy, -scale * dz, mu / r];
+  }
+  function interpolateFft(position) {
+    if (!fft) buildFft();
+    const maxBase = fft.n - 2;
+    const coordinate = position.map((v) => (v + fft.half) / fft.spacing - 0.5);
+    if (coordinate.some((v) => v < -0.5 || v > maxBase + 1.5)) return monopoleField(position);
+    const clamped = coordinate.map((v) => Math.min(maxBase, Math.max(0, v)));
+    const base = clamped.map(Math.floor);
+    const value = [0, 0, 0, 0];
+    for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
+      const weight = [x, y, z].reduce((v, bit, axis) =>
+        v * (bit ? clamped[axis] - base[axis] : 1 - clamped[axis] + base[axis]), 1);
+      const i = ((base[2] + z) * fft.n + base[1] + y) * fft.n + base[0] + x;
+      for (let axis = 0; axis < 3; axis++) value[axis] += weight * fft.acceleration[3 * i + axis];
+      value[3] -= weight * fft.potential[i];
+    }
+    return value;
+  }
   function buildFft() {
     // A 32 cubed live grid keeps the complete FLUPS free-space solve below a
     // browser frame-budget scale. Scientific comparison jobs choose their own
     // source and target batches through the C++ API.
     const n = 32;
-    const half = 4096;
+    // Live orbits sit at ~620–900 m. A ±4096 m box made 256 m cells, so
+    // FLUPS |g| at the probe was ~15% low vs Newton/FMM and 1.07 v_circ
+    // unbound. ±1600 m keeps bound arcs inside and yields 100 m cells.
+    const half = 1600;
     const spacing = 2 * half / n;
     const density = new Float64Array(n ** 3);
     for (let i = 0; i < geometry.massValues.length; i++) {
       const coordinate = [0, 1, 2].map((axis) => (geometry.xyzValues[3 * i + axis] + half) / spacing - 0.5);
       const base = coordinate.map(Math.floor);
-      if (base.some((v) => v < 0 || v + 1 >= n)) throw new Error("Mass source outside FLUPS grid");
+      if (base.some((v) => v < 0 || v + 1 >= n)) continue;
       for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
         const weight = [x, y, z].reduce((value, bit, axis) =>
           value * (bit ? coordinate[axis] - base[axis] : 1 - coordinate[axis] + base[axis]), 1);
@@ -284,21 +335,7 @@ export function createFieldBackend(backend) {
   function evaluate(method, position) {
     if (!geometry) throw new Error("C++ gravity geometry is not configured");
     if (position.length !== 3 || !position.every(Number.isFinite)) throw new Error("Invalid gravity target");
-    if (method === "fft") {
-      if (!fft) buildFft();
-      const coordinate = position.map((v) => (v + fft.half) / fft.spacing - 0.5);
-      const base = coordinate.map(Math.floor);
-      if (base.some((v) => v < 0 || v + 1 >= fft.n)) throw new Error("Gravity target outside FLUPS grid");
-      const value = [0, 0, 0, 0];
-      for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
-        const weight = [x, y, z].reduce((v, bit, axis) =>
-          v * (bit ? coordinate[axis] - base[axis] : 1 - coordinate[axis] + base[axis]), 1);
-        const i = ((base[2] + z) * fft.n + base[1] + y) * fft.n + base[0] + x;
-        for (let axis = 0; axis < 3; axis++) value[axis] += weight * fft.acceleration[3 * i + axis];
-        value[3] -= weight * fft.potential[i];
-      }
-      return value;
-    }
+    if (method === "fft") return interpolateFft(position);
     {
       const target = upload("live-target", position);
       const acceleration = reserve("live-field", 3);

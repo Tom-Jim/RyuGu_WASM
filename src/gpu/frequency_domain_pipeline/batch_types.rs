@@ -321,7 +321,6 @@ fn poll_frequency_domain_readback(
     mut batch_result: ResMut<FrequencyDomainTrajectoryBatchResult>,
     mut sensitivity: ResMut<FrequencyDomainSensitivityMatrix>,
     mut performance: ResMut<FrequencyDomainPerformanceMetrics>,
-    mut runtime_error: ResMut<GravityRuntimeError>,
     inversion: Res<TrajectoryInversionState>,
     active: Res<ActiveGravityMethod>,
 ) {
@@ -332,15 +331,15 @@ fn poll_frequency_domain_readback(
             .is_some_and(|started| started.elapsed() > FREQUENCY_DOMAIN_GPU_TIMEOUT)
     {
         submitted_at.take();
-        runtime_error.raise(
-            "Frequency-domain algorithm GPU request exceeded 10 seconds; possible shader hang or device loss.",
+        bevy::log::warn!(
+            "Frequency-domain GPU chart request exceeded 10 seconds; live Verlet continues."
         );
         return;
     }
     if let Ok(mut error) = channel.pipeline_error.try_lock()
         && let Some(message) = error.take()
     {
-        runtime_error.raise(message);
+        bevy::log::warn!("Frequency-domain GPU diagnostic: {message}");
         return;
     }
     let Ok(mut guard) = channel.data.try_lock() else {
@@ -350,8 +349,9 @@ fn poll_frequency_domain_readback(
     performance.latest = Some(packet.timings);
     if packet.sensitivity_column_count > 0 {
         let Some(capture_id) = packet.batch_capture_id else {
-            runtime_error
-                .raise("Frequency-domain algorithm sensitivity readback has no capture identity.");
+            bevy::log::warn!(
+                "Frequency-domain GPU sensitivity readback has no capture identity."
+            );
             return;
         };
         let column_count = packet.sensitivity_column_count as usize;
@@ -364,12 +364,12 @@ fn poll_frequency_domain_readback(
             return;
         }
         if sample_count == 0 || packet.partial_sums.len() != column_count * sample_count {
-            runtime_error.raise(format!(
-                "Frequency-domain algorithm sensitivity batch returned {} vectors; expected {} x {}.",
+            bevy::log::warn!(
+                "Frequency-domain GPU sensitivity batch returned {} vectors; expected {} x {}.",
                 packet.partial_sums.len(),
                 column_count,
                 sample_count,
-            ));
+            );
             return;
         }
         let assembled_at = Instant::now();
@@ -388,8 +388,9 @@ fn poll_frequency_domain_readback(
             .flatten()
             .any(|acceleration| !acceleration.is_finite())
         {
-            runtime_error
-                .raise("Frequency-domain algorithm sensitivity matrix contains non-finite values.");
+            bevy::log::warn!(
+                "Frequency-domain GPU sensitivity matrix contains non-finite values."
+            );
             return;
         }
         sensitivity.capture_id = Some(capture_id);
@@ -405,50 +406,19 @@ fn poll_frequency_domain_readback(
         inversion.target_evaluation_ms = packet.timings.target_evaluation_ms;
         return;
     }
-    if *active != ActiveGravityMethod::FrequencyDomain
-        || packet.batch_capture_id != inversion.capture_id
-        || !inversion.ready
-    {
-        return;
-    }
-    let decoded = match decode_frequency_domain_packet(&packet) {
-        Ok(decoded) => decoded,
-        Err(FrequencyDomainDecodeError::Incomplete { actual, expected }) => {
-            runtime_error.raise(format!(
-                "Frequency-domain algorithm batch readback is incomplete: {actual} rows, expected {expected}."
-            ));
-            return;
-        }
-        Err(FrequencyDomainDecodeError::Invalid { sample, reason }) => {
-            runtime_error.raise(format!(
-                "Frequency-domain algorithm returned an invalid field at sample {} ({reason}).",
-                sample + 1,
-            ));
-            return;
-        }
-    };
-
-    let Some(capture_id) = packet.batch_capture_id else {
-        runtime_error.raise(
-            "Frequency-domain algorithm aggregate readback has no trajectory capture identity.",
-        );
-        return;
-    };
-    // Publish the complete batch atomically. Clearing the displayed series
-    // before decode made a transient/incomplete GPU packet leave the UI with
-    // an empty frequency response even though the preceding valid response
-    // was still the correct result for the active capture.
-    batch_result.capture_id = Some(capture_id);
-    batch_result.observations = decoded;
-    batch_result.revision = batch_result.revision.wrapping_add(1);
+    // Live Eq.(184) chart is the f64 CPU operator (invert's observation
+    // rows). GPU f32 trajectory stamps stay invert-sensitivity / planning.
+    let _ = (packet, &mut batch_result, &*inversion, *active);
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FrequencyDomainDecodeError {
     Incomplete { actual: usize, expected: usize },
     Invalid { sample: usize, reason: &'static str },
 }
 
+#[allow(dead_code)]
 fn decode_frequency_domain_packet(
     packet: &FrequencyDomainReadbackPacket,
 ) -> Result<Vec<FrequencyDomainObservation>, FrequencyDomainDecodeError> {
@@ -473,6 +443,7 @@ fn decode_frequency_domain_packet(
         .collect()
 }
 
+#[allow(dead_code)]
 fn decode_frequency_domain_sample(
     rows: &[[f32; 4]],
 ) -> Result<FrequencyDomainObservation, &'static str> {

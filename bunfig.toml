@@ -1,0 +1,3 @@
+[run]
+# `bun run <script>` executes package.json scripts with Bun, never Node.
+bun = true

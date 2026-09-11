@@ -1,15 +1,15 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 import { isUpToDate, root, run } from "./build_helpers.mjs";
 
-const args = process.argv.slice(2);
+const args = Bun.argv.slice(2);
 const profile = args.includes("--dev") ? "dev" : "release";
 const extra = [];
 if (args.includes("--force")) extra.push("--force");
-if (args.includes("--fetch") || process.env.RYUGU_FETCH_CPP === "1") extra.push("--fetch");
+if (args.includes("--fetch") || Bun.env.RYUGU_FETCH_CPP === "1") extra.push("--fetch");
 
-run(process.execPath, ["src/tools/build_cpp_wasm.mjs", ...extra]);
-run(process.execPath, ["src/tools/build_rust_backend.mjs", ...extra.filter(flag => flag !== "--fetch")]);
+run("bun", ["src/tools/build_cpp_wasm.mjs", ...extra]);
+run("bun", ["src/tools/build_rust_backend.mjs", ...extra.filter(flag => flag !== "--fetch")]);
 
 const css = join(root, "src/html/tailwind.generated.css");
 if (!isUpToDate(css, [join(root, "src/html/tailwind.css"), join(root, "src/html/index.html"), join(root, "src/html/app.js")])) {
@@ -42,7 +42,7 @@ if (profileChanged || !isUpToDate(frontend, frontendInputs, {
   run("wasm-pack", [
     "build", "--locked", `--${profile}`, "--target", "web", "--out-dir", "pkg", "--out-name", "ryugu_wasm",
   ], root, { RUSTC_WRAPPER: "" });
-  run(process.execPath, ["src/tools/normalize_frontend_wasm.mjs"]);
+  run("bun", ["src/tools/normalize_frontend_wasm.mjs"]);
   writeFileSync(stamp, profile);
 } else {
   if (!previous) writeFileSync(stamp, profile);

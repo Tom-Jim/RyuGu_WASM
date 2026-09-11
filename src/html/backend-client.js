@@ -1,4 +1,17 @@
 /**
+ * wasm-bindgen's u64 glue asserts `typeof === 'bigint'`. A Number id
+ * (JSON, older workers, or a hashed u64 that JS rounded) throws before
+ * `deliver_backend_sensitivity_result` runs, so FMM/FFT invert stays on
+ * Preparing forever. Keep the Worker round-trip in BigInt.
+ */
+export function asU64(value) {
+    if (typeof value === 'bigint') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
+    if (typeof value === 'string' && value !== '') return BigInt(value);
+    return 0n;
+}
+
+/**
  * Create the main-thread half of the numerical Worker bridge. Delivery is
  * push-based: the Worker posts one completion, then `deliverResult` immediately
  * forwards it into the frontend WASM channel selected by the caller.
@@ -51,7 +64,13 @@ export function createNumericalBackendClient({
             const transfer = Object.values(payload)
                 .filter((value) => ArrayBuffer.isView(value))
                 .map((value) => value.buffer);
-            worker.postMessage({ type: 'request', kind, requestId, epoch, payload }, transfer);
+            worker.postMessage({
+                type: 'request',
+                kind,
+                requestId: asU64(requestId),
+                epoch: asU64(epoch),
+                payload,
+            }, transfer);
             return true;
         },
         terminate() {

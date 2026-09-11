@@ -12,7 +12,6 @@ pub(crate) struct DensityWorkerState {
 pub fn convex_optimization_system(
     mut inversion: ResMut<TrajectoryInversionState>,
     mut performance: ResMut<FrequencyDomainPerformanceMetrics>,
-    frequency_domain_sensitivity: Res<FrequencyDomainSensitivityMatrix>,
     density_channel: Res<crate::cpp_backend::BackendDensityChannel>,
     cpp: Res<crate::cpp_backend::CppBackendState>,
     mut worker: Local<DensityWorkerState>,
@@ -30,71 +29,16 @@ pub fn convex_optimization_system(
         job.method,
         inversion.capture_epoch,
     );
-    let matrix_assembly_started = Instant::now();
-    let mut design_matrix_assembly_ms = 0.0;
-    if worker.identity != Some(identity)
-        && job.method == ActiveGravityMethod::FrequencyDomain
-    {
-        if frequency_domain_sensitivity.capture_id != Some(job.capture_id)
-            || frequency_domain_sensitivity.source_hash != job.source_hash
-            || frequency_domain_sensitivity.basis_hash != job.basis_sources.hash
-            || frequency_domain_sensitivity.configuration_hash
-                != crate::gpu::frequency_domain::frequency_domain_sensitivity_configuration_hash()
-            || frequency_domain_sensitivity.voxel_count != job.voxels.len()
-        {
-            inversion.displayed_density = None;
-            inversion.error = Some("Frequency-domain algorithm sensitivity cache identity does not match the frozen trajectory.".into());
-            return;
-        }
-        if frequency_domain_sensitivity.columns.len() < job.voxels.len() {
-            inversion.optimizer = Some(job);
-            return;
-        }
-        if frequency_domain_sensitivity.columns.len() != job.voxels.len()
-            || frequency_domain_sensitivity.sample_count != job.observed_accelerations.len()
-            || frequency_domain_sensitivity
-                .columns
-                .iter()
-                .any(|column| column.len() != frequency_domain_sensitivity.sample_count)
-        {
-            inversion.displayed_density = None;
-            inversion.error = Some(format!(
-                "Frequency-domain algorithm sensitivity matrix is invalid: {} columns, {} samples; expected {} x {}.",
-                frequency_domain_sensitivity.columns.len(),
-                frequency_domain_sensitivity.sample_count,
-                job.voxels.len(),
-                job.observed_accelerations.len(),
-            ));
-            return;
-        }
-        job.sensitivities.clear();
-        job.sensitivities.reserve(
-            frequency_domain_sensitivity.sample_count * frequency_domain_sensitivity.voxel_count,
-        );
-        for sample in 0..frequency_domain_sensitivity.sample_count {
-            for column in &frequency_domain_sensitivity.columns {
-                job.sensitivities.push(column[sample]);
-            }
-        }
-        job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
-        job.initial_objective = objective(&job);
-        design_matrix_assembly_ms = matrix_assembly_started.elapsed().as_secs_f64() * 1.0e3;
-        if !job.timing.matrix_cache_hit {
-            job.timing.matrix_build_ms = job.started_at.elapsed().as_secs_f64() * 1.0e3;
-        }
-        if !job.initial_objective.is_finite() {
-            inversion.displayed_density = None;
-            inversion.error = Some("The Frequency-domain algorithm sensitivity matrix is not finite.".into());
-            return;
-        }
-    }
+    // Frequency-domain invert keeps the CPU Eq.(184) design matrix already in
+    // `job.sensitivities`. GPU f32 sensitivity columns may still dispatch for
+    // planning/timing; they are not the QP matrix. FMM/FFT keep Worker A/b.
     if worker.identity != Some(identity) {
         density_channel.reset();
         *worker = DensityWorkerState {
             identity: Some(identity),
             density_sum: vec![0.0; job.voxels.len()],
             convex_started: Some(Instant::now()),
-            design_matrix_assembly_ms,
+            design_matrix_assembly_ms: 0.0,
             ..Default::default()
         };
     }
@@ -167,7 +111,7 @@ pub fn convex_optimization_system(
         let data = density_request_json(&job, &observations);
         worker.request_id = worker.request_id.wrapping_add(1).max(1);
         let snapshot = crate::cpp_backend::BackendDensitySnapshot {
-            request_id: job.capture_id.rotate_left(27) ^ worker.request_id,
+            request_id: worker.request_id,
             epoch: inversion.capture_epoch,
         };
         match crate::cpp_backend::request_density(&density_channel, snapshot, &data) {

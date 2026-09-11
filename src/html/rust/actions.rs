@@ -298,14 +298,18 @@ pub(crate) fn browser_ui_action_system(
                     continue;
                 }
                 planning.selected_metric = ComparisonMetric::DensityFit;
-                cancel_planning(
-                    &mut planning,
-                    &mut request,
-                    &mut payload,
-                    &mut result,
-                    &channel,
-                    "Trajectory inversion selected; planning work was cancelled.",
-                );
+                // Quadrature owns the GPU exclusively. First/Stress share the
+                // Worker with invert and must keep running when Invert is pressed.
+                if planning.workload_profile == PlanningWorkloadProfile::SourceCrossover {
+                    cancel_planning(
+                        &mut planning,
+                        &mut request,
+                        &mut payload,
+                        &mut result,
+                        &channel,
+                        "Trajectory inversion selected; quadrature was cancelled.",
+                    );
+                }
                 inversion.start_requested = true;
             }
             "planning-metric" => {

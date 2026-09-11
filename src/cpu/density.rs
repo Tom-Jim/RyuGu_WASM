@@ -5,7 +5,11 @@ use bevy::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
-const RADIAL_LAYER_COUNT: u32 = 4;
+pub(crate) const RADIAL_LAYER_COUNT: u32 = 4;
+/// Live Verlet, invert reference, and Worker configure share this angular cap.
+/// Full-mesh direct `source_sets` (tens of thousands of cells × 57 trees) is
+/// what left FMM/FFT invert on "Preparing inversion observations…" forever.
+pub(crate) const MAX_LIVE_ANGULAR_CELLS: usize = 32;
 
 /// Builds the angular-cell/radial-layer discretization used by the radial model.
 /// The mesh is assumed star-shaped with respect to its model origin, which is
@@ -114,6 +118,54 @@ pub fn build_density_quadrature_system(
     });
 }
 
+/// Downsample angular cells the same way `configure_backend` does, scaling
+/// each kept cell's solid angle by the number of skipped neighbours.
+pub(crate) fn reduce_live_quadrature_bytes(bytes: &[u8]) -> Vec<u8> {
+    const RECORD: usize = 32;
+    let layers = RADIAL_LAYER_COUNT as usize;
+    let count = bytes.len() / RECORD;
+    if count <= MAX_LIVE_ANGULAR_CELLS * layers {
+        return bytes.to_vec();
+    }
+    let angular = count / layers;
+    let target = MAX_LIVE_ANGULAR_CELLS.min(angular);
+    let stride = angular.div_ceil(target);
+    let mut reduced = Vec::with_capacity(target * layers * RECORD);
+    for angular_index in (0..angular).step_by(stride) {
+        let represented = (angular - angular_index).min(stride) as f32;
+        for layer in 0..layers {
+            let offset = (angular_index * layers + layer) * RECORD;
+            reduced.extend_from_slice(&bytes[offset..offset + RECORD]);
+            let solid_at = reduced.len() - RECORD + 12;
+            let solid = f32::from_le_bytes(reduced[solid_at..solid_at + 4].try_into().unwrap());
+            reduced[solid_at..solid_at + 4].copy_from_slice(&(solid * represented).to_le_bytes());
+        }
+    }
+    reduced
+}
+
+/// f64 cell records `[direction.xyz, solid, r_inner, r_outer, density, _]`.
+pub(crate) fn reduce_live_cells(cells: &[f64]) -> Vec<f64> {
+    let shells = cells.as_chunks::<8>().0;
+    if shells.len() <= MAX_LIVE_ANGULAR_CELLS * RADIAL_LAYER_COUNT as usize {
+        return cells.to_vec();
+    }
+    let layers = RADIAL_LAYER_COUNT as usize;
+    let angular = shells.len() / layers;
+    let target = MAX_LIVE_ANGULAR_CELLS.min(angular);
+    let stride = angular.div_ceil(target);
+    let mut result = Vec::with_capacity(target * layers * 8);
+    for angular_index in (0..angular).step_by(stride) {
+        for layer in 0..layers {
+            let mut shell = shells[angular_index * layers + layer];
+            let represented = (angular - angular_index).min(stride);
+            shell[3] *= represented as f64;
+            result.extend(shell);
+        }
+    }
+    result
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write(bytes);
@@ -168,5 +220,47 @@ fn radial_density_integral(inner: f64, outer: f64, epsilon: f64) -> f64 {
 fn push_f32s(bytes: &mut Vec<u8>, values: [f32; 4]) {
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod live_reduction_tests {
+    use super::{
+        MAX_LIVE_ANGULAR_CELLS, RADIAL_LAYER_COUNT, reduce_live_cells, reduce_live_quadrature_bytes,
+    };
+
+    #[test]
+    fn small_live_meshes_are_unchanged() {
+        let cells: Vec<f64> = (0..MAX_LIVE_ANGULAR_CELLS * RADIAL_LAYER_COUNT as usize)
+            .flat_map(|i| [0.0, 0.0, 1.0, 1.0, 0.0, 1.0, i as f64, 0.0])
+            .collect();
+        assert_eq!(reduce_live_cells(&cells), cells);
+    }
+
+    #[test]
+    fn large_meshes_keep_thirty_two_angular_cells() {
+        let angular = 256;
+        let layers = RADIAL_LAYER_COUNT as usize;
+        let mut bytes = Vec::new();
+        for a in 0..angular {
+            for layer in 0..layers {
+                for value in [
+                    0.0_f32,
+                    0.0,
+                    1.0,
+                    0.01,
+                    layer as f32,
+                    layer as f32 + 1.0,
+                    a as f32,
+                    0.0,
+                ] {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        let reduced = reduce_live_quadrature_bytes(&bytes);
+        assert_eq!(reduced.len() / 32, MAX_LIVE_ANGULAR_CELLS * layers);
+        let first_solid = f32::from_le_bytes(reduced[12..16].try_into().unwrap());
+        assert!((first_solid - 0.01 * (256 / 32) as f32).abs() < 1e-6);
     }
 }

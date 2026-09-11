@@ -1,13 +1,13 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "fs";
+import { dirname, join } from "path";
 import {
   cmakeCacheUsable, cmakeConfigure, force, isUpToDate, jobs, rmWritable, root, run,
 } from "./build_helpers.mjs";
 
 const sources = JSON.parse(readFileSync(join(root, "C++/sources.lock.json"), "utf8"));
-if (process.argv.includes("--fetch") || process.env.RYUGU_FETCH_CPP === "1"
+if (Bun.argv.includes("--fetch") || Bun.env.RYUGU_FETCH_CPP === "1"
   || Object.keys(sources).some(name => !existsSync(join(root, "C++", name)))) {
-  run(process.execPath, ["src/tools/fetch_cpp.mjs"]);
+  run("bun", ["src/tools/fetch_cpp.mjs"]);
 }
 
 const toolchainFile = join(root, "src/backend/zig/wasm-toolchain.cmake");
@@ -93,8 +93,8 @@ if (needsZig) {
 } else {
   console.log("Skipping zig wasm link (up to date)");
 }
-if (process.argv.includes("--test")) {
-  run(process.execPath, ["src/tools/test_cpp_wasm.mjs", "--fmm", "--flups"]);
+if (Bun.argv.includes("--test")) {
+  run("bun", ["src/tools/test_cpp_wasm.mjs", "--fmm", "--flups"]);
 }
 mkdirSync(join(root, "pkg"), { recursive: true });
 if (existsSync(zigWasm) && (!existsSync(pkgWasm) || statSync(zigWasm).mtimeMs >= statSync(pkgWasm).mtimeMs)) {

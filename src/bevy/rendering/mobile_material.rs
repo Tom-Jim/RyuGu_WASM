@@ -61,16 +61,21 @@ pub fn configure_mobile_materials_system(
 /// Mobile equivalent of `section_alpha_system` for the lightweight material.
 pub fn mobile_section_alpha_system(
     show_section: Res<ShowSection>,
+    active_method: Res<ActiveGravityMethod>,
     inversion: Res<TrajectoryInversionState>,
     ryugu_query: Query<Entity, With<RyuguMarker>>,
     children_query: Query<&Children>,
     material_handles: Query<&MeshMaterial3d<MobileUnlitMaterial>>,
     mut materials: ResMut<Assets<MobileUnlitMaterial>>,
 ) {
-    if !show_section.is_changed() && !inversion.is_changed() {
+    if !show_section.is_changed() && !inversion.is_changed() && !active_method.is_changed() {
         return;
     }
-    let section_visible = show_section.0 || inversion.displayed_density.is_some();
+    let overlay = inversion
+        .displayed_density
+        .as_ref()
+        .is_some_and(|result| result.method == *active_method);
+    let section_visible = show_section.0 || overlay;
     let Some(root) = ryugu_query.iter().next() else {
         return;
     };

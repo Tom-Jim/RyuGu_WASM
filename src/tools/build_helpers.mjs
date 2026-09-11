@@ -1,24 +1,29 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { join } from "node:path";
-import { availableParallelism } from "node:os";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
+import { join } from "path";
 
-export const root = fileURLToPath(new URL("../../", import.meta.url));
-export const jobs = String(typeof availableParallelism === "function" ? availableParallelism() : 4);
-export const force = process.argv.includes("--force");
+export const root = join(import.meta.dir, "../..");
+export const jobs = String(navigator.hardwareConcurrency || 4);
+export const force = Bun.argv.includes("--force");
 
 export function run(command, args, cwd = root, extraEnv) {
-  const result = spawnSync(command, args, {
-    cwd, stdio: "inherit",
-    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+  const result = Bun.spawnSync({
+    cmd: [command, ...args],
+    cwd,
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+    env: extraEnv ? { ...process.env, ...extraEnv } : undefined,
   });
-  if (result.status !== 0) throw new Error(`${command} failed: ${result.status}`);
+  if (result.exitCode !== 0) throw new Error(`${command} failed: ${result.exitCode}`);
 }
 
 export function rmWritable(path) {
   if (!existsSync(path)) return;
-  spawnSync("chmod", ["-R", "u+w", path], { stdio: "ignore" });
+  Bun.spawnSync({
+    cmd: ["chmod", "-R", "u+w", path],
+    stdout: "ignore",
+    stderr: "ignore",
+  });
   rmSync(path, { recursive: true, force: true });
 }
 
