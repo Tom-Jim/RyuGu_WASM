@@ -45,10 +45,10 @@ const GAUSS_WEIGHTS: [f64; 4] = [
 const GAUSS8_NODES: [f64; 8] = [
     -0.960_289_856_497_536_3,
     -0.796_666_477_413_626_7,
-    -0.525_532_409_916_329_0,
+    -0.525_532_409_916_329,
     -0.183_434_642_495_649_8,
     0.183_434_642_495_649_8,
-    0.525_532_409_916_329_0,
+    0.525_532_409_916_329,
     0.796_666_477_413_626_7,
     0.960_289_856_497_536_3,
 ];
@@ -56,8 +56,8 @@ const GAUSS8_WEIGHTS: [f64; 8] = [
     0.101_228_536_290_376_3,
     0.222_381_034_453_374_5,
     0.313_706_645_877_887_3,
-    0.362_683_783_378_362_0,
-    0.362_683_783_378_362_0,
+    0.362_683_783_378_362,
+    0.362_683_783_378_362,
     0.313_706_645_877_887_3,
     0.222_381_034_453_374_5,
     0.101_228_536_290_376_3,
@@ -77,11 +77,12 @@ pub fn build_equation121_modes(bytes: &[u8], source_radius: f64) -> Option<Vec<f
         return None;
     }
     let (mass, center) = quadrature_mass_centroid(cells)?;
-    let mut packed = Vec::with_capacity((EQ121_LIVE_QUADRATURE_COUNT + 1) * EQUATION121_MODE_STRIDE);
+    let mut packed =
+        Vec::with_capacity((EQ121_LIVE_QUADRATURE_COUNT + 1) * EQUATION121_MODE_STRIDE);
     for index in 0..EQ121_LIVE_QUADRATURE_COUNT {
         let (k, weight) = eq121_live_quadrature_node(index, source_radius)?;
         let k_squared = k.length_squared();
-        if !(k_squared > 0.0) {
+        if !k_squared.is_finite() || k_squared <= 0.0 {
             return None;
         }
         let mut rho = Complex64::new(0.0, 0.0);
@@ -94,8 +95,7 @@ pub fn build_equation121_modes(bytes: &[u8], source_radius: f64) -> Option<Vec<f
         // That is still equation (121): IR analytic + UV quadrature of the same
         // integrand. Without it, live FD is a weak flyby hook while FMM orbits.
         rho -= Complex64::from_polar(mass, -k.dot(center));
-        let coefficient =
-            f64::from(G) * weight / (2.0 * std::f64::consts::PI.powi(2) * k_squared);
+        let coefficient = f64::from(G) * weight / (2.0 * std::f64::consts::PI.powi(2) * k_squared);
         let mode = rho * coefficient;
         packed.extend([k.x, k.y, k.z, mode.re, mode.im]);
     }
@@ -113,7 +113,8 @@ pub fn build_equation121_modes(bytes: &[u8], source_radius: f64) -> Option<Vec<f
 /// spatial Eq.(121) residue there (`mathtidy.md` §2). Jacobian is `D_q g`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn evaluate_equation121(modes: &[f64], position: DVec3) -> Option<(DVec3, f64)> {
-    evaluate_equation121_with_jacobian(modes, position).map(|(gravity, potential, _)| (gravity, potential))
+    evaluate_equation121_with_jacobian(modes, position)
+        .map(|(gravity, potential, _)| (gravity, potential))
 }
 
 /// First-order trajectory Taylor of `mathtidy.md` (15)/(119):
@@ -134,7 +135,7 @@ fn evaluate_equation121_with_jacobian(
     modes: &[f64],
     position: DVec3,
 ) -> Option<(DVec3, f64, DMat3)> {
-    if modes.len() % EQUATION121_MODE_STRIDE != 0 || modes.is_empty() {
+    if !modes.len().is_multiple_of(EQUATION121_MODE_STRIDE) || modes.is_empty() {
         return None;
     }
     let (fourier, newton) = split_equation121_modes(modes);
@@ -191,7 +192,7 @@ fn split_equation121_modes(modes: &[f64]) -> (&[f64], Option<(DVec3, f64)>) {
     }
     let trailer_start = modes.len() - EQUATION121_MODE_STRIDE;
     let trailer = &modes[trailer_start..];
-    if trailer[4] != EQUATION121_NEWTON_SENTINEL || !(trailer[3] > 0.0) {
+    if trailer[4] != EQUATION121_NEWTON_SENTINEL || !trailer[3].is_finite() || trailer[3] <= 0.0 {
         return (modes, None);
     }
     (
@@ -457,19 +458,20 @@ pub(crate) fn eq184_chart_observations(
     let quadrature = (0..EQ184_QUADRATURE_COUNT)
         .map(|index| {
             let (wave_vector, weight) = eq184_quadrature_node(index, radius)?;
-            let coefficient = f64::from(G) * 4.0 * std::f64::consts::PI
-                / std::f64::consts::TAU.powi(3)
-                * weight
-                / wave_vector.length_squared().max(1.0e-18);
+            let coefficient =
+                f64::from(G) * 4.0 * std::f64::consts::PI / std::f64::consts::TAU.powi(3) * weight
+                    / wave_vector.length_squared().max(1.0e-18);
             Some((wave_vector, coefficient))
         })
         .collect::<Option<Vec<_>>>()?;
     let density_spectrum = quadrature
         .iter()
         .map(|(wave_vector, _)| {
-            sources.iter().fold(Complex64::new(0.0, 0.0), |sum, source| {
-                sum + Complex64::from_polar(source.mass, -wave_vector.dot(source.position))
-            })
+            sources
+                .iter()
+                .fold(Complex64::new(0.0, 0.0), |sum, source| {
+                    sum + Complex64::from_polar(source.mass, -wave_vector.dot(source.position))
+                })
         })
         .collect::<Vec<_>>();
     let count = knots.len();
@@ -618,7 +620,13 @@ fn hash_source_bytes(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    fn shell_bytes(direction: DVec3, solid_angle: f32, inner: f32, outer: f32, density: f32) -> Vec<u8> {
+    fn shell_bytes(
+        direction: DVec3,
+        solid_angle: f32,
+        inner: f32,
+        outer: f32,
+        density: f32,
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
         for value in [
             direction.x as f32,
@@ -673,13 +681,18 @@ mod tests {
         let density = (f64::from(RYUGU_MASS) / volume) as f32;
         let bytes = fibonacci_sphere_bytes(radius, density, 64);
         let modes = build_equation121_modes(&bytes, radius as f64).expect("modes");
-        let mass = bytes.as_chunks::<32>().0.iter().map(|chunk| {
-            let solid_angle = read_f32_le(chunk, 12) as f64;
-            let inner = read_f32_le(chunk, 16) as f64;
-            let outer = read_f32_le(chunk, 20) as f64;
-            let density = read_f32_le(chunk, 24) as f64;
-            solid_angle * (outer.powi(3) - inner.powi(3)) / 3.0 * density
-        }).sum::<f64>();
+        let mass = bytes
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|chunk| {
+                let solid_angle = read_f32_le(chunk, 12) as f64;
+                let inner = read_f32_le(chunk, 16) as f64;
+                let outer = read_f32_le(chunk, 20) as f64;
+                let density = read_f32_le(chunk, 24) as f64;
+                solid_angle * (outer.powi(3) - inner.powi(3)) / 3.0 * density
+            })
+            .sum::<f64>();
         let gm = f64::from(G) * mass;
         for distance in [500.0, 620.0, 900.0] {
             let position = DVec3::new(-distance, 0.0, 0.0);
@@ -815,7 +828,10 @@ mod tests {
         let observations =
             eq184_chart_observations(&knots, &sources, radius as f64).expect("eq184 chart");
         assert_eq!(observations.len(), 16);
-        let sigmas: Vec<f32> = observations.iter().map(|row| row.laplace_frequency).collect();
+        let sigmas: Vec<f32> = observations
+            .iter()
+            .map(|row| row.laplace_frequency)
+            .collect();
         let norms: Vec<f32> = observations
             .iter()
             .map(|row| row.transformed_field.length())

@@ -228,7 +228,8 @@ fn evaluate_equation121_with_jacobian(
     }
     let (fourier, newton) = if modes.len() >= 2 * EQUATION121_MODE_STRIDE {
         let trailer_start = modes.len() - EQUATION121_MODE_STRIDE;
-        if modes[trailer_start + 4] == EQUATION121_NEWTON_SENTINEL && modes[trailer_start + 3] > 0.0 {
+        if modes[trailer_start + 4] == EQUATION121_NEWTON_SENTINEL && modes[trailer_start + 3] > 0.0
+        {
             (
                 &modes[..trailer_start],
                 Some((
@@ -369,12 +370,7 @@ fn cached_body_values(state: &State, position: DVec3, time: Option<f64>) -> Opti
             return None;
         }
     }
-    Some(vec![
-        field.x,
-        field.y,
-        field.z,
-        state.cached_body_potential,
-    ])
+    Some(vec![field.x, field.y, field.z, state.cached_body_potential])
 }
 
 fn store_cached_body_field(
@@ -425,7 +421,12 @@ fn acceleration(state: &mut State, position: DVec3, time: f64) -> Result<DVec3, 
     let body = if let Some(values) = cached_body_values(state, body_position, Some(time)) {
         DVec3::new(values[0], values[1], values[2])
     } else {
-        let values = field_evaluate(eval_method, body_position.x, body_position.y, body_position.z)?;
+        let values = field_evaluate(
+            eval_method,
+            body_position.x,
+            body_position.y,
+            body_position.z,
+        )?;
         if values.len() != 4 {
             return Err("Invalid gravity response".into());
         }

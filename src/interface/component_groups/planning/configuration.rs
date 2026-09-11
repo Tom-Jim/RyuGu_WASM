@@ -210,6 +210,7 @@ pub enum ComparisonMetric {
 }
 
 impl ComparisonMetric {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn is_inversion(self) -> bool {
         matches!(self, Self::DensityFit | Self::InversionTime)
     }

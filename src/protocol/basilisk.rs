@@ -94,7 +94,9 @@ impl BasiliskAlgorithm {
 
     pub const fn observable(self) -> &'static str {
         match self {
-            Self::FrequencyDomain => "trajectory Laplace transform (Eq.184) + Eq.121 pointwise propagation",
+            Self::FrequencyDomain => {
+                "trajectory Laplace transform (Eq.184) + Eq.121 pointwise propagation"
+            }
             Self::Radial | Self::Werner | Self::Fmm | Self::Fft => "point acceleration",
         }
     }

@@ -90,11 +90,12 @@ pub fn physics_system(
                 if recoverable_live_field_miss(&message) {
                     // Soft status only — do not freeze Invert / First / Stress.
                     // Pause the capture clock until the Worker can advance again.
-                    inversion.capture_note = Some(if message.contains("Waiting for frequency-domain") {
-                        "Waiting for Eq.121 frequency-domain modes…".into()
-                    } else {
-                        "Live field used the far-field fallback; continuing the orbit…".into()
-                    });
+                    inversion.capture_note =
+                        Some(if message.contains("Waiting for frequency-domain") {
+                            "Waiting for Eq.121 frequency-domain modes…".into()
+                        } else {
+                            "Live field used the far-field fallback; continuing the orbit…".into()
+                        });
                     inversion.capture_last_advance_at = None;
                     return;
                 }
@@ -173,8 +174,7 @@ pub fn physics_system(
             velocity: speed(&records[0]),
         });
     }
-    let capturing =
-        !inversion.ready && needs_live_observation_arc(*active, planning.run_requested);
+    let capturing = !inversion.ready && needs_live_observation_arc(*active, planning.run_requested);
     if capturing {
         let now = bevy::platform::time::Instant::now();
         // Accrue only while advances are actually delivering. Gaps above a
@@ -199,14 +199,7 @@ pub fn physics_system(
         }
         // Accumulate every Worker state in the effective capture window.
         for record in records {
-            append_capture_trace_record(
-                &mut inversion,
-                record,
-                position,
-                speed,
-                field,
-                attitude,
-            );
+            append_capture_trace_record(&mut inversion, record, position, speed, field, attitude);
         }
     }
     for pair in records.windows(2) {
@@ -275,9 +268,9 @@ fn recoverable_live_field_miss(message: &str) -> bool {
 }
 
 /// Accrue wall time for a delivered live advance. Slow FMM/FFT ticks (often
-/// >350 ms) still count; only an explicit pause (`capture_last_advance_at =
-/// None`, e.g. waiting for Eq.121 modes) skips the gap. Gaps longer than the
-/// stall cap are treated as a blocked Worker, not live integration.
+/// above 350 ms) still count; only an explicit pause (`capture_last_advance_at`
+/// cleared to `None`, e.g. waiting for Eq.121 modes) skips the gap. Gaps longer
+/// than the stall cap are treated as a blocked Worker, not live integration.
 pub(crate) fn accrue_live_capture_gap(gap_secs: f64) -> Option<f64> {
     const CAPTURE_IDLE_STALL_SECS: f64 = 8.0;
     (gap_secs.is_finite() && gap_secs > 0.0 && gap_secs <= CAPTURE_IDLE_STALL_SECS)
@@ -300,8 +293,12 @@ mod live_capture_gap_tests {
 
     #[test]
     fn flups_grid_miss_is_recoverable() {
-        assert!(recoverable_live_field_miss("Gravity target outside FLUPS grid"));
-        assert!(recoverable_live_field_miss("Mass source outside FLUPS grid"));
+        assert!(recoverable_live_field_miss(
+            "Gravity target outside FLUPS grid"
+        ));
+        assert!(recoverable_live_field_miss(
+            "Mass source outside FLUPS grid"
+        ));
         assert!(recoverable_live_field_miss(
             "Waiting for frequency-domain Eq.121 modes"
         ));

@@ -54,9 +54,7 @@ use bevy_panorbit_camera::PanOrbitCameraPlugin;
 use cpp_backend::WernerReadbackChannel;
 use cpu::{
     density::build_density_quadrature_system,
-    frequency_domain::{
-        build_aggregated_gravity_source_system, publish_equation184_chart_system,
-    },
+    frequency_domain::{build_aggregated_gravity_source_system, publish_equation184_chart_system},
     inversion::{convex_optimization_system, start_density_inversion_system},
     physics::{physics_system, ryugu_rotation_system},
 };

@@ -224,7 +224,7 @@ fn hermite_vector(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32) ->
 /// First derivative of the same cubic Hermite used for positions, in physical
 /// time (`tangent_*` already carry `v * Δt`, so divide by `dt`).
 fn hermite_velocity(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32, dt: f32) -> Vec3 {
-    if !(dt > 0.0) {
+    if !dt.is_finite() || dt <= 0.0 {
         return a.lerp(b, t);
     }
     let t2 = t * t;
@@ -238,7 +238,7 @@ fn hermite_velocity(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32, 
 
 /// Second derivative of the same cubic Hermite (baseline acceleration).
 fn hermite_acceleration(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32, dt: f32) -> Vec3 {
-    if !(dt > 0.0) {
+    if !dt.is_finite() || dt <= 0.0 {
         return Vec3::ZERO;
     }
     let d2 =

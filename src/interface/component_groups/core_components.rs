@@ -781,7 +781,6 @@ pub struct FrequencyDomainReadbackPacket {
 pub struct GravityFieldSample {
     pub snapshot: GravityRequestSnapshot,
     pub body_acceleration: Vec3,
-    pub positive_potential: f32,
 }
 
 #[derive(Default)]

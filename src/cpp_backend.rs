@@ -1127,7 +1127,9 @@ fn upload_frequency_domain_modes(
     mode: Res<DensityMode>,
     state: Res<CppBackendState>,
     mut error: ResMut<GravityRuntimeError>,
-    mut uploaded: Local<Option<(u64, DensityMode)>>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))] mut uploaded: Local<
+        Option<(u64, DensityMode)>,
+    >,
     mut pending: Local<Option<(u64, DensityMode)>>,
 ) {
     #[cfg(target_arch = "wasm32")]

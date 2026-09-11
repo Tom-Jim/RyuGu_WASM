@@ -211,7 +211,6 @@ fn poll(
     history.0.push(GravityFieldSample {
         snapshot: packet.snapshot,
         body_acceleration: value.xyz(),
-        positive_potential: value.w,
     });
 }
 fn dispatch(
@@ -250,13 +249,9 @@ fn dispatch(
     ) else {
         return;
     };
-    if buffers
-        .0
-        .as_ref()
-        .is_some_and(|state| {
-            state.source_hash != input.source_hash || state.layout != EQ184_QUADRATURE_LAYOUT
-        })
-    {
+    if buffers.0.as_ref().is_some_and(|state| {
+        state.source_hash != input.source_hash || state.layout != EQ184_QUADRATURE_LAYOUT
+    }) {
         buffers.0 = None;
     }
     if buffers.0.is_none() {
@@ -350,14 +345,9 @@ fn dispatch(
         return;
     }
     let mut params = [0u8; 48];
-    for (index, value) in [
-        input.position.x,
-        input.position.y,
-        input.position.z,
-        G,
-    ]
-    .iter()
-    .enumerate()
+    for (index, value) in [input.position.x, input.position.y, input.position.z, G]
+        .iter()
+        .enumerate()
     {
         params[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
