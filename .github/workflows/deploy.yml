@@ -35,9 +35,6 @@ jobs:
               with:
                   version: 0.16.0
 
-            - name: Build C++ numerical WASM
-              run: node src/tools/build_cpp_wasm.mjs --fetch
-
             - name: Install Rust Toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
@@ -57,19 +54,12 @@ jobs:
                   cargo check --locked --target wasm32-unknown-unknown --lib
                   cargo clippy --locked --target wasm32-unknown-unknown --manifest-path src/backend/rust/Cargo.toml -- -D warnings
 
-            - name: Build independent Rust backend WASM
-              run: node src/tools/build_rust_backend.mjs
-
-            - name: Build WASM Release
-              run: >-
-                  wasm-pack build --locked --release --target web --out-dir pkg --out-name ryugu_wasm
-                  && node src/tools/normalize_frontend_wasm.mjs
-
-            - name: Build Tailwind stylesheet
-              run: bun run styles
+            # Local serve is `bun start` or `bun .`. Bare `bun run` only lists scripts.
+            - name: Build release WASM
+              run: bun run build -- --fetch
 
             - name: Verify WASM ABI and generated module paths
-              run: node src/tools/check_wasm_build.mjs
+              run: bun run check:wasm
 
             - name: Bundle Vue telemetry UI
               run: >-
@@ -91,7 +81,11 @@ jobs:
                   node --check src/html/backend-client.js
                   node --check src/html/backend-worker.js
                   node --check src/backend/host/cpp_backend.mjs
+                  node --check src/tools/build_helpers.mjs
+                  node --check src/tools/build_cpp_wasm.mjs
                   node --check src/tools/build_rust_backend.mjs
+                  node --check src/tools/build_wasm.mjs
+                  node --check src/tools/run.mjs
                   node --check build/app.js
                   ! grep -Fq 'Runtime compilation is not supported in this build of Vue' build/app.js
                   ! grep -Fq 'Feature flags __VUE_OPTIONS_API__' build/app.js

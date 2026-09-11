@@ -169,11 +169,85 @@ struct State {
     velocity: DVec3,
     initial_rotation: DQuat,
     history: Vec<[f64; 4]>,
+    /// Packed Eq.121 modes: `[kx, ky, kz, coeff_re, coeff_im]` × N.
+    frequency_domain_modes: Vec<f64>,
     trace: Vec<f64>,
     cached_body_field: Option<DVec3>,
+    cached_body_position: Option<DVec3>,
     cached_field_time: f64,
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
+
+const EQUATION121_MODE_STRIDE: usize = 5;
+const EQUATION121_FOURIER_COUNT: usize = 64;
+const EQUATION121_NEWTON_SENTINEL: f64 = 2.0;
+
+/// Upload the finite Eq.121 operator used by frequency-domain live propagation.
+/// Modes are independent of probe state and must be refreshed when density changes.
+#[wasm_bindgen]
+pub fn set_frequency_domain_modes(modes: &[f64]) -> Result<(), JsValue> {
+    if modes.is_empty()
+        || !modes.len().is_multiple_of(EQUATION121_MODE_STRIDE)
+        || !modes.iter().all(|value| value.is_finite())
+    {
+        return Err("Invalid frequency-domain Eq.121 modes".into());
+    }
+    STATE.with(|cell| {
+        cell.borrow_mut().frequency_domain_modes = modes.to_vec();
+    });
+    Ok(())
+}
+
+fn evaluate_equation121(modes: &[f64], position: DVec3) -> Result<(DVec3, f64), JsValue> {
+    if modes.is_empty() || !modes.len().is_multiple_of(EQUATION121_MODE_STRIDE) {
+        return Err("Waiting for frequency-domain Eq.121 modes".into());
+    }
+    let trailer_start = EQUATION121_FOURIER_COUNT * EQUATION121_MODE_STRIDE;
+    let (fourier, newton) = if modes.len() == trailer_start + EQUATION121_MODE_STRIDE
+        && modes[trailer_start + 4] == EQUATION121_NEWTON_SENTINEL
+        && modes[trailer_start + 3] > 0.0
+    {
+        (
+            &modes[..trailer_start],
+            Some((
+                DVec3::new(modes[trailer_start], modes[trailer_start + 1], modes[trailer_start + 2]),
+                modes[trailer_start + 3],
+            )),
+        )
+    } else {
+        (modes, None)
+    };
+    let mut gravity = DVec3::ZERO;
+    let mut potential = 0.0;
+    for mode in fourier.as_chunks::<EQUATION121_MODE_STRIDE>().0 {
+        let k = DVec3::new(mode[0], mode[1], mode[2]);
+        let phase = k.dot(position);
+        let (sin_phase, cos_phase) = phase.sin_cos();
+        let re = mode[3] * cos_phase - mode[4] * sin_phase;
+        let im = mode[3] * sin_phase + mode[4] * cos_phase;
+        gravity -= im * k;
+        potential += re;
+    }
+    // Monopole trailer is required for the IR/UV split. Do not invent GM: that
+    // double-counts when the Fourier nodes still carry the full ρ̂ monopole.
+    if let Some((center, gravitational_parameter)) = newton {
+        let offset = position - center;
+        let distance_squared = offset.length_squared();
+        if distance_squared > 0.0 {
+            let inverse_distance = distance_squared.sqrt().recip();
+            // Uncapped residual + analytic IR monopole (Eq.121). No engineering
+            // residual fraction clamp — that rewrote the force away from the
+            // derivation. Near-surface erf/erfc is a separate appendix split.
+            let monopole = -gravitational_parameter * offset * inverse_distance.powi(3);
+            gravity += monopole;
+            potential += gravitational_parameter * inverse_distance;
+        }
+    }
+    if !gravity.is_finite() || !potential.is_finite() {
+        return Err("Equation (121) returned a non-finite field".into());
+    }
+    Ok((gravity, potential))
+}
 
 fn rotation(state: &State, time: f64) -> DQuat {
     DQuat::from_axis_angle(
@@ -184,8 +258,12 @@ fn rotation(state: &State, time: f64) -> DQuat {
 
 fn field_refresh_interval(method: &str) -> f64 {
     match method {
+        // Werner remains a heavier polyhedral call; cache briefly.
         "werner" => 2.0,
-        "fmm" | "fft" => 8.0,
+        // One Basilisk period (live dt = 1 s). Body spin in that window is
+        // ~2e-4 rad, so reusing g_B is physically small. Planning, surface,
+        // and inversion source_sets never consult this cache.
+        "fmm" | "fft" => 1.0,
         _ => 0.0,
     }
 }
@@ -193,51 +271,43 @@ fn field_refresh_interval(method: &str) -> f64 {
 fn acceleration(state: &mut State, position: DVec3, time: f64) -> Result<DVec3, JsValue> {
     let q = rotation(state, time);
     let body = if state.method == "frequency_domain" {
-        let samples = &state.history;
-        let last = samples
-            .last()
-            .ok_or("Waiting for frequency-domain samples")?;
-        let vector = |s: &[f64; 4]| DVec3::new(s[1], s[2], s[3]);
-        if samples.len() == 1 {
-            vector(last)
-        } else {
-            let upper = samples
-                .iter()
-                .position(|s| s[0] >= time)
-                .unwrap_or(samples.len() - 1);
-            if upper == 0 {
-                vector(&samples[0])
-            } else {
-                let a = &samples[upper - 1];
-                let b = &samples[upper];
-                let interval = (b[0] - a[0]).max(f64::EPSILON);
-                if time > last[0] + 2.0 * interval {
-                    return Err("Waiting for frequency-domain samples".into());
-                }
-                let fraction = ((time - a[0]) / interval).max(0.0);
-                vector(a).lerp(vector(b), fraction)
-            }
-        }
+        // Eq.155/156 require g_B(q_B(t)) at the current body-frame position.
+        // Time-interpolating a stale GPU stamp violates that and produces the
+        // spurious near-central ellipses seen under high simulation acceleration.
+        let body_position = q.inverse() * position;
+        let (field, _) = evaluate_equation121(&state.frequency_domain_modes, body_position)?;
+        field
     } else {
-        let reuse = state
-            .cached_body_field
-            .filter(|_| time - state.cached_field_time < field_refresh_interval(&state.method));
+        let p = q.inverse() * position;
+        let reuse = state.cached_body_field.filter(|_| {
+            let interval = field_refresh_interval(&state.method);
+            if interval <= 0.0 || time - state.cached_field_time > interval {
+                return false;
+            }
+            state.cached_body_position.is_some_and(|cached| {
+                let delta = (p - cached).length();
+                let scale = p.length().max(1.0);
+                delta <= 0.02 * scale
+            })
+        });
         if let Some(field) = reuse {
             field
         } else {
-            let p = q.inverse() * position;
             let values = field_evaluate(&state.method, p.x, p.y, p.z)?;
             if values.len() != 4 {
                 return Err("Invalid gravity response".into());
             }
             let field = DVec3::new(values[0], values[1], values[2]);
             state.cached_body_field = Some(field);
+            state.cached_body_position = Some(p);
             state.cached_field_time = time;
             field
         }
     };
     let field = q * body;
-    if !field.is_finite() || field.length() > 1.5e-3 {
+    // Near-surface / dense IR+UV fields routinely exceed any fixed 1.5e-3
+    // engineering gate; reject only non-finite accelerations.
+    if !field.is_finite() {
         return Err("Invalid gravity acceleration".into());
     }
     Ok(field)
@@ -253,12 +323,11 @@ fn append_trace(state: &mut State, time: f64, field: DVec3) {
 
 fn integration_substeps(method: &str) -> usize {
     match method {
-        // These implementations are intentionally synchronous browser WASM.
-        // Keep their live path responsive; comparison and surface jobs use
-        // their complete requested batches separately.
-        "werner" | "fft" | "fmm" => 1,
-        "radial" => 2,
-        "frequency_domain" => 8,
+        // Live-orbit A/B fairness: FMM/FFT/FD share the same substep count.
+        // Werner stays at 1 (heavier polyhedral). Planning/surface batches are
+        // separate from this live tick path.
+        "werner" => 1,
+        "fft" | "fmm" | "radial" | "frequency_domain" => 2,
         _ => 1,
     }
 }
@@ -314,7 +383,10 @@ pub fn advance_frame(
         || !step_seconds.is_finite()
         || step_seconds <= 0.0
         || steps == 0
-        || steps > 8
+        // Must stay aligned with the frontend `MAX_SIMULATION_ACCELERATION`.
+        // Each step still uses the caller's fixed `step_seconds`; a larger
+        // `steps` only batches more identical-`dt` leaps into one Worker trip.
+        || steps > 64
         || !history.len().is_multiple_of(4)
         || !history.iter().all(|v| v.is_finite())
         || history
@@ -339,6 +411,7 @@ pub fn advance_frame(
         let reset =
             state.epoch != Some(epoch) || state.method != method || state.period_ns != period;
         if reset {
+            let modes = state.frequency_domain_modes.clone();
             *state = State {
                 epoch: Some(epoch),
                 method: method.into(),
@@ -346,6 +419,7 @@ pub fn advance_frame(
                 position: DVec3::from_slice(initial),
                 velocity: DVec3::from_slice(&initial[3..]),
                 initial_rotation: DQuat::from_slice(&initial[6..]).normalize(),
+                frequency_domain_modes: modes,
                 ..Default::default()
             };
         }

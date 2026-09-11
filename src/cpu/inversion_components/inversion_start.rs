@@ -1,74 +1,327 @@
+/// Inputs of a requested inversion, kept while the numerical Worker evaluates
+/// the high-resolution reference observations and the method's voxel
+/// sensitivity matrix. Both are `source_sets` requests on the sensitivity
+/// channel, issued one after the other.
+pub(crate) struct InversionStartJob {
+    method: ActiveGravityMethod,
+    capture_id: u64,
+    source_hash: u64,
+    capture_epoch: u64,
+    voxels: Vec<InvertedDensityVoxel>,
+    voxel_size: f32,
+    basis_sources: VoxelBasisSources,
+    samples: Vec<TrajectoryInversionKnot>,
+    holdout_samples: Vec<TrajectoryInversionKnot>,
+    /// Reference source sets still to be evaluated; `None` once the reference
+    /// cache in `TrajectoryInversionState` is valid for this capture.
+    reference_sets: Option<Vec<Vec<(DVec3, f64)>>>,
+    /// Method sensitivity matrix once it is known (cache hit or delivered).
+    sensitivities: Option<Vec<Vec3>>,
+    pending: Option<PendingInversionRequest>,
+    common_started: Instant,
+    truth_prepare_ms: Option<f64>,
+    method_started: Instant,
+    matrix_started: Option<Instant>,
+    timing: InversionTimingBreakdown,
+}
+
+enum PendingInversionRequest {
+    Reference(crate::cpp_backend::BackendSensitivitySnapshot),
+    Sensitivity(crate::cpp_backend::BackendSensitivitySnapshot),
+}
+
+impl PendingInversionRequest {
+    fn snapshot(&self) -> crate::cpp_backend::BackendSensitivitySnapshot {
+        match self {
+            Self::Reference(snapshot) | Self::Sensitivity(snapshot) => *snapshot,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct InversionStartWorker {
+    job: Option<InversionStartJob>,
+    next_request_id: u64,
+}
+
 pub fn start_density_inversion_system(
     active_method: Res<ActiveGravityMethod>,
     planning: Res<PlanningComparisonState>,
     radial_source: Option<Res<DensityQuadratureSource>>,
     aggregated_source: Option<Res<AggregatedGravitySource>>,
+    channel: Res<crate::cpp_backend::BackendSensitivityChannel>,
     mut sensitivity_caches: ResMut<DensitySensitivityCaches>,
     mut frequency_domain_sensitivity: ResMut<FrequencyDomainSensitivityMatrix>,
     mut frequency_domain_performance: ResMut<FrequencyDomainPerformanceMetrics>,
     mut show_section: ResMut<ShowSection>,
     mut inversion: ResMut<TrajectoryInversionState>,
+    mut worker: Local<InversionStartWorker>,
 ) {
+    let InversionStartWorker {
+        job: job_slot,
+        next_request_id,
+    } = &mut *worker;
+    // A start whose capture, method, or metric went away is abandoned together
+    // with its Worker request. A repeated Invert click while a job is in flight
+    // is ignored instead of restarting from scratch.
+    let abandoned = job_slot.as_ref().is_some_and(|job| {
+        !planning.selected_metric.is_inversion()
+            || !inversion.ready
+            || inversion.capture_id != Some(job.capture_id)
+            || inversion.capture_epoch != job.capture_epoch
+            || *active_method != job.method
+    });
+    if abandoned {
+        *job_slot = None;
+        channel.reset();
+        inversion.preparing = false;
+    }
+    if job_slot.is_some() && inversion.start_requested {
+        inversion.start_requested = false;
+    }
     if !planning.selected_metric.is_inversion() {
+        inversion.preparing = job_slot.is_some();
         return;
     }
-    if !validate_inversion_request(inversion.start_requested, *active_method, &mut inversion) {
+    if job_slot.is_none() {
+        if !validate_inversion_request(inversion.start_requested, *active_method, &mut inversion)
+        {
+            inversion.preparing = false;
+            return;
+        }
+        inversion.start_requested = false;
+        match begin_inversion_start(
+            *active_method,
+            radial_source.as_deref(),
+            aggregated_source.as_deref(),
+            &mut inversion,
+        ) {
+            Ok(job) => {
+                *job_slot = Some(job);
+                inversion.preparing = true;
+            }
+            Err(message) => {
+                inversion.error = Some(message);
+                inversion.preparing = false;
+                return;
+            }
+        }
+    }
+    inversion.preparing = true;
+    let job = job_slot.as_mut().expect("inversion start job");
+
+    if let Some(pending) = job.pending.take() {
+        match channel.take() {
+            None if !channel.is_idle() => {
+                job.pending = Some(pending);
+                return;
+            }
+            // An experiment reset discarded the request; it is re-issued below.
+            None => {}
+            Some(packet)
+                if packet.snapshot == pending.snapshot()
+                    && packet.snapshot.epoch == job.capture_epoch =>
+            {
+                let outcome = match pending {
+                    PendingInversionRequest::Reference(_) => {
+                        apply_reference_answer(job, packet.result, &mut inversion)
+                    }
+                    PendingInversionRequest::Sensitivity(_) => {
+                        apply_sensitivity_answer(job, packet.result, &mut sensitivity_caches)
+                    }
+                };
+                if let Err(message) = outcome {
+                    inversion.error = Some(message);
+                    inversion.preparing = false;
+                    *job_slot = None;
+                    return;
+                }
+            }
+            // A mismatching answer belongs to a superseded request.
+            Some(_) => {}
+        }
+    }
+
+    if let Some(sets) = job.reference_sets.as_ref() {
+        let mut targets = knot_body_targets(&job.samples);
+        targets.extend(knot_body_targets(&job.holdout_samples));
+        let snapshot = next_inversion_snapshot(next_request_id, job);
+        match crate::cpp_backend::request_source_sets(&channel, snapshot, "direct", sets, &targets)
+        {
+            Ok(true) => job.pending = Some(PendingInversionRequest::Reference(snapshot)),
+            Ok(false) => {}
+            Err(message) => {
+                inversion.error = Some(message);
+                inversion.preparing = false;
+                *job_slot = None;
+            }
+        }
         return;
     }
-    inversion.start_requested = false;
+    if job.truth_prepare_ms.is_none() {
+        job.truth_prepare_ms = Some(job.common_started.elapsed().as_secs_f64() * 1.0e3);
+        job.method_started = Instant::now();
+    }
+    let truth_prepare_ms = job.truth_prepare_ms.expect("truth preparation timed");
+
+    match job.method {
+        ActiveGravityMethod::FrequencyDomain => {
+            if job.sensitivities.is_none() {
+                job.timing.matrix_cache_hit = prepare_frequency_domain_cache(
+                    job.capture_id,
+                    job.source_hash,
+                    job.basis_sources.hash,
+                    job.voxels.len(),
+                    job.samples.len(),
+                    &mut frequency_domain_sensitivity,
+                    &mut frequency_domain_performance,
+                    truth_prepare_ms,
+                );
+                job.sensitivities = Some(inversion.reference_training_sensitivities.clone());
+            }
+        }
+        ActiveGravityMethod::MmfftCompressed | ActiveGravityMethod::Fmm => {
+            if job.sensitivities.is_none() {
+                let cache = &sensitivity_caches.0[job.method.performance_index()];
+                let cache_hit = cache.capture_id == Some(job.capture_id)
+                    && cache.source_hash == job.source_hash
+                    && cache.basis_hash == job.basis_sources.hash
+                    && cache.sample_count == job.samples.len()
+                    && cache.values.len() == job.samples.len() * job.voxels.len();
+                if cache_hit {
+                    job.timing.matrix_cache_hit = true;
+                    job.sensitivities = Some(cache.values.clone());
+                } else {
+                    job.matrix_started.get_or_insert_with(Instant::now);
+                    let key = if job.method == ActiveGravityMethod::MmfftCompressed {
+                        "fft"
+                    } else {
+                        "fmm"
+                    };
+                    let columns: Vec<Vec<(DVec3, f64)>> = job
+                        .basis_sources
+                        .columns
+                        .iter()
+                        .map(|column| column.iter().map(|s| (s.position, s.volume)).collect())
+                        .collect();
+                    let targets = knot_body_targets(&job.samples);
+                    let snapshot = next_inversion_snapshot(next_request_id, job);
+                    match crate::cpp_backend::request_source_sets(
+                        &channel, snapshot, key, &columns, &targets,
+                    ) {
+                        Ok(true) => {
+                            job.pending = Some(PendingInversionRequest::Sensitivity(snapshot));
+                        }
+                        Ok(false) => {}
+                        Err(message) => {
+                            inversion.error = Some(message);
+                            inversion.preparing = false;
+                            *job_slot = None;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        _ => unreachable!("forward-only methods were rejected"),
+    }
+
+    let job = job_slot.take().expect("inversion start job");
+    inversion.preparing = false;
+    let sensitivities = job.sensitivities.expect("sensitivity matrix resolved");
+    let current_densities = job
+        .voxels
+        .iter()
+        .map(|voxel| voxel.density)
+        .collect::<Vec<_>>();
+    let mut optimizer = ConvexOptimizationJob {
+        method: job.method,
+        capture_id: job.capture_id,
+        source_hash: job.source_hash,
+        neighbours: build_neighbours(&job.voxels),
+        voxels: job.voxels,
+        basis_sources: job.basis_sources,
+        frozen_samples: job.samples,
+        sensitivities,
+        observed_accelerations: inversion.reference_training_observations.clone(),
+        holdout_observations: inversion.reference_holdout_observations.clone(),
+        holdout_sensitivities: inversion.reference_holdout_sensitivities.clone(),
+        current_densities: current_densities.clone(),
+        best_densities: current_densities,
+        initial_objective: f64::INFINITY,
+        data_error_scale: 1.0,
+        voxel_size: job.voxel_size,
+        started_at: job.method_started,
+        source_preparation_ms: truth_prepare_ms,
+        timing: job.timing,
+    };
+    optimizer.data_error_scale = trajectory_data_error(&optimizer).max(1.0e-24);
+    optimizer.initial_objective = objective(&optimizer);
+    if !optimizer.initial_objective.is_finite() {
+        inversion.error = Some("The voxel sensitivity matrix is not finite.".into());
+        return;
+    }
+    inversion.inverted = true;
+    show_section.0 = false;
+    inversion.displayed_density = Some(density_result_from_job(
+        &optimizer,
+        &optimizer.best_densities,
+        0.0,
+    ));
+    inversion.error = None;
+    inversion.optimizer = Some(optimizer);
+}
+
+fn next_inversion_snapshot(
+    next_request_id: &mut u64,
+    job: &InversionStartJob,
+) -> crate::cpp_backend::BackendSensitivitySnapshot {
+    *next_request_id = next_request_id.wrapping_add(1).max(1);
+    crate::cpp_backend::BackendSensitivitySnapshot {
+        request_id: job.capture_id.rotate_left(13) ^ *next_request_id,
+        epoch: job.capture_epoch,
+    }
+}
+
+/// Assembles everything the inversion needs before any Worker round trip.
+fn begin_inversion_start(
+    method: ActiveGravityMethod,
+    radial_source: Option<&DensityQuadratureSource>,
+    aggregated_source: Option<&AggregatedGravitySource>,
+    inversion: &mut TrajectoryInversionState,
+) -> Result<InversionStartJob, String> {
     let common_started = Instant::now();
-    let Some(source) = radial_source else {
-        inversion.error = Some("The asteroid volume source is not ready.".into());
-        return;
-    };
-    let Some(aggregated) = aggregated_source else {
-        inversion.error = Some("The aggregated gravity source is not ready.".into());
-        return;
-    };
+    let source = radial_source.ok_or("The asteroid volume source is not ready.")?;
+    let aggregated = aggregated_source.ok_or("The aggregated gravity source is not ready.")?;
     let capture_id = inversion.capture_id.expect("validated inversion capture");
-    let method = *active_method;
     let source_hash = inversion.capture_source_hash;
-    let Some((voxels, voxel_size)) = build_density_voxels(&source, method) else {
-        inversion.error = Some("The asteroid volume could not be voxelized.".into());
-        return;
-    };
+    let (voxels, voxel_size) = build_density_voxels(source, method)
+        .ok_or("The asteroid volume could not be voxelized.")?;
     if voxels.len() != EXPECTED_VOXEL_COUNT {
-        inversion.error = Some(format!(
+        return Err(format!(
             "The convex inverse requires 56 voxels, but voxelization produced {}.",
             voxels.len()
         ));
-        return;
     }
-    let Some(basis_sources) = build_voxel_basis_sources(&voxels, &aggregated, voxel_size) else {
-        inversion.error = Some("The shared mass-preserving voxel basis is not ready.".into());
-        return;
-    };
-    let Some(samples) = sample_frozen_trajectory(&inversion.knots) else {
-        inversion.error = Some("The frozen trajectory cannot be sampled.".into());
-        return;
-    };
+    let basis_sources = build_voxel_basis_sources(&voxels, aggregated, voxel_size)
+        .ok_or("The shared mass-preserving voxel basis is not ready.")?;
+    let samples = sample_frozen_trajectory(&inversion.knots)
+        .ok_or("The frozen trajectory cannot be sampled.")?;
+    if !cfg!(target_arch = "wasm32") && method != ActiveGravityMethod::FrequencyDomain {
+        return Err("Density inversion requires the browser numerical Worker.".into());
+    }
     let training_count = (inversion.knots.len() - 1) * TRAJECTORY_SAMPLES_PER_SEGMENT + 1;
     let holdout_count = (inversion.knots.len() - 1) * HOLDOUT_SAMPLES_PER_SEGMENT;
-    if method != ActiveGravityMethod::FrequencyDomain {
-        prepare_reference_cache(
-            capture_id,
-            source_hash,
-            training_count,
-            holdout_count,
-            &samples,
-            &voxels,
-            &source,
-            &mut inversion,
-        );
-        if inversion.error.is_some() {
-            return;
-        }
-    }
-    // Equation (184) is an integral observation operator.  For this method
-    // the RHS and unit-density columns must be generated by the same discrete
-    // Fourier--Laplace operator; do not mix them with the pointwise FMM cache.
+    let mut reference_sets = None;
+    // Only the pointwise reference evaluates holdout samples in the Worker;
+    // the frequency-domain operator derives its own holdout rows.
+    let mut holdout_samples = Vec::new();
     if method == ActiveGravityMethod::FrequencyDomain {
-        let Some((training, training_basis, holdout, holdout_basis)) =
+        // Equation (184) is an integral observation operator.  For this method
+        // the RHS and unit-density columns must be generated by the same
+        // discrete Fourier--Laplace operator; do not mix them with the
+        // pointwise reference cache.
+        let (training, training_basis, holdout, holdout_basis) =
             frequency_domain_training_and_holdout_reference(
                 &inversion.knots,
                 &samples,
@@ -76,100 +329,91 @@ pub fn start_density_inversion_system(
                 &voxels,
                 aggregated.radius,
             )
-        else {
-            inversion.error =
-                Some("The frequency-domain observation operator could not be assembled.".into());
-            return;
-        };
+            .ok_or("The frequency-domain observation operator could not be assembled.")?;
         inversion.reference_cache_capture_id = None;
         inversion.reference_training_observations = training;
         inversion.reference_training_sensitivities = training_basis;
         inversion.reference_holdout_observations = holdout;
         inversion.reference_holdout_sensitivities = holdout_basis;
+    } else if !reference_cache_matches(
+        inversion,
+        capture_id,
+        source_hash,
+        training_count,
+        holdout_count,
+        voxels.len(),
+    ) {
+        let message = "The frozen trajectory has no valid reference observations.";
+        holdout_samples = holdout_frozen_trajectory(&inversion.knots).ok_or(message)?;
+        reference_sets = Some(reference_source_sets(&voxels, source).ok_or(message)?);
     }
-    let truth_prepare_ms = common_started.elapsed().as_secs_f64() * 1.0e3;
-    let method_started = Instant::now();
-    let mut timing = InversionTimingBreakdown::default();
-    let mut sensitivities = inversion.reference_training_sensitivities.clone();
-    match method {
-        ActiveGravityMethod::FrequencyDomain => {
-            timing.matrix_cache_hit = prepare_frequency_domain_cache(
-                capture_id,
-                source_hash,
-                basis_sources.hash,
-                voxels.len(),
-                training_count,
-                &mut frequency_domain_sensitivity,
-                &mut frequency_domain_performance,
-                truth_prepare_ms,
-            );
-        }
-        ActiveGravityMethod::MmfftCompressed | ActiveGravityMethod::Fmm => {
-            let cache = &mut sensitivity_caches.0[method.performance_index()];
-            let cache_hit = cache.capture_id == Some(capture_id)
-                && cache.source_hash == source_hash
-                && cache.basis_hash == basis_sources.hash
-                && cache.sample_count == samples.len()
-                && cache.values.len() == samples.len() * voxels.len();
-            timing.matrix_cache_hit = cache_hit;
-            if cache_hit {
-                sensitivities.clone_from(&cache.values);
-            } else {
-                let matrix_started = Instant::now();
-                // Legacy Rust FFT/FMM sensitivities are no longer dispatched.
-                let key = if method == ActiveGravityMethod::MmfftCompressed { "fft" } else { "fmm" };
-                match crate::cpp_backend::voxel_basis_sensitivities(key, &basis_sources, &samples) {
-                    Ok(values) => sensitivities = values,
-                    Err(message) => { inversion.error = Some(message); return; }
-                }
-                timing.matrix_build_ms = matrix_started.elapsed().as_secs_f64() * 1.0e3;
-                *cache = DensitySensitivityCache {
-                    capture_id: Some(capture_id),
-                    source_hash,
-                    basis_hash: basis_sources.hash,
-                    sample_count: samples.len(),
-                    values: sensitivities.clone(),
-                };
-            }
-        }
-        _ => unreachable!("forward-only methods were rejected"),
-    }
-    let observed_accelerations = inversion.reference_training_observations.clone();
-    let holdout_observations = inversion.reference_holdout_observations.clone();
-    let holdout_sensitivities = inversion.reference_holdout_sensitivities.clone();
-    let current_densities = voxels.iter().map(|voxel| voxel.density).collect::<Vec<_>>();
-    let mut job = ConvexOptimizationJob {
+    Ok(InversionStartJob {
         method,
         capture_id,
         source_hash,
-        neighbours: build_neighbours(&voxels),
+        capture_epoch: inversion.capture_epoch,
         voxels,
-        basis_sources,
-        frozen_samples: samples,
-        sensitivities,
-        observed_accelerations,
-        holdout_observations,
-        holdout_sensitivities,
-        current_densities: current_densities.clone(),
-        best_densities: current_densities,
-        initial_objective: f64::INFINITY,
-        data_error_scale: 1.0,
         voxel_size,
-        started_at: method_started,
-        source_preparation_ms: truth_prepare_ms,
-        timing,
+        basis_sources,
+        samples,
+        holdout_samples,
+        reference_sets,
+        sensitivities: None,
+        pending: None,
+        common_started,
+        truth_prepare_ms: None,
+        method_started: common_started,
+        matrix_started: None,
+        timing: InversionTimingBreakdown::default(),
+    })
+}
+
+fn apply_reference_answer(
+    job: &mut InversionStartJob,
+    result: Result<Vec<f64>, String>,
+    inversion: &mut TrajectoryInversionState,
+) -> Result<(), String> {
+    let (training, training_basis, holdout, holdout_basis) = result
+        .ok()
+        .and_then(|values| {
+            decode_training_and_holdout_reference(
+                &values,
+                &job.samples,
+                &job.holdout_samples,
+                job.voxels.len(),
+            )
+        })
+        .ok_or("The frozen trajectory has no valid reference observations.")?;
+    inversion.reference_cache_capture_id = Some(job.capture_id);
+    inversion.reference_cache_source_hash = job.source_hash;
+    inversion.reference_training_observations = training;
+    inversion.reference_training_sensitivities = training_basis;
+    inversion.reference_holdout_observations = holdout;
+    inversion.reference_holdout_sensitivities = holdout_basis;
+    job.reference_sets = None;
+    Ok(())
+}
+
+fn apply_sensitivity_answer(
+    job: &mut InversionStartJob,
+    result: Result<Vec<f64>, String>,
+    sensitivity_caches: &mut DensitySensitivityCaches,
+) -> Result<(), String> {
+    let values = result.and_then(|values| {
+        decode_voxel_basis_sensitivities(&values, &job.basis_sources, &job.samples)
+    })?;
+    job.timing.matrix_build_ms = job
+        .matrix_started
+        .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1.0e3);
+    sensitivity_caches.0[job.method.performance_index()] = DensitySensitivityCache {
+        capture_id: Some(job.capture_id),
+        source_hash: job.source_hash,
+        basis_hash: job.basis_sources.hash,
+        sample_count: job.samples.len(),
+        values: values.clone(),
     };
-    job.data_error_scale = trajectory_data_error(&job).max(1.0e-24);
-    job.initial_objective = objective(&job);
-    if !job.initial_objective.is_finite() {
-        inversion.error = Some("The voxel sensitivity matrix is not finite.".into());
-        return;
-    }
-    inversion.inverted = true;
-    show_section.0 = false;
-    inversion.displayed_density = Some(density_result_from_job(&job, &job.best_densities, 0.0));
-    inversion.error = None;
-    inversion.optimizer = Some(job);
+    job.sensitivities = Some(values);
+    Ok(())
 }
 
 fn validate_inversion_request(
@@ -177,7 +421,7 @@ fn validate_inversion_request(
     method: ActiveGravityMethod,
     inversion: &mut TrajectoryInversionState,
 ) -> bool {
-    if !pressed || inversion.optimizer.is_some() {
+    if !pressed || inversion.optimizer.is_some() || inversion.preparing {
         return false;
     }
     if matches!(
@@ -214,37 +458,22 @@ fn validate_inversion_request(
     true
 }
 
-fn prepare_reference_cache(
+/// Method-independent truth observations are cached for one immutable
+/// trajectory/source identity and reused across inverse methods.
+fn reference_cache_matches(
+    inversion: &TrajectoryInversionState,
     capture_id: u64,
     source_hash: u64,
     training_count: usize,
     holdout_count: usize,
-    training_samples: &[TrajectoryInversionKnot],
-    voxels: &[InvertedDensityVoxel],
-    source: &DensityQuadratureSource,
-    inversion: &mut TrajectoryInversionState,
-) {
-    let matches = inversion.reference_cache_capture_id == Some(capture_id)
+    voxel_count: usize,
+) -> bool {
+    inversion.reference_cache_capture_id == Some(capture_id)
         && inversion.reference_cache_source_hash == source_hash
         && inversion.reference_training_observations.len() == training_count
-        && inversion.reference_training_sensitivities.len() == training_count * voxels.len()
+        && inversion.reference_training_sensitivities.len() == training_count * voxel_count
         && inversion.reference_holdout_observations.len() == holdout_count
-        && inversion.reference_holdout_sensitivities.len() == holdout_count * voxels.len();
-    if matches {
-        return;
-    }
-    let Some((training, training_basis, holdout, holdout_basis)) =
-        training_and_holdout_reference(&inversion.knots, training_samples, voxels, source)
-    else {
-        inversion.error = Some("The frozen trajectory has no valid reference observations.".into());
-        return;
-    };
-    inversion.reference_cache_capture_id = Some(capture_id);
-    inversion.reference_cache_source_hash = source_hash;
-    inversion.reference_training_observations = training;
-    inversion.reference_training_sensitivities = training_basis;
-    inversion.reference_holdout_observations = holdout;
-    inversion.reference_holdout_sensitivities = holdout_basis;
+        && inversion.reference_holdout_sensitivities.len() == holdout_count * voxel_count
 }
 
 fn prepare_frequency_domain_cache(

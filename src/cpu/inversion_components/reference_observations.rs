@@ -1,31 +1,58 @@
-fn training_and_holdout_reference(
-    knots: &[TrajectoryInversionKnot],
-    training_samples: &[TrajectoryInversionKnot],
+/// Source sets of the method-independent high-resolution truth: the complete
+/// radial source first, then one unit-density set per inversion voxel. The
+/// Worker evaluates all of them against the training and holdout samples in
+/// one `source_sets` request.
+fn reference_source_sets(
     voxels: &[InvertedDensityVoxel],
     radial_source: &DensityQuadratureSource,
+) -> Option<Vec<Vec<(DVec3, f64)>>> {
+    let tree = high_resolution_reference_tree(radial_source)?;
+    let basis_trees = high_resolution_reference_basis_trees(voxels, radial_source)?;
+    let mut sets = Vec::with_capacity(1 + basis_trees.len());
+    sets.push(tree.into_sources());
+    sets.extend(basis_trees.into_iter().map(FmmNode::into_sources));
+    Some(sets)
+}
+
+/// Splits the `[set][sample][4]` answer of `reference_source_sets` into
+/// training observations, training basis, holdout observations, and holdout
+/// basis. Observations must be finite; basis columns are stored as delivered.
+fn decode_training_and_holdout_reference(
+    values: &[f64],
+    training_samples: &[TrajectoryInversionKnot],
+    holdout_samples: &[TrajectoryInversionKnot],
+    voxel_count: usize,
 ) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
     if training_samples.is_empty() {
         return None;
     }
-    let holdout_samples = holdout_frozen_trajectory(knots)?;
-    let tree = high_resolution_reference_tree(radial_source)?;
-    let basis_trees = high_resolution_reference_basis_trees(voxels, radial_source)?;
-    Some((
-        reference_observations(training_samples, &tree)?,
-        evaluate_reference_basis(&basis_trees, training_samples),
-        reference_observations(&holdout_samples, &tree)?,
-        evaluate_reference_basis(&basis_trees, &holdout_samples),
-    ))
-}
-
-fn reference_observations(
-    samples: &[TrajectoryInversionKnot],
-    tree: &FmmNode,
-) -> Option<Vec<Vec3>> {
-    samples
-        .iter()
-        .map(|sample| evaluate_reference_tree(tree, sample))
-        .collect()
+    let sample_count = training_samples.len() + holdout_samples.len();
+    let set_count = 1 + voxel_count;
+    if values.len() != set_count * sample_count * 4 {
+        return None;
+    }
+    let records = values.as_chunks::<4>().0;
+    let set = |index: usize| &records[index * sample_count..(index + 1) * sample_count];
+    let split = |samples: &[TrajectoryInversionKnot], offset: usize| {
+        let observations = samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| {
+                let acceleration = reference_acceleration(sample, &set(0)[offset + index]);
+                acceleration.is_finite().then_some(acceleration)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut basis = Vec::with_capacity(samples.len() * voxel_count);
+        for (index, sample) in samples.iter().enumerate() {
+            for voxel in 0..voxel_count {
+                basis.push(reference_acceleration(sample, &set(1 + voxel)[offset + index]));
+            }
+        }
+        Some((observations, basis))
+    };
+    let (training, training_basis) = split(training_samples, 0)?;
+    let (holdout, holdout_basis) = split(holdout_samples, training_samples.len())?;
+    Some((training, training_basis, holdout, holdout_basis))
 }
 
 fn trajectory_data_error(job: &ConvexOptimizationJob) -> f64 {
@@ -71,9 +98,11 @@ fn normalized_field_error(
 }
 
 /// Discrete equation-(184) observation operator used by the frequency-domain
-/// inverse. Every row is the transform of the complete known trajectory at a
-/// distinct positive Laplace frequency; no aggregate row is duplicated or
-/// interpreted as an instantaneous field sample.
+/// inverse. Every row is the Laplace–Fourier transform of the complete known
+/// trajectory at a distinct positive Laplace frequency (式184), not the
+/// position Volterra form (165). UI-edited knots drive these rows after the
+/// live Eq.121 force has produced the frozen orbit; no aggregate row is
+/// duplicated or interpreted as an instantaneous field sample.
 pub(crate) fn frequency_domain_training_and_holdout_reference(
     knots: &[TrajectoryInversionKnot],
     training_samples: &[TrajectoryInversionKnot],

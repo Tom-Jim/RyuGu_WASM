@@ -36,11 +36,8 @@ pub fn method_selection_system(
     if *active == next {
         return;
     }
-    // A frequency orbit must be produced by Eq.106 for this experiment.
-    // Never carry an observation arc across the Radial/frequency boundary.
-    let preserve_radial_capture = *active != ActiveGravityMethod::FrequencyDomain
-        && next != ActiveGravityMethod::FrequencyDomain
-        && (inversion.ready || !inversion.truth_knots.is_empty());
+    // Each inverse method must capture its own wall-clock live arc. Never
+    // reuse FMM/FFT/frequency-domain observation knots across method switches.
     *active = next;
     runtime_error.clear();
     gravity_blend.0 = 0.0;
@@ -61,9 +58,12 @@ pub fn method_selection_system(
         transform.translation = Vec3::ZERO;
     }
     let queued_inversion = inversion.start_requested;
-    inversion.preserve_truth_track = preserve_radial_capture;
+    inversion.preserve_truth_track = false;
     inversion.optimizer = None;
-    inversion.ready = false;
+    inversion.reset_live_capture();
+    inversion.truth_knots.clear();
+    inversion.truth_capture_id = None;
+    inversion.capture_id = None;
     inversion.start_requested = queued_inversion;
     frequency_domain_result.capture_id = None;
     frequency_domain_result.observations.clear();
@@ -75,6 +75,7 @@ pub fn clear_gpu_histories_on_method_change(
     mut werner: Option<ResMut<WernerGravityHistory>>,
     mut mmfft: Option<ResMut<MmfftCompressedHistory>>,
     mut fmm: Option<ResMut<FmmGravityHistory>>,
+    mut equation106: Option<ResMut<crate::gpu::equation106::Equation106History>>,
 ) {
     if !active.is_changed() {
         return;
@@ -91,6 +92,9 @@ pub fn clear_gpu_histories_on_method_change(
     if let Some(value) = fmm.as_deref_mut() {
         value.0.clear();
     }
+    if let Some(value) = equation106.as_deref_mut() {
+        value.0.clear();
+    }
 }
 
 pub fn reset_inversion_on_method_change(
@@ -104,8 +108,7 @@ pub fn reset_inversion_on_method_change(
     let queued_inversion = inversion.start_requested;
     inversion.capture_id = None;
     inversion.capture_source_hash = 0;
-    inversion.ready = false;
-    inversion.knots.clear();
+    inversion.reset_live_capture();
     inversion.optimizer = None;
     inversion.start_requested = queued_inversion;
     inversion.error = None;

@@ -1,5 +1,3 @@
-const REFERENCE_THETA: f64 = 0.025;
-
 /// Source-count-independent nonlinear field used for planning propagation. It
 /// stores source nodes for the independent backend's ExaFMM solver.
 pub(crate) type PlanningDynamicsTree = FmmNode;
@@ -35,12 +33,27 @@ pub(crate) fn build_planning_dynamics_tree(
 
 pub(crate) struct FmmNode(Vec<(DVec3, f64)>);
 
-fn evaluate_fmm(node: &FmmNode, target: DVec3, theta: f64) -> DVec3 {
-    let method = if theta <= REFERENCE_THETA { "direct" } else { "fmm" };
-    match crate::cpp_backend::evaluate_sources(method, &node.0, &[target]) {
-        Ok(values) => DVec3::new(values[0][0], values[0][1], values[0][2]) / f64::from(G),
-        Err(_) => DVec3::splat(f64::NAN),
+impl FmmNode {
+    fn into_sources(self) -> Vec<(DVec3, f64)> {
+        self.0
     }
+}
+
+/// Body-frame evaluation targets of frozen trajectory samples.
+fn knot_body_targets(samples: &[TrajectoryInversionKnot]) -> Vec<DVec3> {
+    samples
+        .iter()
+        .map(|sample| (sample.body_rotation.inverse() * sample.position).as_dvec3())
+        .collect()
+}
+
+/// Inertial acceleration of one delivered `[gx, gy, gz, potential]` record of
+/// a reference source set. The unit round trip through `G` reproduces the
+/// former per-sample evaluation bit for bit.
+fn reference_acceleration(sample: &TrajectoryInversionKnot, record: &[f64; 4]) -> Vec3 {
+    let acceleration_body =
+        DVec3::new(record[0], record[1], record[2]) / f64::from(G) * G as f64;
+    sample.body_rotation * acceleration_body.as_vec3()
 }
 
 fn high_resolution_reference_tree(source: &DensityQuadratureSource) -> Option<FmmNode> {
@@ -69,14 +82,6 @@ fn high_resolution_reference_tree(source: &DensityQuadratureSource) -> Option<Fm
         })
         .collect::<Vec<_>>();
     (!points.is_empty()).then_some(FmmNode(points))
-}
-
-fn evaluate_reference_tree(tree: &FmmNode, sample: &TrajectoryInversionKnot) -> Option<Vec3> {
-    let body_position = sample.body_rotation.inverse() * sample.position;
-    let acceleration_body =
-        evaluate_fmm(tree, body_position.as_dvec3(), REFERENCE_THETA) * G as f64;
-    let acceleration = sample.body_rotation * acceleration_body.as_vec3();
-    acceleration.is_finite().then_some(acceleration)
 }
 
 fn high_resolution_reference_basis_trees(
@@ -145,15 +150,21 @@ fn high_resolution_reference_basis_trees(
     )
 }
 
-fn evaluate_reference_basis(trees: &[FmmNode], samples: &[TrajectoryInversionKnot]) -> Vec<Vec3> {
-    let mut result = Vec::with_capacity(trees.len() * samples.len());
-    for sample in samples {
-        let body_position = sample.body_rotation.inverse() * sample.position;
-        for tree in trees {
-            let acceleration_body =
-                evaluate_fmm(tree, body_position.as_dvec3(), REFERENCE_THETA) * G as f64;
-            result.push(sample.body_rotation * acceleration_body.as_vec3());
+/// Method sensitivity matrix from the Worker's `[column][sample][4]` answer:
+/// row-major `[sample][column]` inertial accelerations of unit-density voxels.
+fn decode_voxel_basis_sensitivities(
+    values: &[f64],
+    basis: &VoxelBasisSources,
+    samples: &[TrajectoryInversionKnot],
+) -> Result<Vec<Vec3>, String> {
+    let columns = basis.columns.len();
+    let records = crate::cpp_backend::decode_field_batch(values, columns * samples.len())?;
+    let mut result = vec![Vec3::ZERO; samples.len() * columns];
+    for (column_index, column) in records.chunks_exact(samples.len()).enumerate() {
+        for (sample_index, (sample, value)) in samples.iter().zip(column).enumerate() {
+            result[sample_index * columns + column_index] = sample.body_rotation
+                * Vec3::new(value[0] as f32, value[1] as f32, value[2] as f32);
         }
     }
-    result
+    Ok(result)
 }

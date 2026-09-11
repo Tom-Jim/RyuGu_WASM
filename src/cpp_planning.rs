@@ -4,6 +4,44 @@ use bevy::math::DVec3;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// Stop-loss for the C++ FMM/FFT planning slices.
+///
+/// Those two methods rebuild a target-dependent tree/grid on every request.
+/// The outstanding Worker request is the rate limit; the configurable floor
+/// (currently zero) only remains so a non-zero pacing policy can be restored
+/// without changing the dispatch shape. Adaptive tile size
+/// (`adapt_candidate_tile`) and the numerical contract are untouched.
+///
+/// `None` means no slice has been dispatched yet. The web `Instant` is
+/// `performance.now()` and starts near zero, so "one interval ago" cannot be
+/// expressed by subtracting from `Instant::now()` without risking an overflow
+/// panic at startup.
+#[derive(Default)]
+pub(crate) struct PlanningDispatchPacer {
+    last_dispatch: Option<Instant>,
+}
+
+fn planning_dispatch_interval(method: ActiveGravityMethod) -> Duration {
+    match method {
+        ActiveGravityMethod::Fmm => Duration::from_millis(PLANNING_FMM_DISPATCH_MIN_INTERVAL_MS),
+        ActiveGravityMethod::MmfftCompressed => {
+            Duration::from_millis(PLANNING_FFT_DISPATCH_MIN_INTERVAL_MS)
+        }
+        _ => Duration::ZERO,
+    }
+}
+
+fn should_dispatch_planning(
+    pacer: &PlanningDispatchPacer,
+    method: ActiveGravityMethod,
+    now: Instant,
+) -> bool {
+    pacer.last_dispatch.is_none_or(|last_dispatch| {
+        now.saturating_duration_since(last_dispatch) >= planning_dispatch_interval(method)
+    })
+}
 
 struct PendingPlanningEvaluation {
     snapshot: crate::cpp_backend::BackendEvaluateSourcesSnapshot,
@@ -29,6 +67,7 @@ pub(crate) fn dispatch(
     channel: Res<PlanningGpuReadbackChannel>,
     backend_channel: Res<crate::cpp_backend::BackendEvaluateSourcesChannel>,
     mut cache: Local<PlanningCache>,
+    mut pacer: Local<PlanningDispatchPacer>,
 ) {
     let Some(method) = request.method else {
         if backend_channel.in_flight.load(Ordering::Acquire) {
@@ -54,11 +93,7 @@ pub(crate) fn dispatch(
         cache.pending = None;
     }
 
-    let completed = backend_channel
-        .data
-        .lock()
-        .expect("backend source result channel poisoned")
-        .take();
+    let completed = backend_channel.take();
     if let Some(packet) = completed {
         let Some(pending) = cache.pending.take() else {
             cache.last_request = 0;
@@ -96,6 +131,10 @@ pub(crate) fn dispatch(
     {
         return;
     }
+    let now = Instant::now();
+    if !should_dispatch_planning(&pacer, method, now) {
+        return;
+    }
 
     let prepared =
         prepare_evaluation(&batch, &request, method).and_then(|(pending, sources, targets)| {
@@ -115,6 +154,7 @@ pub(crate) fn dispatch(
         });
     match prepared {
         Ok((true, pending)) => {
+            pacer.last_dispatch = Some(now);
             cache.last_request = request.request_id;
             cache.pending = Some(pending);
         }
@@ -285,4 +325,46 @@ fn finish_evaluation(
             PlanningExecutionBackend::CppFlups
         },
     })
+}
+
+#[cfg(test)]
+mod planning_dispatch_pacer_tests {
+    use super::*;
+
+    #[test]
+    fn outstanding_request_is_the_only_dispatch_gate() {
+        let start = Instant::now();
+        let pacer = PlanningDispatchPacer::default();
+        // Nothing dispatched yet: the first slice may go out immediately.
+        assert!(should_dispatch_planning(
+            &pacer,
+            ActiveGravityMethod::Fmm,
+            start
+        ));
+
+        let pacer = PlanningDispatchPacer {
+            last_dispatch: Some(start),
+        };
+        // Zero-floor policy: once the Worker answered, the next slice may go
+        // out on the same frame. Radial never waited.
+        assert!(should_dispatch_planning(
+            &pacer,
+            ActiveGravityMethod::Fmm,
+            start
+        ));
+        assert!(should_dispatch_planning(
+            &pacer,
+            ActiveGravityMethod::MmfftCompressed,
+            start
+        ));
+        assert!(should_dispatch_planning(
+            &pacer,
+            ActiveGravityMethod::RadialAnalytic,
+            start
+        ));
+        let _ = (
+            PLANNING_FMM_DISPATCH_MIN_INTERVAL_MS,
+            PLANNING_FFT_DISPATCH_MIN_INTERVAL_MS,
+        );
+    }
 }

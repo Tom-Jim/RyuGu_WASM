@@ -1,6 +1,4 @@
 use crate::cpu::frequency_domain::AggregatedGravitySource;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::cpu::inversion::PlanningDynamicsTree;
 use crate::cpu::inversion::{build_planning_dynamics_tree, build_voxel_basis_sources};
 use crate::interface::components::*;
 use bevy::math::{DMat3, DQuat, DVec3};
@@ -21,8 +19,6 @@ pub(crate) struct PlanningBatchBuilder {
     candidate_count: u32,
     density_model_count: u32,
     samples_per_candidate: u32,
-    next_candidate: u32,
-    #[cfg(target_arch = "wasm32")]
     next_sample: usize,
     preparation_ms: f64,
     reference_samples: Vec<TrajectoryInversionKnot>,
@@ -36,18 +32,19 @@ pub(crate) struct PlanningBatchBuilder {
     basis_records: Vec<PlanningBasisRecord>,
     basis_hash: u64,
     reference_jets: Vec<PlanningReferenceJet>,
-    #[cfg(not(target_arch = "wasm32"))]
-    dynamics_tree: PlanningDynamicsTree,
-    #[cfg(target_arch = "wasm32")]
-    wasm_positions: Vec<DVec3>,
-    #[cfg(target_arch = "wasm32")]
-    wasm_velocities: Vec<DVec3>,
-    #[cfg(target_arch = "wasm32")]
-    wasm_sources: Vec<(DVec3, f64)>,
-    #[cfg(target_arch = "wasm32")]
-    pending_slice: Option<PendingCandidateSlice>,
-    #[cfg(target_arch = "wasm32")]
+    /// Latest propagated state of every candidate; the next slice starts here.
+    candidate_positions: Vec<DVec3>,
+    candidate_velocities: Vec<DVec3>,
+    /// Point sources of the canonical FMM dynamics field. They are uploaded to
+    /// the Worker once per planning run; slices only carry candidate states.
+    dynamics_sources: Vec<(DVec3, f64)>,
+    /// The Worker acknowledged this run's source upload and no channel reset
+    /// has happened since, so slices may reference the uploaded sources.
+    sources_prepared: bool,
+    pending: Option<PendingCandidateRequest>,
     worker_request_id: u64,
+    /// Last Worker/slice failure detail for the planning status line.
+    pub(crate) last_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,12 +56,27 @@ struct PlanningReferenceJet {
     world_jacobian: DMat3,
 }
 
-#[cfg(target_arch = "wasm32")]
-struct PendingCandidateSlice {
-    snapshot: crate::cpp_backend::BackendCandidatesSnapshot,
-    start_sample: usize,
-    end_sample: usize,
-    started: bevy::platform::time::Instant,
+/// Outstanding request of this builder on the candidates channel.
+enum PendingCandidateRequest {
+    /// `prepare_candidate_sources` upload; must complete before any slice.
+    Prepare {
+        snapshot: crate::cpp_backend::BackendCandidatesSnapshot,
+    },
+    /// `propagate_candidates` slice against the uploaded sources.
+    Slice {
+        snapshot: crate::cpp_backend::BackendCandidatesSnapshot,
+        start_sample: usize,
+        end_sample: usize,
+        started: bevy::platform::time::Instant,
+    },
+}
+
+impl PendingCandidateRequest {
+    fn snapshot(&self) -> crate::cpp_backend::BackendCandidatesSnapshot {
+        match self {
+            Self::Prepare { snapshot } | Self::Slice { snapshot, .. } => *snapshot,
+        }
+    }
 }
 
 impl PlanningBatchBuilder {
@@ -179,39 +191,25 @@ impl PlanningBatchBuilder {
         let dynamics_tree =
             build_planning_dynamics_tree(&canonical_basis_records, density_models.get(..56)?)?;
         let reference_jets = build_planning_reference_jets(&reference_samples);
-        #[cfg(target_arch = "wasm32")]
-        let (wasm_positions, wasm_velocities, wasm_sources) = {
-            let first = *reference_samples.first()?;
-            let mut positions = Vec::with_capacity(candidate_count as usize);
-            for candidate in 0..candidate_count {
-                let (radius, phase, harmonic, phase_rate) =
-                    candidate_perturbation_parameters(candidate, candidate_count);
-                let offset = candidate_initial_offset(
-                    first,
-                    0,
-                    samples_per_candidate,
-                    radius,
-                    phase,
-                    harmonic,
-                    phase_rate,
-                )?;
-                positions.push((first.position + offset).as_dvec3());
-            }
-            (
-                positions,
-                vec![first.velocity.as_dvec3(); candidate_count as usize],
-                dynamics_tree.sources().to_vec(),
-            )
-        };
+        let first = *reference_samples.first()?;
+        let mut candidate_positions = Vec::with_capacity(candidate_count as usize);
+        for candidate in 0..candidate_count {
+            let (radius, phase, harmonic, phase_rate) =
+                candidate_perturbation_parameters(candidate, candidate_count);
+            let offset = candidate_initial_offset(
+                first,
+                0,
+                samples_per_candidate,
+                radius,
+                phase,
+                harmonic,
+                phase_rate,
+            )?;
+            candidate_positions.push((first.position + offset).as_dvec3());
+        }
+        let candidate_velocities = vec![first.velocity.as_dvec3(); candidate_count as usize];
+        let dynamics_sources = dynamics_tree.sources().to_vec();
         let state_count = candidate_count as usize * samples_per_candidate as usize;
-        #[cfg(target_arch = "wasm32")]
-        let states = vec![PlanningCandidateState::default(); state_count];
-        #[cfg(not(target_arch = "wasm32"))]
-        let states = Vec::with_capacity(state_count);
-        #[cfg(target_arch = "wasm32")]
-        let gpu_position_bytes = vec![0; state_count * 16];
-        #[cfg(not(target_arch = "wasm32"))]
-        let gpu_position_bytes = Vec::with_capacity(state_count * 16);
         Some(Self {
             profile,
             run_id,
@@ -224,14 +222,12 @@ impl PlanningBatchBuilder {
             candidate_count,
             density_model_count,
             samples_per_candidate,
-            next_candidate: 0,
-            #[cfg(target_arch = "wasm32")]
             next_sample: 0,
             preparation_ms: started.elapsed().as_secs_f64() * 1.0e3,
             reference_samples,
             reference_states,
-            states,
-            gpu_position_bytes,
+            states: vec![PlanningCandidateState::default(); state_count],
+            gpu_position_bytes: vec![0; state_count * 16],
             density_models,
             density_model_masses,
             density_seed,
@@ -239,18 +235,13 @@ impl PlanningBatchBuilder {
             basis_records,
             basis_hash,
             reference_jets,
-            #[cfg(not(target_arch = "wasm32"))]
-            dynamics_tree,
-            #[cfg(target_arch = "wasm32")]
-            wasm_positions,
-            #[cfg(target_arch = "wasm32")]
-            wasm_velocities,
-            #[cfg(target_arch = "wasm32")]
-            wasm_sources,
-            #[cfg(target_arch = "wasm32")]
-            pending_slice: None,
-            #[cfg(target_arch = "wasm32")]
+            candidate_positions,
+            candidate_velocities,
+            dynamics_sources,
+            sources_prepared: false,
+            pending: None,
             worker_request_id: 0,
+            last_error: None,
         })
     }
 
@@ -275,89 +266,84 @@ impl PlanningBatchBuilder {
             ) == dimensions
     }
 
+    /// Uploads the dynamics sources once, then submits or collects one bounded
+    /// propagation slice per call.
+    ///
+    /// All candidates share one C++ FMM time slice on the numerical Worker.
+    /// Returns `false` only when the batch is unrecoverable; an idle Worker
+    /// (or a native build, which has no Worker) simply reports no progress.
     pub(crate) fn advance(
         &mut self,
         propagation_budget: u32,
         channel: &crate::cpp_backend::BackendCandidatesChannel,
     ) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let started = bevy::platform::time::Instant::now();
-            let _ = channel;
-            let end = (self.next_candidate + propagation_budget.max(1)).min(self.candidate_count);
-            let generated = generate_candidate_range_parallel(
-                self.next_candidate,
-                end,
-                self.candidate_count,
-                &self.reference_samples,
-                &self.reference_jets,
-                &self.dynamics_tree,
-            );
-            let Some(mut generated) = generated else {
-                return false;
-            };
-            generated.sort_unstable_by_key(|(candidate, _, _)| *candidate);
-            for (_, states, bytes) in generated {
-                self.states.extend(states);
-                self.gpu_position_bytes.extend(bytes);
-            }
-            self.next_candidate = end;
-            self.preparation_ms += started.elapsed().as_secs_f64() * 1.0e3;
-            true
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.advance_wasm(propagation_budget, channel)
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn advance_wasm(
-        &mut self,
-        propagation_budget: u32,
-        channel: &crate::cpp_backend::BackendCandidatesChannel,
-    ) -> bool {
-        if let Some(pending) = self.pending_slice.take() {
-            let packet = channel
-                .data
-                .lock()
-                .expect("backend candidate result channel poisoned")
-                .take();
-            match packet {
+        if let Some(pending) = self.pending.take() {
+            match channel.take() {
                 None if !channel.is_idle() => {
-                    // The slice is still being propagated.
-                    self.pending_slice = Some(pending);
+                    // The Worker is still working on it.
+                    self.pending = Some(pending);
                     return true;
                 }
                 // Cancelling an experiment clears the channel, so a free
-                // channel with nothing delivered means this slice was
-                // discarded. Fall through and re-issue it below.
-                None => {}
+                // channel with nothing delivered means this request was
+                // discarded. The upload is repeated before the next slice so a
+                // slice never depends on an acknowledgement from before the
+                // reset; fall through and re-issue below.
+                None => self.sources_prepared = false,
                 Some(packet) => {
-                    if packet.snapshot != pending.snapshot
+                    if packet.snapshot != pending.snapshot()
                         || packet.snapshot.epoch != self.capture_epoch
-                        || packet.snapshot.request_id != pending.snapshot.request_id
                     {
                         return false;
                     }
-                    let Some(trajectory) = packet.result.ok().filter(|values| {
-                        values.len()
-                            == self.candidate_count as usize
-                                * (pending.end_sample - pending.start_sample + 1)
-                                * 6
-                            && values.iter().all(|value| value.is_finite())
-                    }) else {
-                        return false;
-                    };
-                    if !self.apply_candidate_slice(
-                        pending.start_sample,
-                        pending.end_sample,
-                        &trajectory,
-                    ) {
-                        return false;
+                    match pending {
+                        PendingCandidateRequest::Prepare { .. } => {
+                            if let Err(message) = packet.result {
+                                self.last_error = Some(message);
+                                return false;
+                            }
+                            self.sources_prepared = true;
+                            return true;
+                        }
+                        PendingCandidateRequest::Slice {
+                            start_sample,
+                            end_sample,
+                            started,
+                            ..
+                        } => {
+                            let trajectory = match packet.result {
+                                Ok(values)
+                                    if values.len()
+                                        == self.candidate_count as usize
+                                            * (end_sample - start_sample + 1)
+                                            * 6
+                                        && values.iter().all(|value| value.is_finite()) =>
+                                {
+                                    values
+                                }
+                                Ok(_) => {
+                                    self.last_error = Some(
+                                        "Planning candidate slice returned an invalid trajectory layout."
+                                            .into(),
+                                    );
+                                    return false;
+                                }
+                                Err(message) => {
+                                    self.last_error = Some(message);
+                                    return false;
+                                }
+                            };
+                            if !self.apply_candidate_slice(start_sample, end_sample, &trajectory) {
+                                self.last_error = Some(
+                                    "Planning candidate slice could not be applied to the batch."
+                                        .into(),
+                                );
+                                return false;
+                            }
+                            self.preparation_ms += started.elapsed().as_secs_f64() * 1.0e3;
+                            return true;
+                        }
                     }
-                    self.preparation_ms += pending.started.elapsed().as_secs_f64() * 1.0e3;
-                    return true;
                 }
             }
         }
@@ -366,25 +352,39 @@ impl PlanningBatchBuilder {
         if sample_count < 2 {
             return false;
         }
+        if !self.sources_prepared {
+            let snapshot = self.next_snapshot();
+            return match crate::cpp_backend::request_prepare_candidate_sources(
+                channel,
+                snapshot,
+                &self.dynamics_sources,
+            ) {
+                Ok(true) => {
+                    self.pending = Some(PendingCandidateRequest::Prepare { snapshot });
+                    true
+                }
+                Ok(false) => true,
+                Err(message) => {
+                    self.last_error = Some(message);
+                    false
+                }
+            };
+        }
         let start_sample = self.next_sample.min(sample_count - 1);
         let end_sample =
             (start_sample + propagation_budget.max(1) as usize).min(sample_count - 1);
         if start_sample == end_sample {
-            self.next_candidate = self.candidate_count;
             self.next_sample = end_sample;
             return true;
         }
         let Some(request) = self.serialize_candidate_slice(start_sample, end_sample) else {
+            self.last_error = Some("Planning candidate slice could not be serialized.".into());
             return false;
         };
-        self.worker_request_id = self.worker_request_id.wrapping_add(1).max(1);
-        let snapshot = crate::cpp_backend::BackendCandidatesSnapshot {
-            request_id: self.run_id.rotate_left(23) ^ self.worker_request_id,
-            epoch: self.capture_epoch,
-        };
+        let snapshot = self.next_snapshot();
         match crate::cpp_backend::request_candidates(channel, snapshot, &request) {
             Ok(true) => {
-                self.pending_slice = Some(PendingCandidateSlice {
+                self.pending = Some(PendingCandidateRequest::Slice {
                     snapshot,
                     start_sample,
                     end_sample,
@@ -393,19 +393,29 @@ impl PlanningBatchBuilder {
                 true
             }
             Ok(false) => true,
-            Err(_) => false,
+            Err(message) => {
+                self.last_error = Some(message);
+                false
+            }
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    fn next_snapshot(&mut self) -> crate::cpp_backend::BackendCandidatesSnapshot {
+        self.worker_request_id = self.worker_request_id.wrapping_add(1).max(1);
+        crate::cpp_backend::BackendCandidatesSnapshot {
+            request_id: self.run_id.rotate_left(23) ^ self.worker_request_id,
+            epoch: self.capture_epoch,
+        }
+    }
+
     fn serialize_candidate_slice(&self, start_sample: usize, end_sample: usize) -> Option<String> {
         let candidate_positions: Vec<_> = self
-            .wasm_positions
+            .candidate_positions
             .iter()
             .map(|position| position.to_array())
             .collect();
         let candidate_velocities: Vec<_> = self
-            .wasm_velocities
+            .candidate_velocities
             .iter()
             .map(|velocity| velocity.to_array())
             .collect();
@@ -428,28 +438,24 @@ impl PlanningBatchBuilder {
                 jacobian: jet.world_jacobian.to_cols_array(),
             })
             .collect();
-        let sources: Vec<_> = self
-            .wasm_sources
-            .iter()
-            .map(|(position, mass)| (position.to_array(), *mass))
-            .collect();
+        // An empty `sources` list tells the backend to use the sources this
+        // run uploaded with `prepare_candidate_sources`.
         #[derive(serde::Serialize)]
         struct CandidateRequest<'a> {
             positions: &'a [[f64; 3]],
             velocities: &'a [[f64; 3]],
             jets: &'a [CandidateJet],
-            sources: &'a [([f64; 3], f64)],
+            sources: [([f64; 3], f64); 0],
         }
         serde_json::to_string(&CandidateRequest {
             positions: &candidate_positions,
             velocities: &candidate_velocities,
             jets: &jets,
-            sources: &sources,
+            sources: [],
         })
         .ok()
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn apply_candidate_slice(
         &mut self,
         start_sample: usize,
@@ -478,38 +484,21 @@ impl PlanningBatchBuilder {
                 }
             }
             let final_start = candidate_start + (local_sample_count - 1) * 6;
-            self.wasm_positions[candidate] =
+            self.candidate_positions[candidate] =
                 DVec3::from_slice(&trajectory[final_start..final_start + 3]);
-            self.wasm_velocities[candidate] =
+            self.candidate_velocities[candidate] =
                 DVec3::from_slice(&trajectory[final_start + 3..final_start + 6]);
         }
         self.next_sample = end_sample;
-        if self.is_complete() {
-            self.next_candidate = self.candidate_count;
-        }
         true
     }
 
     pub(crate) fn preparation_progress(&self) -> f64 {
-        #[cfg(target_arch = "wasm32")]
-        {
-            (self.next_sample + 1) as f64 / self.reference_samples.len() as f64
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            f64::from(self.next_candidate) / f64::from(self.candidate_count.max(1))
-        }
+        (self.next_sample + 1) as f64 / self.reference_samples.len() as f64
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.next_sample + 1 >= self.reference_samples.len()
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.next_candidate == self.candidate_count
-        }
+        self.next_sample + 1 >= self.reference_samples.len()
     }
 
     pub(crate) fn finish(self) -> Option<(PlanningCandidateBatch, f64)> {
@@ -573,72 +562,4 @@ impl PlanningBatchBuilder {
             self.preparation_ms,
         ))
     }
-}
-
-/// Native planning uses a bounded work queue so trajectory propagation does
-/// not serialize behind GPU submission or UI rendering. Results are sorted by
-/// candidate index before they are appended, preserving the deterministic GPU
-/// buffer layout used by the WASM build. Browser WASM submits the same bounded
-/// slices to the dedicated numerical Worker and polls their result channel.
-#[cfg(not(target_arch = "wasm32"))]
-fn generate_candidate_range_parallel(
-    start: u32,
-    end: u32,
-    candidate_count: u32,
-    reference: &[TrajectoryInversionKnot],
-    reference_jets: &[PlanningReferenceJet],
-    dynamics_tree: &PlanningDynamicsTree,
-) -> Option<Vec<(u32, Vec<PlanningCandidateState>, Vec<u8>)>> {
-    use crossbeam_channel::bounded;
-
-    if start >= end {
-        return Some(Vec::new());
-    }
-    let worker_count = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min((end - start) as usize)
-        .max(1);
-    let (work_tx, work_rx) = bounded::<u32>(worker_count);
-    // Workers must never block publishing completion while the scheduler is
-    // still filling the bounded work queue; otherwise a full two-way queue
-    // can deadlock before the main thread begins collection.
-    let (result_tx, result_rx) =
-        crossbeam_channel::unbounded::<Option<(u32, Vec<PlanningCandidateState>, Vec<u8>)>>();
-    std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let work_rx = work_rx.clone();
-            let result_tx = result_tx.clone();
-            scope.spawn(move || {
-                while let Ok(candidate) = work_rx.recv() {
-                    let mut states = Vec::with_capacity(reference.len());
-                    let mut bytes = Vec::with_capacity(reference.len() * 16);
-                    let result = append_dynamical_candidate_states(
-                        candidate,
-                        candidate_count,
-                        reference,
-                        reference_jets,
-                        Some(dynamics_tree),
-                        &mut states,
-                        &mut bytes,
-                    )
-                    .map(|()| (candidate, states, bytes));
-                    if result_tx.send(result).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-        drop(result_tx);
-        for candidate in start..end {
-            if work_tx.send(candidate).is_err() {
-                return None;
-            }
-        }
-        drop(work_tx);
-        let mut generated = Vec::with_capacity((end - start) as usize);
-        for _ in start..end {
-            generated.push(result_rx.recv().ok()??);
-        }
-        Some(generated)
-    })
 }

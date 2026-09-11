@@ -298,9 +298,14 @@ pub(crate) fn browser_ui_publish_system(
         },
         "inversion": {
             "ready": state.inversion.ready,
-            "running": state.inversion.optimizer.is_some(),
+            "running": state.inversion.optimizer.is_some()
+                || state.inversion.preparing
+                || state.inversion.start_requested,
+            "preparing": state.inversion.preparing,
             "inverted": state.inversion.inverted,
             "error": state.inversion.error,
+            "captureNote": state.inversion.capture_note,
+            "wallElapsedSeconds": state.inversion.wall_elapsed_seconds,
             "results": inversion_results,
             "displayed": displayed_density,
             "trajectory": trajectory,

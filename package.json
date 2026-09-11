@@ -1,17 +1,21 @@
 {
   "name": "ryugu-wasm",
   "version": "0.1.0",
+  "private": true,
+  "main": "src/tools/run.mjs",
+  "module": "src/tools/run.mjs",
   "scripts": {
+    "start": "node src/tools/run.mjs",
+    "preview": "node src/tools/run.mjs",
+    "dev": "node src/tools/run.mjs --dev",
+    "serve": "bun src/server.ts",
     "fetch:cpp": "node src/tools/fetch_cpp.mjs",
     "build:cpp": "node src/tools/build_cpp_wasm.mjs",
     "build:backend": "bun run build:cpp && node src/tools/build_rust_backend.mjs",
     "check:wasm": "node src/tools/check_wasm_build.mjs",
-    "build:wasm": "bun run build:backend && RUSTC_WRAPPER= wasm-pack build --locked --dev --target web --out-dir pkg --out-name ryugu_wasm && node src/tools/normalize_frontend_wasm.mjs",
-    "build": "bun run build:backend && bun run styles && RUSTC_WRAPPER= wasm-pack build --locked --release --target web --out-dir pkg --out-name ryugu_wasm && node src/tools/normalize_frontend_wasm.mjs",
-    "styles": "bunx @tailwindcss/cli -i src/html/tailwind.css -o src/html/tailwind.generated.css --minify",
-    "dev": "bun run styles && bun run build:wasm && bun run src/server.ts",
-    "preview": "bun run build && bun run src/server.ts",
-    "serve": "bun run src/server.ts"
+    "build:wasm": "node src/tools/build_wasm.mjs --dev",
+    "build": "node src/tools/build_wasm.mjs --release",
+    "styles": "bunx @tailwindcss/cli -i src/html/tailwind.css -o src/html/tailwind.generated.css --minify"
   },
   "dependencies": {
     "echarts": "^6.1.0",

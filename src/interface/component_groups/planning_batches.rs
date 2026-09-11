@@ -4,18 +4,30 @@ pub const PLANNING_PERTURBATION_RADIUS_METERS: f32 = 15.0;
 pub const PLANNING_GPU_TILE_INITIAL_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MIN_CANDIDATES: u32 = 8;
 pub const PLANNING_GPU_TILE_MAX_CANDIDATES: u32 = 16;
+// First keeps a fixed tile width for fairness; these bounds document that
+// contract even though First never adapts at runtime.
+const _: () = assert!(
+    PLANNING_GPU_TILE_INITIAL_CANDIDATES >= PLANNING_GPU_TILE_MIN_CANDIDATES
+        && PLANNING_GPU_TILE_INITIAL_CANDIDATES <= PLANNING_GPU_TILE_MAX_CANDIDATES
+);
 // Stress uses the same candidate-tile range for all three GPU backends.  A
 // method-specific tile width changes request counts and hides dispatch/readback
 // overhead inside what is meant to be a shared-workload robustness run.
-pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 8;
+// Wider tiles cut Worker round-trips; adaptive sizing still shrinks under load.
+pub const PLANNING_GENERIC_TILE_INITIAL_CANDIDATES: u32 = 32;
 pub const PLANNING_GENERIC_TILE_MIN_CANDIDATES: u32 = 8;
-pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 16;
+pub const PLANNING_GENERIC_TILE_MAX_CANDIDATES: u32 = 128;
+/// Minimum real time between FMM/FFT planning Worker submissions.
+/// Outstanding in-flight work is already the rate limit; a non-zero floor only
+/// inserted idle gaps after the Worker finished. Keep at zero so the next
+/// slice posts as soon as the channel is free.
+pub const PLANNING_FMM_DISPATCH_MIN_INTERVAL_MS: u64 = 0;
+pub const PLANNING_FFT_DISPATCH_MIN_INTERVAL_MS: u64 = 0;
 /// Candidate propagation is performed by batched C++ FMM time slices in a
-/// dedicated browser worker. Keep each slice bounded so cancellation and
-/// progress updates stay responsive while all candidates share the same FMM
-/// target traversal.
-pub const PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME: u32 = 8;
-pub const PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME: u32 = 2;
+/// dedicated browser worker. Larger slices amortize postMessage and FMM setup
+/// while cancellation still lands between slices.
+pub const PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME: u32 = 12;
+pub const PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME: u32 = 8;
 pub const PLANNING_MIN_INTERACTIVE_FPS: f64 = 57.0;
 pub const PLANNING_TARGET_REQUEST_MS: f64 = 18.0;
 pub const PLANNING_MAX_REQUEST_MS: f64 = 34.0;

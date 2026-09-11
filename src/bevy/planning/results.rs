@@ -20,17 +20,10 @@ fn adapt_candidate_tile(job: &mut PlanningBatchJob, packet: &PlanningGpuPacket) 
     let can_grow = request_ms < PLANNING_TARGET_REQUEST_MS
         && frame_rate.is_none_or(|fps| fps >= 59.0)
         && recent_frame_ms.is_none_or(|milliseconds| milliseconds <= 17.2);
-    let (minimum, maximum) = if job.method == ActiveGravityMethod::FrequencyDomain {
-        (
-            PLANNING_GPU_TILE_MIN_CANDIDATES,
-            PLANNING_GPU_TILE_MAX_CANDIDATES,
-        )
-    } else {
-        (
-            PLANNING_GENERIC_TILE_MIN_CANDIDATES,
-            PLANNING_GENERIC_TILE_MAX_CANDIDATES,
-        )
-    };
+    let (minimum, maximum) = (
+        PLANNING_GENERIC_TILE_MIN_CANDIDATES,
+        PLANNING_GENERIC_TILE_MAX_CANDIDATES,
+    );
     job.candidate_tile_size = if should_shrink {
         (job.candidate_tile_size / 2).max(minimum)
     } else if can_grow {
@@ -409,7 +402,7 @@ fn planning_progress_text(job: &PlanningBatchJob) -> String {
         ActiveGravityMethod::Fmm | ActiveGravityMethod::MmfftCompressed
     )
     .then_some(
-        " C++ FMM/FFT evaluation runs in the numerical Worker; per-request tree/grid preparation may extend total completion time without blocking rendering.",
+        " C++ FMM/FFT evaluation runs in the numerical Worker and is rate-limited because each slice rebuilds its tree/grid; total completion time is longer so rendering stays responsive.",
     )
     .unwrap_or_default();
     format!(

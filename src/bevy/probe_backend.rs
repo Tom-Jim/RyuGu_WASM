@@ -6,10 +6,13 @@ pub fn apply_probe_input_system(
     mut gravity_blend: ResMut<GravityBlendFactor>,
     mut radial_potential: ResMut<GravityPotential>,
     mut werner_potential: Option<ResMut<WernerPotential>>,
-    mut radial_samples: Option<ResMut<RadialGravityHistory>>,
-    mut werner_samples: Option<ResMut<WernerGravityHistory>>,
-    mut mmfft_samples: Option<ResMut<MmfftCompressedHistory>>,
-    mut fmm_samples: Option<ResMut<FmmGravityHistory>>,
+    mut histories: ParamSet<(
+        Option<ResMut<RadialGravityHistory>>,
+        Option<ResMut<WernerGravityHistory>>,
+        Option<ResMut<MmfftCompressedHistory>>,
+        Option<ResMut<FmmGravityHistory>>,
+        Option<ResMut<crate::gpu::equation106::Equation106History>>,
+    )>,
     mut simulation_clock: ResMut<SimulationClock>,
     mut jacobi_history: ResMut<JacobiHistory>,
     mut frequency_domain_result: ResMut<FrequencyDomainTrajectoryBatchResult>,
@@ -32,16 +35,20 @@ pub fn apply_probe_input_system(
     if let Some(potential) = werner_potential.as_deref_mut() {
         potential.0 = None;
     }
-    for history in [
-        radial_samples.as_deref_mut().map(|history| &mut history.0),
-        werner_samples.as_deref_mut().map(|history| &mut history.0),
-        mmfft_samples.as_deref_mut().map(|history| &mut history.0),
-        fmm_samples.as_deref_mut().map(|history| &mut history.0),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        history.clear();
+    if let Some(history) = histories.p0().as_deref_mut() {
+        history.0.clear();
+    }
+    if let Some(history) = histories.p1().as_deref_mut() {
+        history.0.clear();
+    }
+    if let Some(history) = histories.p2().as_deref_mut() {
+        history.0.clear();
+    }
+    if let Some(history) = histories.p3().as_deref_mut() {
+        history.0.clear();
+    }
+    if let Some(history) = histories.p4().as_deref_mut() {
+        history.0.clear();
     }
     simulation_clock.reset_state();
     jacobi_history.reset();
@@ -139,6 +146,7 @@ pub fn reset_after_probe_crash_state_system(
         Option<ResMut<WernerGravityHistory>>,
         Option<ResMut<MmfftCompressedHistory>>,
         Option<ResMut<FmmGravityHistory>>,
+        Option<ResMut<crate::gpu::equation106::Equation106History>>,
     )>,
 ) {
     if !reset_request.0 {
@@ -172,6 +180,9 @@ pub fn reset_after_probe_crash_state_system(
         history.0.clear();
     }
     if let Some(history) = histories.p3().as_deref_mut() {
+        history.0.clear();
+    }
+    if let Some(history) = histories.p4().as_deref_mut() {
         history.0.clear();
     }
 }

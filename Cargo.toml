@@ -27,9 +27,6 @@ wgpu29 = { package = "wgpu", version = "=29.0.4" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-crossbeam-channel = "0.5"
-
 [profile.dev]
 opt-level = 1
 

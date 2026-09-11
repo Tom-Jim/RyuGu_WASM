@@ -5,50 +5,41 @@
 //! contract shared by the Rust WASM backend, the HTML shell, and the
 //! Zig/C++ WASM adapter. The contract deliberately uses SI units and an
 //! integer nanosecond clock so display timing never becomes simulation timing.
+//!
+//! The wire constants and `#[repr(C)]` payload structs are the contract itself:
+//! the browser only publishes the spacecraft-state half, so the native-side
+//! items are intentionally unused here.
 #![allow(dead_code)]
 
+use crate::cpp_backend::{BackendComparisonChannel, BackendComparisonSnapshot};
 use crate::cpu::frequency_domain::{AggregatedGravitySource, FrequencyDomainPointSource};
 use crate::interface::components::{
     ActiveGravityMethod, BasiliskBridgeState, BasiliskSnapshot, CassiniMarker, DensityMode,
     GravitySampleHistory, RyuguMarker, SimulationClock, Velocity,
 };
-use bevy::math::Vec3;
-use bevy::platform::time::Instant;
+use bevy::math::{DVec3, Vec3};
 use bevy::prelude::*;
-use std::time::Duration;
 
-/// `point_source_acceleration` still calls the synchronous, main-thread
-/// `cpp_backend::evaluate_sources` adapter (it has not been migrated to the
-/// numerical Worker request/response channel used by `physics_system`,
-/// `cpp_planning::dispatch`, and `record_probe_jacobi_system`). Advance
-/// requests are no longer wall-clock throttled (see
-/// `cpp_backend::should_advance_backend`), so without this pacer this
-/// diagnostic-only comparison would now run far more often than it used to
-/// and reintroduce a main-thread stall into the very path that was just
-/// fixed. This interval matches the previous Radial/FrequencyDomain advance
-/// pacing and is a deliberate stop-gap, not the final fix: the correct fix is
-/// giving this call its own `backend_channel!` (for example
-/// `BackendComparisonChannel`) and a matching Worker request/delivery pair,
-/// exactly like the other four call sites.
-const BASILISK_COMPARISON_MIN_INTERVAL: Duration = Duration::from_millis(250);
-
-#[derive(Default)]
-struct BasiliskComparisonPacer {
-    last_call: Option<Instant>,
+/// Outstanding oracle request of the protocol comparison.
+///
+/// The measured acceleration and the algorithm are captured when the request
+/// is issued, so the delivered reference is only ever paired with the physics
+/// sample it was computed for.
+struct PendingComparison {
+    snapshot: BackendComparisonSnapshot,
+    sample: (u64, u64),
+    algorithm: BasiliskAlgorithm,
+    measured: Vec3,
 }
 
-impl BasiliskComparisonPacer {
-    fn allow(&mut self) -> bool {
-        let now = Instant::now();
-        if self
-            .last_call
-            .is_some_and(|last| now.duration_since(last) < BASILISK_COMPARISON_MIN_INTERVAL)
-        {
-            return false;
-        }
-        self.last_call = Some(now);
-        true
-    }
+/// Request → poll state of the comparison oracle. At most one reference is in
+/// flight; a new one is only requested for a physics sample that has not been
+/// compared yet, so the outstanding request is the rate limit.
+#[derive(Default)]
+struct ComparisonOracle {
+    pending: Option<PendingComparison>,
+    last_sample: Option<(u64, u64)>,
+    next_request_id: u64,
 }
 
 pub const PROTOCOL_NAME: &str = "ryugu-basilisk-v1";
@@ -103,7 +94,7 @@ impl BasiliskAlgorithm {
 
     pub const fn observable(self) -> &'static str {
         match self {
-            Self::FrequencyDomain => "trajectory Laplace transform + Eq.106 pointwise propagation",
+            Self::FrequencyDomain => "trajectory Laplace transform (Eq.184) + Eq.121 pointwise propagation",
             Self::Radial | Self::Werner | Self::Fmm | Self::Fft => "point acceleration",
         }
     }
@@ -186,7 +177,8 @@ fn publish_basilisk_snapshot_system(
     mut state: ResMut<BasiliskBridgeState>,
     cassini: Query<(&Transform, &Velocity), With<CassiniMarker>>,
     ryugu: Query<&Transform, (With<RyuguMarker>, Without<CassiniMarker>)>,
-    mut comparison_pacer: Local<BasiliskComparisonPacer>,
+    channel: Res<BackendComparisonChannel>,
+    mut oracle: Local<ComparisonOracle>,
 ) {
     let Ok((transform, velocity)) = cassini.single() else {
         return;
@@ -224,28 +216,68 @@ fn publish_basilisk_snapshot_system(
         fmm.as_deref(),
         frequency.as_deref(),
     );
-    let Some(measured) = history_sample(history, clock.epoch) else {
+
+    // Consume a delivered reference first. It is only accepted for the exact
+    // request (and epoch) it was issued for; anything else is dropped and the
+    // comparison keeps its last completed value.
+    if let Some(packet) = channel.take() {
+        let Some(pending) = oracle.pending.take() else {
+            return;
+        };
+        if packet.snapshot != pending.snapshot || pending.snapshot.epoch != clock.epoch {
+            return;
+        }
+        let Some(reference) = packet
+            .result
+            .ok()
+            .and_then(|values| point_source_acceleration_from_values(&values))
+        else {
+            return;
+        };
+        oracle.last_sample = Some(pending.sample);
+        let comparison = &mut state.comparisons[algorithm_index(pending.algorithm)];
+        comparison.sample_count = comparison.sample_count.saturating_add(1);
+        comparison.relative_acceleration_error = relative_vector_error(reference, pending.measured);
+        comparison.reference_acceleration_mps2 = reference.to_array().map(f64::from);
+        comparison.measured_acceleration_mps2 = pending.measured.to_array().map(f64::from);
+        return;
+    }
+    if oracle.pending.is_some() {
+        if !channel.is_idle() {
+            // Still computing: skip this frame rather than block on it.
+            return;
+        }
+        // An experiment reset cleared the channel; the request is gone.
+        oracle.pending = None;
+    }
+    let Some((sample, measured)) = history_sample(history, clock.epoch) else {
         return;
     };
+    if oracle.last_sample == Some(sample) {
+        return;
+    }
     let Some(source) = source.as_deref() else {
         return;
     };
-    // Stop-gap rate limit: see `BasiliskComparisonPacer` above. This call is
-    // still a synchronous, main-thread WASM call and must not run on every
-    // accepted physics tick now that advance requests are unthrottled.
-    if !comparison_pacer.allow() {
-        return;
-    }
     let body_position = ryugu_transform.rotation.inverse() * transform.translation;
-    let Some(reference) = point_source_acceleration(source, *density_mode, body_position) else {
+    let Some((sources, target)) = point_source_request(source, *density_mode, body_position) else {
         return;
     };
-    let index = algorithm_index(algorithm);
-    let comparison = &mut state.comparisons[index];
-    comparison.sample_count = comparison.sample_count.saturating_add(1);
-    comparison.relative_acceleration_error = relative_vector_error(reference, measured);
-    comparison.reference_acceleration_mps2 = reference.to_array().map(f64::from);
-    comparison.measured_acceleration_mps2 = measured.to_array().map(f64::from);
+    oracle.next_request_id = oracle.next_request_id.wrapping_add(1).max(1);
+    let snapshot = BackendComparisonSnapshot {
+        request_id: sample.1.rotate_left(29) ^ oracle.next_request_id,
+        epoch: clock.epoch,
+    };
+    if crate::cpp_backend::request_comparison_sources(&channel, snapshot, &sources, target)
+        == Ok(true)
+    {
+        oracle.pending = Some(PendingComparison {
+            snapshot,
+            sample,
+            algorithm,
+            measured,
+        });
+    }
 }
 
 pub const fn simulation_time_nanos(seconds: f64) -> u64 {
@@ -262,11 +294,12 @@ pub fn algorithm_index(algorithm: BasiliskAlgorithm) -> usize {
 /// Independent f64 point-source oracle used by the protocol comparison.  It
 /// is intentionally separate from the frequency-domain GPU pipeline and uses
 /// the same mass-preserving residues already used by the CPU reference path.
-pub fn point_source_acceleration(
+/// The direct sum itself runs in the numerical Worker; this builds the request.
+fn point_source_request(
     source: &AggregatedGravitySource,
     density_mode: DensityMode,
     position: Vec3,
-) -> Option<Vec3> {
+) -> Option<(Vec<(DVec3, f64)>, DVec3)> {
     let points: &[FrequencyDomainPointSource] = match density_mode {
         DensityMode::Variable => &source.sources,
         DensityMode::Constant => &source.constant_sources,
@@ -281,11 +314,14 @@ pub fn point_source_acceleration(
     if points.is_empty() || !position.is_finite() {
         return None;
     }
-    // The independent sum runs in the C++ numerical module.
-    let sources: Vec<_> = points.iter().map(|p| (p.position, p.mass)).collect();
-    let values =
-        crate::cpp_backend::evaluate_sources("direct", &sources, &[position.as_dvec3()]).ok()?;
-    let acceleration = bevy::math::DVec3::new(values[0][0], values[0][1], values[0][2]);
+    let sources = points.iter().map(|p| (p.position, p.mass)).collect();
+    Some((sources, position.as_dvec3()))
+}
+
+/// Decodes the single `[gx, gy, gz, potential]` record of the oracle answer.
+fn point_source_acceleration_from_values(values: &[f64]) -> Option<Vec3> {
+    let record = crate::cpp_backend::decode_field_batch(values, 1).ok()?[0];
+    let acceleration = DVec3::new(record[0], record[1], record[2]);
     acceleration.is_finite().then_some(acceleration.as_vec3())
 }
 
@@ -294,10 +330,20 @@ pub fn relative_vector_error(reference: Vec3, measured: Vec3) -> f64 {
     f64::from(reference.distance(measured)) / denominator
 }
 
-pub fn history_sample(history: Option<&GravitySampleHistory>, epoch: u64) -> Option<Vec3> {
+/// Latest accepted physics sample of the current epoch: its identity
+/// `(epoch, request_id)` and the measured body-frame acceleration.
+pub fn history_sample(
+    history: Option<&GravitySampleHistory>,
+    epoch: u64,
+) -> Option<((u64, u64), Vec3)> {
     history
         .and_then(|history| history.latest_for_epoch(epoch))
-        .map(|sample| sample.body_acceleration)
+        .map(|sample| {
+            (
+                (sample.snapshot.epoch, sample.snapshot.request_id),
+                sample.body_acceleration,
+            )
+        })
 }
 
 #[cfg(test)]
@@ -326,11 +372,18 @@ mod tests {
     }
 
     #[test]
-    fn comparison_pacer_rejects_immediate_resubmission_and_allows_after_interval() {
-        let mut pacer = BasiliskComparisonPacer::default();
-        assert!(pacer.allow());
-        assert!(!pacer.allow());
-        pacer.last_call = Some(Instant::now() - BASILISK_COMPARISON_MIN_INTERVAL);
-        assert!(pacer.allow());
+    fn oracle_answer_decodes_one_finite_record() {
+        assert_eq!(
+            point_source_acceleration_from_values(&[1.0, -2.0, 3.0, 4.0]),
+            Some(Vec3::new(1.0, -2.0, 3.0))
+        );
+        assert_eq!(
+            point_source_acceleration_from_values(&[1.0, 2.0, 3.0]),
+            None
+        );
+        assert_eq!(
+            point_source_acceleration_from_values(&[1.0, f64::NAN, 3.0, 4.0]),
+            None
+        );
     }
 }

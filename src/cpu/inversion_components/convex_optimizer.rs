@@ -107,11 +107,7 @@ pub fn convex_optimization_system(
     }
 
     if let Some(pending) = worker.pending_snapshot {
-        let packet = density_channel
-            .data
-            .lock()
-            .expect("backend density result channel poisoned")
-            .take();
+        let packet = density_channel.take();
         let Some(packet) = packet else {
             if !density_channel.is_idle() {
                 inversion.optimizer = Some(job);
@@ -160,7 +156,7 @@ pub fn convex_optimization_system(
     if worker.realization < OBSERVATION_NOISE_REALIZATIONS {
         // Queue the job instead of serializing the same problem every frame
         // while the numerical backend is still being configured.
-        if !cpp.worker_ready {
+        if !cpp.ready {
             inversion.optimizer = Some(job);
             return;
         }

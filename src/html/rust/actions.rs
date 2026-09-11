@@ -44,6 +44,8 @@ pub(crate) struct BrowserUiActions<'w> {
     rotation: ResMut<'w, DisplayRotation>,
     planning: ResMut<'w, PlanningComparisonState>,
     inversion: ResMut<'w, TrajectoryInversionState>,
+    sensitivity: ResMut<'w, DensitySensitivityCaches>,
+    frequency_domain_sensitivity: ResMut<'w, FrequencyDomainSensitivityMatrix>,
     request: ResMut<'w, PlanningGpuRequest>,
     payload: ResMut<'w, PlanningMethodPayload>,
     result: ResMut<'w, PlanningGpuResult>,
@@ -67,6 +69,8 @@ pub(crate) fn browser_ui_action_system(
         mut rotation,
         mut planning,
         mut inversion,
+        mut sensitivity,
+        mut frequency_domain_sensitivity,
         mut request,
         mut payload,
         mut result,
@@ -390,6 +394,13 @@ pub(crate) fn browser_ui_action_system(
                 inversion.inverted = false;
                 inversion.optimizer = None;
                 inversion.batch_capture_id = None;
+                inversion.reference_cache_capture_id = None;
+                inversion.reference_training_observations.clear();
+                inversion.reference_training_sensitivities.clear();
+                inversion.reference_holdout_observations.clear();
+                inversion.reference_holdout_sensitivities.clear();
+                *sensitivity = DensitySensitivityCaches::default();
+                *frequency_domain_sensitivity = FrequencyDomainSensitivityMatrix::default();
                 inversion.results = std::array::from_fn(|_| None);
                 inversion.best_results = std::array::from_fn(|_| None);
                 inversion.displayed_density = None;

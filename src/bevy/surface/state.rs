@@ -41,6 +41,11 @@ pub(crate) struct SurfaceFieldOverlay;
 #[derive(Resource, Default)]
 pub(crate) struct SurfaceFieldComputeState {
     job: Option<SurfaceFieldJob>,
+    /// Identity of the current job; Worker requests carry it as their epoch so
+    /// a chunk answered for a cancelled or replaced job is never applied.
+    job_id: u64,
+    next_request_id: u64,
+    pending: Option<PendingSurfaceChunk>,
 }
 
 struct SurfaceFieldJob {
@@ -51,26 +56,24 @@ struct SurfaceFieldJob {
     datasets: Vec<SurfaceFieldDataset>,
 }
 
+/// One chunk of surface patches whose stencil is being evaluated by the
+/// numerical Worker.
+struct PendingSurfaceChunk {
+    snapshot: crate::cpp_backend::BackendSurfaceSnapshot,
+    method_index: usize,
+    start: usize,
+    end: usize,
+}
+
 enum SurfaceEvaluator {
+    /// Pointwise field of the geometry configured in the numerical Worker.
     Cpp(ActiveGravityMethod),
-    Equation106(Vec<(DVec3, Complex64)>),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FieldValue {
-    gravity: Vec3,
-    potential: f32,
-    jacobian: DMat3,
-}
-
-impl Default for FieldValue {
-    fn default() -> Self {
-        Self {
-            gravity: Vec3::ZERO,
-            potential: 0.0,
-            jacobian: DMat3::ZERO,
-        }
-    }
+    /// Discrete Eq.121 IR/UV operator (residual modes + analytic IR monopole).
+    Equation121 {
+        modes: Vec<(DVec3, Complex64)>,
+        center: DVec3,
+        gravitational_parameter: f64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +89,7 @@ pub(crate) fn queue_surface_field(
     method: ActiveGravityMethod,
 ) {
     compute.job = None;
+    compute.job_id = compute.job_id.wrapping_add(1);
     state.latest = None;
     state.comparison = None;
     state.selected_patch = None;
@@ -111,6 +115,7 @@ pub(crate) fn cancel_surface_field(
     status: &str,
 ) {
     compute.job = None;
+    compute.job_id = compute.job_id.wrapping_add(1);
     state.computing = false;
     state.latest = None;
     state.comparison = None;
@@ -132,6 +137,7 @@ pub(crate) fn queue_surface_comparison(
         state.status = "Choose two different algorithms for an error map.".into();
         return;
     }
+    compute.job_id = compute.job_id.wrapping_add(1);
     state.latest = None;
     state.comparison = None;
     state.selected_patch = None;

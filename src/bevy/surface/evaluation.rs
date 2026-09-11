@@ -101,14 +101,23 @@ fn build_evaluator(
             })
         }
         */
-        // Surface fields use the Eq.106 inverse-pole spatial operator. Eq.184
-        // remains exclusively a trajectory transform, never a coarse FFT alias.
+        // Surface fields use the same discrete Eq.121 IR/UV split as live
+        // Worker propagation. Eq.184 remains exclusively a trajectory Laplace
+        // observation, never a coarse FFT alias of the force.
         ActiveGravityMethod::FrequencyDomain => {
             let radius = topology
                 .positions
                 .iter()
                 .map(|p| f64::from(p.length() * scale))
                 .fold(1.0_f64, f64::max);
+            let mass: f64 = sources.iter().map(|source| source.mass).sum();
+            let center = if mass > 0.0 {
+                sources.iter().fold(DVec3::ZERO, |sum, source| {
+                    sum + source.position * source.mass
+                }) / mass
+            } else {
+                DVec3::ZERO
+            };
             let modes = (0..EQ184_QUADRATURE_COUNT)
                 .filter_map(|index| {
                     let (k, weight) = eq184_quadrature_node(index, radius)?;
@@ -116,33 +125,44 @@ fn build_evaluator(
                         .iter()
                         .fold(Complex64::new(0.0, 0.0), |sum, source| {
                             sum + Complex64::from_polar(source.mass, -k.dot(source.position))
-                        });
+                        })
+                        - Complex64::from_polar(mass, -k.dot(center));
                     let coefficient = f64::from(G) * weight
                         / (2.0 * std::f64::consts::PI.powi(2) * k.length_squared());
                     Some((k, density * coefficient))
                 })
                 .collect();
-            SurfaceEvaluator::Equation106(modes)
+            SurfaceEvaluator::Equation121 {
+                modes,
+                center,
+                gravitational_parameter: f64::from(G) * mass,
+            }
         }
     }
 }
 
-fn evaluate_patch(evaluator: &SurfaceEvaluator, patch: SurfaceFieldPatch) -> SurfaceFieldSample {
-    let value = evaluator.field_at(patch.body_position);
-    let jacobian = if matches!(evaluator, SurfaceEvaluator::Equation106(_)) {
-        value.jacobian
-    } else {
-        finite_difference_jacobian(evaluator, patch.body_position)
-    };
-    let effective = value.gravity + centrifugal_acceleration(patch.body_position);
+/// Eq.121 surface sample (residual Fourier + analytic IR monopole).
+fn evaluate_patch_locally(
+    modes: &[(DVec3, Complex64)],
+    center: DVec3,
+    gravitational_parameter: f64,
+    patch: SurfaceFieldPatch,
+) -> SurfaceFieldSample {
+    let (gravity, jacobian) =
+        equation121_field(modes, center, gravitational_parameter, patch.body_position);
+    surface_sample(patch, gravity, jacobian)
+}
+
+fn surface_sample(patch: SurfaceFieldPatch, gravity: Vec3, jacobian: DMat3) -> SurfaceFieldSample {
+    let effective = gravity + centrifugal_acceleration(patch.body_position);
     let outward_force = (-effective).normalize_or_zero();
     let alignment = outward_force.dot(patch.normal).clamp(-1.0, 1.0);
     SurfaceFieldSample {
         position: patch.body_position,
         normal: patch.normal,
-        gravity: value.gravity,
+        gravity,
         effective_gravity: effective,
-        gravity_magnitude: value.gravity.length(),
+        gravity_magnitude: gravity.length(),
         effective_gravity_magnitude: effective.length(),
         gradient_magnitude: frobenius_norm(jacobian),
         slope_degrees: alignment.acos().to_degrees(),
@@ -155,66 +175,101 @@ fn centrifugal_acceleration(position: Vec3) -> Vec3 {
     -omega.cross(omega.cross(position))
 }
 
-fn finite_difference_jacobian(evaluator: &SurfaceEvaluator, position: Vec3) -> DMat3 {
-    let h = evaluator.derivative_step();
-    let mut columns = [DVec3::ZERO; 3];
-    for (axis, column) in columns.iter_mut().enumerate() {
-        let direction = match axis {
-            0 => Vec3::X,
-            1 => Vec3::Y,
-            _ => Vec3::Z,
-        };
-        let plus = evaluator
-            .field_at(position + direction * h)
-            .gravity
-            .as_dvec3();
-        let minus = evaluator
-            .field_at(position - direction * h)
-            .gravity
-            .as_dvec3();
-        *column = (plus - minus) / (2.0 * h as f64);
+/// Number of Worker evaluations per surface patch: the patch centre plus the
+/// `±h` stencil along each axis for the central-difference Jacobian.
+const SURFACE_STENCIL: usize = 7;
+
+/// Body-frame targets for one chunk of patches, laid out
+/// `[centre, +x, -x, +y, -y, +z, -z]` per patch.
+fn surface_stencil_targets(patches: &[SurfaceFieldPatch], h: f32) -> Vec<DVec3> {
+    let mut targets = Vec::with_capacity(patches.len() * SURFACE_STENCIL);
+    for patch in patches {
+        let position = patch.body_position;
+        targets.push(position.as_dvec3());
+        for direction in [Vec3::X, Vec3::Y, Vec3::Z] {
+            targets.push((position + direction * h).as_dvec3());
+            targets.push((position - direction * h).as_dvec3());
+        }
     }
-    DMat3::from_cols(columns[0], columns[1], columns[2])
+    targets
 }
 
-impl SurfaceEvaluator {
-    fn field_at(&self, position: Vec3) -> FieldValue {
-        match self {
-            Self::Cpp(method) => match crate::cpp_backend::evaluate(*method, position) {
-                Ok((gravity, potential)) => FieldValue {
-                    gravity,
-                    potential,
-                    jacobian: DMat3::ZERO,
-                },
-                Err(_) => FieldValue {
-                    gravity: Vec3::splat(f32::NAN),
-                    potential: f32::NAN,
-                    jacobian: DMat3::ZERO,
-                },
-            },
-            Self::Equation106(modes) => {
-                let mut field = FieldValue::default();
-                let mut gravity = DVec3::ZERO;
-                let mut potential = 0.0;
-                for (k, density) in modes {
-                    let value = *density * Complex64::from_polar(1.0, k.dot(position.as_dvec3()));
-                    gravity -= value.im * *k;
-                    potential += value.re;
-                    field.jacobian -= DMat3::from_cols(*k * k.x, *k * k.y, *k * k.z) * value.re;
-                }
-                field.gravity = gravity.as_vec3();
-                field.potential = potential as f32;
-                field
-            }
-        }
-    }
+/// Turns the Worker's `[gx, gy, gz, potential]` records for one stencil chunk
+/// into surface samples with central-difference Jacobians.
+fn decode_surface_chunk(
+    patches: &[SurfaceFieldPatch],
+    h: f32,
+    values: &[f64],
+) -> Result<Vec<SurfaceFieldSample>, String> {
+    let records = crate::cpp_backend::decode_field_batch(values, patches.len() * SURFACE_STENCIL)?;
+    let gravity = |record: &[f64; 4]| Vec3::new(record[0] as f32, record[1] as f32, record[2] as f32);
+    Ok(patches
+        .iter()
+        .zip(records.as_chunks::<SURFACE_STENCIL>().0)
+        .map(|(patch, stencil)| {
+            let columns = [0, 1, 2].map(|axis| {
+                let plus = gravity(&stencil[1 + 2 * axis]).as_dvec3();
+                let minus = gravity(&stencil[2 + 2 * axis]).as_dvec3();
+                (plus - minus) / (2.0 * h as f64)
+            });
+            surface_sample(
+                *patch,
+                gravity(&stencil[0]),
+                DMat3::from_cols(columns[0], columns[1], columns[2]),
+            )
+        })
+        .collect())
+}
 
-    fn derivative_step(&self) -> f32 {
-        match self {
-            Self::Cpp(ActiveGravityMethod::MmfftCompressed) => 64.0,
-            Self::Cpp(_) => 0.5,
-            Self::Equation106(_) => 0.5,
-        }
+fn equation121_field(
+    modes: &[(DVec3, Complex64)],
+    center: DVec3,
+    gravitational_parameter: f64,
+    position: Vec3,
+) -> (Vec3, DMat3) {
+    let mut jacobian = DMat3::ZERO;
+    let mut gravity = DVec3::ZERO;
+    let query = position.as_dvec3();
+    for (k, density) in modes {
+        let value = *density * Complex64::from_polar(1.0, k.dot(query));
+        gravity -= value.im * *k;
+        jacobian -= DMat3::from_cols(*k * k.x, *k * k.y, *k * k.z) * value.re;
+    }
+    let offset = query - center;
+    let distance_squared = offset.length_squared();
+    if distance_squared > 0.0 && gravitational_parameter > 0.0 {
+        let inverse_distance = distance_squared.sqrt().recip();
+        let inv3 = inverse_distance.powi(3);
+        let inv5 = inverse_distance.powi(5);
+        gravity += -gravitational_parameter * offset * inv3;
+        // ∂/∂q (−GM r̂/r²) = −GM (I/r³ − 3 r⊗r / r⁵)
+        let monopole_jacobian = DMat3::from_cols(
+            DVec3::new(
+                -gravitational_parameter * (inv3 - 3.0 * offset.x * offset.x * inv5),
+                gravitational_parameter * 3.0 * offset.x * offset.y * inv5,
+                gravitational_parameter * 3.0 * offset.x * offset.z * inv5,
+            ),
+            DVec3::new(
+                gravitational_parameter * 3.0 * offset.y * offset.x * inv5,
+                -gravitational_parameter * (inv3 - 3.0 * offset.y * offset.y * inv5),
+                gravitational_parameter * 3.0 * offset.y * offset.z * inv5,
+            ),
+            DVec3::new(
+                gravitational_parameter * 3.0 * offset.z * offset.x * inv5,
+                gravitational_parameter * 3.0 * offset.z * offset.y * inv5,
+                -gravitational_parameter * (inv3 - 3.0 * offset.z * offset.z * inv5),
+            ),
+        );
+        jacobian += monopole_jacobian;
+    }
+    (gravity.as_vec3(), jacobian)
+}
+
+/// Central-difference step of the pointwise Worker evaluators.
+fn derivative_step(method: ActiveGravityMethod) -> f32 {
+    match method {
+        ActiveGravityMethod::MmfftCompressed => 64.0,
+        _ => 0.5,
     }
 }
 

@@ -4330,7 +4330,6 @@ dependencies = [
  "bevy_framepace",
  "bevy_panorbit_camera",
  "bytemuck",
- "crossbeam-channel",
  "getrandom 0.4.3",
  "num-complex",
  "rand",

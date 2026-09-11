@@ -4,11 +4,23 @@ use std::collections::HashMap;
 use crate::cpu::frequency_domain::{
     eq184_laplace_sigma, eq184_quadrature_node, eq184_trajectory_term,
 };
+use crate::cpu::planning::{
+    PLANNING_REFERENCE_SOURCE_CHUNK, PLANNING_REFERENCE_STENCIL, accumulate_planning_reference,
+    planning_reference_sources, push_planning_reference_stencil,
+};
 use num_complex::Complex64;
 
 // Independent of foreground/background frame rate. Long scheduling gaps are
 // suspension, not evidence that a GPU request failed to make progress.
 const PLANNING_GPU_WAIT_TIMEOUT_SECONDS: f64 = 300.0;
+
+/// Outstanding f64 reference request: the cache keys of the points it covers,
+/// in request order.
+struct PendingPlanningReference {
+    snapshot: crate::cpp_backend::BackendReferenceSnapshot,
+    keys: Vec<(u64, u64, u32, [u32; 3])>,
+    source_count: usize,
+}
 
 #[derive(Default)]
 pub(crate) struct PlanningReferenceCache {
@@ -16,10 +28,10 @@ pub(crate) struct PlanningReferenceCache {
     fields: HashMap<(u64, u64, u32, [u32; 3]), (DVec3, DMat3)>,
     packet_id: Option<u64>,
     target_indices: Vec<u32>,
+    /// Number of leading `target_indices` whose fields are already cached.
     target_cursor: usize,
-    source_cursor: usize,
-    partial_field: DVec3,
-    partial_gradient: DMat3,
+    pending: Option<PendingPlanningReference>,
+    next_request_id: u64,
     frequency_domain_identity: Option<(u64, u64, u32)>,
     frequency_domain_quadrature: Vec<(DVec3, f64)>,
     frequency_domain_density_spectrum: Vec<Complex64>,
@@ -39,8 +51,14 @@ pub fn planning_batch_evaluator_system(
         crate::gpu::frequency_domain::PlanningFrequencyDomainWorkspace,
     >,
     mut reference_cache: Local<PlanningReferenceCache>,
+    reference_channel: Res<crate::cpp_backend::BackendReferenceChannel>,
 ) {
     let Some(mut job) = planning.batch_job.take() else {
+        // No planning job owns the reference channel: drop any answer that
+        // arrives for a cancelled one.
+        if reference_cache.pending.take().is_some() {
+            reference_channel.reset();
+        }
         return;
     };
     let render_failure = channel
@@ -111,21 +129,23 @@ pub fn planning_batch_evaluator_system(
             // synchronous CPU source interactions before the browser can paint.
             if packet.readback_valid && (!job.warm_repetition || job.certified_repetition) {
                 let started = bevy::platform::time::Instant::now();
-                let ready = prepare_planning_references(&batch, &packet, &mut reference_cache);
+                let ready = prepare_planning_references(
+                    &batch,
+                    &packet,
+                    &mut reference_cache,
+                    &reference_channel,
+                );
                 job.verification_ms += started.elapsed().as_secs_f64() * 1.0e3;
                 if !ready {
-                    let fraction = (reference_cache.target_cursor as f64
-                        + reference_cache.source_cursor as f64
-                            / batch.basis_records.len().max(1) as f64)
+                    let fraction = reference_cache.target_cursor as f64
                         / reference_cache.target_indices.len().max(1) as f64;
                     job.reference_inflight_fraction =
                         f64::from(packet.request.candidate_count) * fraction.clamp(0.0, 1.0);
                     planning.status = format!(
-                        "{} independent f64 verification: target {}/{}, source {}/{} (time-sliced)",
+                        "{} independent f64 verification: target {}/{} ({} sources, numerical Worker)",
                         job.method.planning_label(),
                         reference_cache.target_cursor + 1,
                         reference_cache.target_indices.len(),
-                        reference_cache.source_cursor,
                         batch.basis_records.len()
                     );
                     job.awaiting_gpu_seconds = 0.0;

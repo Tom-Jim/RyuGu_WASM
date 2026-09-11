@@ -1,38 +1,113 @@
-import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  cmakeCacheUsable, cmakeConfigure, force, isUpToDate, jobs, rmWritable, root, run,
+} from "./build_helpers.mjs";
 
-const root = fileURLToPath(new URL("../../", import.meta.url));
-function run(command, args, cwd = root) {
-  const result = spawnSync(command, args, { cwd, stdio: "inherit" });
-  if (result.status !== 0) throw new Error(`${command} failed: ${result.status}`);
-}
 const sources = JSON.parse(readFileSync(join(root, "C++/sources.lock.json"), "utf8"));
-if (process.argv.includes("--fetch") || Object.keys(sources).some(name => !existsSync(join(root, "C++", name)))) {
+if (process.argv.includes("--fetch") || process.env.RYUGU_FETCH_CPP === "1"
+  || Object.keys(sources).some(name => !existsSync(join(root, "C++", name)))) {
   run(process.execPath, ["src/tools/fetch_cpp.mjs"]);
 }
-const toolchain = `-DCMAKE_TOOLCHAIN_FILE=${join(root, "src/backend/zig/wasm-toolchain.cmake")}`;
-run("cmake", ["-S", "C++/fftw3-release", "-B", "src/backend/zig/deps/fftw", toolchain,
-  // FFTW's pinned CMake project declares CMake 3.0.  Set the policy floor here
-  // so current CMake versions do not enable deprecated pre-3.10 compatibility.
-  "-DCMAKE_POLICY_VERSION_MINIMUM=3.10", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTS=OFF", "-DDISABLE_FORTRAN=ON"]);
-run("cmake", ["--build", "src/backend/zig/deps/fftw", "-j", "4"]);
-run("cmake", ["-S", "src/backend/zig/flups", "-B", "src/backend/zig/deps/flups", toolchain]);
-run("cmake", ["--build", "src/backend/zig/deps/flups", "-j", "4"]);
-run("zig", ["build", "-Dtarget=wasm32-wasi", "-Doptimize=ReleaseFast",
-  "-Dexafmm-root=../../../C++/exafmm-t", "-Dflups-root=../../../C++/flups"], join(root, "src/backend/zig"));
+
+const toolchainFile = join(root, "src/backend/zig/wasm-toolchain.cmake");
+const cmakeRoot = join(root, "target/cpp-wasm");
+const fftwBin = join(cmakeRoot, "fftw");
+const flupsBin = join(cmakeRoot, "flups");
+const fftwLib = join(fftwBin, "libfftw3.a");
+const flupsLib = join(flupsBin, "libflups.a");
+const zigDir = join(root, "src/backend/zig");
+const zigWasm = join(zigDir, "zig-out/bin/ryugu_backend.wasm");
+const pkgWasm = join(root, "pkg/ryugu_backend.wasm");
+const host = join(root, "src/backend/host/cpp_backend.mjs");
+const cmakeArgs = [`-DCMAKE_TOOLCHAIN_FILE=${toolchainFile}`];
+const fftwInputs = [
+  join(root, "C++/fftw3-release/CMakeLists.txt"),
+  toolchainFile,
+  join(root, "C++/sources.lock.json"),
+];
+const flupsInputs = [
+  join(root, "src/backend/zig/flups/CMakeLists.txt"),
+  join(root, "src/backend/zig/browser"),
+  toolchainFile,
+  join(root, "C++/sources.lock.json"),
+];
+
+function reuseArchive(oldLib, newLib, oldBin) {
+  mkdirSync(dirname(newLib), { recursive: true });
+  if (!existsSync(newLib) && existsSync(oldLib)) {
+    copyFileSync(oldLib, newLib);
+    console.log(`Reusing ${oldLib}`);
+  }
+  rmWritable(join(oldBin, "CMakeFiles", "pkgRedirects"));
+  rmWritable(join(oldBin, "CMakeFiles"));
+}
+
+reuseArchive(join(root, "src/backend/zig/deps/fftw/libfftw3.a"), fftwLib, join(root, "src/backend/zig/deps/fftw"));
+reuseArchive(join(root, "src/backend/zig/deps/flups/libflups.a"), flupsLib, join(root, "src/backend/zig/deps/flups"));
+
+function buildArchive(src, bin, lib, inputs, extraArgs) {
+  if (isUpToDate(lib, inputs)) {
+    console.log(`Skipping cmake in ${bin} (archive up to date)`);
+    return;
+  }
+  if (force || !cmakeCacheUsable(bin, toolchainFile, inputs)) {
+    cmakeConfigure(src, bin, extraArgs);
+  }
+  run("cmake", ["--build", bin, "-j", jobs]);
+}
+
+buildArchive("C++/fftw3-release", fftwBin, fftwLib, fftwInputs, [
+  ...cmakeArgs,
+  "-DCMAKE_POLICY_VERSION_MINIMUM=3.10",
+  "-DCMAKE_BUILD_TYPE=Release",
+  "-DBUILD_SHARED_LIBS=OFF",
+  "-DBUILD_TESTS=OFF",
+  "-DDISABLE_FORTRAN=ON",
+]);
+buildArchive("src/backend/zig/flups", flupsBin, flupsLib, flupsInputs, [
+  ...cmakeArgs,
+  "-DCMAKE_BUILD_TYPE=Release",
+]);
+
+const zigInputs = [
+  join(zigDir, "build.zig"),
+  join(zigDir, "wasm-toolchain.cmake"),
+  join(zigDir, "wasm_exports.cpp"),
+  join(zigDir, "scheduler.cpp"),
+  join(zigDir, "basilisk_bridge.cpp"),
+  join(zigDir, "basilisk_bridge.h"),
+  join(zigDir, "browser"),
+  join(zigDir, "flups"),
+  join(root, "C++/sources.lock.json"),
+  fftwLib,
+  flupsLib,
+];
+const needsZig = !isUpToDate(pkgWasm, zigInputs) || !existsSync(zigWasm);
+if (needsZig) {
+  run("zig", [
+    "build", "-Dtarget=wasm32-wasi", "-Doptimize=ReleaseFast",
+    "-Dexafmm-root=../../../C++/exafmm-t", "-Dflups-root=../../../C++/flups",
+    `-Dfftw-archive=${fftwLib}`, `-Dflups-archive=${flupsLib}`,
+  ], zigDir);
+} else {
+  console.log("Skipping zig wasm link (up to date)");
+}
 if (process.argv.includes("--test")) {
   run(process.execPath, ["src/tools/test_cpp_wasm.mjs", "--fmm", "--flups"]);
 }
 mkdirSync(join(root, "pkg"), { recursive: true });
-copyFileSync(join(root, "src/backend/zig/zig-out/bin/ryugu_backend.wasm"), join(root, "pkg/ryugu_backend.wasm"));
-copyFileSync(join(root, "src/backend/host/cpp_backend.mjs"), join(root, "pkg/backend.mjs"));
+if (existsSync(zigWasm) && (!existsSync(pkgWasm) || statSync(zigWasm).mtimeMs >= statSync(pkgWasm).mtimeMs)) {
+  copyFileSync(zigWasm, pkgWasm);
+}
+copyFileSync(host, join(root, "pkg/backend.mjs"));
 mkdirSync(join(root, "pkg/licenses"), { recursive: true });
 for (const dependency of ["basilisk", "boost", "eigen", "exafmm-t", "flups", "fftw3", "fftw3-release", "mpi-serial", "h3lpr"]) {
-  for (const file of readdirSync(join(root, "C++", dependency))) {
+  const directory = join(root, "C++", dependency);
+  if (!existsSync(directory)) continue;
+  for (const file of readdirSync(directory)) {
     if (/^(LICENSE|COPYING)([._-].*)?$/.test(file)) {
-      copyFileSync(join(root, "C++", dependency, file), join(root, "pkg/licenses", `${dependency}-${file}`));
+      copyFileSync(join(directory, file), join(root, "pkg/licenses", `${dependency}-${file}`));
     }
   }
 }

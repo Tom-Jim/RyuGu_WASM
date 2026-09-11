@@ -111,8 +111,8 @@
                 <div id="planning-progress"></div>
                 <div id="planning-result" class="result-strip">No comparison result yet.</div>
                 <div class="runtime-row">
-                    <label class="range-row accent"><span>Acceleration <output id="acceleration-out">1×</output></span><input id="acceleration" type="range" min="1" max="8" step="1" value="1" /></label>
-                    <div class="stat-grid"><div><small>Runtime VRAM</small><strong id="vram">--</strong></div><div><small>Quadrature</small><strong id="quadrature-state">IDLE</strong></div></div>
+                    <label class="range-row accent"><span>Acceleration <output id="acceleration-out">1×</output></span><input id="acceleration" type="range" min="1" max="64" step="1" value="1" /></label>
+                    <div class="stat-grid"><div><small>Runtime VRAM</small><strong id="vram">--</strong></div></div>
                 </div>
                 <button onclick="window.ryuguUi?.activate?.(this)" id="quadrature-start" data-action="quadrature-open">Configure quadrature 32K → 8192K</button>
                 <div id="inversion-status" class="inversion-status">Trajectory inversion is ready when samples are captured.</div>
@@ -239,12 +239,19 @@
             await wasm.default({ module_or_path: `./pkg/ryugu_wasm_bg.wasm${suffix}` });
             const { createNumericalBackendClient } = await import(`./src/html/backend-client.js${suffix}`);
             globalThis.ryuguNumericalWorkerReady = false;
+            // Per-kind delivery counters for diagnostics (DevTools:
+            // `ryuguBackendStats`); the numerical results themselves never
+            // pass through here except as opaque typed arrays.
+            const backendStats = { delivered: {}, failed: {} };
+            globalThis.ryuguBackendStats = backendStats;
             globalThis.ryuguBackendClient = createNumericalBackendClient({
                 cacheSuffix: suffix,
                 deliverResult(result) {
                     const requestId = result.requestId;
                     const epoch = result.epoch;
                     const error = result.ok ? undefined : result.error;
+                    const tally = result.ok ? backendStats.delivered : backendStats.failed;
+                    tally[result.kind] = (tally[result.kind] ?? 0) + 1;
                     switch (result.kind) {
                         case 'advance':
                             wasm.deliver_backend_advance_result(
@@ -274,44 +281,61 @@
                         case 'configure':
                             wasm.deliver_backend_configure_result(requestId, epoch, error);
                             break;
+                        case 'prepare_candidate_sources':
+                            // The upload shares the candidates channel with the
+                            // slices that depend on it; it carries no values.
+                            wasm.deliver_backend_candidates_result(
+                                requestId, epoch, new Float64Array(), error,
+                            );
+                            break;
+                        case 'clear_candidate_sources':
+                            // Fire-and-forget release; nothing waits for it.
+                            if (error) console.error(`Candidate source release failed: ${error}`);
+                            break;
+                        case 'frequency_domain_modes':
+                            // Eq.121 operator upload; advance waits on modes being present.
+                            wasm.deliver_backend_frequency_domain_modes_result(error);
+                            break;
+                        case 'surface_field':
+                            wasm.deliver_backend_surface_field_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'comparison_sources':
+                            wasm.deliver_backend_comparison_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'reference_sources':
+                            wasm.deliver_backend_reference_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
+                        case 'source_sets':
+                            wasm.deliver_backend_sensitivity_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
                         default:
                             console.error(`Unknown numerical Worker result: ${result.kind}`);
                     }
                 },
                 onReady() {
+                    // The Worker owns the only numerical backend instances; Bevy
+                    // waits for this flag before configuring geometry or
+                    // advancing physics, while the controls and WebGPU scene
+                    // stay responsive.
                     globalThis.ryuguNumericalWorkerReady = true;
+                    document.getElementById('operator-chain').textContent = 'Numerical backend ready.';
                     window.dispatchEvent(new Event('ryugu-numerical-worker-ready'));
                 },
                 onFailed(message) {
                     globalThis.ryuguNumericalWorkerReady = false;
                     console.error(`Numerical Worker failed: ${message}`);
+                    document.getElementById('operator-chain').textContent =
+                        `Numerical backend failed: ${message}`;
                 },
             });
-            // Do not block first paint on the large numerical module. Bevy
-            // waits for this flag before configuring C++ geometry or advancing
-            // physics, while the controls and WebGPU scene stay responsive.
-            globalThis.ryuguNumericalBackendReady = false;
-            requestAnimationFrame(() => setTimeout(() => {
-                void (async () => {
-                    const { instantiateBackend, createFieldBackend } = await import(`./pkg/backend.mjs${suffix}`);
-                    const backendResponse = await fetch(`./pkg/ryugu_backend.wasm${suffix}`);
-                    if (!backendResponse.ok) throw new Error(`C++ backend download failed: ${backendResponse.status}`);
-                    const numericalModule = await instantiateBackend(await backendResponse.arrayBuffer());
-                    globalThis.ryuguCpp = createFieldBackend(numericalModule);
-                    globalThis.ryuguScheduler = numericalModule.api;
-                    const rustBackend = await import(`./pkg/backend/ryugu_backend.js${suffix}`);
-                    await rustBackend.default({ module_or_path: `./pkg/backend/ryugu_backend_bg.wasm${suffix}` });
-                    if (rustBackend.protocol_version() !== 1) throw new Error('Unsupported backend protocol');
-                    globalThis.ryuguRustBackend = rustBackend;
-                    globalThis.ryuguNumericalBackendReady = true;
-                    document.getElementById('operator-chain').textContent = 'Numerical backend ready.';
-                    window.dispatchEvent(new Event('ryugu-numerical-backend-ready'));
-                })().catch((error) => {
-                    console.error(error);
-                    document.getElementById('operator-chain').textContent =
-                        `Numerical backend failed: ${error instanceof Error ? error.message : String(error)}`;
-                });
-            }, 0));
             try {
                 const resume = JSON.parse(sessionStorage.getItem('ryugu-device-lost-resume') || 'null');
                 if (resume) {

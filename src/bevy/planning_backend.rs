@@ -11,16 +11,17 @@ pub fn update_planning_results_from_inversion_system(
     if !planning.run_requested {
         // A UI cancellation must release the CPU-side candidate builder too;
         // otherwise a hidden quadrature page would retain a large work queue.
-        *batch_builder = None;
-        candidates_channel.reset();
+        discard_candidate_builder(&mut batch_builder, &candidates_channel);
         return;
     }
     if planning.batch_job.is_some() {
         return;
     }
+    // Candidate slices and the f64 planning reference both run in the
+    // numerical Worker, which must hold the configured geometry first.
     if !cpp.ready {
         planning.status = format!(
-            "{} queued: waiting for the C++ numerical backend.",
+            "{} queued: waiting for the numerical Worker.",
             planning.workload_profile.label()
         );
         return;
@@ -49,7 +50,7 @@ pub fn update_planning_results_from_inversion_system(
         )
     });
     if !builder_matches {
-        candidates_channel.reset();
+        discard_candidate_builder(&mut batch_builder, &candidates_channel);
         let Some(radial) = radial else {
             planning.status =
                 "Planning queued: the common radial volume source is not ready.".into();
@@ -97,23 +98,18 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     let builder = batch_builder.as_mut().expect("matched planning builder");
-    let propagation_budget = if cfg!(target_arch = "wasm32") {
-        match planning.workload_profile {
-            PlanningWorkloadProfile::First => PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME,
-            PlanningWorkloadProfile::InteractiveStress => PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME,
-            PlanningWorkloadProfile::SourceCrossover => 1,
-        }
-    } else {
-        std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .saturating_mul(2)
-            .min(u32::MAX as usize) as u32
+    let propagation_budget = match planning.workload_profile {
+        PlanningWorkloadProfile::First => PLANNING_FIRST_BUILD_SAMPLES_PER_FRAME,
+        PlanningWorkloadProfile::InteractiveStress => PLANNING_STRESS_BUILD_SAMPLES_PER_FRAME,
+        PlanningWorkloadProfile::SourceCrossover => 1,
     };
     if !builder.advance(propagation_budget, &candidates_channel) {
-        planning.status = "Planning candidate propagation failed.".into();
+        planning.status = builder
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "Planning candidate propagation failed.".into());
         planning.run_requested = false;
-        *batch_builder = None;
-        candidates_channel.reset();
+        discard_candidate_builder(&mut batch_builder, &candidates_channel);
         return;
     }
     planning.preparation_progress = builder.preparation_progress();
@@ -126,6 +122,7 @@ pub fn update_planning_results_from_inversion_system(
         return;
     }
     candidates_channel.reset();
+    crate::cpp_backend::clear_candidate_sources();
     let Some((batch, common_preparation_ms)) =
         batch_builder.take().and_then(|builder| builder.finish())
     else {
@@ -169,7 +166,11 @@ pub fn update_planning_results_from_inversion_system(
         request_id: planning.run_id.wrapping_shl(24),
         density_model: 0,
         candidate_start: 0,
-        candidate_tile_size: PLANNING_GPU_TILE_INITIAL_CANDIDATES,
+        candidate_tile_size: if planning.workload_profile.is_compute_benchmark() {
+            PLANNING_GPU_TILE_INITIAL_CANDIDATES
+        } else {
+            PLANNING_GENERIC_TILE_INITIAL_CANDIDATES
+        },
         minimum_tile_size_used: u32::MAX,
         maximum_tile_size_used: 0,
         gpu_request_count: 0,
@@ -251,6 +252,22 @@ pub fn update_planning_results_from_inversion_system(
         method_order[1].planning_label(),
         method_order[2].planning_label(),
     );
+}
+
+/// Drops a candidate builder together with its Worker-side state.
+///
+/// Every builder uploads its own dynamics sources before its first slice, so
+/// releasing the upload whenever a builder goes away (cancellation, capture or
+/// dimension change, propagation failure) guarantees that a later run can never
+/// propagate against sources prepared for an earlier one.
+fn discard_candidate_builder(
+    batch_builder: &mut Option<crate::cpu::planning::PlanningBatchBuilder>,
+    candidates_channel: &crate::cpp_backend::BackendCandidatesChannel,
+) {
+    if batch_builder.take().is_some() {
+        candidates_channel.reset();
+        crate::cpp_backend::clear_candidate_sources();
+    }
 }
 
 fn planning_method_order(seed: u64) -> [ActiveGravityMethod; 3] {

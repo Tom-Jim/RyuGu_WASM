@@ -1,9 +1,16 @@
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { existsSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { isUpToDate, root, run } from "./build_helpers.mjs";
 
-const cwd = fileURLToPath(new URL("../backend/rust/", import.meta.url));
-const result = spawnSync("wasm-pack", ["build", "--locked", "--release", "--target", "web",
-  "--out-dir", "../../../pkg/backend", "--out-name", "ryugu_backend"], {
-  cwd, stdio: "inherit", env: { ...process.env, RUSTC_WRAPPER: "" },
-});
-if (result.status !== 0) throw new Error(`Rust backend build failed: ${result.status}`);
+const crate = join(root, "src/backend/rust");
+const output = join(root, "pkg/backend/ryugu_backend_bg.wasm");
+if (isUpToDate(output, [join(crate, "src"), join(crate, "Cargo.toml"), join(crate, "Cargo.lock")])) {
+  console.log("Skipping Rust backend WASM (up to date)");
+} else {
+  const manifest = join(root, "pkg/backend/package.json");
+  if (existsSync(manifest)) unlinkSync(manifest);
+  run("wasm-pack", [
+    "build", "--locked", "--release", "--target", "web",
+    "--out-dir", "../../../pkg/backend", "--out-name", "ryugu_backend",
+  ], crate, { RUSTC_WRAPPER: "" });
+}

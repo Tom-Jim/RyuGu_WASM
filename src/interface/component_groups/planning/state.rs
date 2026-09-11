@@ -274,13 +274,11 @@ impl PlanningComparisonState {
     }
 
     pub fn blocks_realtime_gpu(&self) -> bool {
-        // Keep rendering / input responsive while a prepared benchmark owns
-        // the compute queue. First/Stress must not compete with real-time
-        // kernels or trigger a probe collision halfway through validation.
-        // Before a First/Stress capture is ready, live integration still runs.
-        self.run_requested
-            && (self.batch_job.is_some()
-                || self.workload_profile == PlanningWorkloadProfile::SourceCrossover)
+        // Quadrature sweeps occupy the GPU for a long time. First/Stress must
+        // stay concurrent with live orbit, the gizmo trail, and Jacobi/spectral
+        // plotting: the Worker Eq.121 integrator and GPU Eq.121 diagnostic stamps
+        // keep running while those benchmarks use their own queues.
+        self.run_requested && self.workload_profile == PlanningWorkloadProfile::SourceCrossover
     }
 
     pub fn completed_workload(&self) -> Option<PlanningWorkloadIdentity> {

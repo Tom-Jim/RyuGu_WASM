@@ -18,11 +18,13 @@ pub const ORBIT_HISTORY_LEN: usize = 100_000;
 pub const JACOBI_HISTORY_CAPACITY: usize = 256;
 /// Keep at least two complete maximum-acceleration pointwise-field batches.
 /// A batch contains the authoritative anchor plus one endpoint for every
-/// accelerated stable step (9 samples at 8x). A smaller capacity silently
+/// accelerated stable step (65 samples at 64×). A smaller capacity silently
 /// evicts the authoritative sample before the integrator can consume it.
+/// Acceleration only multiplies how many fixed-`dt` stable steps one Worker
+/// advance carries; it never widens the integration step itself.
 pub const GRAVITY_SAMPLE_HISTORY_CAPACITY: usize = 2 * (MAX_SIMULATION_ACCELERATION as usize + 1);
 pub const MIN_SIMULATION_ACCELERATION: u32 = 1;
-pub const MAX_SIMULATION_ACCELERATION: u32 = 8;
+pub const MAX_SIMULATION_ACCELERATION: u32 = 64;
 pub const VISIBILITY_THRESHOLD: f32 = 250.0;
 pub const NORMAL_ARROW_LENGTH: f32 = 35.0;
 
@@ -126,10 +128,32 @@ impl ProbeVisualState {
 }
 
 /// Number of uniformly resampled detector states exposed by the trajectory
-/// inversion controls.  The capture is presentation-only and never feeds the
-/// gravity evaluators or the fixed-step integrator.
+/// inversion controls. After each inverse-capable method has run for
+/// [`TRAJECTORY_INVERSION_CAPTURE_SECONDS`] of real wall-clock time, physics
+/// Hermite-samples sixteen states along the path actually integrated in that
+/// window (position, velocity, acceleration, body attitude). Higher simulation
+/// acceleration therefore yields a longer arc in the same ~5 s of wall time.
+/// Those knots feed the UI editors, Bevy gizmos, and density inversion
+/// observations; they never drive the live fixed-step integrator itself.
 pub const TRAJECTORY_INVERSION_SAMPLE_COUNT: usize = 16;
+/// Real elapsed seconds of live integration before the capture window closes.
 pub const TRAJECTORY_INVERSION_CAPTURE_SECONDS: f64 = 5.0;
+/// Reject captures whose chord length is still a near-stationary cluster.
+pub const TRAJECTORY_INVERSION_MIN_PATH_LENGTH: f32 = 16.0;
+/// Adjacent uniform knots must be visually separable (gizmo radius is ~8).
+pub const TRAJECTORY_INVERSION_MIN_ADJACENT_SEPARATION: f32 = 0.75;
+/// Reject captures whose sampled velocities are effectively identical.
+pub const TRAJECTORY_INVERSION_MIN_VELOCITY_VARIANCE: f32 = 1.0e-6;
+
+/// Inverse-capable methods that accumulate a live wall-clock observation arc.
+pub fn supports_live_inversion_capture(method: ActiveGravityMethod) -> bool {
+    matches!(
+        method,
+        ActiveGravityMethod::FrequencyDomain
+            | ActiveGravityMethod::MmfftCompressed
+            | ActiveGravityMethod::Fmm
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrajectoryInversionKnot {
@@ -287,7 +311,7 @@ pub struct ConvexOptimizationJob {
 
 /// Backend state for the frozen Quintic Hermite trajectory.
 /// `capture_epoch` keeps defaults tied to the currently running simulation;
-/// changing a probe parameter starts a fresh five-second capture automatically.
+/// changing a probe parameter starts a fresh five-second wall-clock capture.
 #[derive(Resource)]
 pub struct TrajectoryInversionState {
     /// Current simulation epoch observed by the capture system. This is
@@ -296,16 +320,27 @@ pub struct TrajectoryInversionState {
     pub runtime_epoch: u64,
     pub capture_epoch: u64,
     pub last_capture_request_id: Option<u64>,
+    /// Wall-clock instant when the live capture window opened for this epoch.
+    pub capture_started_at: Option<Instant>,
+    /// Last successful advance delivery while capturing. Accrual is paused
+    /// only while this is `None` (explicit waits such as Eq.121 modes).
+    pub capture_last_advance_at: Option<Instant>,
+    /// Effective live-advance seconds accrued toward the capture window.
     pub wall_elapsed_seconds: f64,
+    /// Non-fatal capture progress note (modes wait, degenerate arc, …).
+    pub capture_note: Option<String>,
+    /// Dense live Worker states accumulated during the wall-clock window.
+    /// Sixteen uniform knots are Hermite-resampled from this path only after
+    /// the window closes and the span passes degeneracy checks.
+    pub capture_trace: Vec<TrajectoryInversionKnot>,
     pub knots: Vec<TrajectoryInversionKnot>,
-    /// Frozen synthetic truth track generated from the logarithmic-density
-    /// radial source. Non-Werner inverse methods reuse this exact track.
+    /// Frozen live observation arc for the active inverse method. Each method
+    /// (Frequency-domain / FFT / FMM) captures its own wall-clock Worker
+    /// trajectory; method switches discard and recapture rather than reuse.
     pub truth_knots: Vec<TrajectoryInversionKnot>,
     pub truth_capture_id: Option<u64>,
     pub truth_capture_epoch: u64,
-    /// Source identity paired with `truth_capture_id`. Method switches must
-    /// restore both values or the next inversion looks like a different
-    /// physical problem and invalidates the accumulated comparison results.
+    /// Source identity paired with `truth_capture_id`.
     pub truth_source_hash: u64,
     /// Long radial truth path used for the common non-Werner display.
     pub truth_orbit: Vec<Vec3>,
@@ -313,10 +348,12 @@ pub struct TrajectoryInversionState {
     pub capture_id: Option<u64>,
     pub capture_source_hash: u64,
     pub ready: bool,
-    /// The browser frontend may request inversion before the five-second capture
-    /// is complete. Keep the request in the state machine until validation can
-    /// actually start the optimizer.
+    /// Invert stays disabled in the UI until `ready` (sixteen gizmos present).
+    /// A queued start is still accepted in Rust once validation can run.
     pub start_requested: bool,
+    /// True while the inversion start job is in the Worker (`source_sets`)
+    /// and the convex optimizer has not been installed yet.
+    pub preparing: bool,
     pub inverted: bool,
     pub error: Option<String>,
     pub optimizer: Option<ConvexOptimizationJob>,
@@ -342,7 +379,11 @@ impl Default for TrajectoryInversionState {
             runtime_epoch: 0,
             capture_epoch: 0,
             last_capture_request_id: None,
+            capture_started_at: None,
+            capture_last_advance_at: None,
             wall_elapsed_seconds: 0.0,
+            capture_note: None,
+            capture_trace: Vec::with_capacity(4_096),
             knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
             truth_knots: Vec::with_capacity(TRAJECTORY_INVERSION_SAMPLE_COUNT),
             truth_capture_id: None,
@@ -354,6 +395,7 @@ impl Default for TrajectoryInversionState {
             capture_source_hash: 0,
             ready: false,
             start_requested: false,
+            preparing: false,
             inverted: false,
             error: None,
             optimizer: None,
@@ -368,6 +410,20 @@ impl Default for TrajectoryInversionState {
             best_results: std::array::from_fn(|_| None),
             displayed_density: None,
         }
+    }
+}
+
+impl TrajectoryInversionState {
+    /// Drop in-progress live samples so a fresh wall-clock window can open.
+    pub fn reset_live_capture(&mut self) {
+        self.capture_started_at = None;
+        self.capture_last_advance_at = None;
+        self.wall_elapsed_seconds = 0.0;
+        self.capture_note = None;
+        self.capture_trace.clear();
+        self.knots.clear();
+        self.ready = false;
+        self.preparing = false;
     }
 }
 
@@ -727,6 +783,16 @@ impl GravitySampleHistory {
             .is_some_and(|latest| latest.snapshot.request_id == sample.snapshot.request_id)
         {
             self.samples.pop_back();
+        }
+        // Late GPU readbacks must not append an older timestamp into the same
+        // epoch: the frequency-domain Worker rejects non-monotonic histories and
+        // permanently pauses propagation.
+        if self.samples.back().is_some_and(|latest| {
+            latest.snapshot.epoch == sample.snapshot.epoch
+                && sample.snapshot.simulation_time_seconds
+                    <= latest.snapshot.simulation_time_seconds
+        }) {
+            return;
         }
         if self.samples.len() == GRAVITY_SAMPLE_HISTORY_CAPACITY {
             self.samples.pop_front();

@@ -6,8 +6,9 @@ use crate::interface::components::{
 };
 
 /// Select the physical snapshot history used by pointwise runtime systems.
-/// Frequency mode uses only Eq.106 inverse-pole samples; Eq.184 aggregate
-/// observations cannot be passed through this pointwise contract.
+/// Frequency-domain live dynamics evaluate Eq.121 inside the Worker; GPU
+/// Eq.121 stamps remain diagnostics. Eq.184 aggregate observations cannot
+/// drive pointwise dynamics through this contract.
 pub fn select_history<'a>(
     method: ActiveGravityMethod,
     radial: Option<&'a RadialGravityHistory>,

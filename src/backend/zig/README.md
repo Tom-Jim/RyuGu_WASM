@@ -13,7 +13,9 @@ node src/tools/build_cpp_wasm.mjs
 ```
 
 The build writes `pkg/ryugu_backend.wasm`, `pkg/backend.mjs`, and dependency
-license notices. Numerical tests run only with the explicit `--test` flag. Dependencies
+license notices. CMake's FFTW and FLUPS binary directories live under
+`target/cpp-wasm`; unchanged archives and the Zig link step are skipped.
+Numerical tests run only with the explicit `--test` flag. Dependencies
 are Git checkouts in `C++`, pinned in `C++/sources.lock.json`. Browser patches
 are versioned under `C++/patches` and applied by the fetch script.
 

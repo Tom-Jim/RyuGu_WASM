@@ -1,4 +1,4 @@
-use crate::cpu::frequency_domain::{AggregatedGravitySource, generate_fixed_point_trajectory};
+use crate::cpu::frequency_domain::AggregatedGravitySource;
 use crate::cpu::inversion::{quintic_knot_accelerations, quintic_segment_position_acceleration};
 use crate::interface::components::*;
 use bevy::prelude::*;
@@ -99,33 +99,28 @@ pub fn setup_scene(
     commands.entity(probe).add_child(probe_visual_entity);
 }
 
-/// Builds one deterministic finite-length equation-(185) fixed-point arc and
-/// exposes sixteen uniform knots. The resulting known trajectory is shared
-/// by equation-(184), FFT, and FMM; it never depends on radial readback.
+/// Finalizes the live wall-clock observation arc accumulated by physics.
+/// Frequency-domain, Packed FFT, and FMM each capture their own Worker trajectory;
+/// the sixteen knots are never shared across method boundaries.
 pub fn capture_trajectory_inversion_system(
     clock: Res<SimulationClock>,
     active_method: Res<ActiveGravityMethod>,
     frequency_domain_source: Option<Res<AggregatedGravitySource>>,
     density_mode: Res<DensityMode>,
-    probe_initial: Res<ProbeInitialConditions>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
     if inversion.runtime_epoch != clock.epoch {
         let queued_inversion = inversion.start_requested;
-        let preserve_truth_track = inversion.preserve_truth_track;
         inversion.preserve_truth_track = false;
         inversion.runtime_epoch = clock.epoch;
         inversion.capture_epoch = clock.epoch;
         inversion.last_capture_request_id = None;
-        inversion.wall_elapsed_seconds = 0.0;
-        inversion.knots.clear();
-        if !preserve_truth_track {
-            inversion.truth_knots.clear();
-            inversion.truth_capture_id = None;
-            inversion.truth_capture_epoch = 0;
-            inversion.truth_source_hash = 0;
-            inversion.truth_orbit.clear();
-        }
+        inversion.reset_live_capture();
+        inversion.truth_knots.clear();
+        inversion.truth_capture_id = None;
+        inversion.truth_capture_epoch = 0;
+        inversion.truth_source_hash = 0;
+        inversion.truth_orbit.clear();
         inversion.capture_id = None;
         inversion.capture_source_hash = frequency_domain_source.as_ref().map_or(0, |source| {
             match *density_mode {
@@ -133,76 +128,195 @@ pub fn capture_trajectory_inversion_system(
                 DensityMode::Constant => source.constant_hash,
             }
         });
-        inversion.ready = false;
         inversion.inverted = false;
         inversion.start_requested = queued_inversion;
         inversion.error = None;
         inversion.optimizer = None;
-        if !preserve_truth_track {
-            inversion.batch_capture_id = None;
-            inversion.displayed_density = None;
-            inversion.results = std::array::from_fn(|_| None);
-            inversion.best_results = std::array::from_fn(|_| None);
-        }
-        if preserve_truth_track && !inversion.truth_knots.is_empty() {
-            inversion.knots = inversion.truth_knots.clone();
-            inversion.capture_id = inversion.truth_capture_id;
-            inversion.capture_epoch = inversion.truth_capture_epoch;
-            inversion.capture_source_hash = inversion.truth_source_hash;
-            inversion.ready = true;
-            inversion.displayed_density = inversion.results[active_method.performance_index()]
-                .clone()
-                .or_else(|| inversion.best_results[active_method.performance_index()].clone());
-        }
+        inversion.batch_capture_id = None;
+        inversion.displayed_density = None;
+        inversion.results = std::array::from_fn(|_| None);
+        inversion.best_results = std::array::from_fn(|_| None);
+        inversion.reference_cache_capture_id = None;
+        inversion.reference_training_observations.clear();
+        inversion.reference_training_sensitivities.clear();
+        inversion.reference_holdout_observations.clear();
+        inversion.reference_holdout_sensitivities.clear();
     }
     if !inversion.ready
         && let Some(source) = frequency_domain_source.as_ref()
     {
-        inversion.capture_source_hash = match *density_mode {
+        let next_hash = match *density_mode {
             DensityMode::Variable => source.source_hash,
             DensityMode::Constant => source.constant_hash,
         };
+        // Mid-capture density/source identity changes must not seal a mixed arc
+        // under the new hash; restart the wall-clock window.
+        if inversion.capture_started_at.is_some()
+            && inversion.capture_source_hash != 0
+            && inversion.capture_source_hash != next_hash
+        {
+            inversion.reset_live_capture();
+        }
+        inversion.capture_source_hash = next_hash;
     }
     if inversion.ready {
         return;
     }
-    // Frequency-mode knots are accumulated by the causal Eq.106 GPU-driven
-    // integrator, not by the direct reference generator or Radial history.
-    let knots = if *active_method == ActiveGravityMethod::FrequencyDomain {
-        if inversion.knots.len() != TRAJECTORY_INVERSION_SAMPLE_COUNT {
-            return;
-        }
-        inversion.knots.clone()
-    } else {
-        let Some(source) = frequency_domain_source.as_ref() else {
-            return;
-        };
-        let Some(knots) = generate_fixed_point_trajectory(
-            source,
-            *density_mode,
-            probe_initial.position,
-            probe_initial.velocity(),
-            TRAJECTORY_INVERSION_CAPTURE_SECONDS,
-            TRAJECTORY_INVERSION_SAMPLE_COUNT,
-        ) else {
-            return;
-        };
-        knots
+    if !supports_live_inversion_capture(*active_method) {
+        return;
+    }
+    // Wait for ~5 real seconds of live integration, then uniform-sample the
+    // full path accumulated in that wall-clock window. Higher acceleration
+    // advances more simulation time in the same real interval → longer arc.
+    if inversion.capture_started_at.is_none()
+        || inversion.wall_elapsed_seconds + 1e-9 < TRAJECTORY_INVERSION_CAPTURE_SECONDS
+    {
+        return;
+    }
+    if inversion.capture_trace.len() < 2 {
+        return;
+    }
+    let Some(knots) =
+        resample_uniform_capture_knots(&inversion.capture_trace, TRAJECTORY_INVERSION_SAMPLE_COUNT)
+    else {
+        return;
     };
+    if inversion_knots_are_degenerate(&knots) {
+        // Keep integrating past the nominal window until the probe has moved
+        // enough for a usable, visually distinct sixteen-knot arc.
+        inversion.capture_note = Some(
+            "Waiting for a non-degenerate arc (path length / velocity span still below threshold)…"
+                .into(),
+        );
+        return;
+    }
+    inversion.capture_note = None;
     inversion.knots = knots;
-    if inversion.truth_knots.is_empty() {
-        inversion.truth_knots = inversion.knots.clone();
-        inversion.truth_capture_id = Some(hash_trajectory_capture(&inversion.truth_knots));
-        inversion.truth_capture_epoch = inversion.capture_epoch;
-        inversion.truth_source_hash = inversion.capture_source_hash;
-    }
-    if !inversion.truth_knots.is_empty() {
-        inversion.knots = inversion.truth_knots.clone();
-    }
+    inversion.truth_knots = inversion.knots.clone();
+    inversion.truth_capture_id = Some(hash_trajectory_capture(&inversion.truth_knots));
+    inversion.truth_capture_epoch = inversion.capture_epoch;
+    inversion.truth_source_hash = inversion.capture_source_hash;
     inversion.capture_id = inversion.truth_capture_id;
-    inversion.capture_epoch = inversion.truth_capture_epoch;
-    inversion.capture_source_hash = inversion.truth_source_hash;
     inversion.ready = true;
+}
+
+fn hermite_vector(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32) -> Vec3 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    (2.0 * t3 - 3.0 * t2 + 1.0) * a
+        + (t3 - 2.0 * t2 + t) * tangent_a
+        + (-2.0 * t3 + 3.0 * t2) * b
+        + (t3 - t2) * tangent_b
+}
+
+/// First derivative of the same cubic Hermite used for positions, in physical
+/// time (`tangent_*` already carry `v * Δt`, so divide by `dt`).
+fn hermite_velocity(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32, dt: f32) -> Vec3 {
+    if !(dt > 0.0) {
+        return a.lerp(b, t);
+    }
+    let t2 = t * t;
+    let d =
+        (6.0 * t2 - 6.0 * t) * a
+            + (3.0 * t2 - 4.0 * t + 1.0) * tangent_a
+            + (-6.0 * t2 + 6.0 * t) * b
+            + (3.0 * t2 - 2.0 * t) * tangent_b;
+    d / dt
+}
+
+/// Second derivative of the same cubic Hermite (baseline acceleration).
+fn hermite_acceleration(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32, dt: f32) -> Vec3 {
+    if !(dt > 0.0) {
+        return Vec3::ZERO;
+    }
+    let d2 =
+        (12.0 * t - 6.0) * a
+            + (6.0 * t - 4.0) * tangent_a
+            + (-12.0 * t + 6.0) * b
+            + (6.0 * t - 2.0) * tangent_b;
+    d2 / (dt * dt)
+}
+
+/// Uniformly sample `count` knots across the simulation-time span of `trace`.
+fn resample_uniform_capture_knots(
+    trace: &[TrajectoryInversionKnot],
+    count: usize,
+) -> Option<Vec<TrajectoryInversionKnot>> {
+    if count < 2 || trace.len() < 2 {
+        return None;
+    }
+    let start_time = trace.first()?.simulation_time_seconds;
+    let end_time = trace.last()?.simulation_time_seconds;
+    let span = end_time - start_time;
+    if !(span.is_finite() && span > 1e-6) {
+        return None;
+    }
+    let mut knots = Vec::with_capacity(count);
+    let mut segment = 0usize;
+    for index in 0..count {
+        let sample_time = start_time + span * (index as f64) / (count - 1) as f64;
+        while segment + 1 < trace.len()
+            && trace[segment + 1].simulation_time_seconds < sample_time - 1e-12
+        {
+            segment += 1;
+        }
+        let a = trace[segment];
+        let b = trace[(segment + 1).min(trace.len() - 1)];
+        let interval = (b.simulation_time_seconds - a.simulation_time_seconds).max(f64::EPSILON);
+        let fraction = ((sample_time - a.simulation_time_seconds) / interval).clamp(0.0, 1.0) as f32;
+        let dt = interval as f32;
+        let tangent_a = a.velocity * dt;
+        let tangent_b = b.velocity * dt;
+        knots.push(TrajectoryInversionKnot {
+            position: hermite_vector(a.position, b.position, tangent_a, tangent_b, fraction),
+            velocity: hermite_velocity(
+                a.position,
+                b.position,
+                tangent_a,
+                tangent_b,
+                fraction,
+                dt,
+            ),
+            simulation_time_seconds: sample_time - start_time,
+            baseline_acceleration: hermite_acceleration(
+                a.position,
+                b.position,
+                tangent_a,
+                tangent_b,
+                fraction,
+                dt,
+            ),
+            body_rotation: a.body_rotation.slerp(b.body_rotation, fraction),
+        });
+    }
+    (knots.len() == count).then_some(knots)
+}
+
+fn inversion_knots_are_degenerate(knots: &[TrajectoryInversionKnot]) -> bool {
+    if knots.len() < 2 {
+        return true;
+    }
+    let mut path_length = 0.0_f32;
+    let mut min_adjacent = f32::INFINITY;
+    let mut velocity_span = 0.0_f32;
+    let first_velocity = knots[0].velocity;
+    for window in knots.windows(2) {
+        let separation = window[0].position.distance(window[1].position);
+        if !separation.is_finite() {
+            return true;
+        }
+        path_length += separation;
+        min_adjacent = min_adjacent.min(separation);
+    }
+    for knot in knots {
+        velocity_span = velocity_span.max(knot.velocity.distance(first_velocity));
+        if !knot.position.is_finite() || !knot.velocity.is_finite() {
+            return true;
+        }
+    }
+    path_length < TRAJECTORY_INVERSION_MIN_PATH_LENGTH
+        || min_adjacent < TRAJECTORY_INVERSION_MIN_ADJACENT_SEPARATION
+        || velocity_span < TRAJECTORY_INVERSION_MIN_VELOCITY_VARIANCE
 }
 
 pub(crate) fn hash_trajectory_capture(knots: &[TrajectoryInversionKnot]) -> u64 {
@@ -247,14 +361,15 @@ pub fn camera_follow_system(
 const PROBE_VISUAL_BLEND_SECONDS: f32 = 0.12;
 
 fn probe_visual_extrapolation_limit(method: ActiveGravityMethod) -> f32 {
-    // Keep this presentation-only horizon at twice the current backend pacing
-    // interval. Stage D will remove the long pacing intervals after requests
-    // become asynchronous; this guard remains useful if a worker stalls.
+    // Presentation-only dead-reckoning horizon. Advance requests are paced by
+    // the outstanding Worker request (`cpp_backend::should_advance_backend`),
+    // so the gap between authoritative samples is the Worker's answer time.
+    // Cap the extrapolation at roughly twice that per-method latency so a
+    // stalled Worker freezes the model instead of flying it off the orbit.
     match method {
         ActiveGravityMethod::RadialAnalytic | ActiveGravityMethod::FrequencyDomain => 0.5,
-        ActiveGravityMethod::MmfftCompressed => 1.5,
+        ActiveGravityMethod::MmfftCompressed | ActiveGravityMethod::Fmm => 0.8,
         ActiveGravityMethod::HomogeneousWerner => 2.0,
-        ActiveGravityMethod::Fmm => 3.0,
     }
 }
 
@@ -405,18 +520,14 @@ pub fn render_gizmos_system(
             );
         }
     }
-    // Equation-(184) input knots are a complete known observation trajectory,
-    // not the live inertial orbit. The frequency-domain mode now displays its
-    // continuous rotating-body integration above; drawing the frozen knots on
-    // top of it would create a second, misleading orbit.
+    // Sixteen live observation knots for the active inverse method. Draw both
+    // the quintic arc and discrete markers so the UI editors, gizmos, and
+    // inversion share one visible sample set — including frequency-domain.
     let display_knots: &[TrajectoryInversionKnot] =
-        if *active_method == ActiveGravityMethod::FrequencyDomain {
-            &[]
-        } else if *active_method != ActiveGravityMethod::HomogeneousWerner
-            && inversion.truth_knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT
+        if supports_live_inversion_capture(*active_method)
+            && inversion.ready
+            && inversion.knots.len() == TRAJECTORY_INVERSION_SAMPLE_COUNT
         {
-            &inversion.truth_knots
-        } else if inversion.inverted {
             &inversion.knots
         } else {
             &[]
@@ -457,6 +568,27 @@ pub fn render_gizmos_system(
                     Color::hsl(315.0 - 45.0 * t, 0.92, 0.58 + 0.12 * t),
                 )
             }));
+        }
+        for (index, knot) in display_knots.iter().enumerate() {
+            let t = index as f32 / (display_knots.len() - 1) as f32;
+            let color = Color::hsl(315.0 - 45.0 * t, 0.95, 0.62);
+            gizmos.sphere(knot.position, 8.0, color).resolution(6);
+            let axis = 14.0_f32;
+            gizmos.line(
+                knot.position - Vec3::X * axis,
+                knot.position + Vec3::X * axis,
+                color,
+            );
+            gizmos.line(
+                knot.position - Vec3::Y * axis,
+                knot.position + Vec3::Y * axis,
+                color,
+            );
+            gizmos.line(
+                knot.position - Vec3::Z * axis,
+                knot.position + Vec3::Z * axis,
+                color,
+            );
         }
     }
     if show_normals.0

@@ -46,7 +46,12 @@ export function createNumericalBackendClient({
         isReady: () => ready && !failed,
         request(kind, requestId, epoch, payload) {
             if (!ready || failed) return false;
-            worker.postMessage({ type: 'request', kind, requestId, epoch, payload });
+            // Payload arrays are standalone copies owned by this request, so
+            // their buffers move to the Worker instead of being cloned again.
+            const transfer = Object.values(payload)
+                .filter((value) => ArrayBuffer.isView(value))
+                .map((value) => value.buffer);
+            worker.postMessage({ type: 'request', kind, requestId, epoch, payload }, transfer);
             return true;
         },
         terminate() {

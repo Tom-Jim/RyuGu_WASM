@@ -17,19 +17,23 @@ window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats 
         && Number.isFinite(sample.times?.[index]) && sample.times[index] > 0);
       const rejected = rows.length - valid.length;
       const qualified = complete && rejected === 0;
-      // Keep completed timings visible even when the independent accuracy
-      // gate fails. A failed result must be marked as failed, not rendered as
-      // an empty chart that suggests that no measurement was produced.
+      // `value`/`low`/`high` are the published timing: null unless every
+      // repetition passed the accuracy gate. A failed cell must never be
+      // plotted as a point or range. `observed` is a diagnostic-only median of
+      // the completed repetitions so a FAIL cell can be marked with a warning
+      // marker instead of an empty chart that suggests no measurement was made.
       const measured = rows.map((sample) => sample[timingKey]?.[index]);
       const timingAvailable = complete && measured.every((time) => Number.isFinite(time) && time >= 0);
       const sorted = timingAvailable ? measured.sort((a, b) => a - b) : [];
       const median = sorted.length ? (sorted[Math.floor(sorted.length / 2)] + sorted[Math.ceil(sorted.length / 2) - 1]) / 2 : null;
+      const published = qualified && timingAvailable;
       const maximumError = (key) => rows.every((sample) => Number.isFinite(sample[key]?.[index]))
         ? Math.max(...rows.map((sample) => sample[key][index])) : null;
       return {
-        value: timingAvailable && median > 0 ? median : null,
-        low: timingAvailable ? sorted[0] : null,
-        high: timingAvailable ? sorted[sorted.length - 1] : null,
+        value: published && median > 0 ? median : null,
+        low: published ? sorted[0] : null,
+        high: published ? sorted[sorted.length - 1] : null,
+        observed: timingAvailable && median > 0 ? median : null,
         timingAvailable,
         belowResolution: timingAvailable && median === 0,
         count: rows.length,
@@ -46,23 +50,24 @@ window.ryuguCurveStatistics = (samples, densityModels, targets, requiredRepeats 
 };
 
 // A full source axis is shared by every series. Missing/failed cells remain
-// explicit gaps; completed cells do not wait for the rest of the sweep.
+// explicit gaps (line breaks); completed cells do not wait for the rest of the
+// sweep. Failed cells are exposed only as separate warning markers.
 window.ryuguCurvePlotData = (groups, sourceCounts) => {
   const bySource = new Map(groups.map((group) => [group.sources, group]));
   return Array.from({ length: 6 }, (_, methodIndex) => ({
     points: sourceCounts.map((source) => {
       const method = bySource.get(source)?.methods[methodIndex];
-      return [source, method && ['PASS', 'FAIL'].includes(method.status) ? method.value : null, method];
+      return [source, method?.status === 'PASS' ? method.value : null, method];
     }),
     ranges: sourceCounts.flatMap((source) => {
       const method = bySource.get(source)?.methods[methodIndex];
-      return method && ['PASS', 'FAIL'].includes(method.status) && method.low > 0 && Number.isFinite(method.high)
+      return method?.status === 'PASS' && method.low > 0 && Number.isFinite(method.high)
         ? [[source, method.low, method.high]] : [];
     }),
     failed: sourceCounts.map((source) => {
       const method = bySource.get(source)?.methods[methodIndex];
-      return method && method.status === 'FAIL' && Number.isFinite(method.value)
-        ? [source, method.value, method] : null;
+      return method?.status === 'FAIL' && Number.isFinite(method.observed)
+        ? [source, method.observed, method] : null;
     }).filter(Boolean),
   }));
 };
@@ -591,18 +596,31 @@ window.ryuguPlanningProgress = (planning) => ({
       status.textContent = inversion.error;
     } else if (inversion.running) {
       status.dataset.state = 'running';
-      status.textContent = 'Convex density inversion running…';
+      status.textContent = inversion.preparing
+        ? 'Preparing inversion observations…'
+        : 'Convex density inversion running…';
     } else if (results.length) {
       status.dataset.state = 'ready';
       status.textContent = results.map((row) => `${row.method}: ρ ${finiteText(row.density)} · ${finiteText(row.timeMs, 'ms')}`).join(' | ');
     } else {
       status.dataset.state = inversion.ready ? 'ready' : 'capturing';
-      status.textContent = inversion.ready ? 'Trajectory captured. Inversion is ready.' : 'Capturing the common trajectory for inversion…';
+      if (inversion.ready) {
+        status.textContent = 'Trajectory captured. Inversion is ready.';
+      } else if (inversion.captureNote) {
+        status.textContent = inversion.captureNote;
+      } else {
+        const elapsed = Number(inversion.wallElapsedSeconds);
+        const captured = Number.isFinite(elapsed) && elapsed > 0
+          ? ` ${elapsed.toFixed(1)}/5.0s`
+          : '';
+        status.textContent =
+          `Capturing sixteen live orbit points over ~5 effective advance seconds (longer arc at higher acceleration)…${captured}`;
+      }
     }
-    // Queue the request even while the five-second capture is warming up.
-    // Rust keeps it in the inversion state and starts it once the frozen
-    // trajectory is valid; disabling here made the action appear broken.
-    inversionButton.disabled = !inversionSupported || inversion.running;
+    // Invert only after the sixteen orbit-point gizmos/sample set exist.
+    // Queuing while capture is incomplete made the button look broken and let
+    // requests race a still-empty observation arc.
+    inversionButton.disabled = !inversionSupported || inversion.running || !inversion.ready;
   }
   const vectorText = (values) => (values ?? []).map((value) => Number(value).toFixed(3)).join(', ');
   function renderTrajectoryControls(inversion, method) {
@@ -831,7 +849,7 @@ window.ryuguPlanningProgress = (planning) => ({
       $('#health-dot').style.background = snapshot.runtimeError ? '#ff6262' : '#43e58a';
       $('#method-label').textContent = snapshot.methodLabel;
       $('#operator-chain').textContent = snapshot.method === 'frequency_domain'
-        ? 'Eq.106 → computed orbit → Eq.184 → density inversion'
+        ? 'Eq.121 force → computed orbit → Eq.184 → density inversion'
         : `${snapshot.methodLabel} → orbit → physical diagnostics`;
       const activeMemoryIndex = methodKeys.indexOf(snapshot.method);
       const activeMemory = Number.isFinite(snapshot.activeVramBytes)
@@ -856,7 +874,6 @@ window.ryuguPlanningProgress = (planning) => ({
       renderSurfaceField(snapshot.surfaceField);
       $('#modal-status').textContent = snapshot.planning.workload === 'quadrature'
         ? snapshot.planning.status : 'Choose parameters, then press Run to start the quadrature task.';
-      $('#quadrature-state').textContent = snapshot.planning.running ? Math.round(snapshot.planning.sourceCount / 1000) + 'K · R' + snapshot.planning.repeat : 'IDLE';
       // First/Stress and the selected-scope sweep share one planning slot.
       // The action handler replaces the current job, so only an active
       // quadrature sweep should disable a repeat click.

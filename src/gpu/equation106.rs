@@ -1,6 +1,10 @@
-//! Independent Eq.106 inverse-pole force pipeline for causal orbit propagation.
+//! Independent Eq.121 inverse-pole diagnostic pipeline (GPU stamps).
+//! Live orbit propagation uses the Worker Eq.121 IR/UV evaluator; Eq.184 is
+//! the trajectory Laplace observation used by density inversion.
 //! Density construction is cached on the GPU; only a 16-byte field is read back.
-use crate::cpu::frequency_domain::{EQ184_QUADRATURE_COUNT, eq184_quadrature_node};
+use crate::cpu::frequency_domain::{
+    EQ184_QUADRATURE_COUNT, EQ184_QUADRATURE_LAYOUT, eq184_quadrature_node,
+};
 use crate::interface::components::*;
 use bevy::prelude::*;
 use bevy::render::{
@@ -43,6 +47,9 @@ struct Input {
     source_count: u32,
     source_hash: u64,
     radius: f64,
+    mass: f32,
+    gm: f32,
+    center: Vec3,
 }
 #[derive(Resource, Default)]
 struct Buffers(Option<BufferState>);
@@ -52,6 +59,7 @@ struct BufferState {
     staging: Buffer,
     bind_group: BindGroup,
     source_hash: u64,
+    layout: u64,
     last: Option<(u64, u64)>,
     spectrum_ready: bool,
 }
@@ -151,6 +159,13 @@ fn extract(
         input.source_count = (bytes.len() / 32) as u32;
         input.source_hash = hash;
         input.radius = source.radius as f64;
+        if let Some((mass, center)) =
+            crate::cpu::frequency_domain::quadrature_mass_centroid(bytes.as_chunks::<32>().0)
+        {
+            input.mass = mass as f32;
+            input.center = Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+            input.gm = G * input.mass;
+        }
     }
     input.position = body.rotation.inverse() * (probe.translation - body.translation);
     input.snapshot = Some(GravityRequestSnapshot {
@@ -234,7 +249,9 @@ fn dispatch(
     if buffers
         .0
         .as_ref()
-        .is_some_and(|state| state.source_hash != input.source_hash)
+        .is_some_and(|state| {
+            state.source_hash != input.source_hash || state.layout != EQ184_QUADRATURE_LAYOUT
+        })
     {
         buffers.0 = None;
     }
@@ -250,7 +267,7 @@ fn dispatch(
         }
         let uniform = device.create_buffer(&BufferDescriptor {
             label: Some("eq106_params"),
-            size: 32,
+            size: 48,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -315,6 +332,7 @@ fn dispatch(
             staging,
             bind_group,
             source_hash: input.source_hash,
+            layout: EQ184_QUADRATURE_LAYOUT,
             last: None,
             spectrum_ready: false,
         });
@@ -327,15 +345,29 @@ fn dispatch(
     if channel.in_flight.swap(true, Ordering::AcqRel) {
         return;
     }
-    let mut params = [0u8; 32];
-    for (index, value) in [input.position.x, input.position.y, input.position.z, G]
-        .iter()
-        .enumerate()
+    let mut params = [0u8; 48];
+    for (index, value) in [
+        input.position.x,
+        input.position.y,
+        input.position.z,
+        G,
+    ]
+    .iter()
+    .enumerate()
     {
         params[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
     params[16..20].copy_from_slice(&input.source_count.to_le_bytes());
     params[20..24].copy_from_slice(&(EQ184_QUADRATURE_COUNT as u32).to_le_bytes());
+    params[24..28].copy_from_slice(&input.mass.to_le_bytes());
+    params[28..32].copy_from_slice(&input.gm.to_le_bytes());
+    for (index, value) in [input.center.x, input.center.y, input.center.z, 0.0]
+        .iter()
+        .enumerate()
+    {
+        let offset = 32 + index * 4;
+        params[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
     queue.write_buffer(&state.uniform, 0, &params);
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("eq106_encoder"),

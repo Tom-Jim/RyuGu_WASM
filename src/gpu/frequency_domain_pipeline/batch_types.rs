@@ -3,7 +3,7 @@
 // evaluated on the device before reciprocal-space reduction.
 
 use crate::cpu::frequency_domain::{
-    EQ184_BASE_LAPLACE_SIGMA, EQ184_QUADRATURE_COUNT, eq184_quadrature_node,
+    EQ184_BASE_LAPLACE_SIGMA, EQ184_QUADRATURE_COUNT, EQ184_QUADRATURE_LAYOUT, eq184_quadrature_node,
 };
 use crate::interface::components::*;
 use bevy::log::{debug, error, info, trace};
@@ -32,7 +32,7 @@ const OUTPUT_BYTES: u64 = OUTPUT_ROWS_PER_BLOCK * 16;
 const FREQUENCY_DOMAIN_GPU_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const fn frequency_domain_sensitivity_configuration_hash() -> u64 {
-    (FREQUENCY_COUNT as u64) << 32 ^ QUADRATURE_COUNT as u64
+    (FREQUENCY_COUNT as u64) << 32 ^ QUADRATURE_COUNT as u64 ^ EQ184_QUADRATURE_LAYOUT
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,6 +126,7 @@ struct FrequencyDomainGpuBuffersInner {
     source_radius: f32,
     element_capacity: u32,
     source_hash: u64,
+    quadrature_layout: u64,
     target_count: u32,
     last_submitted: Option<(u64, u64)>,
     density_spectrum_ready: bool,

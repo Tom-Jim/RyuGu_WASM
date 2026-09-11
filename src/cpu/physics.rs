@@ -1,15 +1,6 @@
 use crate::interface::components::*;
 use bevy::prelude::*;
 
-fn hermite_vector(a: Vec3, b: Vec3, tangent_a: Vec3, tangent_b: Vec3, t: f32) -> Vec3 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    (2.0 * t3 - 3.0 * t2 + 1.0) * a
-        + (t3 - 2.0 * t2 + t) * tangent_a
-        + (-2.0 * t3 + 3.0 * t2) * b
-        + (t3 - t2) * tangent_b
-}
-
 fn hash_benchmark_trajectory(samples: &[GravityBenchmarkSample]) -> u64 {
     samples
         .iter()
@@ -30,6 +21,37 @@ fn hash_benchmark_trajectory(samples: &[GravityBenchmarkSample]) -> u64 {
         })
 }
 
+fn append_capture_trace_record(
+    inversion: &mut TrajectoryInversionState,
+    record: &[f64; 14],
+    position: impl Fn(&[f64; 14]) -> Vec3,
+    speed: impl Fn(&[f64; 14]) -> Vec3,
+    field: impl Fn(&[f64; 14]) -> Vec3,
+    attitude: impl Fn(&[f64; 14]) -> Quat,
+) {
+    let simulation_time_seconds = record[0];
+    if inversion
+        .capture_trace
+        .last()
+        .is_some_and(|last| simulation_time_seconds <= last.simulation_time_seconds + 1e-12)
+    {
+        return;
+    }
+    // Bound memory while waiting for a non-degenerate wall-clock arc.
+    const CAPTURE_TRACE_CAPACITY: usize = 65_536;
+    if inversion.capture_trace.len() >= CAPTURE_TRACE_CAPACITY {
+        let drop = CAPTURE_TRACE_CAPACITY / 4;
+        inversion.capture_trace.drain(..drop);
+    }
+    inversion.capture_trace.push(TrajectoryInversionKnot {
+        position: position(record),
+        velocity: speed(record),
+        simulation_time_seconds,
+        baseline_acceleration: field(record),
+        body_rotation: attitude(record),
+    });
+}
+
 pub fn physics_system(
     mut frame_pacer: Local<crate::cpp_backend::BackendFramePacer>,
     ready: Res<crate::cpp_backend::CppBackendState>,
@@ -39,7 +61,6 @@ pub fn physics_system(
         (&mut Transform, &mut Velocity, &mut OrbitHistory),
         (With<CassiniMarker>, Without<RyuguMarker>),
     >,
-    frequency: Option<Res<crate::gpu::equation106::Equation106History>>,
     active: Res<ActiveGravityMethod>,
     planning: Res<PlanningComparisonState>,
     acceleration: Res<SimulationAcceleration>,
@@ -50,7 +71,7 @@ pub fn physics_system(
     mut benchmark: ResMut<GravityBenchmarkTrajectory>,
     mut inversion: ResMut<TrajectoryInversionState>,
 ) {
-    if !ready.ready || !ready.worker_ready || error.is_active() || planning.blocks_realtime_gpu() {
+    if !ready.ready || error.is_active() || planning.blocks_realtime_gpu() {
         return;
     }
     let (Ok(body), Ok((mut transform, mut velocity, mut orbit))) =
@@ -58,11 +79,7 @@ pub fn physics_system(
     else {
         return;
     };
-    let packet = advance_channel
-        .data
-        .lock()
-        .expect("backend advance result channel poisoned")
-        .take();
+    let packet = advance_channel.take();
     let trace = if let Some(packet) = packet {
         if packet.snapshot.epoch != clock.epoch || packet.snapshot.request_id != clock.request_id {
             return;
@@ -70,7 +87,12 @@ pub fn physics_system(
         match packet.result {
             Ok(trace) => trace,
             Err(message) => {
-                if message.contains("Waiting for frequency-domain samples") {
+                if message.contains("Waiting for frequency-domain") {
+                    // Soft status only — do not freeze the pipeline. Pause the
+                    // capture clock until Eq.121 modes land and advances resume.
+                    inversion.capture_note =
+                        Some("Waiting for Eq.121 frequency-domain modes…".into());
+                    inversion.capture_last_advance_at = None;
                     return;
                 }
                 error.raise(message);
@@ -81,33 +103,11 @@ pub fn physics_system(
         if !crate::cpp_backend::should_advance_backend(&mut frame_pacer, &advance_channel) {
             return;
         }
-        let mut steps = acceleration.stable_steps();
-        let mut history = Vec::new();
-        if *active == ActiveGravityMethod::FrequencyDomain {
-            let Some(frequency) = frequency else { return };
-            for sample in &frequency.0.samples {
-                if sample.snapshot.epoch != clock.epoch {
-                    continue;
-                }
-                history.push(sample.snapshot.simulation_time_seconds);
-                history.extend(sample.body_acceleration.to_array().map(f64::from));
-            }
-            let samples = history.as_chunks::<4>().0;
-            let Some(last) = samples.last() else { return };
-            let horizon = if samples.len() > 1 {
-                2.0 * (last[0] - samples[samples.len() - 2][0])
-            } else {
-                clock.fixed_step_seconds
-            };
-            let available = ((last[0] + horizon - clock.elapsed_seconds) / clock.fixed_step_seconds
-                + 1e-6)
-                .floor()
-                .max(0.0) as u32;
-            steps = steps.min(available);
-            if steps == 0 {
-                return;
-            }
-        }
+        let steps = acceleration.stable_steps();
+        // Live FD evaluates Eq.121 at the current body-frame position inside
+        // the Worker. GPU Eq.121 stamps are diagnostics only; packing them
+        // here can abort advance_frame on a non-monotonic diagnostic clock.
+        let history = Vec::new();
         let initial: Vec<f64> = transform
             .translation
             .to_array()
@@ -156,46 +156,43 @@ pub fn physics_system(
             velocity: speed(&records[0]),
         });
     }
-    if *active == ActiveGravityMethod::FrequencyDomain
-        && !inversion.ready
-        && inversion.knots.is_empty()
-    {
-        let r = &records[0];
-        inversion.knots.push(TrajectoryInversionKnot {
-            position: position(r),
-            velocity: speed(r),
-            simulation_time_seconds: r[0],
-            baseline_acceleration: field(r),
-            body_rotation: attitude(r),
-        });
+    let capturing = supports_live_inversion_capture(*active) && !inversion.ready;
+    if capturing {
+        let now = bevy::platform::time::Instant::now();
+        // Accrue only while advances are actually delivering. Gaps above a
+        // few frames mean the Worker was blocked (modes / First / Stress);
+        // pause the capture clock across that wall time.
+        if inversion.capture_started_at.is_none() {
+            inversion.capture_started_at = Some(now);
+            inversion.capture_last_advance_at = Some(now);
+            inversion.wall_elapsed_seconds = 0.0;
+            inversion.capture_note = None;
+            inversion.capture_trace.clear();
+            inversion.knots.clear();
+        } else if let Some(last) = inversion.capture_last_advance_at {
+            let gap = now.saturating_duration_since(last).as_secs_f64();
+            if let Some(accrued) = accrue_live_capture_gap(gap) {
+                inversion.wall_elapsed_seconds += accrued;
+            }
+            inversion.capture_last_advance_at = Some(now);
+        } else {
+            // Resuming after an explicit pause (e.g. waiting for modes).
+            inversion.capture_last_advance_at = Some(now);
+        }
+        // Accumulate every Worker state in the effective capture window.
+        for record in records {
+            append_capture_trace_record(
+                &mut inversion,
+                record,
+                position,
+                speed,
+                field,
+                attitude,
+            );
+        }
     }
     for pair in records.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        if *active == ActiveGravityMethod::FrequencyDomain && !inversion.ready {
-            let interval = TRAJECTORY_INVERSION_CAPTURE_SECONDS
-                / (TRAJECTORY_INVERSION_SAMPLE_COUNT - 1) as f64;
-            while inversion.knots.len() < TRAJECTORY_INVERSION_SAMPLE_COUNT {
-                let time = inversion.knots.len() as f64 * interval;
-                if time > b[0] + 1e-9 {
-                    break;
-                }
-                let dt = (b[0] - a[0]) as f32;
-                let fraction = ((time - a[0]) / (b[0] - a[0])).clamp(0.0, 1.0) as f32;
-                inversion.knots.push(TrajectoryInversionKnot {
-                    position: hermite_vector(
-                        position(a),
-                        position(b),
-                        speed(a) * dt,
-                        speed(b) * dt,
-                        fraction,
-                    ),
-                    velocity: speed(a).lerp(speed(b), fraction),
-                    simulation_time_seconds: time,
-                    baseline_acceleration: field(a).lerp(field(b), fraction),
-                    body_rotation: attitude(a).slerp(attitude(b), fraction),
-                });
-            }
-        }
+        let b = &pair[1];
         if *active == ActiveGravityMethod::RadialAnalytic
             && inversion.truth_orbit.len() < ORBIT_HISTORY_LEN
         {
@@ -217,10 +214,12 @@ pub fn physics_system(
     // The independent backend may return fewer records than the legacy GPU
     // substep batch. Retain the latest authoritative state on every tick so
     // the visible orbit reflects real propagation rather than an empty trail.
-    if orbit.0.len() >= ORBIT_HISTORY_LEN {
-        orbit.0.pop_front();
+    for record in records {
+        if orbit.0.len() >= ORBIT_HISTORY_LEN {
+            orbit.0.pop_front();
+        }
+        orbit.0.push_back(position(record));
     }
-    orbit.0.push_back(position(last));
     transform.translation = position(last);
     velocity.0 = speed(last);
     clock.elapsed_seconds = (last[0] * 1e9).round() * 1e-9;
@@ -248,5 +247,30 @@ pub fn ryugu_rotation_system(
         // physics is waiting for a GPU readback, both clock and body frame now
         // remain frozen instead of silently diverging.
         transform.rotation = rotation;
+    }
+}
+
+/// Accrue wall time for a delivered live advance. Slow FMM/FFT ticks (often
+/// >350 ms) still count; only an explicit pause (`capture_last_advance_at =
+/// None`, e.g. waiting for Eq.121 modes) skips the gap. Gaps longer than the
+/// stall cap are treated as a blocked Worker, not live integration.
+pub(crate) fn accrue_live_capture_gap(gap_secs: f64) -> Option<f64> {
+    const CAPTURE_IDLE_STALL_SECS: f64 = 8.0;
+    (gap_secs.is_finite() && gap_secs > 0.0 && gap_secs <= CAPTURE_IDLE_STALL_SECS)
+        .then_some(gap_secs)
+}
+
+#[cfg(test)]
+mod live_capture_gap_tests {
+    use super::accrue_live_capture_gap;
+
+    #[test]
+    fn slow_fmm_ticks_still_accrue() {
+        assert_eq!(accrue_live_capture_gap(0.2), Some(0.2));
+        assert_eq!(accrue_live_capture_gap(0.5), Some(0.5));
+        assert_eq!(accrue_live_capture_gap(2.0), Some(2.0));
+        assert_eq!(accrue_live_capture_gap(8.0), Some(8.0));
+        assert_eq!(accrue_live_capture_gap(30.0), None);
+        assert_eq!(accrue_live_capture_gap(0.0), None);
     }
 }

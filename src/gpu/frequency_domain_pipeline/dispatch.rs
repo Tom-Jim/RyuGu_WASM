@@ -53,6 +53,7 @@ fn dispatch_frequency_domain(
             || inner.source_layout != extracted.source_layout
             || inner.target_count != extracted.observation_count
             || inner.element_capacity != element_capacity
+            || inner.quadrature_layout != EQ184_QUADRATURE_LAYOUT
     }) {
         // Rebuild only when buffer capacities or binding shapes change.
         buffers.0 = None;
@@ -137,6 +138,7 @@ fn dispatch_frequency_domain(
             source_radius: extracted.radius,
             element_capacity,
             source_hash: extracted.source_hash,
+            quadrature_layout: EQ184_QUADRATURE_LAYOUT,
             source_layout: extracted.source_layout,
             target_count,
             last_submitted: None,

@@ -47,7 +47,7 @@ The interface should feel like a flight-dynamics test bench: dark instrument gla
 
 ### Product context and register
 
-- **Audience and primary job:** numerical-method researchers comparing gravity evaluators, checking Eq.106 propagation quality, and running density inversion.
+- **Audience and primary job:** numerical-method researchers comparing gravity evaluators, checking Eq.121 propagation quality and Eq.184 inversion, and running density inversion.
 - **Target market(s) and evidence:** research and engineering use; no region-specific workflow is encoded.
 - **Locale(s) and language policy:** current controls are concise technical English; the shell supports Chinese user context without changing symbols, units, or method names.
 - **Usage scene:** desktop and mobile GPU-capable browsers, with readable controls and explicit gesture ownership during long calculations.
@@ -59,7 +59,7 @@ The interface should feel like a flight-dynamics test bench: dark instrument gla
 
 ## Colors
 
-Near-black `background` and restrained `surface` layers preserve contrast with the 3D view. `primary` is reserved for focus, selection, and primary actions. Method curves keep stable identities: Eq.106 cyan, Werner red, packed FFT amber, and FMM green. Danger never relies on color alone and is paired with error text and a recovery action.
+Near-black `background` and restrained `surface` layers preserve contrast with the 3D view. `primary` is reserved for focus, selection, and primary actions. Method curves keep stable identities: frequency-domain (Eq.121/184) cyan, Werner red, packed FFT amber, and FMM green. Danger never relies on color alone and is paired with error text and a recovery action.
 
 ## Typography
 

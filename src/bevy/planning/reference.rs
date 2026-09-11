@@ -15,10 +15,20 @@ fn reference_key(
     )
 }
 
+/// Reference points requested from the Worker per round trip.
+/// First verifies every sample in a tile (up to 8×241); a small batch turns
+/// each GPU packet into dozens of Worker round-trips. Larger batches keep the
+/// numerical contract identical while amortizing source uploads.
+const PLANNING_REFERENCE_TARGETS_PER_REQUEST: usize = 256;
+
+/// Drives the independent f64 reference for one GPU packet through the
+/// reference channel. Returns `true` once every requested target has a cached
+/// field (finite or `NaN` for an invalid one).
 fn prepare_planning_references(
     batch: &PlanningCandidateBatch,
     packet: &PlanningGpuPacket,
     cache: &mut PlanningReferenceCache,
+    channel: &crate::cpp_backend::BackendReferenceChannel,
 ) -> bool {
     if packet.request.method == Some(ActiveGravityMethod::FrequencyDomain) {
         return prepare_frequency_domain_reference(batch, packet, cache);
@@ -35,61 +45,128 @@ fn prepare_planning_references(
     }
     if cache.packet_id != Some(packet.request.request_id) {
         cache.packet_id = Some(packet.request.request_id);
-        cache.target_indices =
-            if packet.request.method == Some(ActiveGravityMethod::FrequencyDomain) {
-                let count =
-                    packet.request.candidate_count as usize * batch.samples_per_candidate as usize;
-                (0..count).map(|index| index as u32).collect()
-            } else {
-                packet.state_indices.clone()
-            };
+        cache.target_indices = packet.state_indices.clone();
         cache.target_cursor = 0;
-        cache.source_cursor = 0;
-        cache.partial_field = DVec3::ZERO;
-        cache.partial_gradient = DMat3::ZERO;
+        // A request issued for the previous packet must not be applied to
+        // this one even if its keys happen to overlap.
+        if cache.pending.take().is_some() {
+            channel.reset();
+        }
     }
-    let started = bevy::platform::time::Instant::now();
     let global_start =
         packet.request.candidate_start as usize * batch.samples_per_candidate as usize;
-    let row = packet.request.density_model as usize * 56;
-    while cache.target_cursor < cache.target_indices.len() {
-        let state_index = global_start + cache.target_indices[cache.target_cursor] as usize;
+    let density_model = packet.request.density_model;
+
+    if let Some(pending) = cache.pending.take() {
+        match channel.take() {
+            None if !channel.is_idle() => {
+                cache.pending = Some(pending);
+                return false;
+            }
+            // An experiment reset discarded the request; it is re-issued below.
+            None => {}
+            Some(delivered)
+                if delivered.snapshot == pending.snapshot
+                    && delivered.snapshot.epoch == batch.capture_epoch =>
+            {
+                let chunk_count = pending
+                    .source_count
+                    .div_ceil(PLANNING_REFERENCE_SOURCE_CHUNK as usize);
+                let points = pending.keys.len() * PLANNING_REFERENCE_STENCIL;
+                let records = delivered
+                    .result
+                    .ok()
+                    .filter(|values| values.len() == chunk_count * points * 4)
+                    .map(|values| values.as_chunks::<4>().0.to_vec());
+                for (point, key) in pending.keys.iter().enumerate() {
+                    let value = records
+                        .as_deref()
+                        .and_then(|records| {
+                            accumulate_planning_reference((0..chunk_count).map(|chunk| {
+                                let start = chunk * points + point * PLANNING_REFERENCE_STENCIL;
+                                &records[start..start + PLANNING_REFERENCE_STENCIL]
+                            }))
+                        })
+                        .unwrap_or((DVec3::NAN, DMat3::NAN));
+                    cache.fields.insert(*key, value);
+                }
+            }
+            // A mismatching answer belongs to a superseded request: drop it.
+            Some(_) => {}
+        }
+    }
+
+    let mut keys = Vec::new();
+    let mut targets = Vec::new();
+    let mut index = cache.target_cursor;
+    let mut cursor_settled = false;
+    while index < cache.target_indices.len() && keys.len() < PLANNING_REFERENCE_TARGETS_PER_REQUEST
+    {
+        let state_index = global_start + cache.target_indices[index] as usize;
         let Some(state) = batch.states.get(state_index) else {
             return true;
         }; // reduction rejects malformed output
         let target = state.body_position().as_dvec3();
-        let key = reference_key(target, batch, packet.request.density_model);
+        let key = reference_key(target, batch, density_model);
+        index += 1;
         if cache.fields.contains_key(&key) {
-            cache.target_cursor += 1;
+            if !cursor_settled {
+                cache.target_cursor = index;
+            }
             continue;
         }
-        let end = (cache.source_cursor + 512).min(batch.basis_records.len());
-        let valid = crate::cpu::planning::accumulate_planning_reference_chunk(
-            target,
-            &batch.basis_records[cache.source_cursor..end],
-            &batch.density_models[row..row + 56],
-            &mut cache.partial_field,
-            &mut cache.partial_gradient,
-        )
-        .is_some();
-        cache.source_cursor = end;
-        if !valid || end == batch.basis_records.len() {
-            let value = if valid {
-                (cache.partial_field, cache.partial_gradient)
-            } else {
-                (DVec3::NAN, DMat3::NAN)
-            };
-            cache.fields.insert(key, value);
-            cache.partial_field = DVec3::ZERO;
-            cache.partial_gradient = DMat3::ZERO;
-            cache.source_cursor = 0;
-            cache.target_cursor += 1;
+        cursor_settled = true;
+        if keys.contains(&key) {
+            continue;
         }
-        if started.elapsed().as_secs_f64() >= 0.003 {
-            return false;
+        if !push_planning_reference_stencil(target, &mut targets) {
+            cache.fields.insert(key, (DVec3::NAN, DMat3::NAN));
+            continue;
+        }
+        keys.push(key);
+    }
+    if keys.is_empty() {
+        return index >= cache.target_indices.len();
+    }
+    let row = density_model as usize * 56;
+    let sources = batch
+        .density_models
+        .get(row..row + 56)
+        .and_then(|densities| planning_reference_sources(&batch.basis_records, densities));
+    let Some(sources) = sources else {
+        for key in keys {
+            cache.fields.insert(key, (DVec3::NAN, DMat3::NAN));
+        }
+        return false;
+    };
+    cache.next_request_id = cache.next_request_id.wrapping_add(1).max(1);
+    let snapshot = crate::cpp_backend::BackendReferenceSnapshot {
+        request_id: packet.request.request_id.rotate_left(20) ^ cache.next_request_id,
+        epoch: batch.capture_epoch,
+    };
+    match crate::cpp_backend::request_reference_sources(
+        channel,
+        snapshot,
+        &sources,
+        &targets,
+        PLANNING_REFERENCE_SOURCE_CHUNK,
+    ) {
+        Ok(true) => {
+            cache.pending = Some(PendingPlanningReference {
+                snapshot,
+                keys,
+                source_count: sources.len(),
+            });
+        }
+        // Worker busy or not ready yet: try again next frame.
+        Ok(false) => {}
+        Err(_) => {
+            for key in keys {
+                cache.fields.insert(key, (DVec3::NAN, DMat3::NAN));
+            }
         }
     }
-    true
+    false
 }
 
 fn prepare_frequency_domain_reference(
@@ -133,7 +210,7 @@ fn prepare_frequency_domain_reference(
     };
     let started = bevy::platform::time::Instant::now();
     while cache.frequency_domain_source_cursor < batch.basis_records.len() {
-        let end = (cache.frequency_domain_source_cursor + 256).min(batch.basis_records.len());
+        let end = (cache.frequency_domain_source_cursor + 2_048).min(batch.basis_records.len());
         for source in &batch.basis_records[cache.frequency_domain_source_cursor..end] {
             let voxel_density = f64::from(
                 *densities
@@ -158,7 +235,10 @@ fn prepare_frequency_domain_reference(
             }
         }
         cache.frequency_domain_source_cursor = end;
-        if started.elapsed().as_secs_f64() >= 0.003 {
+        // Planning already owns the exclusive compute slot; a slightly longer
+        // slice finishes the spectrum in far fewer frames without changing
+        // the accumulated operator.
+        if started.elapsed().as_secs_f64() >= 0.008 {
             return false;
         }
     }

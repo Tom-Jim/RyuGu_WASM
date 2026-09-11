@@ -68,7 +68,8 @@ pub fn build(b: *std.Build) void {
         if (wasm) {
             module.addIncludePath(b.path("browser"));
             module.addIncludePath(b.path("../../../C++/fftw3-release/api"));
-            module.addObjectFile(b.path("deps/fftw/libfftw3.a"));
+            const fftw_archive = b.option([]const u8, "fftw-archive", "Path to libfftw3.a") orelse "../../../target/cpp-wasm/fftw/libfftw3.a";
+            module.addObjectFile(.{ .cwd_relative = fftw_archive });
             module.addCSourceFile(.{ .file = b.path("browser/blas.cpp"), .flags = cxx_flags });
         } else {
             module.linkSystemLibrary("fftw3", .{ .use_pkg_config = .no });
@@ -81,7 +82,8 @@ pub fn build(b: *std.Build) void {
         if (wasm) {
             module.addIncludePath(b.path("browser"));
             module.addIncludePath(b.path("../../../C++/fftw3-release/api"));
-            module.addObjectFile(b.path("deps/flups/libflups.a"));
+            const flups_archive = b.option([]const u8, "flups-archive", "Path to libflups.a") orelse "../../../target/cpp-wasm/flups/libflups.a";
+            module.addObjectFile(.{ .cwd_relative = flups_archive });
         }
     }
     if (b.option([]const u8, "flups-lib", "Directory containing libflups")) |path| {

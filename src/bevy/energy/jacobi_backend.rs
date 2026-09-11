@@ -1,20 +1,22 @@
-const LIVE_JACOBI_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+/// Prevents a very fast Worker from turning Jacobi submits into a busy poll.
+/// New samples are otherwise driven by physics `request_id`, not wall-clock.
+const LIVE_JACOBI_SUBMIT_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub(crate) struct LiveJacobiPacer {
-    last_update: Option<Instant>,
+    last_submit: Option<Instant>,
 }
 
 impl LiveJacobiPacer {
     fn allow(&mut self) -> bool {
         let now = Instant::now();
         if self
-            .last_update
-            .is_some_and(|last| now.duration_since(last) < LIVE_JACOBI_UPDATE_INTERVAL)
+            .last_submit
+            .is_some_and(|last| now.duration_since(last) < LIVE_JACOBI_SUBMIT_INTERVAL)
         {
             return false;
         }
-        self.last_update = Some(now);
+        self.last_submit = Some(now);
         true
     }
 }
@@ -55,6 +57,7 @@ pub fn record_probe_jacobi_system(
     mut history: ResMut<JacobiHistory>,
     cpp_backend: Res<crate::cpp_backend::CppBackendState>,
     evaluate_channel: Res<crate::cpp_backend::BackendEvaluateChannel>,
+    advance_channel: Res<crate::cpp_backend::BackendAdvanceChannel>,
     mut live_pacer: Local<LiveJacobiPacer>,
     mut live_worker: Local<LiveJacobiWorker>,
 ) {
@@ -66,7 +69,7 @@ pub fn record_probe_jacobi_system(
     // Keep the frequency-domain history path below because it represents the
     // spectral transform diagnostic rather than an instantaneous potential.
     if *active_method != ActiveGravityMethod::FrequencyDomain {
-        if !cpp_backend.ready || !cpp_backend.worker_ready {
+        if !cpp_backend.ready {
             // Keep the invariant "no pending request implies nothing in
             // flight" so a re-configured backend can always start again.
             if live_worker.pending.take().is_some() {
@@ -87,11 +90,7 @@ pub fn record_probe_jacobi_system(
             RYUGU_SPIN_AXIS.normalize() * (std::f32::consts::TAU / RYUGU_ROTATION_PERIOD_SECS);
         let angular_velocity_body = world_to_body * angular_velocity_world;
 
-        let completed = evaluate_channel
-            .data
-            .lock()
-            .expect("backend evaluate result channel poisoned")
-            .take();
+        let completed = evaluate_channel.take();
         if let Some(packet) = completed {
             let Some(pending) = live_worker.pending.take() else {
                 return;
@@ -140,6 +139,12 @@ pub fn record_probe_jacobi_system(
                 return;
             }
             live_worker.pending = None;
+        }
+        if history.last_request_id == Some(clock.request_id) {
+            return;
+        }
+        if !advance_channel.is_idle() {
+            return;
         }
         if !live_pacer.allow() {
             return;
@@ -226,4 +231,16 @@ pub fn record_probe_jacobi_system(
         simulation_time_seconds,
         jacobi_constant,
     });
+}
+
+#[cfg(test)]
+mod live_jacobi_pacer_tests {
+    use super::*;
+
+    #[test]
+    fn live_jacobi_submit_floor_rejects_immediate_retry() {
+        let mut pacer = LiveJacobiPacer::default();
+        assert!(pacer.allow());
+        assert!(!pacer.allow());
+    }
 }
