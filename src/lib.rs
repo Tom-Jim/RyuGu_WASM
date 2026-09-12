@@ -36,10 +36,11 @@ use bevy_app::{
     },
     energy::record_probe_jacobi_system,
     render::{
-        ScientificGizmos, camera_follow_system, camera_keyboard_zoom_system,
-        capture_trajectory_inversion_system, configure_scientific_gizmos,
+        DensitySliceMaterial, DensityVolumeState, ScientificGizmos, bake_density_volume_system,
+        camera_follow_system, camera_keyboard_zoom_system, capture_trajectory_inversion_system,
+        configure_scientific_gizmos, ensure_density_slice_system,
         probe_visual_extrapolation_system, render_gizmos_system, render_section_system,
-        section_alpha_system, setup_scene,
+        section_alpha_system, setup_scene, update_density_slice_system,
     },
     scale::{build_topology_system, normalize_model_scale_system},
     surface_field::{
@@ -59,8 +60,8 @@ use cpu::{
     physics::{physics_system, ryugu_rotation_system},
 };
 use gpu::{
-    frequency_domain::FrequencyDomainGpuComputePlugin, normals::NormalsComputePlugin,
-    planning::PlanningGpuComputePlugin,
+    frequency_domain::FrequencyDomainGpuComputePlugin, gravity_field::GravityFieldComputePlugin,
+    normals::NormalsComputePlugin, planning::PlanningGpuComputePlugin,
 };
 use interface::components::{
     ActiveGravityMethod, CameraMode, DensityC, DensityMode, DensitySensitivityCaches,
@@ -114,6 +115,11 @@ fn ryugu_render_error_handler(
                 channel.reset_after_device_loss();
             }
             if let Some(channel) = main_world.get_resource::<NormalsReadbackChannel>() {
+                channel.reset_after_device_loss();
+            }
+            if let Some(channel) =
+                main_world.get_resource::<gpu::gravity_field::GravityFieldChannel>()
+            {
                 channel.reset_after_device_loss();
             }
 
@@ -469,6 +475,7 @@ pub fn main() {
         .init_resource::<DensityMode>()
         .init_resource::<SurfaceFieldComputeState>()
         .init_resource::<SurfaceFieldGeometry>()
+        .init_resource::<DensityVolumeState>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(WinitSettings {
             // In browsers, Continuous is driven by requestAnimationFrame.
@@ -551,6 +558,7 @@ pub fn main() {
         // app.add_plugins(WernerComputePlugin);
         app.add_plugins(FrequencyDomainGpuComputePlugin);
         app.add_plugins(gpu::equation106::Equation106Plugin);
+        app.add_plugins(GravityFieldComputePlugin);
         // MMFFT+compression is the fourth GPU integration slot. Its packed
         // source buffer and tiled reduction are built once and evaluated in
         // the render-world compute pass.
@@ -558,6 +566,7 @@ pub fn main() {
         // app.add_plugins(FmmComputePlugin);
     }
 
+    app.add_plugins(MaterialPlugin::<DensitySliceMaterial>::default());
     app.add_systems(Startup, (configure_scientific_gizmos, setup_scene).chain());
 
     #[cfg(target_arch = "wasm32")]
@@ -668,6 +677,16 @@ pub fn main() {
     .add_systems(
         Update,
         (render_gizmos_system, render_section_system).chain(),
+    )
+    .add_systems(
+        Update,
+        (
+            ensure_density_slice_system,
+            bake_density_volume_system,
+            update_density_slice_system,
+        )
+            .chain()
+            .after(render_section_system),
     )
     .add_systems(
         FixedUpdate,

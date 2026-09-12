@@ -111,6 +111,8 @@ pub fn build_equation121_modes(bytes: &[u8], source_radius: f64) -> Option<Vec<f
 
 /// Inverse Laplace of Eq.(106) on a point of the reference line equals the
 /// spatial Eq.(121) residue there (`mathtidy.md` §2). Jacobian is `D_q g`.
+/// Live FD orbit/glyphs use Worker FLUPS; keep this CPU path for tests and
+/// diagnostics (not the sparse packed Section glyph path).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn evaluate_equation121(modes: &[f64], position: DVec3) -> Option<(DVec3, f64)> {
     evaluate_equation121_with_jacobian(modes, position)

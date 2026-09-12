@@ -11,10 +11,10 @@ pub struct ScientificGizmos;
 
 pub fn configure_scientific_gizmos(mut store: ResMut<GizmoConfigStore>) {
     let (config, _) = store.config_mut::<ScientificGizmos>();
-    config.line.width = 1.75;
+    config.line.width = 2.5;
     config.line.perspective = false;
     config.line.joints = GizmoLineJoint::Round(4);
-    config.depth_bias = -0.002;
+    config.depth_bias = -0.01;
 }
 
 pub fn setup_scene(

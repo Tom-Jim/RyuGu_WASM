@@ -50,6 +50,7 @@ pub fn start_density_inversion_system(
     radial_source: Option<Res<DensityQuadratureSource>>,
     aggregated_source: Option<Res<AggregatedGravitySource>>,
     channel: Res<crate::cpp_backend::BackendSensitivityChannel>,
+    gravity_field: Res<crate::cpp_backend::BackendGravityFieldChannel>,
     mut sensitivity_caches: ResMut<DensitySensitivityCaches>,
     mut frequency_domain_sensitivity: ResMut<FrequencyDomainSensitivityMatrix>,
     mut frequency_domain_performance: ResMut<FrequencyDomainPerformanceMetrics>,
@@ -95,6 +96,9 @@ pub fn start_density_inversion_system(
             Ok(job) => {
                 *job_slot = Some(job);
                 inversion.preparing = true;
+                // Drop visual-only glyph work so invert source_sets / solve_density
+                // own the numerical Worker immediately.
+                gravity_field.reset();
             }
             Err(message) => {
                 inversion.error = Some(message);
@@ -344,14 +348,10 @@ fn begin_inversion_start(
         source_hash: aggregated.source_hash,
         constant_hash: aggregated.constant_hash,
     };
-    // FMM/FFT invert must use the same 32-angular live mesh as Verlet. FD
-    // invert is the Eq.(184) operator on the full quadrature and stays that way.
-    let basis_geometry = if method == ActiveGravityMethod::FrequencyDomain {
-        aggregated
-    } else {
-        &live_aggregated
-    };
-    let basis_sources = build_voxel_basis_sources(&voxels, basis_geometry, voxel_size)
+    // Eq.(184) κ nodes stay 64-wide; ρ̂ must use the same live-reduced mesh as
+    // Verlet/FLUPS configure. Folding the full triangle quadrature into 56
+    // voxel columns on the main thread freezes the browser when Invert is pressed.
+    let basis_sources = build_voxel_basis_sources(&voxels, &live_aggregated, voxel_size)
         .ok_or("The shared mass-preserving voxel basis is not ready.")?;
     let samples = sample_frozen_trajectory(&inversion.knots)
         .ok_or("The frozen trajectory cannot be sampled.")?;

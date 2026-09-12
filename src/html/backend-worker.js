@@ -52,18 +52,48 @@ function detachedResult(value) {
     return new value.constructor(value);
 }
 
+function isInvertKind(kind) {
+    return kind === 'source_sets' || kind === 'solve_density';
+}
+
+function hasInvertWork() {
+    return batchQueue.some((item) => isInvertKind(item.kind));
+}
+
+// Drop visual-only field batches so Invert owns the Worker immediately.
+function dropVisualFieldWork() {
+    for (let i = batchQueue.length - 1; i >= 0; i -= 1) {
+        const kind = batchQueue[i].kind;
+        if (kind === 'gravity_field' || kind === 'surface_field') {
+            batchQueue.splice(i, 1);
+        }
+    }
+}
+
 async function yieldForLiveOrbit() {
     await new Promise((resolve) => setTimeout(resolve, 0));
-    // Nested yields must not run a 64-step advance inside a timed tile.
-    // Jacobi `evaluate` and Eq.121 modes may still drain; live `advance`
-    // returns to the weighted pump instead.
+    // Abort mid-tile Section glyphs when Invert arrives; otherwise a long FMM
+    // gravity_field holds `pumping` and solve_density never starts (UI stuck on
+    // "Convex density inversion running…" with FPS still high).
+    if (hasInvertWork()) {
+        throw new Error('Field evaluation cancelled for density inversion');
+    }
+    // Pointwise `surface_field` / `gravity_field` tiles call this. Prefer live
+    // `advance` so FMM glyph batches do not hitch the orbit. Source-chunk work
+    // uses CONTINUE + the weighted pump instead, so a 64-step advance does not
+    // nest inside an `evaluate_sources` tile.
     const index = liveQueue.findIndex((item) => (
-        item.kind === 'evaluate' || item.kind === 'frequency_domain_modes'
+        item.kind === 'advance'
+        || item.kind === 'evaluate'
+        || item.kind === 'frequency_domain_modes'
     ));
     if (index < 0) return;
     const item = liveQueue.splice(index, 1)[0];
     await handleRequest(item);
     await new Promise((resolve) => setTimeout(resolve, 0));
+    if (hasInvertWork()) {
+        throw new Error('Field evaluation cancelled for density inversion');
+    }
 }
 
 function evaluateSourcesFull(backend, method, xyz, masses, targets) {
@@ -143,13 +173,17 @@ async function runRequest(message) {
             return null;
         case 'evaluate':
             return detachedResult(backend.evaluate(payload.method, payload.x, payload.y, payload.z));
-        case 'surface_field': {
+        case 'surface_field':
+        case 'gravity_field': {
             // Pointwise field of the configured geometry at every target.
+            // Gravity glyphs under FMM/FFT are especially costly — yield often
+            // and drain live advance so orbit stays smooth while Section is on.
             const targets = payload.targets;
             const count = targets.length / 3;
             const out = new Float64Array(count * 4);
+            const yieldEvery = kind === 'gravity_field' ? 8 : 16;
             for (let i = 0; i < count; i += 1) {
-                if (i % 16 === 0) await yieldForLiveOrbit();
+                if (i % yieldEvery === 0) await yieldForLiveOrbit();
                 out.set(
                     backend.evaluate(payload.method, targets[3 * i], targets[3 * i + 1], targets[3 * i + 2]),
                     4 * i,
@@ -163,25 +197,32 @@ async function runRequest(message) {
         case 'reference_sources':
             return continueReferenceSources(backend, message);
         case 'source_sets': {
-            // Invert reference + voxel columns. Do not yield to live advance
-            // between sets: that drain never finished under 64×, so FMM/FFT
-            // invert sat on "Preparing inversion observations…" forever.
-            // Frequency-domain invert skips this Worker path entirely.
+            // Invert reference + voxel columns. Chunk with CONTINUE so the Worker
+            // event loop can breathe (UI / cancel / solve_density). Do NOT drain
+            // live advance here: under 64× that starved Preparing forever.
+            // Frequency-domain invert skips this Worker path (CPU Eq.184).
             const offsets = payload.setOffsets;
             const setCount = offsets.length - 1;
             const targetValues = (payload.targets.length / 3) * 4;
-            const out = new Float64Array(setCount * targetValues);
-            for (let index = 0; index < setCount; index += 1) {
-                const start = offsets[index];
-                const end = offsets[index + 1];
-                const block = backend.evaluate_sources(
-                    payload.method,
-                    payload.xyz.subarray(3 * start, 3 * end),
-                    payload.masses.subarray(start, end),
-                    payload.targets,
-                );
-                out.set(block, index * targetValues);
+            if (setCount <= 0) return new Float64Array(0);
+            const index = message._setIndex || 0;
+            if (!message._out) message._out = new Float64Array(setCount * targetValues);
+            const start = offsets[index];
+            const end = offsets[index + 1];
+            const block = backend.evaluate_sources(
+                payload.method,
+                payload.xyz.subarray(3 * start, 3 * end),
+                payload.masses.subarray(start, end),
+                payload.targets,
+            );
+            message._out.set(block, index * targetValues);
+            if (index + 1 < setCount) {
+                message._setIndex = index + 1;
+                return CONTINUE;
             }
+            const out = message._out;
+            message._out = null;
+            message._setIndex = 0;
             return out;
         }
         case 'prepare_candidate_sources':
@@ -266,6 +307,9 @@ self.onmessage = ({ data }) => {
     if (data?.type !== 'request') return;
     // Configure stays first. Weighted pump: K batch : 1 live while batch
     // work is queued so First/Stress/Invert make progress without freezing orbit.
+    if (isInvertKind(data.kind)) {
+        dropVisualFieldWork();
+    }
     if (LIVE_KINDS.has(data.kind)) liveQueue.push(data);
     else batchQueue.push(data);
     pump();
@@ -276,6 +320,18 @@ function takeQueuedRequest() {
     if (configure >= 0) {
         batchStreak = 0;
         return liveQueue.splice(configure, 1)[0];
+    }
+    // Prefer live advance over visual-only gravity glyphs.
+    const advance = liveQueue.findIndex((item) => item.kind === 'advance');
+    if (advance >= 0 && batchQueue.some((item) => item.kind === 'gravity_field')) {
+        batchStreak = 0;
+        return liveQueue.splice(advance, 1)[0];
+    }
+    // Prefer density QP / invert source_sets over any leftover visual batch.
+    const invertWork = batchQueue.findIndex((item) => isInvertKind(item.kind));
+    if (invertWork > 0) {
+        const [item] = batchQueue.splice(invertWork, 1);
+        batchQueue.unshift(item);
     }
     if (liveQueue.length && batchQueue.length) {
         if (batchStreak < BATCH_WEIGHT) {
@@ -297,6 +353,9 @@ async function pump() {
             const data = takeQueuedRequest();
             if (!data) break;
             await handleRequest(data);
+            // Yield after every request (including CONTINUE chunks) so the page
+            // stays responsive during long invert source_sets / solve_density.
+            await new Promise((resolve) => setTimeout(resolve, 0));
         }
     } finally {
         pumping = false;

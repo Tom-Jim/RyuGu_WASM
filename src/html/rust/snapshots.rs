@@ -17,6 +17,7 @@ pub(crate) struct BrowserUiSnapshot<'w> {
     frequency_domain: Res<'w, FrequencyDomainTrajectoryBatchResult>,
     surface: Res<'w, SurfaceFieldState>,
     density_mode: Res<'w, DensityMode>,
+    gravity_field: Res<'w, crate::gpu::gravity_field::GravityFieldGlyphs>,
 }
 
 pub(crate) fn browser_ui_publish_system(
@@ -245,6 +246,18 @@ pub(crate) fn browser_ui_publish_system(
         "camera": if *state.camera == CameraMode::FollowCassini { "follow" } else { "overview" },
         "normals": state.normals.0,
         "section": state.section.0,
+        "gravityField": {
+            "enabled": state.gravity_field.enabled,
+            "fieldCount": state.gravity_field.fields.len(),
+            "sourceCount": state.gravity_field.source_count,
+            "evalMode": state.gravity_field.eval_mode,
+            "maxMagnitude": state
+                .gravity_field
+                .fields
+                .iter()
+                .map(|field| field.w)
+                .fold(0.0_f32, f32::max),
+        },
         "acceleration": state.acceleration.0,
         "rotation": state.rotation.0,
         "probe": {

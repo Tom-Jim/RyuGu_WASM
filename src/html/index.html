@@ -301,6 +301,11 @@
                                 requestId, epoch, result.value ?? new Float64Array(), error,
                             );
                             break;
+                        case 'gravity_field':
+                            wasm.deliver_backend_gravity_field_result(
+                                requestId, epoch, result.value ?? new Float64Array(), error,
+                            );
+                            break;
                         case 'comparison_sources':
                             wasm.deliver_backend_comparison_result(
                                 requestId, epoch, result.value ?? new Float64Array(), error,

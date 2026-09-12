@@ -1,6 +1,3 @@
-use bevy::render::render_resource::AsBindGroup;
-use bevy::shader::ShaderRef;
-
 const MOBILE_UNLIT_SHADER: &str = "embedded://ryugu_wasm/wgsl/mobile_unlit.wgsl";
 
 /// A deliberately small material used only by mobile browsers. Unlike

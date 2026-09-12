@@ -54,6 +54,22 @@ pub fn convex_optimization_system(
         let packet = density_channel.take();
         let Some(packet) = packet else {
             if !density_channel.is_idle() {
+                // A wedged in_flight (stale Worker reply after reset, or a
+                // solve_density stuck behind cancelled field work) left Invert
+                // on "Convex density inversion running…" forever.
+                let waited = worker
+                    .convex_started
+                    .map(|started| started.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                if waited > 45.0 {
+                    density_channel.reset();
+                    worker.pending_snapshot = None;
+                    inversion.error = Some(
+                        "Density Worker did not return a solution; try Invert again.".into(),
+                    );
+                    *worker = DensityWorkerState::default();
+                    return;
+                }
                 inversion.optimizer = Some(job);
                 return;
             }

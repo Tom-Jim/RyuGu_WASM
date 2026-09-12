@@ -156,6 +156,12 @@ backend_channel!(
     Vec<f64>
 );
 backend_channel!(
+    BackendGravityFieldSnapshot,
+    BackendGravityFieldPacket,
+    BackendGravityFieldChannel,
+    Vec<f64>
+);
+backend_channel!(
     BackendComparisonSnapshot,
     BackendComparisonPacket,
     BackendComparisonChannel,
@@ -188,6 +194,7 @@ pub struct BackendChannels<'w> {
     pub evaluate: Res<'w, BackendEvaluateChannel>,
     pub configure: Res<'w, BackendConfigureChannel>,
     pub surface: Res<'w, BackendSurfaceChannel>,
+    pub gravity_field: Res<'w, BackendGravityFieldChannel>,
     pub comparison: Res<'w, BackendComparisonChannel>,
     pub reference: Res<'w, BackendReferenceChannel>,
     pub sensitivity: Res<'w, BackendSensitivityChannel>,
@@ -202,6 +209,7 @@ impl BackendChannels<'_> {
         self.evaluate.reset();
         self.configure.reset();
         self.surface.reset();
+        self.gravity_field.reset();
         self.comparison.reset();
         self.reference.reset();
         self.sensitivity.reset();
@@ -218,6 +226,7 @@ struct BackendDeliveryChannels {
     evaluate: BackendEvaluateChannel,
     configure: BackendConfigureChannel,
     surface: BackendSurfaceChannel,
+    gravity_field: BackendGravityFieldChannel,
     comparison: BackendComparisonChannel,
     reference: BackendReferenceChannel,
     sensitivity: BackendSensitivityChannel,
@@ -308,6 +317,14 @@ backend_delivery!(
     surface,
     BackendSurfacePacket,
     BackendSurfaceSnapshot,
+    Vec<f64>
+);
+#[cfg(target_arch = "wasm32")]
+backend_delivery!(
+    deliver_backend_gravity_field_result,
+    gravity_field,
+    BackendGravityFieldPacket,
+    BackendGravityFieldSnapshot,
     Vec<f64>
 );
 #[cfg(target_arch = "wasm32")]
@@ -415,6 +432,9 @@ export function request_backend_frequency_domain_modes(requestId, epoch, modes) 
 export function request_backend_surface_field(requestId, epoch, method, targets) {
     post_backend_request('surface_field', requestId, epoch, { method, targets });
 }
+export function request_backend_gravity_field(requestId, epoch, method, targets) {
+    post_backend_request('gravity_field', requestId, epoch, { method, targets });
+}
 export function request_backend_comparison_sources(requestId, epoch, xyz, masses, targets) {
     post_backend_request('comparison_sources', requestId, epoch,
         { method: 'direct', xyz, masses, targets });
@@ -495,6 +515,13 @@ extern "C" {
         targets: &[f64],
     ) -> Result<(), JsValue>;
     #[wasm_bindgen(catch)]
+    fn request_backend_gravity_field(
+        request_id: u64,
+        epoch: u64,
+        method: &str,
+        targets: &[f64],
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
     fn request_backend_comparison_sources(
         request_id: u64,
         epoch: u64,
@@ -524,16 +551,15 @@ extern "C" {
 }
 
 /// Backend key of a method whose field is evaluated pointwise against the
-/// configured geometry. Frequency-domain has its own GPU operator.
-fn pointwise_method_key(method: ActiveGravityMethod) -> Result<&'static str, String> {
+/// configured geometry. Frequency-domain maps to Worker FLUPS (`evaluate`
+/// → Eq.(121) inv-Laplace of Eq.(106) at a point), matching live orbit.
+pub fn pointwise_method_key(method: ActiveGravityMethod) -> Result<&'static str, String> {
     match method {
         ActiveGravityMethod::RadialAnalytic => Ok("radial"),
         ActiveGravityMethod::HomogeneousWerner => Ok("werner"),
         ActiveGravityMethod::Fmm => Ok("fmm"),
         ActiveGravityMethod::MmfftCompressed => Ok("fft"),
-        ActiveGravityMethod::FrequencyDomain => {
-            Err("Frequency-domain uses its dedicated operator".into())
-        }
+        ActiveGravityMethod::FrequencyDomain => Ok("frequency_domain"),
     }
 }
 
@@ -825,6 +851,37 @@ pub fn request_surface_field(
     }
 }
 
+/// Exterior gravity-arrow samples: same Worker pointwise operators as the
+/// surface product (radial / Werner / FMM / FFT / frequency_domain FLUPS),
+/// on a dedicated channel so live glyphs do not fight surface-field compute.
+pub fn request_gravity_field(
+    channel: &BackendGravityFieldChannel,
+    snapshot: BackendGravityFieldSnapshot,
+    method: ActiveGravityMethod,
+    targets: &[bevy::math::DVec3],
+) -> Result<bool, String> {
+    let key = pointwise_method_key(method)?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        if !backend_worker_ready() || !channel.begin(snapshot) {
+            return Ok(false);
+        }
+        let positions = flatten_targets(targets);
+        if let Err(error) =
+            request_backend_gravity_field(snapshot.request_id, snapshot.epoch, key, &positions)
+        {
+            channel.reset();
+            return Err(format!("Gravity-field Worker request: {error:?}"));
+        }
+        Ok(true)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (channel, snapshot, key, targets);
+        Ok(false)
+    }
+}
+
 /// Direct f64 point-source oracle for the Basilisk protocol comparison.
 pub fn request_comparison_sources(
     channel: &BackendComparisonChannel,
@@ -996,6 +1053,7 @@ impl Plugin for CppBackendPlugin {
         let evaluate = BackendEvaluateChannel::default();
         let configure = BackendConfigureChannel::default();
         let surface = BackendSurfaceChannel::default();
+        let gravity_field = BackendGravityFieldChannel::default();
         let comparison = BackendComparisonChannel::default();
         let reference = BackendReferenceChannel::default();
         let sensitivity = BackendSensitivityChannel::default();
@@ -1008,6 +1066,7 @@ impl Plugin for CppBackendPlugin {
             evaluate: evaluate.clone(),
             configure: configure.clone(),
             surface: surface.clone(),
+            gravity_field: gravity_field.clone(),
             comparison: comparison.clone(),
             reference: reference.clone(),
             sensitivity: sensitivity.clone(),
@@ -1020,6 +1079,7 @@ impl Plugin for CppBackendPlugin {
             .insert_resource(evaluate)
             .insert_resource(configure)
             .insert_resource(surface)
+            .insert_resource(gravity_field)
             .insert_resource(comparison)
             .insert_resource(reference)
             .insert_resource(sensitivity)
@@ -1304,12 +1364,13 @@ mod backend_channel_tests {
             .init_resource::<BackendEvaluateChannel>()
             .init_resource::<BackendConfigureChannel>()
             .init_resource::<BackendSurfaceChannel>()
+            .init_resource::<BackendGravityFieldChannel>()
             .init_resource::<BackendComparisonChannel>()
             .init_resource::<BackendReferenceChannel>()
             .init_resource::<BackendSensitivityChannel>()
             .add_systems(Update, |channels: BackendChannels| channels.reset_all());
 
-        fn flags(world: &World) -> [Arc<AtomicBool>; 10] {
+        fn flags(world: &World) -> [Arc<AtomicBool>; 11] {
             [
                 world.resource::<BackendAdvanceChannel>().in_flight.clone(),
                 world
@@ -1327,6 +1388,10 @@ mod backend_channel_tests {
                     .in_flight
                     .clone(),
                 world.resource::<BackendSurfaceChannel>().in_flight.clone(),
+                world
+                    .resource::<BackendGravityFieldChannel>()
+                    .in_flight
+                    .clone(),
                 world
                     .resource::<BackendComparisonChannel>()
                     .in_flight

@@ -13,6 +13,7 @@ use bevy::shader::Shader;
 pub(crate) enum EmbeddedShader {
     Equation106,
     FrequencyDomain,
+    GravityField,
     Normals,
     PlanningMetrics,
 }
@@ -21,6 +22,7 @@ pub(crate) fn load(server: &AssetServer, shader: EmbeddedShader) -> Handle<Shade
     match shader {
         EmbeddedShader::Equation106 => load_embedded_asset!(server, "equation106.wgsl"),
         EmbeddedShader::FrequencyDomain => load_embedded_asset!(server, "frequency_domain.wgsl"),
+        EmbeddedShader::GravityField => load_embedded_asset!(server, "gravity_field.wgsl"),
         EmbeddedShader::Normals => load_embedded_asset!(server, "normals.wgsl"),
         EmbeddedShader::PlanningMetrics => {
             load_embedded_asset!(server, "planning_metrics.wgsl")
@@ -37,6 +39,8 @@ impl Plugin for WgslPlugin {
         embedded_asset!(app, "normals.wgsl");
         embedded_asset!(app, "planning_metrics.wgsl");
         embedded_asset!(app, "mobile_unlit.wgsl");
+        embedded_asset!(app, "density_slice.wgsl");
+        embedded_asset!(app, "gravity_field.wgsl");
     }
 }
 
