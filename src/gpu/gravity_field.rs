@@ -15,6 +15,7 @@
 use crate::cpu::frequency_domain::{AggregatedGravitySource, FrequencyDomainPointSource};
 use crate::interface::components::*;
 use bevy::math::DVec3;
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
@@ -26,7 +27,6 @@ use bevy::render::{
     },
     renderer::{RenderDevice, RenderQueue},
 };
-use bevy::platform::time::Instant;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -263,9 +263,9 @@ fn prepare_gravity_field_samples_system(
                     DensityMode::Constant => source.constant_hash,
                 })
             }
-            ActiveGravityMethod::HomogeneousWerner => aggregated
-                .as_ref()
-                .map_or(0, |source| source.constant_hash),
+            ActiveGravityMethod::HomogeneousWerner => {
+                aggregated.as_ref().map_or(0, |source| source.constant_hash)
+            }
             _ => aggregated.as_ref().map_or(0, |source| match *density_mode {
                 DensityMode::Variable => source.source_hash,
                 DensityMode::Constant => source.constant_hash,
@@ -328,9 +328,12 @@ fn prepare_gravity_field_samples_system(
             | ActiveGravityMethod::RadialAnalytic
             | ActiveGravityMethod::HomogeneousWerner
             | ActiveGravityMethod::Fmm
-            | ActiveGravityMethod::MmfftCompressed => {
-                Some((EVAL_MODE_WORKER, Vec::new(), glyphs.positions.len() as u32, Vec4::ZERO))
-            }
+            | ActiveGravityMethod::MmfftCompressed => Some((
+                EVAL_MODE_WORKER,
+                Vec::new(),
+                glyphs.positions.len() as u32,
+                Vec4::ZERO,
+            )),
         }
     };
 
@@ -358,11 +361,9 @@ fn seed_gravity_field_cpu_system(mut glyphs: ResMut<GravityFieldGlyphs>) {
     {
         return;
     }
-    let Some(fields) = evaluate_payload_cpu(
-        glyphs.source_count,
-        &glyphs.source_bytes,
-        &glyphs.positions,
-    ) else {
+    let Some(fields) =
+        evaluate_payload_cpu(glyphs.source_count, &glyphs.source_bytes, &glyphs.positions)
+    else {
         return;
     };
     glyphs.fields = fields;
